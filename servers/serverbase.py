@@ -8,6 +8,7 @@ import torch
 from aggregator.base_aggregator import BaseAggregator
 from context.context import Context
 from privacy_attacks.auditor import MembershipAuditor
+from privacy_defenses import DefenseController
 from users.user import UserBase
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ class ServerBase:
         eval_interval: int = 5,
         eval_batch_size: int = 64,
         audit_config: dict | None = None,
+        defense_config: dict | None = None,
     ):
         if train_mode not in {"centralized", "local"}:
             raise ValueError("train_mode must be 'centralized' or 'local'.")
@@ -60,6 +62,7 @@ class ServerBase:
         self.save_models_enabled = save_models
         self.eval_interval = eval_interval
         self.audit_config = audit_config or {"enabled": True}
+        self.defense_config = defense_config or {"name": "none"}
         self.target_client_id = int(self.audit_config.get("target_client_id", 0))
         self.ensure_target = bool(
             self.audit_config.get("ensure_target_participation", True)
@@ -82,6 +85,15 @@ class ServerBase:
             "synthetic_mean": float(self.audit_config.get("synthetic_mean", 0.0)),
             "synthetic_std": float(self.audit_config.get("synthetic_std", 0.1)),
         }
+        defense_seeded_config = dict(self.defense_config)
+        defense_seeded_config.setdefault("seed", int(self.audit_config.get("seed", 42)))
+        self.defense = DefenseController(
+            config=defense_seeded_config,
+            device=device,
+            total_users=total_users,
+            num_classes=len(class_names),
+            total_rounds=num_glob_iters,
+        )
         for user_id in range(total_users):
             user = UserBase(
                 device=device,
@@ -96,9 +108,11 @@ class ServerBase:
                 local_epochs=local_epochs,
                 collate_fn=collate_fn,
                 code_poison_config=code_poison_config,
+                defense_controller=self.defense,
             )
             self.ctx.users.append(user)
             self.ctx.samples_num.append(user.train_samples)
+        self.defense.samples_num = list(self.ctx.samples_num)
 
         if model_load_path:
             state = torch.load(model_load_path, map_location=device)
@@ -113,6 +127,7 @@ class ServerBase:
             results_dir=results_dir,
             collate_fn=collate_fn,
             config=self.audit_config,
+            defense_config=self.defense_config,
         )
         self.code_poison_enabled = "codepoison" in self.auditor.attacks
 
@@ -181,6 +196,7 @@ class ServerBase:
             self.ctx.glob_iter = round_index
             selected_ids = self._sample_users()
             self.ctx.user_selected = selected_ids
+            self.defense.prepare_round(selected_ids, round_index)
             logger.info("Round %s selected clients: %s", round_index, selected_ids)
 
             base_state = self.ctx.get_base_model_state(self.target_client_id)
@@ -190,10 +206,21 @@ class ServerBase:
                 use_code_poison = (
                     self.code_poison_enabled and user_id == self.target_client_id
                 )
-                user.train(code_poison=use_code_poison)
+                user.train(
+                    code_poison=use_code_poison,
+                    round_index=round_index,
+                )
                 self.ctx.set_updated_model_state(
                     user_id, self._clone_state(user.get_parameters())
                 )
+
+            self.defense.after_local_training(
+                users=self.ctx.users,
+                base_state=base_state,
+                updated_states=self.ctx.updated_model_state,
+                selected_ids=selected_ids,
+                round_index=round_index,
+            )
 
             self.auditor.observe_round(
                 round_index=round_index,
@@ -215,4 +242,6 @@ class ServerBase:
             self._clone_state(final_state, cpu=True),
             os.path.join(self.results_dir, "final_prompt.pt"),
         )
+        defense_summary = self.defense.save_summary(self.results_dir)
+        logger.info("Privacy defense completed: %s", defense_summary)
         return self.auditor.finalize(self.model, final_state)

@@ -1,5 +1,7 @@
 # Privacy attacks in Federated Prompt Tuning
 
+> 五种独立防御及“攻击/防御/攻击+防御”运行方式见 [docs/defenses.md](docs/defenses.md)。
+
 本仓库从 SEISMOGRAPH 中提取了联邦提示微调（Federated Prompt Tuning, FPT）主流程，删除了全部后门攻击、触发器优化、恶意客户端逻辑和 SEISMOGRAPH 防御，仅保留：
 
 - 冻结的 CLIP 图像/文本骨干；

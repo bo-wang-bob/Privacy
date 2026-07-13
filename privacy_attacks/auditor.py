@@ -24,6 +24,7 @@ from privacy_attacks.query_attacks import run_canary, run_yoqo
 from privacy_attacks.rmia import run_rmia
 from privacy_attacks.transfer import run_transfer_representation_attack
 from privacy_attacks.whitebox import run_active_whitebox, run_passive_whitebox
+from privacy_defenses import attach_hamp_output_transform
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,11 @@ class MembershipAuditor:
         results_dir: str,
         collate_fn=None,
         config: dict | None = None,
+        defense_config: dict | None = None,
     ):
         self.config = config or {}
+        self.defense_config = dict(defense_config or {"name": "none"})
+        self.defense_name = str(self.defense_config.get("name", "none")).lower()
         self.enabled = bool(self.config.get("enabled", True))
         self.attacks = list(
             self.config.get(
@@ -85,6 +89,11 @@ class MembershipAuditor:
         if not 0 <= target_client_id < len(users):
             raise ValueError("target_client_id is outside the client range.")
         self.model = copy.deepcopy(model).to(device)
+        if self.defense_name == "hamp":
+            attach_hamp_output_transform(
+                self.model,
+                float(self.defense_config.get("hamp_output_temperature", 4.0)),
+            )
         self.users = users
         self.target_client_id = target_client_id
         self.device = device
@@ -390,6 +399,11 @@ class MembershipAuditor:
         os.makedirs(self.results_dir, exist_ok=True)
         final_model = copy.deepcopy(final_model).to(self.device)
         final_model.load_state_dict(final_state, strict=False)
+        if self.defense_name == "hamp":
+            attach_hamp_output_transform(
+                final_model,
+                float(self.defense_config.get("hamp_output_temperature", 4.0)),
+            )
         for attack in self.attacks:
             try:
                 self.results.append(self._run(attack, final_model, final_state))
@@ -403,6 +417,7 @@ class MembershipAuditor:
             json.dump(
                 {
                     "target_client_id": self.target_client_id,
+                    "defense": self.defense_name,
                     "attacks": summaries,
                     "errors": self.errors,
                 },

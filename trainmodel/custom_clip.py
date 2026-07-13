@@ -344,6 +344,8 @@ class CustomCLIP(BaseModel):
         - Classification: Cosine similarity between image and text features
     """
 
+    _supports_native_hamp_output = True
+
     def __init__(
         self,
         clip_model: CLIPModel,
@@ -419,6 +421,7 @@ class CustomCLIP(BaseModel):
         # Compute cosine similarity scaled by learned temperature
         logit_scale = self.clip_model.logit_scale.exp()
         logits = logit_scale * image_features @ text_features.t()  # (B, K)
+        logits = logits / float(getattr(self, "_hamp_output_temperature", 1.0))
 
         logger.debug(
             f"CustomCLIP forward: batch_size={x.shape[0]}, logits shape={logits.shape}, logit_scale={logit_scale.item():.4f}"
@@ -513,6 +516,8 @@ class CustomCLIP(BaseModel):
         new_model.prompt_learner.load_state_dict(
             self.prompt_learner.state_dict(), strict=True
         )
+        if hasattr(self, "_hamp_output_temperature"):
+            new_model._hamp_output_temperature = self._hamp_output_temperature
         return new_model
 
     def __deepcopy__(self, memo):

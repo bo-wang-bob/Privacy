@@ -27,6 +27,7 @@ class UserBase:
         collate_fn=None,
         eval_batch_size: int = 64,
         code_poison_config: dict | None = None,
+        defense_controller=None,
     ):
         if batch_size <= 0 or eval_batch_size <= 0 or local_epochs <= 0:
             raise ValueError("Batch sizes and local_epochs must be positive.")
@@ -43,6 +44,7 @@ class UserBase:
         self.local_epochs = local_epochs
         self.collate_fn = collate_fn
         self.code_poison_config = code_poison_config or {}
+        self.defense_controller = defense_controller
         self.trainloader = DataLoader(
             train_data,
             batch_size=batch_size,
@@ -72,7 +74,33 @@ class UserBase:
             if name in names
         }
 
-    def train_model(self, model: torch.nn.Module, code_poison: bool = False) -> None:
+    def train_model(
+        self,
+        model: torch.nn.Module,
+        code_poison: bool = False,
+        round_index: int = 0,
+        privacy_probe: bool = False,
+    ) -> None:
+        if self.defense_controller is not None:
+            effective_round = round_index
+            if privacy_probe and round_index == 0:
+                effective_round = max(
+                    0,
+                    int(self.defense_controller.total_rounds) - 1,
+                )
+            self.defense_controller.train_client(
+                self,
+                model,
+                round_index=effective_round,
+                code_poison=code_poison,
+            )
+            if privacy_probe:
+                self.defense_controller.after_probe_training(
+                    model,
+                    client_id=self.id,
+                    round_index=effective_round,
+                )
+            return
         model.to(self.device)
         model.train()
         trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
@@ -96,8 +124,12 @@ class UserBase:
                 loss.backward()
                 optimizer.step()
 
-    def train(self, code_poison: bool = False) -> None:
-        self.train_model(self.model, code_poison=code_poison)
+    def train(self, code_poison: bool = False, round_index: int = 0) -> None:
+        self.train_model(
+            self.model,
+            code_poison=code_poison,
+            round_index=round_index,
+        )
 
     @torch.no_grad()
     def evaluate(self) -> tuple[float, int, int]:

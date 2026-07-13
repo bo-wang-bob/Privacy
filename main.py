@@ -10,6 +10,7 @@ import yaml
 
 from aggregator.aggregator_builder import build_aggregator
 from privacy_attacks.auditor import SUPPORTED_ATTACKS
+from privacy_defenses import SUPPORTED_DEFENSES
 from servers.serverbase import ServerBase
 from utils.data_loader import generate_dirichlet_split, generate_iid_split
 
@@ -53,6 +54,29 @@ def validate_config(config: dict) -> None:
     unknown = sorted(attacks - SUPPORTED_ATTACKS)
     if unknown:
         raise ValueError(f"Unknown membership attacks: {', '.join(unknown)}")
+    if audit.get("enabled", True) and not attacks:
+        raise ValueError("audit.enabled=true requires at least one membership attack.")
+    defense = config.get("defense", {})
+    defense_name = str(defense.get("name", "none")).lower()
+    if defense_name not in SUPPORTED_DEFENSES:
+        raise ValueError(f"Unknown privacy defense: {defense_name}")
+    if defense_name == "mist" and config["sample_users"] < 2:
+        raise ValueError("MIST requires at least two selected client submodels.")
+    if not 0 < float(defense.get("dp_delta", 1e-5)) < 1:
+        raise ValueError("defense.dp_delta must be in (0, 1).")
+    if defense_name == "prompt_dp":
+        if float(defense.get("dp_max_grad_norm", 1.0)) <= 0:
+            raise ValueError("defense.dp_max_grad_norm must be positive.")
+        if float(defense.get("dp_noise_multiplier", 1.0)) <= 0:
+            raise ValueError("defense.dp_noise_multiplier must be positive.")
+    if not 0 <= float(defense.get("cofedmid_recycle_ratio", 0.1)) <= 1:
+        raise ValueError("defense.cofedmid_recycle_ratio must be in [0, 1].")
+    if not 0 <= float(defense.get("cofedmid_perturb_ratio", 0.1)) <= 1:
+        raise ValueError("defense.cofedmid_perturb_ratio must be in [0, 1].")
+    if not 0 <= float(defense.get("soft_obfuscation_strength", 0.5)) <= 1:
+        raise ValueError("defense.soft_obfuscation_strength must be in [0, 1].")
+    if float(defense.get("hamp_output_temperature", 4.0)) < 1:
+        raise ValueError("defense.hamp_output_temperature must be at least one.")
     spatial = {
         "fedmia_loss",
         "fedmia_cosine",
@@ -86,9 +110,17 @@ def run(config: dict) -> list[dict]:
         f"cuda:{config['gpu']}" if torch.cuda.is_available() else "cpu"
     )
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    configured_attacks = list(config.get("audit", {}).get("attacks", []))
+    if not bool(config.get("audit", {}).get("enabled", True)) or not configured_attacks:
+        attack_label = "no_attack"
+    elif len(configured_attacks) == 1:
+        attack_label = configured_attacks[0]
+    else:
+        attack_label = "multi_attack"
+    defense_label = str(config.get("defense", {}).get("name", "none")).lower()
     result_dir = os.path.join(
         config["results_dir"],
-        f"{config['dataset_name']}_fedprompt_privacy_{timestamp}",
+        f"{config['dataset_name']}_{attack_label}_{defense_label}_{timestamp}",
     )
     os.makedirs(result_dir, exist_ok=True)
     with open(os.path.join(result_dir, "run_config.yaml"), "w", encoding="utf-8") as file:
@@ -159,6 +191,7 @@ def run(config: dict) -> list[dict]:
         collate_fn=collate_fn,
         eval_interval=config["eval_interval"],
         audit_config=audit_config,
+        defense_config=config.get("defense", {"name": "none"}),
     )
     summaries = server.train()
     logger.info("Privacy audit completed: %s", summaries)
@@ -251,6 +284,25 @@ def default_config() -> dict:
             "promptmia_delta_min": 0.02,
             "promptmia_similarity_span": 0.05,
         },
+        "defense": {
+            "name": "none",
+            "dp_max_grad_norm": 1.0,
+            "dp_noise_multiplier": 1.0,
+            "dp_delta": 1e-5,
+            "cofedmid_intervals": 4,
+            "cofedmid_recycle_ratio": 0.1,
+            "cofedmid_entropy_weight": 0.05,
+            "cofedmid_exp3_gamma": 0.2,
+            "cofedmid_noise_std": 0.05,
+            "cofedmid_perturb_ratio": 0.1,
+            "mist_cross_steps": 1,
+            "mist_cross_weight": 1.0,
+            "soft_obfuscation_strength": 0.5,
+            "soft_noise_std": 0.05,
+            "hamp_true_probability": 0.6,
+            "hamp_entropy_weight": 0.05,
+            "hamp_output_temperature": 4.0,
+        },
     }
 
 
@@ -266,14 +318,26 @@ def parse_args() -> dict:
     parser.add_argument("--sample_users", type=int)
     parser.add_argument("--target_client_id", type=int)
     parser.add_argument("--audit_attacks", help="Comma-separated attack names")
+    parser.add_argument(
+        "--attack",
+        choices=["none", *sorted(SUPPORTED_ATTACKS)],
+        help="Run one attack; use 'none' for defense-only or plain training.",
+    )
+    parser.add_argument(
+        "--defense",
+        choices=sorted(SUPPORTED_DEFENSES),
+        help="Run one independent defense; use 'none' for attack-only or plain training.",
+    )
     args = parser.parse_args()
     config = default_config()
     if args.config:
         with open(args.config, "r", encoding="utf-8") as file:
             loaded = yaml.safe_load(file) or {}
         audit = config["audit"] | loaded.pop("audit", {})
+        defense = config["defense"] | loaded.pop("defense", {})
         config.update(loaded)
         config["audit"] = audit
+        config["defense"] = defense
     for key in ("dataset_name", "gpu", "seed", "num_global_iters", "sample_users"):
         value = getattr(args, key)
         if value is not None:
@@ -284,6 +348,12 @@ def parse_args() -> dict:
         config["audit"]["attacks"] = [
             item.strip() for item in args.audit_attacks.split(",") if item.strip()
         ]
+        config["audit"]["enabled"] = bool(config["audit"]["attacks"])
+    if args.attack is not None:
+        config["audit"]["enabled"] = args.attack != "none"
+        config["audit"]["attacks"] = [] if args.attack == "none" else [args.attack]
+    if args.defense is not None:
+        config["defense"]["name"] = args.defense
     return config
 
 

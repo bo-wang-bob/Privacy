@@ -107,7 +107,11 @@ def run_active_whitebox(
                 for parameter, gradient in zip(trainable, gradients):
                     parameter.add_(gradient, alpha=ascent_lr)
         before_loss, before_norm = _loss_and_gradient_norm(probe, image, label)
-        target_user.train_model(probe, code_poison=False)
+        target_user.train_model(
+            probe,
+            code_poison=False,
+            privacy_probe=True,
+        )
         after_loss, after_norm = _loss_and_gradient_norm(probe, image, label)
         scores.append((before_loss - after_loss) + (before_norm - after_norm))
     return AttackResult(

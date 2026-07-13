@@ -136,7 +136,11 @@ def run_promptmia(
         )
         candidate_gradient = torch.autograd.grad(candidate_loss, parameter)[0]
         candidate_gradient = candidate_gradient.reshape(-1, parameter.shape[-1])[:count]
-        target_user.train_model(probe, code_poison=False)
+        target_user.train_model(
+            probe,
+            code_poison=False,
+            privacy_probe=True,
+        )
         after = parameter.reshape(-1, parameter.shape[-1])[:count].detach()
         update = before - after
         update_norm = update.norm(dim=1)

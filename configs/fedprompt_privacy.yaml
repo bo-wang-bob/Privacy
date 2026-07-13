@@ -81,3 +81,22 @@ audit:
   promptmia_keys: 4
   promptmia_delta_min: 0.02
   promptmia_similarity_span: 0.05
+
+defense:
+  name: none
+  dp_max_grad_norm: 1.0
+  dp_noise_multiplier: 1.0
+  dp_delta: 0.00001
+  cofedmid_intervals: 4
+  cofedmid_recycle_ratio: 0.1
+  cofedmid_entropy_weight: 0.05
+  cofedmid_exp3_gamma: 0.2
+  cofedmid_noise_std: 0.05
+  cofedmid_perturb_ratio: 0.1
+  mist_cross_steps: 1
+  mist_cross_weight: 1.0
+  soft_obfuscation_strength: 0.5
+  soft_noise_std: 0.05
+  hamp_true_probability: 0.6
+  hamp_entropy_weight: 0.05
+  hamp_output_temperature: 4.0
