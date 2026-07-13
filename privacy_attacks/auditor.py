@@ -15,6 +15,13 @@ from privacy_attacks.features import (
     trainable_names,
 )
 from privacy_attacks.fedmia import run_fedmia
+from privacy_attacks.imia import run_imia
+from privacy_attacks.model_utils import last_client_states
+from privacy_attacks.pipra import run_pipra
+from privacy_attacks.promptmia import run_promptmia
+from privacy_attacks.quantile import run_quantile_mia
+from privacy_attacks.query_attacks import run_canary, run_yoqo
+from privacy_attacks.rmia import run_rmia
 from privacy_attacks.transfer import run_transfer_representation_attack
 from privacy_attacks.whitebox import run_active_whitebox, run_passive_whitebox
 
@@ -27,6 +34,13 @@ SUPPORTED_ATTACKS = {
     "fedmia_cosine",
     "transfer_representation",
     "codepoison",
+    "pipra",
+    "rmia",
+    "imia",
+    "quantile_mia",
+    "yoqo",
+    "canary",
+    "promptmia",
 }
 
 
@@ -55,6 +69,13 @@ class MembershipAuditor:
                     "fedmia_cosine",
                     "transfer_representation",
                     "codepoison",
+                    "pipra",
+                    "rmia",
+                    "imia",
+                    "quantile_mia",
+                    "yoqo",
+                    "canary",
+                    "promptmia",
                 ],
             )
         )
@@ -183,6 +204,13 @@ class MembershipAuditor:
             "gradient_signature": signatures,
             "probabilities": torch.stack(probabilities),
             "representations": torch.stack(representations),
+            "client_states": {
+                user_id: {
+                    name: tensor.detach().cpu().clone()
+                    for name, tensor in updated_states[user_id].items()
+                }
+                for user_id in selected_ids
+            },
         }
         self.observations.append(observation)
         logger.info("Collected privacy signals for round %s", round_index)
@@ -232,6 +260,123 @@ class MembershipAuditor:
                 self.membership,
                 mean=float(self.config.get("synthetic_mean", 0.0)),
                 std=float(self.config.get("synthetic_std", 0.1)),
+            )
+        if attack == "rmia":
+            return run_rmia(
+                self.observations,
+                self.membership,
+                self.labels,
+                self.target_client_id,
+                float(self.config.get("auxiliary_fraction", 0.5)),
+                self.seed,
+                offline_a=float(self.config.get("rmia_offline_a", 0.3)),
+                gamma=float(self.config.get("rmia_gamma", 1.0)),
+            )
+        if attack == "quantile_mia":
+            return run_quantile_mia(
+                self.observations,
+                self.membership,
+                self.labels,
+                self.target_client_id,
+                float(self.config.get("auxiliary_fraction", 0.5)),
+                self.seed,
+                quantile=float(self.config.get("qmia_quantile", 0.9)),
+                epochs=int(self.config.get("qmia_epochs", 200)),
+                learning_rate=float(self.config.get("qmia_learning_rate", 0.01)),
+            )
+        if attack in {"pipra", "imia"}:
+            target_model = copy.deepcopy(final_model)
+            try:
+                target_state, _, _ = last_client_states(
+                    self.observations, self.target_client_id
+                )
+                target_model.load_state_dict(target_state, strict=False)
+            except ValueError:
+                target_model.load_state_dict(final_state, strict=False)
+            if attack == "pipra":
+                return run_pipra(
+                    target_model,
+                    self.images,
+                    self.labels,
+                    self.membership,
+                    float(self.config.get("auxiliary_fraction", 0.5)),
+                    self.seed,
+                    shadow_prompts=int(self.config.get("pipra_shadow_prompts", 4)),
+                    shadow_steps=int(self.config.get("pipra_shadow_steps", 20)),
+                    shadow_learning_rate=float(
+                        self.config.get("pipra_shadow_learning_rate", 0.02)
+                    ),
+                    attack_epochs=int(self.config.get("pipra_attack_epochs", 200)),
+                    attack_learning_rate=float(
+                        self.config.get("pipra_attack_learning_rate", 0.01)
+                    ),
+                    temperature=float(self.config.get("pipra_temperature", 0.1)),
+                )
+            return run_imia(
+                target_model,
+                self.images,
+                self.labels,
+                self.membership,
+                float(self.config.get("auxiliary_fraction", 0.5)),
+                self.seed,
+                imitative_models=int(self.config.get("imia_models", 4)),
+                warmup_steps=int(self.config.get("imia_warmup_steps", 10)),
+                imitation_steps=int(self.config.get("imia_imitation_steps", 20)),
+                pivot_steps=int(self.config.get("imia_pivot_steps", 20)),
+                learning_rate=float(self.config.get("imia_learning_rate", 0.02)),
+                pivots_per_class=int(self.config.get("imia_pivots_per_class", 4)),
+            )
+        if attack == "yoqo":
+            return run_yoqo(
+                final_model,
+                self.observations,
+                self.target_client_id,
+                self.images,
+                self.labels,
+                self.membership,
+                max_samples=int(self.config.get("query_max_samples", 16)),
+                steps=int(self.config.get("yoqo_steps", 20)),
+                learning_rate=float(self.config.get("yoqo_learning_rate", 0.01)),
+                epsilon=float(self.config.get("query_epsilon", 0.1)),
+                distortion_weight=float(
+                    self.config.get("yoqo_distortion_weight", 1.0)
+                ),
+                reference_models=int(self.config.get("query_reference_models", 2)),
+            )
+        if attack == "canary":
+            return run_canary(
+                final_model,
+                self.observations,
+                self.target_client_id,
+                self.images,
+                self.labels,
+                self.membership,
+                max_samples=int(self.config.get("query_max_samples", 16)),
+                num_canaries=int(self.config.get("canary_num_queries", 2)),
+                optimization_steps=int(self.config.get("canary_steps", 20)),
+                shadow_steps=int(self.config.get("canary_shadow_steps", 3)),
+                learning_rate=float(self.config.get("canary_learning_rate", 0.01)),
+                shadow_learning_rate=float(
+                    self.config.get("canary_shadow_learning_rate", 0.02)
+                ),
+                epsilon=float(self.config.get("query_epsilon", 0.1)),
+                reference_models=int(self.config.get("query_reference_models", 2)),
+            )
+        if attack == "promptmia":
+            return run_promptmia(
+                final_model,
+                final_state,
+                self.users[self.target_client_id],
+                self.images,
+                self.labels,
+                self.membership,
+                max_samples=int(self.config.get("promptmia_max_samples", 16)),
+                adversarial_keys=int(self.config.get("promptmia_keys", 4)),
+                delta_min=float(self.config.get("promptmia_delta_min", 0.02)),
+                similarity_span=float(
+                    self.config.get("promptmia_similarity_span", 0.05)
+                ),
+                seed=self.seed,
             )
         raise AssertionError(f"Unhandled attack {attack}")
 

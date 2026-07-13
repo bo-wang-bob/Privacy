@@ -25,10 +25,27 @@ audit:
   strict: true
   target_client_id: 0
   ensure_target_participation: true
-  attacks: [nasr_passive, fedmia_loss, fedmia_cosine, transfer_representation, codepoison]
+  attacks: [nasr_passive, fedmia_loss, fedmia_cosine, transfer_representation, codepoison, pipra, rmia, imia, quantile_mia, yoqo, canary, promptmia]
   max_samples_per_group: 4
   audit_interval: 1
   calibration_fraction: 0.5
   codepoison_weight: 1.0
   synthetic_mean: 0.0
   synthetic_std: 0.1
+  auxiliary_fraction: 0.5
+  qmia_epochs: 10
+  pipra_shadow_prompts: 2
+  pipra_shadow_steps: 1
+  pipra_attack_epochs: 10
+  imia_models: 1
+  imia_warmup_steps: 1
+  imia_imitation_steps: 1
+  imia_pivot_steps: 1
+  query_max_samples: 4
+  query_reference_models: 1
+  yoqo_steps: 1
+  canary_num_queries: 1
+  canary_steps: 1
+  canary_shadow_steps: 1
+  promptmia_max_samples: 4
+  promptmia_keys: 2

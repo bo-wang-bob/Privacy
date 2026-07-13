@@ -38,6 +38,58 @@
 
 原实现面向完整 CNN；这里仅更新 soft prompt，且不引入第二归一化层。该机制是训练代码投毒型隐私攻击，不包含触发器、目标标签或后门成功率逻辑。
 
+## 5. PIPRA: Your Prompts Are Not Safe
+
+论文：[AAAI 2026 官方页面](https://ojs.aaai.org/index.php/AAAI/article/view/40839)。截至实现时未发现作者公开的官方代码，因此 `privacy_attacks/pipra.py` 按论文第 4--12 式实现：
+
+- 将已知 OUT 数据划分并训练多个 prompt-only shadow prompts；
+- 使用冻结 VLM 提取图像特征，以及由真实标签选择的 prompt 文本特征；
+- 以 shadow prompt/成员为正对、shadow prompt/非成员为负对；
+- 联合训练共享特征投影器、InfoNCE 对比目标和二元判别器；
+- 推断阶段不使用目标模型 logits、损失或梯度。
+
+## 6. RMIA
+
+论文：[ICML 2024 / PMLR](https://proceedings.mlr.press/v235/zarifzadeh24a.html)。官方实现位于 [Privacy Meter](https://github.com/privacytrustlab/ml_privacy_meter/tree/master/research/2024_rmia)。
+
+`privacy_attacks/rmia.py` 使用同一通信轮的非目标客户端 prompts 作为 reference models，实现论文 offline marginal estimate 与 population likelihood-ratio dominance score。已知 OUT 辅助集与最终查询集严格拆分。
+
+## 7. IMIA
+
+论文：[USENIX Security 2026 官方页面](https://www.usenix.org/conference/usenixsecurity26/presentation/du)。截至实现时未发现官方代码。
+
+`privacy_attacks/imia.py` 实现论文的 weighted log-probability imitation loss、warm-up checkpoint、imitative OUT model、同类别低损失 pivot、imitative IN model，以及最终的非参数距离分数：
+
+`(s_obs - mean(s_out))^2 - (s_obs - mean(s_in))^2`。
+
+所有 imitative models 共享冻结骨干，只随机初始化和训练 soft prompt。
+
+## 8. Scalable Membership Inference via Quantile Regression
+
+论文：[NeurIPS 2023](https://proceedings.neurips.cc/paper_files/paper/2023/hash/01328d0767830e73a612f9073e9ff15f-Abstract-Conference.html)，[官方代码](https://github.com/amazon-science/quantile-mia)。
+
+`privacy_attacks/quantile.py` 使用目标客户端已知 OUT 样本的 CLIP/prompt 表示和真实类别置信度训练 pinball-loss 分位数回归器。成员分数是观测置信度超过条件分位数阈值的幅度。
+
+## 9. YOQO
+
+论文：[ICLR 2024](https://proceedings.iclr.cc/paper_files/paper/2024/hash/b3edfc1950c30c42e2ecf6637ab7fb09-Abstract-Conference.html)，[官方代码](https://github.com/WU-YU-TONG/YOQO)。
+
+`privacy_attacks/query_attacks.py` 的 offline 适配使用非目标客户端 prompts 作为 OUT shadow models，选择最高概率错误类并优化受限扰动，使 OUT prompts 转向错误类。对目标 prompt 只执行一次查询，并仅保留 argmax hard label；预测仍保持真实类别时判为更可能是成员。
+
+## 10. Canary in a Coalmine
+
+论文：[ICLR 2023](https://openreview.net/pdf?id=b7SBTEBFnC)，[官方代码](https://github.com/YuxinWenRick/canary-in-a-coalmine)。
+
+本适配从非目标客户端 prompts 构造 OUT surrogates，并用单个候选样本对其 prompt-only 副本短暂微调得到 IN surrogates。查询优化同时让 IN surrogates 保持真实类、OUT surrogates 转向错误类，最终集成多条查询的 scaled-confidence difference。
+
+## 11. PromptMIA: Leveraging Soft Prompts for Privacy Attacks in FPT
+
+论文当前为 [arXiv:2601.06641](https://arxiv.org/abs/2601.06641)，尚不是正式顶会版本，也未发现公开代码。
+
+`privacy_attacks/promptmia.py` 忠实实现论文 Algorithm 1/2：先从目标查询方向移除随机向量的平行分量，再合成具有指定余弦相似度和原查询范数的 key，并在 `s_max + delta_min` 到 `s_max + delta_min + span` 中生成多样 key 集合。
+
+原论文使用带 key 的视觉 prompt pool，而本仓库使用所有样本共享的 CoOp 文本 prompt，没有 top-N prompt-selection event。因此这里明确实现为适配版：将 adversarial keys 写入隔离 prompt-token 副本，让目标客户端正常本地训练，再以这些 token 的更新强度和候选梯度对齐度评分。该 probe 不进入 FedAvg，不改变正式训练轨迹；结果元数据会记录此架构差异。
+
 ## Shared evaluation
 
 所有攻击统一输出 ROC AUC、TPR@10% FPR、TPR@1% FPR 和 TPR@0.1% FPR。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。

@@ -11,6 +11,8 @@ from aggregator.fedavg_aggregator import aggregate_fedavg_model_states
 from main import default_config, validate_config
 from privacy_attacks.code_poison import generate_membership_encoding_samples
 from privacy_attacks.metrics import membership_metrics
+from privacy_attacks.model_utils import scaled_confidence
+from privacy_attacks.promptmia import generate_key_with_similarity
 from servers.serverbase import ServerBase
 
 
@@ -70,6 +72,21 @@ def test_membership_metrics_and_secret_samples_are_deterministic():
     assert not torch.equal(first[0], first[1])
 
 
+def test_recent_attack_primitives_match_paper_definitions():
+    query = torch.tensor([1.0, 2.0, -1.0, 0.5])
+    key = generate_key_with_similarity(
+        query, 0.73, torch.Generator().manual_seed(7)
+    )
+    cosine = F.cosine_similarity(query, key, dim=0)
+    assert torch.allclose(cosine, torch.tensor(0.73), atol=1e-5)
+    assert torch.allclose(query.norm(), key.norm(), atol=1e-5)
+
+    probabilities = torch.tensor([[0.7, 0.2, 0.1], [0.1, 0.6, 0.3]])
+    scores = scaled_confidence(probabilities, torch.tensor([0, 1]))
+    expected = torch.log(torch.tensor([0.7 / 0.2, 0.6 / 0.3]))
+    assert torch.allclose(scores, expected)
+
+
 def test_configuration_rejects_removed_backdoor_and_defense_names():
     config = default_config()
     config["audit"]["attacks"] = ["a3fl"]
@@ -124,12 +141,36 @@ def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
                 "fedmia_cosine",
                 "transfer_representation",
                 "codepoison",
+                "pipra",
+                "rmia",
+                "imia",
+                "quantile_mia",
+                "yoqo",
+                "canary",
+                "promptmia",
             ],
             "max_samples_per_group": 4,
             "audit_interval": 1,
             "calibration_fraction": 0.5,
             "active_max_samples": 4,
             "active_ascent_steps": 1,
+            "auxiliary_fraction": 0.5,
+            "qmia_epochs": 3,
+            "pipra_shadow_prompts": 2,
+            "pipra_shadow_steps": 1,
+            "pipra_attack_epochs": 3,
+            "imia_models": 1,
+            "imia_warmup_steps": 1,
+            "imia_imitation_steps": 1,
+            "imia_pivot_steps": 1,
+            "query_max_samples": 4,
+            "query_reference_models": 1,
+            "yoqo_steps": 1,
+            "canary_num_queries": 1,
+            "canary_steps": 1,
+            "canary_shadow_steps": 1,
+            "promptmia_max_samples": 4,
+            "promptmia_keys": 2,
         },
     )
     summaries = server.train()
@@ -140,6 +181,13 @@ def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
         "fedmia_cosine",
         "transfer_representation",
         "codepoison",
+        "pipra",
+        "rmia",
+        "imia",
+        "quantile_mia",
+        "yoqo",
+        "canary",
+        "promptmia",
     }
     assert (tmp_path / "privacy_audit" / "summary.json").exists()
     assert (tmp_path / "privacy_audit" / "predictions.csv").exists()

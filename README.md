@@ -18,6 +18,13 @@
 | `fedmia_cosine` | FedMIA-II | 以候选样本提示梯度与客户端 prompt update 的余弦相似度构造单尾零假设，并跨轮平均 |
 | `transfer_representation` | Wu et al. 表示差异攻击 | 将目标客户端提示视为 student prompt，其他客户端更新形成 shadow prompts，学习其联合图文表示差异 |
 | `codepoison` | Chen & Pattabiraman CodePoison MIA | 本地提示训练同时记忆由样本哈希确定的秘密合成伙伴，再以合成伙伴损失推断成员身份 |
+| `pipra` | PIPRA, AAAI 2026 | 训练多个 shadow prompts，并仅从候选图像与标签条件 prompt 的跨模态几何关系推断成员，不使用目标预测输出 |
+| `rmia` | RMIA, ICML 2024 | 使用非目标客户端提示作为 reference models，以已知 OUT 总体进行低成本相对似然比检验 |
+| `imia` | IMIA, USENIX Security 2026 | 仅训练 prompt 的目标感知模仿模型，分别估计 OUT 行为与同类别 pivot 的 IN 行为 |
+| `quantile_mia` | Quantile-MIA, NeurIPS 2023 | 在已知非成员样本上拟合条件置信度分位数，用目标置信度超出条件阈值的幅度打分 |
+| `yoqo` | YOQO, ICLR 2024 | 由非目标 prompt 离线构造 improvement-area 查询，对目标 prompt 只保留一次 hard label 响应 |
+| `canary` | Canary, ICLR 2023 | 用 prompt-only IN/OUT surrogate pairs 优化一组多样查询，再集成目标与 OUT prompts 的校准置信度 |
+| `promptmia` | PromptMIA, 2026 预印本 | 按论文余弦区间算法构造多样化 adversarial keys；在当前共享 CoOp prompt 中以隔离 token-update probe 适配 |
 
 详细对应关系、公开实现来源和适配边界见 [docs/attack_mapping.md](docs/attack_mapping.md)。
 
@@ -52,7 +59,7 @@ python main.py --config configs/fedprompt_privacy.yaml \
   --dataset_name cifar100 \
   --num_global_iters 10 \
   --target_client_id 0 \
-  --audit_attacks nasr_passive,fedmia_loss,fedmia_cosine
+  --audit_attacks pipra,fedmia_loss,rmia,imia,quantile_mia,yoqo,canary,promptmia
 ```
 
 ## 输出

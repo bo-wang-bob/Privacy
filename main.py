@@ -53,12 +53,21 @@ def validate_config(config: dict) -> None:
     unknown = sorted(attacks - SUPPORTED_ATTACKS)
     if unknown:
         raise ValueError(f"Unknown membership attacks: {', '.join(unknown)}")
-    spatial = {"fedmia_loss", "fedmia_cosine", "transfer_representation"}
+    spatial = {
+        "fedmia_loss",
+        "fedmia_cosine",
+        "transfer_representation",
+        "rmia",
+        "yoqo",
+        "canary",
+    }
     if audit.get("enabled", True) and attacks & spatial and config["sample_users"] < 2:
-        raise ValueError("FedMIA and representation attacks require at least two clients per round.")
+        raise ValueError(
+            "Cross-client membership attacks require at least two clients per round."
+        )
     if audit.get("enabled", True) and attacks & spatial and config["train_mode"] != "centralized":
         raise ValueError(
-            "FedMIA and representation attacks require a shared centralized FedAvg model."
+            "Cross-client membership attacks require a shared centralized FedAvg model."
         )
 
 
@@ -191,6 +200,13 @@ def default_config() -> dict:
                 "fedmia_cosine",
                 "transfer_representation",
                 "codepoison",
+                "pipra",
+                "rmia",
+                "imia",
+                "quantile_mia",
+                "yoqo",
+                "canary",
+                "promptmia",
             ],
             "max_samples_per_group": 32,
             "audit_interval": 2,
@@ -201,6 +217,39 @@ def default_config() -> dict:
             "codepoison_weight": 1.0,
             "synthetic_mean": 0.0,
             "synthetic_std": 0.1,
+            "auxiliary_fraction": 0.5,
+            "rmia_offline_a": 0.3,
+            "rmia_gamma": 1.0,
+            "qmia_quantile": 0.9,
+            "qmia_epochs": 200,
+            "qmia_learning_rate": 0.01,
+            "pipra_shadow_prompts": 4,
+            "pipra_shadow_steps": 20,
+            "pipra_shadow_learning_rate": 0.02,
+            "pipra_attack_epochs": 200,
+            "pipra_attack_learning_rate": 0.01,
+            "pipra_temperature": 0.1,
+            "imia_models": 4,
+            "imia_warmup_steps": 10,
+            "imia_imitation_steps": 20,
+            "imia_pivot_steps": 20,
+            "imia_learning_rate": 0.02,
+            "imia_pivots_per_class": 4,
+            "query_max_samples": 16,
+            "query_reference_models": 2,
+            "query_epsilon": 0.1,
+            "yoqo_steps": 20,
+            "yoqo_learning_rate": 0.01,
+            "yoqo_distortion_weight": 1.0,
+            "canary_num_queries": 2,
+            "canary_steps": 20,
+            "canary_shadow_steps": 3,
+            "canary_learning_rate": 0.01,
+            "canary_shadow_learning_rate": 0.02,
+            "promptmia_max_samples": 16,
+            "promptmia_keys": 4,
+            "promptmia_delta_min": 0.02,
+            "promptmia_similarity_span": 0.05,
         },
     }
 
