@@ -2,6 +2,7 @@ import csv
 import logging
 import os
 import random
+import json
 
 import torch
 
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class ServerBase:
-    """Federated prompt-tuning server with FedAvg and privacy audit hooks."""
+    """Federated prompt-tuning server with pluggable methods and privacy audits."""
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class ServerBase:
         eval_batch_size: int = 64,
         audit_config: dict | None = None,
         defense_config: dict | None = None,
+        method_config: dict | None = None,
     ):
         if train_mode not in {"centralized", "local"}:
             raise ValueError("train_mode must be 'centralized' or 'local'.")
@@ -58,6 +60,8 @@ class ServerBase:
         self.num_glob_iters = num_glob_iters
         self.user_per_round = user_per_round
         self.aggregator = aggregator
+        self.federated_method = aggregator.name
+        self.method_config = dict(method_config or {})
         self.results_dir = results_dir
         self.save_models_enabled = save_models
         self.eval_interval = eval_interval
@@ -109,6 +113,8 @@ class ServerBase:
                 collate_fn=collate_fn,
                 code_poison_config=code_poison_config,
                 defense_controller=self.defense,
+                federated_method=self.federated_method,
+                method_config=self.method_config,
             )
             self.ctx.users.append(user)
             self.ctx.samples_num.append(user.train_samples)
@@ -199,7 +205,11 @@ class ServerBase:
             self.defense.prepare_round(selected_ids, round_index)
             logger.info("Round %s selected clients: %s", round_index, selected_ids)
 
-            base_state = self.ctx.get_base_model_state(self.target_client_id)
+            base_states = {
+                user_id: self._clone_state(self.ctx.get_base_model_state(user_id))
+                for user_id in selected_ids
+            }
+            base_state = base_states[self.target_client_id]
             for user_id in selected_ids:
                 user = self.ctx.users[user_id]
                 user.set_parameters(self.ctx.get_base_model_state(user_id))
@@ -227,6 +237,7 @@ class ServerBase:
                 base_state=base_state,
                 updated_states=self.ctx.updated_model_state,
                 selected_ids=selected_ids,
+                base_states=base_states,
             )
             self.aggregator.aggregate(self.ctx)
             self._save_round(round_index + 1)
@@ -244,4 +255,38 @@ class ServerBase:
         )
         defense_summary = self.defense.save_summary(self.results_dir)
         logger.info("Privacy defense completed: %s", defense_summary)
+        method_summary = {
+            "federated_method": self.federated_method,
+            "configuration": self.method_config,
+            "state_scope": (
+                "global_plus_persistent_per_client_local"
+                if self.federated_method == "dpfpl"
+                else "shared_global"
+            ),
+        }
+        if self.federated_method == "dpfpl":
+            method_summary["privacy_mechanisms"] = {
+                "local": "RGP low-rank gradient clipping and Gaussian perturbation",
+                "global": "client update clipping and server Gaussian perturbation",
+                "delta": float(self.method_config.get("delta", 1e-5)),
+            }
+        elif self.federated_method == "fedask":
+            method_summary["privacy_mechanisms"] = {
+                "local": "full-prompt per-sample clipping/noise followed by asymmetric B update",
+                "aggregation": "two-stage randomized sketch and SVD reconstruction",
+                "delta": float(self.method_config.get("delta", 1e-5)),
+            }
+        if hasattr(self.aggregator, "last_reconstruction_error"):
+            method_summary["last_reconstruction_error"] = float(
+                self.aggregator.last_reconstruction_error
+            )
+        if hasattr(self.aggregator, "last_clip_fraction"):
+            method_summary["last_global_clip_fraction"] = float(
+                self.aggregator.last_clip_fraction
+            )
+        with open(
+            os.path.join(self.results_dir, "federated_method_summary.json"),
+            "w", encoding="utf-8",
+        ) as file:
+            json.dump(method_summary, file, indent=2, allow_nan=False)
         return self.auditor.finalize(self.model, final_state)

@@ -8,6 +8,19 @@ local_epochs: 1
 total_users: 4
 sample_users: 4
 aggregator: fedavg
+dpfpl:
+  rank: 2
+  local_clip_norm: 1.0
+  local_noise_multiplier: 1.0
+  global_clip_norm: 1.0
+  global_noise_multiplier: 1.0
+  delta: 0.00001
+fedask:
+  rank: 2
+  oversampling: 1
+  clip_norm: 1.0
+  noise_multiplier: 1.0
+  delta: 0.00001
 dirichlet_alpha: 100
 gpu: 0
 seed: 42

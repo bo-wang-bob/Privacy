@@ -84,6 +84,8 @@ class PromptLearner(nn.Module):
         n_ctx: int = 32,
         template: str = DEFAULT_PROMPT_TEMPLATE,
         class_specific_ctx: bool = False,
+        parameterization: str = "full",
+        low_rank: int = 4,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
@@ -93,6 +95,8 @@ class PromptLearner(nn.Module):
         self.n_cls: int = len(classnames)
         self.n_ctx: int = n_ctx
         self.class_specific_ctx = class_specific_ctx
+        self.parameterization = parameterization.lower()
+        self.low_rank = int(low_rank)
         self.device = device
 
         # Get text embedding dimension from CLIP model config
@@ -103,7 +107,27 @@ class PromptLearner(nn.Module):
             ctx_shape = (self.n_cls, n_ctx, d)
         else:
             ctx_shape = (n_ctx, d)
-        self.ctx = nn.Parameter(torch.randn(*ctx_shape, device=device) * 0.02)
+        initial_ctx = torch.randn(*ctx_shape, device=device) * 0.02
+        if self.parameterization == "full":
+            self.ctx = nn.Parameter(initial_ctx)
+        elif self.parameterization == "dpfpl":
+            self.global_ctx = nn.Parameter(initial_ctx.clone())
+            self.local_ctx = nn.Parameter(torch.zeros_like(initial_ctx))
+        elif self.parameterization == "fedask":
+            rows = int(initial_ctx.numel() // initial_ctx.shape[-1])
+            rank = min(self.low_rank, rows, int(initial_ctx.shape[-1]))
+            if rank <= 0:
+                raise ValueError("FedASK low_rank must be positive.")
+            self.low_rank = rank
+            self.register_buffer("base_ctx", initial_ctx.clone())
+            self.fedask_A = nn.Parameter(
+                torch.randn(rank, initial_ctx.shape[-1], device=device) * 0.02
+            )
+            self.fedask_B = nn.Parameter(torch.zeros(rows, rank, device=device))
+        else:
+            raise ValueError(
+                "parameterization must be one of: full, dpfpl, fedask."
+            )
 
         # logger.info(
         #     f"PromptLearner initialized: n_cls={self.n_cls}, n_ctx={n_ctx}, hidden_size={d}, device={device}"
@@ -150,7 +174,17 @@ class PromptLearner(nn.Module):
         """Return absolute positions of learnable context tokens in the prompt."""
         return self.ctx_positions
 
-    def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
+    def effective_context(self) -> torch.Tensor:
+        if self.parameterization == "full":
+            return self.ctx
+        if self.parameterization == "dpfpl":
+            return self.global_ctx + self.local_ctx
+        adapter = self.fedask_B @ self.fedask_A
+        return self.base_ctx + adapter.reshape_as(self.base_ctx)
+
+    def forward(
+        self, ctx_override: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Construct prompt embeddings by concatenating prefix, learnable context, and suffix.
 
@@ -160,11 +194,14 @@ class PromptLearner(nn.Module):
         """
         K: int = self.n_cls
 
+        effective_ctx = (
+            self.effective_context() if ctx_override is None else ctx_override
+        )
         if self.class_specific_ctx:
-            ctx = self.ctx
+            ctx = effective_ctx
         else:
             # Expand shared learnable context to all classes: (n_ctx, d) -> (K, n_ctx, d)
-            ctx = self.ctx.unsqueeze(0).expand(K, -1, -1)
+            ctx = effective_ctx.unsqueeze(0).expand(K, -1, -1)
 
         # Concatenate: [BOS] + [learnable context] + [class name + EOS]
         prompt_embeds = torch.cat([self.token_prefix, ctx, self.token_suffix], dim=1)
@@ -354,6 +391,8 @@ class CustomCLIP(BaseModel):
         n_ctx=32,
         template: str = DEFAULT_PROMPT_TEMPLATE,
         class_specific_ctx: bool = False,
+        parameterization: str = "full",
+        low_rank: int = 4,
         device=torch.device("cpu"),
     ):
         super().__init__()
@@ -368,6 +407,8 @@ class CustomCLIP(BaseModel):
         self.n_ctx: int = n_ctx
         self.template = template
         self.class_specific_ctx = class_specific_ctx
+        self.parameterization = parameterization.lower()
+        self.low_rank = int(low_rank)
         self.processor = processor
         self.device = device
 
@@ -379,6 +420,8 @@ class CustomCLIP(BaseModel):
             n_ctx=self.n_ctx,
             template=self.template,
             class_specific_ctx=self.class_specific_ctx,
+            parameterization=self.parameterization,
+            low_rank=self.low_rank,
             device=self.device,
         )
 
@@ -390,7 +433,12 @@ class CustomCLIP(BaseModel):
         # )
         logger.debug(f"CustomCLIP classnames: {classnames}")
 
-    def forward(self, x: torch.Tensor, return_intermediate: bool = False) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    def forward_with_context(
+        self,
+        x: torch.Tensor,
+        context: Optional[torch.Tensor] = None,
+        return_intermediate: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Forward pass for image classification.
 
@@ -410,7 +458,7 @@ class CustomCLIP(BaseModel):
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         # Generate text features from learnable prompts
-        prompt_embeds, attn_mask = self.prompt_learner()
+        prompt_embeds, attn_mask = self.prompt_learner(context)
         text_features = self.text_encoder(
             prompt_embeds, attn_mask, self.clip_model
         )
@@ -429,6 +477,15 @@ class CustomCLIP(BaseModel):
         if return_intermediate:
             return logits, image_features, text_features
         return logits
+
+    def forward(self, x: torch.Tensor, return_intermediate: bool = False):
+        return self.forward_with_context(
+            x, context=None, return_intermediate=return_intermediate
+        )
+
+    def get_effective_prompt(self) -> torch.Tensor:
+        """Return the prompt matrix actually consumed by the text encoder."""
+        return self.prompt_learner.effective_context()
 
     @torch.no_grad()
     def get_text_features(self, normalize: bool = True) -> torch.Tensor:
@@ -511,6 +568,8 @@ class CustomCLIP(BaseModel):
             n_ctx=self.n_ctx,
             template=self.template,
             class_specific_ctx=self.class_specific_ctx,
+            parameterization=self.parameterization,
+            low_rank=self.low_rank,
             device=self.device,
         )
         new_model.prompt_learner.load_state_dict(

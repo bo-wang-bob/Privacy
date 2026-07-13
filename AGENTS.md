@@ -1,6 +1,7 @@
 # Repository guidance
 
-This repository supports federated CLIP soft-prompt tuning with plain FedAvg and membership-privacy auditing only.
+This repository supports federated CLIP soft-prompt tuning with FedAvg, DP-FPL,
+or FedASK and membership-privacy auditing.
 
 - Do not reintroduce backdoor triggers, malicious-client poisoning, ASR metrics, or SEISMOGRAPH defenses.
 - CLIP weights must be loaded locally with `local_files_only=True`.

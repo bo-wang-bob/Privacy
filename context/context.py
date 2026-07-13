@@ -2,7 +2,7 @@ import torch
 
 
 class Context:
-    """Cross-round state for federated prompt tuning."""
+    """Cross-round state for global or personalized federated prompt tuning."""
 
     def __init__(
         self,

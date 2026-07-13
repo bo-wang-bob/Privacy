@@ -43,8 +43,30 @@ def _load_local_clip(cache_dir: str, device: torch.device):
 def validate_config(config: dict) -> None:
     if config["train_mode"] not in {"centralized", "local"}:
         raise ValueError("train_mode must be 'centralized' or 'local'.")
-    if config["aggregator"].lower() != "fedavg":
-        raise ValueError("This privacy branch intentionally supports plain FedAvg only.")
+    method = config["aggregator"].lower()
+    if method not in {"fedavg", "dpfpl", "fedask"}:
+        raise ValueError("aggregator must be fedavg, dpfpl, or fedask.")
+    method_config = config.get(method, {})
+    if method in {"dpfpl", "fedask"} and int(method_config.get("rank", 4)) <= 0:
+        raise ValueError(f"{method}.rank must be positive.")
+    if method == "dpfpl":
+        for key in ("local_clip_norm", "global_clip_norm"):
+            if float(method_config.get(key, 1.0)) <= 0:
+                raise ValueError(f"dpfpl.{key} must be positive.")
+        for key in ("local_noise_multiplier", "global_noise_multiplier"):
+            if float(method_config.get(key, 1.0)) < 0:
+                raise ValueError(f"dpfpl.{key} must be non-negative.")
+    if method == "fedask":
+        if float(method_config.get("clip_norm", 1.0)) <= 0:
+            raise ValueError("fedask.clip_norm must be positive.")
+        if float(method_config.get("noise_multiplier", 1.0)) < 0:
+            raise ValueError("fedask.noise_multiplier must be non-negative.")
+        if int(method_config.get("oversampling", 2)) < 0:
+            raise ValueError("fedask.oversampling must be non-negative.")
+    if method in {"dpfpl", "fedask"} and not 0 < float(
+        method_config.get("delta", 1e-5)
+    ) < 1:
+        raise ValueError(f"{method}.delta must be in (0, 1).")
     if config["total_users"] <= 1:
         raise ValueError("total_users must be greater than one.")
     if not 1 <= config["sample_users"] <= config["total_users"]:
@@ -89,7 +111,12 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "Cross-client membership attacks require at least two clients per round."
         )
-    if audit.get("enabled", True) and attacks & spatial and config["train_mode"] != "centralized":
+    if (
+        audit.get("enabled", True)
+        and attacks & spatial
+        and config["train_mode"] != "centralized"
+        and method != "dpfpl"
+    ):
         raise ValueError(
             "Cross-client membership attacks require a shared centralized FedAvg model."
         )
@@ -120,7 +147,7 @@ def run(config: dict) -> list[dict]:
     defense_label = str(config.get("defense", {}).get("name", "none")).lower()
     result_dir = os.path.join(
         config["results_dir"],
-        f"{config['dataset_name']}_{attack_label}_{defense_label}_{timestamp}",
+        f"{config['dataset_name']}_{config['aggregator']}_{attack_label}_{defense_label}_{timestamp}",
     )
     os.makedirs(result_dir, exist_ok=True)
     with open(os.path.join(result_dir, "run_config.yaml"), "w", encoding="utf-8") as file:
@@ -152,6 +179,12 @@ def run(config: dict) -> list[dict]:
         )
 
     processor, clip_model = _load_local_clip(config["cache_dir"], device)
+    method = config["aggregator"].lower()
+    method_config = dict(config.get(method, {}))
+    method_config.setdefault("seed", seed)
+    parameterization = {
+        "fedavg": "full", "dpfpl": "dpfpl", "fedask": "fedask"
+    }[method]
     model = CustomCLIP(
         clip_model=clip_model,
         processor=processor,
@@ -160,6 +193,8 @@ def run(config: dict) -> list[dict]:
         n_ctx=config["n_ctx"],
         template=get_default_prompt_template(config["dataset_name"]),
         class_specific_ctx=config["class_specific_ctx"],
+        parameterization=parameterization,
+        low_rank=int(method_config.get("rank", 4)),
     )
 
     def collate_fn(batch):
@@ -169,8 +204,13 @@ def run(config: dict) -> list[dict]:
 
     audit_config = dict(config.get("audit", {}))
     audit_config.setdefault("seed", seed)
+    effective_train_mode = (
+        "local" if method == "dpfpl"
+        else "centralized" if method == "fedask"
+        else config["train_mode"]
+    )
     server = ServerBase(
-        train_mode=config["train_mode"],
+        train_mode=effective_train_mode,
         device=device,
         dataset_name=config["dataset_name"],
         train_sets=train_sets,
@@ -185,13 +225,24 @@ def run(config: dict) -> list[dict]:
         total_users=config["total_users"],
         results_dir=result_dir,
         user_per_round=config["sample_users"],
-        aggregator=build_aggregator("fedavg", device=device),
+        aggregator=build_aggregator(
+            method,
+            device=device,
+            seed=seed,
+            rank=int(method_config.get("rank", 4)),
+            oversampling=int(method_config.get("oversampling", 2)),
+            global_clip_norm=float(method_config.get("global_clip_norm", 1.0)),
+            global_noise_multiplier=float(
+                method_config.get("global_noise_multiplier", 1.0)
+            ),
+        ),
         model_load_path=config.get("model_load_path"),
         save_models=config["save_models"],
         collate_fn=collate_fn,
         eval_interval=config["eval_interval"],
         audit_config=audit_config,
         defense_config=config.get("defense", {"name": "none"}),
+        method_config=method_config,
     )
     summaries = server.train()
     logger.info("Privacy audit completed: %s", summaries)
@@ -210,6 +261,21 @@ def default_config() -> dict:
         "total_users": 10,
         "sample_users": 10,
         "aggregator": "fedavg",
+        "dpfpl": {
+            "rank": 4,
+            "local_clip_norm": 1.0,
+            "local_noise_multiplier": 1.0,
+            "global_clip_norm": 1.0,
+            "global_noise_multiplier": 1.0,
+            "delta": 1e-5,
+        },
+        "fedask": {
+            "rank": 4,
+            "oversampling": 2,
+            "clip_norm": 1.0,
+            "noise_multiplier": 1.0,
+            "delta": 1e-5,
+        },
         "dirichlet_alpha": 0.1,
         "gpu": 0,
         "seed": 42,
@@ -316,6 +382,7 @@ def parse_args() -> dict:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--num_global_iters", type=int)
     parser.add_argument("--sample_users", type=int)
+    parser.add_argument("--aggregator", choices=["fedavg", "dpfpl", "fedask"])
     parser.add_argument("--target_client_id", type=int)
     parser.add_argument("--audit_attacks", help="Comma-separated attack names")
     parser.add_argument(
@@ -338,7 +405,7 @@ def parse_args() -> dict:
         config.update(loaded)
         config["audit"] = audit
         config["defense"] = defense
-    for key in ("dataset_name", "gpu", "seed", "num_global_iters", "sample_users"):
+    for key in ("dataset_name", "gpu", "seed", "num_global_iters", "sample_users", "aggregator"):
         value = getattr(args, key)
         if value is not None:
             config[key] = value

@@ -170,6 +170,7 @@ class MembershipAuditor:
         base_state: dict[str, torch.Tensor],
         updated_states: dict[int, dict[str, torch.Tensor]],
         selected_ids: list[int],
+        base_states: dict[int, dict[str, torch.Tensor]] | None = None,
     ) -> None:
         if not self.should_observe(round_index):
             return
@@ -187,7 +188,8 @@ class MembershipAuditor:
         representations = []
         for user_id in selected_ids:
             state = updated_states[user_id]
-            update = flatten_state_delta(base_state, state, names)
+            client_base = base_state if base_states is None else base_states[user_id]
+            update = flatten_state_delta(client_base, state, names)
             update_norm = update.norm().clamp_min(1e-12)
             sample_norm = sample_gradients.norm(dim=1).clamp_min(1e-12)
             cosine.append((sample_gradients @ update) / (sample_norm * update_norm))

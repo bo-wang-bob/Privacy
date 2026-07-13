@@ -104,7 +104,7 @@ def test_configuration_rejects_removed_backdoor_and_defense_names():
     try:
         validate_config(config)
     except ValueError as error:
-        assert "FedAvg" in str(error)
+        assert "fedavg" in str(error)
     else:
         raise AssertionError("Removed defense unexpectedly accepted")
 
@@ -116,6 +116,54 @@ def test_configuration_rejects_removed_backdoor_and_defense_names():
         assert "Unknown privacy defense" in str(error)
     else:
         raise AssertionError("Removed SEISMOGRAPH defense unexpectedly accepted")
+
+
+class ToyPromptLearner(nn.Module):
+    def __init__(self, method: str):
+        super().__init__()
+        self.method = method
+        initial = torch.tensor(
+            [[0.2, -0.2, 0.1, 0.3], [-0.1, 0.2, -0.2, 0.1]]
+        )
+        if method == "dpfpl":
+            self.global_ctx = nn.Parameter(initial.clone())
+            self.local_ctx = nn.Parameter(torch.zeros_like(initial))
+        else:
+            self.register_buffer("base_ctx", initial.clone())
+            self.fedask_A = nn.Parameter(torch.randn(2, 4) * 0.02)
+            self.fedask_B = nn.Parameter(torch.zeros(2, 2))
+
+    def effective_context(self):
+        if self.method == "dpfpl":
+            return self.global_ctx + self.local_ctx
+        return self.base_ctx + self.fedask_B @ self.fedask_A
+
+
+class ToyPrivateMethodModel(nn.Module):
+    def __init__(self, method: str):
+        super().__init__()
+        self.prompt_learner = ToyPromptLearner(method)
+
+    def forward_with_context(self, images, context, return_intermediate=False):
+        signal = images.mean(dim=(1, 2, 3))
+        image_features = F.normalize(
+            torch.stack(
+                (signal, -signal, signal.square(), torch.ones_like(signal)), dim=1
+            ),
+            dim=1,
+        )
+        text_features = F.normalize(context, dim=1)
+        logits = image_features @ text_features.t()
+        if return_intermediate:
+            return logits, image_features, text_features
+        return logits
+
+    def forward(self, images, return_intermediate=False):
+        return self.forward_with_context(
+            images,
+            self.prompt_learner.effective_context(),
+            return_intermediate=return_intermediate,
+        )
 
 
 def test_defense_primitives_preserve_required_invariants():
@@ -227,6 +275,79 @@ def test_defense_only_mode_skips_attack_audit():
     assert summaries == []
     assert (path / "defense_summary.json").exists()
     assert not (path / "privacy_audit" / "summary.json").exists()
+
+
+def test_dpfpl_and_fedask_run_as_fedavg_replacements():
+    root = Path(".test_artifacts") / "private_methods"
+    for method, mode in (("dpfpl", "local"), ("fedask", "centralized")):
+        path = root / method
+        path.mkdir(parents=True, exist_ok=True)
+        method_config = {
+            "rank": 2,
+            "seed": 17,
+            "local_clip_norm": 0.5,
+            "local_noise_multiplier": 0.1,
+            "global_clip_norm": 0.5,
+            "global_noise_multiplier": 0.1,
+            "clip_norm": 0.5,
+            "noise_multiplier": 0.1,
+            "oversampling": 1,
+        }
+        server = ServerBase(
+            train_mode=mode,
+            device=torch.device("cpu"),
+            dataset_name="toy",
+            train_sets=[_dataset(index * 0.02) for index in range(3)],
+            test_sets=[_dataset(0.4 + index * 0.02) for index in range(3)],
+            class_names=["zero", "one"],
+            model=ToyPrivateMethodModel(method),
+            batch_size=4,
+            eval_batch_size=8,
+            learning_rate=0.05,
+            num_glob_iters=2,
+            local_epochs=1,
+            total_users=3,
+            results_dir=str(path),
+            user_per_round=3,
+            aggregator=build_aggregator(method, **method_config),
+            eval_interval=1,
+            audit_config={
+                "enabled": True,
+                "strict": True,
+                "target_client_id": 0,
+                "ensure_target_participation": True,
+                "attacks": ["fedmia_loss"],
+                "max_samples_per_group": 4,
+                "audit_interval": 1,
+            },
+            defense_config={"name": "hamp", "hamp_output_temperature": 2.0},
+            method_config=method_config,
+        )
+        summaries = server.train()
+        assert [item["attack"] for item in summaries] == ["fedmia_loss"]
+        summary = json.loads(
+            (path / "federated_method_summary.json").read_text(encoding="utf-8")
+        )
+        assert summary["federated_method"] == method
+        if method == "dpfpl":
+            global_name = next(
+                name for name in server.ctx.new_model_state[0]
+                if name.endswith("global_ctx")
+            )
+            local_name = next(
+                name for name in server.ctx.new_model_state[0]
+                if name.endswith("local_ctx")
+            )
+            assert torch.equal(
+                server.ctx.new_model_state[0][global_name],
+                server.ctx.new_model_state[1][global_name],
+            )
+            assert not torch.equal(
+                server.ctx.new_model_state[0][local_name],
+                server.ctx.new_model_state[1][local_name],
+            )
+        else:
+            assert summary["last_reconstruction_error"] < 1e-4
 
 
 def test_training_time_attack_and_prompt_dp_can_run_together():
