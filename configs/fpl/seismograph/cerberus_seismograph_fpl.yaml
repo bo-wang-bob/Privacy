@@ -1,0 +1,30 @@
+train_mode: centralized
+dataset_name: caltech101
+batch_size: 16
+learning_rate: 0.001
+num_global_iters: 60
+local_epochs: 2
+local_poison_epochs: 2
+
+total_users: 10
+sample_users: 10
+malnum: 2
+poisonratio: 4
+
+attack_method: cerberus
+attack_start: 20
+attack_interval: 1
+trigger_optimization_interval: 2
+attack_end: 60
+
+defense: seismograph
+defense_params:
+  seismograph_k: 1.0
+  seismograph_h: 5.0
+
+gpu: 0
+dirichlet_alpha: 0.1
+seed: 42
+
+fpl: true
+trigger_size: 16

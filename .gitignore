@@ -1,0 +1,113 @@
+# Local agent and assistant files
+.codex
+CLAUDE.md
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit tests / coverage reports
+tests/
+unit_tests/
+test_*
+!tests/
+!tests/test_seismograph.py
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Jupyter notebooks
+*.ipynb
+!CLIP.ipynb
+.ipynb_checkpoints
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Runtime data and outputs
+data/
+logs*/
+results*/
+saved_models/
+checkpoints/
+triggered_examples/
+user_f_*
+tsne_results/
+figures/
+motivation_analysis/
+mnist_results/
+fashionmnist_result/
+mnist_metric/
+prototype_results/
+caltech101_results_1/
+results_20260404/
+
+# Generated reports and analysis artifacts
+*.pdf
+analysis_scripts/
+analyze_distance_heatmaps.py
+analyze_defense_summary.py
+defense_summary.csv
+plot_benign_avg_poison_acc_by_attack.py
+plot_update_distance_heatmaps.py
+plot_text_raw_top1_history_3d.py
+plot_defense_summary.py
+
+# Local scripts and metadata
+.github/
+.mplconfig/
+run_caltech101.sh
+
+# Local experimental components
+aggregator/mytest_aggregator.py
+configs/mytest/
+aggregator/*_max*_aggregator.py
+configs/fpl/*_max*/
