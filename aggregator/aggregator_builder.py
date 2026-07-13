@@ -1,12 +1,8 @@
-from aggregator.seismograph_aggregator import SeismographAggregator
+from aggregator.fedavg_aggregator import FedAvgAggregator
 
 
-def build_aggregator(aggregator_name: str, **kwargs) -> SeismographAggregator:
-    """Build the only aggregator supported by this minimal branch."""
-    normalized_name = aggregator_name.lower()
-    if normalized_name != "seismograph":
-        raise ValueError(
-            "This branch only supports the 'seismograph' aggregator; "
-            f"got {aggregator_name!r}."
-        )
-    return SeismographAggregator(**kwargs)
+def build_aggregator(aggregator_name: str, **kwargs) -> FedAvgAggregator:
+    normalized = aggregator_name.lower()
+    if normalized != "fedavg":
+        raise ValueError(f"Only plain FedAvg is supported; got {aggregator_name!r}.")
+    return FedAvgAggregator(**kwargs)

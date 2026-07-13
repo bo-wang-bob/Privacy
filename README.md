@@ -1,84 +1,79 @@
-# SEISMOGRAPH
+# Privacy attacks in Federated Prompt Tuning
 
-SEISMOGRAPH 只保留联邦提示学习（FPL）下的三种后门攻击，以及
-`aggregator/seismograph_aggregator.py` 聚合器：
+本仓库从 SEISMOGRAPH 中提取了联邦提示微调（Federated Prompt Tuning, FPT）主流程，删除了全部后门攻击、触发器优化、恶意客户端逻辑和 SEISMOGRAPH 防御，仅保留：
 
-- `cerberus`
-- `a3fl`
-- `sabre`
-- 唯一聚合方式：`seismograph`
+- 冻结的 CLIP 图像/文本骨干；
+- 可训练的 soft prompt；
+- 客户端本地提示微调；
+- 按样本数加权的 FedAvg；
+- 面向联邦提示学习的成员推理隐私审计。
 
-程序会在配置解析和运行入口同时检查这个范围。`fpl: false`、其他攻击或其他
-`defense` 会直接报错，不会静默退回其他实现。
+## 已实现的成员推理攻击
 
-## 环境与本地模型
+| 配置名 | 论文方法 | 在联邦提示学习中的适配 |
+|---|---|---|
+| `nasr_passive` | Nasr et al. 被动白盒 MIA | 组合提示梯度 token 范数、输出、损失与客户端提示更新关系，训练监督攻击头 |
+| `nasr_active` | Nasr et al. 主动梯度上升 MIA | 对候选样本进行隔离的提示梯度上升探测，再观察目标客户端本地训练后的损失/梯度骤降；不污染正式全局训练 |
+| `fedmia_loss` | FedMIA-I | 以所有非目标客户端的候选样本置信度构造单尾零假设，并跨通信轮平均 |
+| `fedmia_cosine` | FedMIA-II | 以候选样本提示梯度与客户端 prompt update 的余弦相似度构造单尾零假设，并跨轮平均 |
+| `transfer_representation` | Wu et al. 表示差异攻击 | 将目标客户端提示视为 student prompt，其他客户端更新形成 shadow prompts，学习其联合图文表示差异 |
+| `codepoison` | Chen & Pattabiraman CodePoison MIA | 本地提示训练同时记忆由样本哈希确定的秘密合成伙伴，再以合成伙伴损失推断成员身份 |
+
+详细对应关系、公开实现来源和适配边界见 [docs/attack_mapping.md](docs/attack_mapping.md)。
+
+## 环境
+
+推荐 Python 3.10+：
 
 ```bash
-conda activate pfedba
+pip install -r requirements.txt
 ```
 
-FPL 使用本地 CLIP 缓存，默认目录为
-`checkpoints/clip-vit-base-patch32`。加载始终设置
-`local_files_only=True`，不会自动联网下载。
+CLIP 始终以 `local_files_only=True` 加载。请提前将 `openai/clip-vit-base-patch32` 放入 `cache_dir` 指定的本地缓存。程序不会自动下载模型权重。
 
 ## 运行
 
+完整配置：
+
 ```bash
-python main.py --config configs/fpl/seismograph/cerberus_seismograph_fpl.yaml --gpu 0
-python main.py --config configs/fpl/seismograph/a3fl_seismograph_fpl.yaml --gpu 0
-python main.py --config configs/fpl/seismograph/sabre_seismograph_fpl.yaml --gpu 0
+python main.py --config configs/fedprompt_privacy.yaml
 ```
 
-CLI 可以覆盖 YAML 中仍受支持的参数，例如：
+轻量配置：
 
 ```bash
-python main.py \
-  --config configs/fpl/seismograph/a3fl_seismograph_fpl.yaml \
+python main.py --config configs/fedprompt_privacy_quick.yaml
+```
+
+可以从命令行覆盖常用参数：
+
+```bash
+python main.py --config configs/fedprompt_privacy.yaml \
   --dataset_name cifar100 \
-  --poisonratio 2 \
-  --gpu 1 \
-  --seed 123
+  --num_global_iters 10 \
+  --target_client_id 0 \
+  --audit_attacks nasr_passive,fedmia_loss,fedmia_cosine
 ```
 
-FPL 中 `poisonratio` 表示每个 batch 的投毒样本数，必须是
-`0 <= poisonratio <= batch_size` 的整数。
+## 输出
 
-SEISMOGRAPH 历史异常过滤参数通过 `defense_params` 配置：
+每次运行会在 `results/<dataset>_fedprompt_privacy_<time>/` 生成：
 
-```yaml
-defense: seismograph
-defense_params:
-  seismograph_k: 1.0
-  seismograph_h: 5.0
+- `run_config.yaml`：实际运行配置；
+- `training_metrics.csv`：全局提示的干净任务指标；
+- `final_prompt.pt`：最终可训练提示参数；
+- `privacy_audit/summary.json`：各攻击 AUC 与低 FPR TPR；
+- `privacy_audit/predictions.csv`：逐候选样本分数；
+- `privacy_audit/signals.pt`：不含原始图像的跨客户端、跨轮审计信号。
+
+## 测试
+
+轻量测试不需要数据集或 CLIP 权重：
+
+```bash
+pytest -q
 ```
 
-## 核心流程
+## 研究用途说明
 
-1. `main.py` 读取 YAML/CLI，验证最小分支能力范围并加载本地 CLIP。
-2. `utils/trigger.py` 为 Cerberus、A3FL 或 SABRE 创建 FPL 触发器。
-3. `servers/serverbase.py` 完成客户端采样、本地正常/攻击训练和指标记录。
-4. `utils/seismograph_text_feature_analysis.py` 计算客户端文本特征的 raw top-1
-   奇异值，并维护历史异常分数。
-5. `aggregator/seismograph_aggregator.py` 排除持续异常的客户端，再按样本数
-   加权聚合其可训练 prompt 参数。
-
-主要运行输出位于 `results/`，包括：
-
-- `run_config.yaml`
-- `detailed_metrics.csv`
-- `summary_metrics.csv`
-- `text_feature_raw_top1_history/`
-- `update_metric_analysis/`
-- `saved_models/final_analysis/`
-
-## 保留的源码结构
-
-```text
-aggregator/   seismograph 聚合器、基类和唯一构建入口
-configs/      三种攻击各一个 FPL + seismograph 配置
-context/      跨轮联邦状态
-servers/      FPL 训练循环与三种攻击的触发器优化
-trainmodel/   CustomCLIP 与模型基类
-users/        FPL 客户端正常/攻击训练和评估
-utils/        数据加载、触发器、投毒与 seismograph 分析
-```
+这些实现用于获得统一、可复现的隐私风险基线。不同论文原本的模型、数据划分和威胁模型并不完全一致，因此本仓库报告的是“在联邦 soft-prompt 训练中的适配结果”，不能直接替代论文原始实验数字。

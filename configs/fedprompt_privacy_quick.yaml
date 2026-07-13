@@ -1,0 +1,34 @@
+train_mode: centralized
+dataset_name: cifar100
+batch_size: 8
+eval_batch_size: 32
+learning_rate: 0.001
+num_global_iters: 2
+local_epochs: 1
+total_users: 4
+sample_users: 4
+aggregator: fedavg
+dirichlet_alpha: 100
+gpu: 0
+seed: 42
+fpl_shots: 4
+cache_dir: ./checkpoints/clip-vit-base-patch32
+n_ctx: 8
+class_specific_ctx: false
+model_load_path: null
+save_models: false
+eval_interval: 1
+results_dir: ./results
+
+audit:
+  enabled: true
+  strict: true
+  target_client_id: 0
+  ensure_target_participation: true
+  attacks: [nasr_passive, fedmia_loss, fedmia_cosine, transfer_representation, codepoison]
+  max_samples_per_group: 4
+  audit_interval: 1
+  calibration_fraction: 0.5
+  codepoison_weight: 1.0
+  synthetic_mean: 0.0
+  synthetic_std: 0.1

@@ -1,39 +1,19 @@
 from typing import Dict, Tuple
 
 DTD_DATASET_ALIASES: Tuple[str, ...] = (
-    "dtd",
-    "describable-textures",
-    "describabletextures",
+    "dtd", "describable-textures", "describabletextures"
 )
-
 CALTECH256_DATASET_ALIASES: Tuple[str, ...] = (
-    "caltech256",
-    "caltech-256",
-    "256_objectcategories",
-    "256-objectcategories",
-    "256objectcategories",
+    "caltech256", "caltech-256", "256_objectcategories",
+    "256-objectcategories", "256objectcategories",
 )
-
 TINYIMAGENET_DATASET_ALIASES: Tuple[str, ...] = (
-    "tiny-imagenet",
-    "tinyimagenet200",
-    "tiny-imagenet-200",
+    "tiny-imagenet", "tinyimagenet200", "tiny-imagenet-200"
 )
-
 AIRCRAFT_DATASET_ALIASES: Tuple[str, ...] = (
-    "aircraft",
-    "fgvcaircraft",
-    "fgvc-aircraft",
-    "fgvc_aircraft",
-    "fgvc-aircraft-2013b",
-    "fgvc_aircraft_2013b",
+    "aircraft", "fgvcaircraft", "fgvc-aircraft", "fgvc_aircraft",
+    "fgvc-aircraft-2013b", "fgvc_aircraft_2013b",
 )
-
-SUPPORTED_FPL_ATTACKS = ("cerberus", "a3fl", "sabre")
-
-# A3FL and SABRE use the shared poisoned local-training routine. Cerberus has
-# its own collusion-aware objective.
-SHARED_POISON_TRAIN_ATTACKS = ("a3fl", "sabre")
 
 DATASET_MAPPING: Dict[str, str] = {
     "mnist": "MNIST",
@@ -60,29 +40,13 @@ NORMALIZE_PARAMS: Dict[str, Tuple[Tuple[float, ...], Tuple[float, ...]]] = {
     "cifar100": ((0.5071, 0.4865, 0.4409), (0.2673, 0.2564, 0.2761)),
     "svhn": ((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970)),
     "tinyimagenet": ((0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262)),
-    **{
-        alias: ((0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262))
-        for alias in TINYIMAGENET_DATASET_ALIASES
-    },
+    **{alias: ((0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262)) for alias in TINYIMAGENET_DATASET_ALIASES},
     "caltech101": ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     "oxfordpets": ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     "flowers": ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     "food101": ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     "food-101": ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
-    **{
-        alias: ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-        for alias in CALTECH256_DATASET_ALIASES
-    },
-    **{
-        alias: ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-        for alias in AIRCRAFT_DATASET_ALIASES
-    },
-    **{
-        alias: ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-        for alias in DTD_DATASET_ALIASES
-    },
+    **{alias: ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)) for alias in CALTECH256_DATASET_ALIASES},
+    **{alias: ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)) for alias in AIRCRAFT_DATASET_ALIASES},
+    **{alias: ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)) for alias in DTD_DATASET_ALIASES},
 }
-
-
-CLIP_IMAGE_MEAN = (0.48145466, 0.4578275, 0.40821073)
-CLIP_IMAGE_STD = (0.26862954, 0.26130258, 0.27577711)
