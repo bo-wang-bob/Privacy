@@ -2,32 +2,66 @@
 
 ## DP-FPL (`aggregator: dpfpl`)
 
-对应论文：*Privacy-Preserving Personalized Federated Prompt Learning for Multimodal Large Language Models*，ICLR 2025。
+对应 ICLR 2025 论文 *Privacy-Preserving Personalized Federated Prompt Learning for Multimodal Large Language Models*。
 
-- 模型提示为 `global_ctx + local_ctx`。全局提示由服务器同步，本地提示在每个客户端跨轮持久保存。
-- 每个本地批次把完整本地提示分解为正交低秩因子 `U,V` 与残差 `R`，前向使用 `global + U·V + R`。
-- 裁剪 `global/U/V` 梯度，只向低秩因子梯度加入局部高斯噪声，再按论文 RGP 公式重构完整本地提示梯度。
-- 服务器裁剪客户端全局更新、按样本数加权，并加入全局高斯噪声。本地提示不会上传或聚合。
+- 实际提示为 `global_ctx + local_ctx`。全局提示由服务器同步，本地提示按客户端跨轮持久保存。
+- 每个私有步骤使用一次随机 power iteration 得到正交低秩因子 `U,V` 和残差 `R`，前向使用 `global + U·V + R`。
+- 对每个样本分别计算并裁剪 `global/U/V` 梯度；只向 `U/V` 梯度加入局部高斯噪声，再按 RGP 公式重构完整本地梯度。
+- 客户端协议消息只包含裁剪后的全局提示梯度。服务器按样本数加权时，GDP 噪声敏感度使用最大客户端权重，而不是错误地假设所有权重均为 `1/N`。
 
-配置参数：`rank`、`local_clip_norm`、`local_noise_multiplier`、`global_clip_norm`、`global_noise_multiplier`、`delta`。
+主要参数：
 
-论文：[ICLR Proceedings](https://proceedings.iclr.cc/paper_files/paper/2025/hash/4431224d3762aa655f0aee4eaf04ff16-Abstract-Conference.html)。截至实现时未发现作者公开代码，因此本实现依据论文算法与公式完成。
+- `rank`、`local_steps`：低秩和每轮私有本地步数；
+- `local_clip_norm`、`global_clip_norm`：逐样本本地裁剪和客户端全局更新裁剪；
+- `local_noise_multiplier`、`global_noise_multiplier`：噪声标准差与对应敏感度之比；
+- `local_target_epsilon`、`global_target_epsilon`：可选目标预算；设置后程序使用保守 Gaussian RDP accountant 反推噪声；
+- `delta`；
+- `reproducible_dp_noise`：仅测试时使用。默认 `false`，使用不写入结果文件的 OS 随机种子。
+
+论文：[ICLR Proceedings](https://proceedings.iclr.cc/paper_files/paper/2025/hash/4431224d3762aa655f0aee4eaf04ff16-Abstract-Conference.html)。未发现作者公开代码，本实现依据论文算法和公式适配。
 
 ## FedASK (`aggregator: fedask`)
 
-对应论文：*Differentially Private Federated Low Rank Adaptation Beyond Fixed-Matrix*，NeurIPS 2025。
+对应 NeurIPS 2025 论文 *Differentially Private Federated Low Rank Adaptation Beyond Fixed-Matrix*。
 
-- 将可训练 soft prompt 写成 `base_ctx + B·A`，把原论文 LoRA 的低秩更新映射到提示矩阵。
-- 客户端固定 `A`，计算完整提示矩阵的逐样本梯度，裁剪、加噪后右乘 `A^T` 更新 `B`，避免直接在两个因子上注入更高维噪声。
-- 聚合阶段使用共享随机矩阵 `Omega`：客户端先发送 `Y_i=B_i(A_i Omega)`；服务器 QR 得到 `Q`；客户端再发送 `P_i=A_i^T(B_i^T Q)`；服务器对加权 `P` 做 SVD 并重构新的 `B,A`。
-- `federated_method_summary.json` 记录最后一轮草图重构相对误差，便于检查 `rank/oversampling` 是否足够。
+- soft prompt 写成 `base_ctx + scaling·B·A`；`scaling=1` 等价于令原论文 LoRA 的 `α/r=1`。
+- 客户端固定 `A`，计算完整 prompt 矩阵的逐样本梯度，经裁剪和高斯扰动后右乘 `A^T` 更新 `B`。
+- 协议消息为 `Y_i=B_i(A_iΩ)` 和 `P_i=A_i^T(B_i^TQ)`，而不是完整客户端 `A/B`。
+- 服务器对加权草图执行 QR、SVD 和 rank 截断，同时记录截断前误差、最终误差、客户端 `B` 子空间秩以及由秩宽度给出的最低 oversampling 诊断。该宽度条件不是重构精度保证，实际结果以两项重构误差为准。
 
-配置参数：`rank`、`oversampling`、`clip_norm`、`noise_multiplier`、`delta`。
+主要参数：
 
-论文：[NeurIPS Proceedings](https://papers.nips.cc/paper_files/paper/2025/hash/a686ddca183f72ee9f3f04896eb11bcb-Abstract-Conference.html)。官方实现：[PrivacyFedLLM](https://github.com/SII-FLEEECERmw/PrivacyFedLLM)。本仓库的两阶段草图与 SVD 因子恢复遵循该官方实现。
+- `rank`、`oversampling`、`scaling`、`local_steps`；
+- `clip_norm`、`noise_multiplier`；
+- `target_epsilon`：可选目标预算；
+- `delta`、`reproducible_dp_noise`。
 
-## 与攻击/防御的组合
+论文：[NeurIPS Proceedings](https://papers.nips.cc/paper_files/paper/2025/hash/a686ddca183f72ee9f3f04896eb11bcb-Abstract-Conference.html)。官方代码：[PrivacyFedLLM](https://github.com/SII-FLEEECERmw/PrivacyFedLLM)。两阶段草图和 SVD 恢复遵循官方实现。
 
-攻击审计始终读取每个客户端实际训练后、聚合前的可训练状态。DP-FPL 下更新差值使用该客户端自己的个性化基线；FedASK 下审计 `A/B` 上传状态，同时黑盒攻击观察其实际 `base+B·A` 输出。
+## 隐私会计
 
-所选独立防御在论文方法的原生隐私训练之后执行为显式防御阶段；不会暗中组合两个防御。因而同一条命令可以比较无防御、仅防御、仅攻击或“一个攻击 + 一个防御”。
+`federated_method_summary.json` 报告保守 Gaussian RDP 上界，不使用客户端抽样或数据抽样带来的隐私放大，因此不会虚报更小的 ε。DP-FPL 分别报告本地 LDP 和服务器 GDP；FedASK 报告本地 DP-SGD 的端到端保守上界。`nasr_active` 与 `promptmia` 对目标客户端发起的额外私有更新查询也会计入校准和最终 ε。
+
+当噪声乘数为零，或显式开启 `reproducible_dp_noise` 并把确定性种子用于测试时，摘要中的 `formal_dp_enabled` 为 `false`。
+
+SOFT 和 CoFedMID 含有未由该 accountant 覆盖的数据依赖样本选择；它们与 DP-FPL/FedASK 同时运行时仍报告便于比较的数值上界，但 `formal_dp_enabled` 会设为 `false`，避免把实验性组合误称为形式化 DP 保证。
+
+## 攻击可见性
+
+`audit.audit_view` 支持：
+
+- `protocol_plus_released_prompts`（默认）：更新攻击只能使用真实协议消息，同时允许攻击公开发布的 prompt 检查点；
+- `released_prompt`：不使用通信更新，只审计公开 prompt；
+- `full_whitebox`：允许完整内部客户端状态，用作强攻击上界。
+
+DP-FPL 的协议视图不会暴露 `local_ctx` 更新；FedASK 的协议视图只使用两阶段草图。审计摘要会保存所用视图和具体威胁模型。
+
+## 与五种防御组合
+
+DP-FPL/FedASK 不再先完成原生训练、再额外执行一遍普通防御训练：
+
+- HAMP、SOFT、CoFedMID 的目标或样本变换进入同一次逐样本裁剪/加噪流水线；
+- Prompt-DP 通过更严格的裁剪阈值和更大的噪声乘数组合，不增加普通 SGD 阶段；
+- MIST 保留反事实第二阶段，但该阶段仍调用 DP-FPL/FedASK 自身的私有更新规则，并计入隐私 accountant。
+
+因此“一个方法 + 一个防御”不会因无意中多跑完整本地 epoch 而获得不公平的训练预算，也不会在私有机制之后追加未保护的数据相关更新。

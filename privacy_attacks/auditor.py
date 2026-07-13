@@ -5,6 +5,7 @@ import logging
 import os
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from privacy_attacks.code_poison import run_code_poison_attack
@@ -58,10 +59,25 @@ class MembershipAuditor:
         collate_fn=None,
         config: dict | None = None,
         defense_config: dict | None = None,
+        federated_method: str = "fedavg",
     ):
         self.config = config or {}
         self.defense_config = dict(defense_config or {"name": "none"})
         self.defense_name = str(self.defense_config.get("name", "none")).lower()
+        self.federated_method = str(federated_method).lower()
+        self.audit_view = str(
+            self.config.get("audit_view", "protocol_plus_released_prompts")
+        ).lower()
+        if self.audit_view == "protocol_plus_queries":
+            self.audit_view = "protocol_plus_released_prompts"
+        if self.audit_view not in {
+            "protocol_plus_released_prompts",
+            "full_whitebox",
+            "released_prompt",
+        }:
+            raise ValueError(
+                "audit.audit_view must be protocol_plus_released_prompts, full_whitebox, or released_prompt."
+            )
         self.enabled = bool(self.config.get("enabled", True))
         self.attacks = list(
             self.config.get(
@@ -89,6 +105,11 @@ class MembershipAuditor:
         if not 0 <= target_client_id < len(users):
             raise ValueError("target_client_id is outside the client range.")
         self.model = copy.deepcopy(model).to(device)
+        self.initial_prompt_state = {
+            name: parameter.detach().clone()
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
         if self.defense_name == "hamp":
             attach_hamp_output_transform(
                 self.model,
@@ -101,9 +122,7 @@ class MembershipAuditor:
         self.collate_fn = collate_fn
         self.seed = int(self.config.get("seed", 42))
         self.audit_interval = int(self.config.get("audit_interval", 1))
-        self.calibration_fraction = float(
-            self.config.get("calibration_fraction", 0.5)
-        )
+        self.calibration_fraction = float(self.config.get("calibration_fraction", 0.5))
         if self.audit_interval <= 0:
             raise ValueError("audit_interval must be positive.")
         self.observations: list[dict] = []
@@ -164,6 +183,49 @@ class MembershipAuditor:
     def should_observe(self, round_index: int) -> bool:
         return self.enabled and round_index % self.audit_interval == 0
 
+    @staticmethod
+    def _clone_prompt_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {name: tensor.detach().clone() for name, tensor in state.items()}
+
+    def _dpfpl_public_state(
+        self, source: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        state = self._clone_prompt_state(self.initial_prompt_state)
+        for name, tensor in source.items():
+            if name.endswith("global_ctx"):
+                state[name] = tensor.detach().clone()
+        return state
+
+    def _observable_base_state(
+        self, base_state: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        if self.audit_view != "full_whitebox" and self.federated_method == "dpfpl":
+            return self._dpfpl_public_state(base_state)
+        return base_state
+
+    def _observable_client_state(
+        self,
+        user_id: int,
+        updated_state: dict[str, torch.Tensor],
+        released_states: dict[int, dict[str, torch.Tensor]] | None,
+    ) -> dict[str, torch.Tensor]:
+        if self.audit_view == "full_whitebox":
+            return updated_state
+        if (
+            self.audit_view == "protocol_plus_released_prompts"
+            and self.federated_method == "fedavg"
+        ):
+            # The full FedAvg model update is itself a protocol message.
+            return updated_state
+        if not released_states:
+            raise ValueError("Released prompt state is required by this audit view.")
+        released = released_states.get(user_id, released_states.get(0))
+        if released is None:
+            raise ValueError(f"No released prompt is available for client {user_id}.")
+        if self.federated_method == "dpfpl":
+            return self._dpfpl_public_state(released)
+        return released
+
     def observe_round(
         self,
         round_index: int,
@@ -171,14 +233,21 @@ class MembershipAuditor:
         updated_states: dict[int, dict[str, torch.Tensor]],
         selected_ids: list[int],
         base_states: dict[int, dict[str, torch.Tensor]] | None = None,
+        protocol_messages: dict[int, dict] | None = None,
+        released_states: dict[int, dict[str, torch.Tensor]] | None = None,
     ) -> None:
         if not self.should_observe(round_index):
             return
         names = trainable_names(self.model)
-        self.model.load_state_dict(base_state, strict=False)
+        observable_names = names
+        if self.audit_view != "full_whitebox" and self.federated_method == "dpfpl":
+            observable_names = [name for name in names if name.endswith("global_ctx")]
+        self.model.load_state_dict(
+            self._observable_base_state(base_state), strict=False
+        )
         self.model.eval()
         sample_gradients, signatures, _ = per_sample_prompt_gradients(
-            self.model, self.images, self.labels
+            self.model, self.images, self.labels, observable_names
         )
 
         confidence = []
@@ -186,16 +255,40 @@ class MembershipAuditor:
         gradient_difference = []
         probabilities = []
         representations = []
+        observable_states = {}
         for user_id in selected_ids:
-            state = updated_states[user_id]
+            state = self._observable_client_state(
+                user_id, updated_states[user_id], released_states
+            )
+            observable_states[user_id] = state
             client_base = base_state if base_states is None else base_states[user_id]
-            update = flatten_state_delta(client_base, state, names)
+            if self.audit_view == "released_prompt":
+                update = torch.ones(1)
+            elif (
+                self.audit_view == "protocol_plus_released_prompts"
+                and protocol_messages is not None
+                and user_id in protocol_messages
+            ):
+                tensors = protocol_messages[user_id].get("tensors", {})
+                update = torch.cat(
+                    [tensor.detach().flatten().cpu() for tensor in tensors.values()]
+                )
+            else:
+                update = flatten_state_delta(client_base, state, observable_names)
+            compared_gradients = sample_gradients
+            if update.numel() != sample_gradients.shape[1]:
+                width = min(64, update.numel(), sample_gradients.shape[1])
+                update = F.adaptive_avg_pool1d(update.view(1, 1, -1), width).flatten()
+                compared_gradients = F.adaptive_avg_pool1d(
+                    sample_gradients.unsqueeze(1), width
+                ).squeeze(1)
             update_norm = update.norm().clamp_min(1e-12)
-            sample_norm = sample_gradients.norm(dim=1).clamp_min(1e-12)
-            cosine.append((sample_gradients @ update) / (sample_norm * update_norm))
+            sample_norm = compared_gradients.norm(dim=1).clamp_min(1e-12)
+            cosine.append((compared_gradients @ update) / (sample_norm * update_norm))
             update_sq = update.square().sum()
             gradient_difference.append(
-                update_sq - (update.unsqueeze(0) - sample_gradients).square().sum(dim=1)
+                update_sq
+                - (update.unsqueeze(0) - compared_gradients).square().sum(dim=1)
             )
 
             self.model.load_state_dict(state, strict=False)
@@ -218,10 +311,24 @@ class MembershipAuditor:
             "client_states": {
                 user_id: {
                     name: tensor.detach().cpu().clone()
-                    for name, tensor in updated_states[user_id].items()
+                    for name, tensor in observable_states[user_id].items()
                 }
                 for user_id in selected_ids
             },
+            "protocol_messages": {
+                user_id: {
+                    "kind": protocol_messages[user_id].get("kind", "unknown"),
+                    "tensors": {
+                        name: tensor.detach().cpu().clone()
+                        for name, tensor in protocol_messages[user_id]
+                        .get("tensors", {})
+                        .items()
+                    },
+                }
+                for user_id in selected_ids
+                if protocol_messages is not None and user_id in protocol_messages
+            },
+            "audit_view": self.audit_view,
         }
         self.observations.append(observation)
         logger.info("Collected privacy signals for round %s", round_index)
@@ -349,9 +456,7 @@ class MembershipAuditor:
                 steps=int(self.config.get("yoqo_steps", 20)),
                 learning_rate=float(self.config.get("yoqo_learning_rate", 0.01)),
                 epsilon=float(self.config.get("query_epsilon", 0.1)),
-                distortion_weight=float(
-                    self.config.get("yoqo_distortion_weight", 1.0)
-                ),
+                distortion_weight=float(self.config.get("yoqo_distortion_weight", 1.0)),
                 reference_models=int(self.config.get("query_reference_models", 2)),
             )
         if attack == "canary":
@@ -420,6 +525,19 @@ class MembershipAuditor:
                 {
                     "target_client_id": self.target_client_id,
                     "defense": self.defense_name,
+                    "federated_method": self.federated_method,
+                    "audit_view": self.audit_view,
+                    "threat_model": {
+                        "protocol_messages": self.audit_view
+                        in {"protocol_plus_released_prompts", "full_whitebox"},
+                        "released_prompt_checkpoints": self.audit_view
+                        in {
+                            "protocol_plus_released_prompts",
+                            "released_prompt",
+                            "full_whitebox",
+                        },
+                        "raw_internal_client_state": self.audit_view == "full_whitebox",
+                    },
                     "attacks": summaries,
                     "errors": self.errors,
                 },

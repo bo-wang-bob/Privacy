@@ -10,17 +10,25 @@ sample_users: 10
 aggregator: fedavg
 dpfpl:
   rank: 4
+  local_steps: 1
   local_clip_norm: 1.0
   local_noise_multiplier: 1.0
+  local_target_epsilon: null
   global_clip_norm: 1.0
   global_noise_multiplier: 1.0
+  global_target_epsilon: null
   delta: 0.00001
+  reproducible_dp_noise: false
 fedask:
   rank: 4
   oversampling: 2
+  scaling: 1.0
+  local_steps: 2
   clip_norm: 1.0
   noise_multiplier: 1.0
+  target_epsilon: null
   delta: 0.00001
+  reproducible_dp_noise: false
 dirichlet_alpha: 0.1
 gpu: 0
 seed: 42
@@ -35,6 +43,7 @@ results_dir: ./results
 
 audit:
   enabled: true
+  audit_view: protocol_plus_released_prompts
   strict: true
   target_client_id: 0
   ensure_target_participation: true
@@ -100,6 +109,7 @@ defense:
   dp_max_grad_norm: 1.0
   dp_noise_multiplier: 1.0
   dp_delta: 0.00001
+  reproducible_dp_noise: false
   cofedmid_intervals: 4
   cofedmid_recycle_ratio: 0.1
   cofedmid_entropy_weight: 0.05

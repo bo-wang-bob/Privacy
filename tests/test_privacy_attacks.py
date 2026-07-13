@@ -1,4 +1,5 @@
 import json
+import copy
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -16,6 +17,11 @@ from privacy_attacks.model_utils import scaled_confidence
 from privacy_attacks.promptmia import generate_key_with_similarity
 from privacy_defenses import DefenseController, attach_hamp_output_transform
 from servers.serverbase import ServerBase
+from utils.privacy_accounting import (
+    calibrate_gaussian_noise,
+    gaussian_rdp_epsilon,
+    planned_private_probe_steps,
+)
 
 
 class ToyPromptModel(nn.Module):
@@ -74,11 +80,38 @@ def test_membership_metrics_and_secret_samples_are_deterministic():
     assert not torch.equal(first[0], first[1])
 
 
+def test_private_noise_calibration_meets_requested_budget():
+    multiplier = calibrate_gaussian_noise(
+        target_epsilon=3.0,
+        steps=20,
+        delta=1e-5,
+        mechanisms_per_step=2,
+    )
+    epsilon = gaussian_rdp_epsilon(
+        multiplier, steps=20, delta=1e-5, mechanisms_per_step=2
+    )
+    assert epsilon <= 3.0 + 1e-8
+    assert gaussian_rdp_epsilon(multiplier * 0.9, 20, 1e-5, 2) > 3.0
+
+
+def test_active_client_update_queries_are_counted_in_privacy_budget():
+    assert (
+        planned_private_probe_steps(
+            {
+                "enabled": True,
+                "attacks": ["nasr_active", "promptmia", "fedmia_loss"],
+                "active_max_samples": 6,
+                "promptmia_max_samples": 4,
+            }
+        )
+        == 10
+    )
+    assert planned_private_probe_steps({"enabled": False}) == 0
+
+
 def test_recent_attack_primitives_match_paper_definitions():
     query = torch.tensor([1.0, 2.0, -1.0, 0.5])
-    key = generate_key_with_similarity(
-        query, 0.73, torch.Generator().manual_seed(7)
-    )
+    key = generate_key_with_similarity(query, 0.73, torch.Generator().manual_seed(7))
     cosine = F.cosine_similarity(query, key, dim=0)
     assert torch.allclose(cosine, torch.tensor(0.73), atol=1e-5)
     assert torch.allclose(query.norm(), key.norm(), atol=1e-5)
@@ -122,9 +155,7 @@ class ToyPromptLearner(nn.Module):
     def __init__(self, method: str):
         super().__init__()
         self.method = method
-        initial = torch.tensor(
-            [[0.2, -0.2, 0.1, 0.3], [-0.1, 0.2, -0.2, 0.1]]
-        )
+        initial = torch.tensor([[0.2, -0.2, 0.1, 0.3], [-0.1, 0.2, -0.2, 0.1]])
         if method == "dpfpl":
             self.global_ctx = nn.Parameter(initial.clone())
             self.local_ctx = nn.Parameter(torch.zeros_like(initial))
@@ -171,11 +202,13 @@ def test_defense_primitives_preserve_required_invariants():
     images, _ = next(iter(torch.utils.data.DataLoader(_dataset(), batch_size=8)))
     original_logits = model(images)
     attach_hamp_output_transform(model, temperature=4.0)
+    model.eval()
     defended_logits = model(images)
     assert torch.equal(original_logits.argmax(dim=1), defended_logits.argmax(dim=1))
-    assert torch.softmax(defended_logits, dim=1).amax(dim=1).mean() < torch.softmax(
-        original_logits, dim=1
-    ).amax(dim=1).mean()
+    assert (
+        torch.softmax(defended_logits, dim=1).amax(dim=1).mean()
+        < torch.softmax(original_logits, dim=1).amax(dim=1).mean()
+    )
 
     controller = DefenseController(
         {
@@ -292,6 +325,8 @@ def test_dpfpl_and_fedask_run_as_fedavg_replacements():
             "clip_norm": 0.5,
             "noise_multiplier": 0.1,
             "oversampling": 1,
+            "local_steps": 1,
+            "reproducible_dp_noise": True,
         }
         server = ServerBase(
             train_mode=mode,
@@ -329,13 +364,56 @@ def test_dpfpl_and_fedask_run_as_fedavg_replacements():
             (path / "federated_method_summary.json").read_text(encoding="utf-8")
         )
         assert summary["federated_method"] == method
+        assert (
+            summary["privacy_accounting"][
+                (
+                    "local_epsilon_upper_bound"
+                    if method == "dpfpl"
+                    else "epsilon_upper_bound"
+                )
+            ]
+            is not None
+        )
+        messages = server.ctx.protocol_messages
+        observation_states = server.auditor.observations[-1]["client_states"]
+        if method == "dpfpl":
+            assert all(
+                message["kind"] == "global_prompt_gradient"
+                and all(name.endswith("global_ctx") for name in message["tensors"])
+                for message in messages.values()
+            )
+            local_name = next(
+                name
+                for name in server.auditor.initial_prompt_state
+                if name.endswith("local_ctx")
+            )
+            assert all(
+                torch.equal(
+                    state[local_name],
+                    server.auditor.initial_prompt_state[local_name].cpu(),
+                )
+                for state in observation_states.values()
+            )
+        else:
+            assert all(
+                message["kind"] == "fedask_sketch"
+                and set(message["tensors"]) == {"stage1_y", "stage2_p"}
+                for message in messages.values()
+            )
+            released = server.ctx.new_model_state[0]
+            assert all(
+                all(torch.equal(state[name], released[name].cpu()) for name in released)
+                for state in observation_states.values()
+            )
         if method == "dpfpl":
             global_name = next(
-                name for name in server.ctx.new_model_state[0]
+                name
+                for name in server.ctx.new_model_state[0]
                 if name.endswith("global_ctx")
             )
             local_name = next(
-                name for name in server.ctx.new_model_state[0]
+                name
+                for name in server.ctx.new_model_state[0]
                 if name.endswith("local_ctx")
             )
             assert torch.equal(
@@ -348,6 +426,139 @@ def test_dpfpl_and_fedask_run_as_fedavg_replacements():
             )
         else:
             assert summary["last_reconstruction_error"] < 1e-4
+            assert "last_pretruncation_error" in summary
+
+
+def test_target_may_be_absent_when_participation_is_not_forced():
+    path = Path(".test_artifacts") / "target_absent"
+    path.mkdir(parents=True, exist_ok=True)
+    server = _defended_server(path, "none", attack_enabled=False)
+    server.ensure_target = False
+    server._sample_users = lambda: [1, 2, 3]
+    assert server.train() == []
+
+
+def test_every_defense_uses_private_method_pipeline_without_duplicate_epochs():
+    root = Path(".test_artifacts") / "private_method_defenses"
+    defense_config = {
+        "seed": 23,
+        "reproducible_dp_noise": True,
+        "dp_max_grad_norm": 0.5,
+        "dp_noise_multiplier": 0.2,
+        "dp_delta": 1e-5,
+        "cofedmid_intervals": 2,
+        "cofedmid_recycle_ratio": 0.25,
+        "cofedmid_noise_std": 0.01,
+        "cofedmid_perturb_ratio": 0.5,
+        "mist_cross_steps": 1,
+        "mist_cross_weight": 1.0,
+        "soft_obfuscation_strength": 0.5,
+        "soft_noise_std": 0.01,
+        "hamp_true_probability": 0.6,
+        "hamp_entropy_weight": 0.05,
+        "hamp_output_temperature": 2.0,
+    }
+    for method, mode in (("dpfpl", "local"), ("fedask", "centralized")):
+        for defense in ("cofedmid", "prompt_dp", "mist", "soft", "hamp"):
+            path = root / method / defense
+            path.mkdir(parents=True, exist_ok=True)
+            method_config = {
+                "rank": 2,
+                "local_steps": 1,
+                "seed": 29,
+                "reproducible_dp_noise": True,
+                "local_clip_norm": 0.5,
+                "local_noise_multiplier": 0.2,
+                "global_clip_norm": 0.5,
+                "global_noise_multiplier": 0.2,
+                "clip_norm": 0.5,
+                "noise_multiplier": 0.2,
+                "oversampling": 1,
+                "delta": 1e-5,
+            }
+            selected_defense = defense_config | {"name": defense}
+            server = ServerBase(
+                train_mode=mode,
+                device=torch.device("cpu"),
+                dataset_name="toy",
+                train_sets=[_dataset(index * 0.02) for index in range(3)],
+                test_sets=[_dataset(0.4 + index * 0.02) for index in range(3)],
+                class_names=["zero", "one"],
+                model=ToyPrivateMethodModel(method),
+                batch_size=8,
+                eval_batch_size=8,
+                learning_rate=0.05,
+                num_glob_iters=1,
+                local_epochs=1,
+                total_users=3,
+                results_dir=str(path),
+                user_per_round=3,
+                aggregator=build_aggregator(method, **method_config),
+                eval_interval=1,
+                audit_config={
+                    "enabled": False,
+                    "attacks": [],
+                    "target_client_id": 0,
+                },
+                defense_config=selected_defense,
+                method_config=method_config,
+            )
+            assert server.train() == []
+            expected_steps = 2 if defense == "mist" else 1
+            assert set(server.defense.steps.values()) == {expected_steps}
+            if defense == "cofedmid":
+                assert set(server.defense.cofedmid_selected_arm) == {0, 1, 2}
+            if defense == "soft":
+                assert (
+                    server.defense.summary()["metrics"]["soft_selected_fraction"] == 0.0
+                )
+
+
+def test_fedask_active_probe_keeps_a_fixed_and_updates_b_privately():
+    path = Path(".test_artifacts") / "fedask_active_probe"
+    path.mkdir(parents=True, exist_ok=True)
+    method_config = {
+        "rank": 2,
+        "local_steps": 1,
+        "clip_norm": 0.5,
+        "noise_multiplier": 0.2,
+        "reproducible_dp_noise": True,
+        "seed": 31,
+    }
+    server = ServerBase(
+        train_mode="centralized",
+        device=torch.device("cpu"),
+        dataset_name="toy",
+        train_sets=[_dataset(index * 0.02) for index in range(2)],
+        test_sets=[_dataset(0.4 + index * 0.02) for index in range(2)],
+        class_names=["zero", "one"],
+        model=ToyPrivateMethodModel("fedask"),
+        batch_size=8,
+        eval_batch_size=8,
+        learning_rate=0.05,
+        num_glob_iters=1,
+        local_epochs=1,
+        total_users=2,
+        results_dir=str(path),
+        user_per_round=2,
+        aggregator=build_aggregator("fedask", rank=2, oversampling=1),
+        audit_config={"enabled": False, "attacks": [], "target_client_id": 0},
+        defense_config={
+            "name": "cofedmid",
+            "cofedmid_intervals": 2,
+            "cofedmid_recycle_ratio": 0.25,
+            "cofedmid_noise_std": 0.1,
+            "cofedmid_perturb_ratio": 1.0,
+        },
+        method_config=method_config,
+    )
+    user = server.ctx.users[0]
+    probe = copy.deepcopy(user.model)
+    before_a = probe.prompt_learner.fedask_A.detach().clone()
+    before_b = probe.prompt_learner.fedask_B.detach().clone()
+    user.train_model(probe, privacy_probe=True)
+    assert torch.equal(before_a, probe.prompt_learner.fedask_A)
+    assert not torch.equal(before_b, probe.prompt_learner.fedask_B)
 
 
 def test_training_time_attack_and_prompt_dp_can_run_together():

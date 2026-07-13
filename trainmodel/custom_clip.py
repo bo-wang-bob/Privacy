@@ -86,6 +86,7 @@ class PromptLearner(nn.Module):
         class_specific_ctx: bool = False,
         parameterization: str = "full",
         low_rank: int = 4,
+        low_rank_scaling: float = 1.0,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
@@ -97,6 +98,7 @@ class PromptLearner(nn.Module):
         self.class_specific_ctx = class_specific_ctx
         self.parameterization = parameterization.lower()
         self.low_rank = int(low_rank)
+        self.low_rank_scaling = float(low_rank_scaling)
         self.device = device
 
         # Get text embedding dimension from CLIP model config
@@ -124,6 +126,7 @@ class PromptLearner(nn.Module):
                 torch.randn(rank, initial_ctx.shape[-1], device=device) * 0.02
             )
             self.fedask_B = nn.Parameter(torch.zeros(rows, rank, device=device))
+            self.fedask_scaling = self.low_rank_scaling
         else:
             raise ValueError(
                 "parameterization must be one of: full, dpfpl, fedask."
@@ -179,7 +182,7 @@ class PromptLearner(nn.Module):
             return self.ctx
         if self.parameterization == "dpfpl":
             return self.global_ctx + self.local_ctx
-        adapter = self.fedask_B @ self.fedask_A
+        adapter = self.fedask_scaling * (self.fedask_B @ self.fedask_A)
         return self.base_ctx + adapter.reshape_as(self.base_ctx)
 
     def forward(
@@ -393,6 +396,7 @@ class CustomCLIP(BaseModel):
         class_specific_ctx: bool = False,
         parameterization: str = "full",
         low_rank: int = 4,
+        low_rank_scaling: float = 1.0,
         device=torch.device("cpu"),
     ):
         super().__init__()
@@ -409,6 +413,7 @@ class CustomCLIP(BaseModel):
         self.class_specific_ctx = class_specific_ctx
         self.parameterization = parameterization.lower()
         self.low_rank = int(low_rank)
+        self.low_rank_scaling = float(low_rank_scaling)
         self.processor = processor
         self.device = device
 
@@ -422,6 +427,7 @@ class CustomCLIP(BaseModel):
             class_specific_ctx=self.class_specific_ctx,
             parameterization=self.parameterization,
             low_rank=self.low_rank,
+            low_rank_scaling=self.low_rank_scaling,
             device=self.device,
         )
 
@@ -469,7 +475,8 @@ class CustomCLIP(BaseModel):
         # Compute cosine similarity scaled by learned temperature
         logit_scale = self.clip_model.logit_scale.exp()
         logits = logit_scale * image_features @ text_features.t()  # (B, K)
-        logits = logits / float(getattr(self, "_hamp_output_temperature", 1.0))
+        if not self.training:
+            logits = logits / float(getattr(self, "_hamp_output_temperature", 1.0))
 
         logger.debug(
             f"CustomCLIP forward: batch_size={x.shape[0]}, logits shape={logits.shape}, logit_scale={logit_scale.item():.4f}"
@@ -570,6 +577,7 @@ class CustomCLIP(BaseModel):
             class_specific_ctx=self.class_specific_ctx,
             parameterization=self.parameterization,
             low_rank=self.low_rank,
+            low_rank_scaling=self.low_rank_scaling,
             device=self.device,
         )
         new_model.prompt_learner.load_state_dict(

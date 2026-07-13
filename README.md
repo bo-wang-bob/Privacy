@@ -34,6 +34,8 @@ python main.py --config configs/fedprompt_privacy.yaml \
 
 方法参数在配置文件的 `dpfpl:` 与 `fedask:` 段中设置。DP-FPL 自动使用个性化客户端状态；FedAvg 和 FedASK 使用共享全局状态。
 
+可以通过 `audit.audit_view` 明确攻击者可见性。默认的 `protocol_plus_released_prompts` 仅把真实上传消息用于更新攻击，并允许查询公开 prompt；也可选择 `released_prompt` 或用于强上界的 `full_whitebox`。方法摘要会报告保守的隐私预算和 FedASK 草图重构诊断。
+
 ## 环境
 
 推荐 Python 3.10+：

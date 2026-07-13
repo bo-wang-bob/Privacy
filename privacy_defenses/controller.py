@@ -15,6 +15,7 @@ from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
+from utils.privacy_accounting import private_generator
 
 from privacy_attacks.code_poison import (
     compromised_prompt_loss,
@@ -26,9 +27,13 @@ SUPPORTED_DEFENSES = {"none", "cofedmid", "prompt_dp", "mist", "soft", "hamp"}
 
 
 def _trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
     if not parameters:
-        raise ValueError("A privacy defense requires at least one trainable prompt tensor.")
+        raise ValueError(
+            "A privacy defense requires at least one trainable prompt tensor."
+        )
     return parameters
 
 
@@ -57,7 +62,9 @@ def _assign_flat_gradient(
     offset = 0
     for parameter in parameters:
         count = parameter.numel()
-        parameter.grad = flat_gradient[offset : offset + count].view_as(parameter).clone()
+        parameter.grad = (
+            flat_gradient[offset : offset + count].view_as(parameter).clone()
+        )
         offset += count
     if offset != flat_gradient.numel():
         raise ValueError("Processed gradient does not match trainable prompt size.")
@@ -94,6 +101,8 @@ def _mean_loader_loss(model: torch.nn.Module, loader, device: torch.device) -> f
 
 
 def _hamp_output_hook(_module, _inputs, output):
+    if _module.training:
+        return output
     temperature = float(getattr(_module, "_hamp_output_temperature", 1.0))
     if isinstance(output, tuple):
         return (output[0] / temperature, *output[1:])
@@ -139,20 +148,26 @@ class DefenseController:
         self.batch_counts = defaultdict(int)
         self.cofedmid_interval_weights: dict[int, torch.Tensor] = {}
         self.cofedmid_selected_arm: dict[int, tuple[int, float, float]] = {}
+        self._private_cofedmid_choices: dict[int, tuple[int, float, int]] = {}
         self._class_assignments: dict[tuple[int, int], set[int]] = {}
         self._generator_calls = defaultdict(int)
         self._selected_by_round: dict[int, list[int]] = {}
+        self.federated_method = "fedavg"
+        self.method_config: dict = {}
+        self.additional_private_steps = 0
 
     @property
     def enabled(self) -> bool:
         return self.name != "none"
 
     def _generator(self, client_id: int, round_index: int, offset: int = 0):
-        device_type = self.device.type if self.device.type in {"cpu", "cuda"} else "cpu"
-        key = (int(client_id), int(round_index), int(offset), device_type)
+        generator_device = (
+            self.device if self.device.type in {"cpu", "cuda"} else torch.device("cpu")
+        )
+        key = (int(client_id), int(round_index), int(offset), str(generator_device))
         call_index = self._generator_calls[key]
         self._generator_calls[key] += 1
-        generator = torch.Generator(device=device_type)
+        generator = torch.Generator(device=generator_device)
         generator.manual_seed(
             self.seed
             + 1000003 * int(client_id)
@@ -165,6 +180,67 @@ class DefenseController:
     def _record(self, key: str, value: float) -> None:
         self.batch_metrics[key] += float(value)
         self.batch_counts[key] += 1
+
+    def validation_loss(self, model: torch.nn.Module, loader) -> float:
+        return _mean_loader_loss(model, loader, self.device)
+
+    def begin_private_cofedmid(self, user, model, round_index: int) -> float | None:
+        """Choose the EXP3 difficulty arm before a private-method client update."""
+        if self.name != "cofedmid":
+            return None
+        intervals = int(self.config.get("cofedmid_intervals", 4))
+        if intervals <= 0:
+            raise ValueError("cofedmid_intervals must be positive.")
+        gamma = float(self.config.get("cofedmid_exp3_gamma", 0.2))
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError("cofedmid_exp3_gamma must be in [0, 1].")
+        weights = self.cofedmid_interval_weights.get(user.id)
+        if weights is None or weights.numel() != intervals:
+            weights = torch.ones(intervals, dtype=torch.float64)
+            self.cofedmid_interval_weights[user.id] = weights
+        probabilities = (1.0 - gamma) * weights / weights.sum()
+        probabilities += gamma / intervals
+        generator = torch.Generator().manual_seed(
+            self.seed + 1000003 * int(user.id) + 1009 * int(round_index) + 307
+        )
+        arm = int(torch.multinomial(probabilities.float(), 1, generator=generator))
+        self._private_cofedmid_choices[user.id] = (
+            arm,
+            float(probabilities[arm]),
+            int(round_index),
+        )
+        return self.validation_loss(model, user.testloader)
+
+    def private_cofedmid_arm(self, client_id: int, round_index: int) -> int:
+        choice = self._private_cofedmid_choices.get(client_id)
+        if choice is None or choice[2] != int(round_index):
+            raise RuntimeError("CoFedMID EXP3 arm was not initialized for this update.")
+        return choice[0]
+
+    def finish_private_cofedmid(
+        self,
+        user,
+        model,
+        round_index: int,
+        before_validation: float | None,
+    ) -> None:
+        if self.name != "cofedmid" or before_validation is None:
+            return
+        arm, probability, choice_round = self._private_cofedmid_choices.pop(user.id)
+        if choice_round != int(round_index):
+            raise RuntimeError("CoFedMID EXP3 state belongs to a different round.")
+        reward = max(
+            -1.0,
+            min(
+                1.0,
+                before_validation - self.validation_loss(model, user.testloader),
+            ),
+        )
+        intervals = int(self.config.get("cofedmid_intervals", 4))
+        gamma = float(self.config.get("cofedmid_exp3_gamma", 0.2))
+        weights = self.cofedmid_interval_weights[user.id]
+        weights[arm] *= math.exp(gamma * reward / max(intervals * probability, 1e-12))
+        self.cofedmid_selected_arm[user.id] = (arm, probability, reward)
 
     def prepare_round(self, selected_ids: list[int], round_index: int) -> None:
         self._selected_by_round[int(round_index)] = list(selected_ids)
@@ -241,8 +317,14 @@ class DefenseController:
         max_norm = float(self.config.get("dp_max_grad_norm", 1.0))
         noise_multiplier = float(self.config.get("dp_noise_multiplier", 1.0))
         if max_norm <= 0 or noise_multiplier <= 0:
-            raise ValueError("Prompt-DP clipping and noise multiplier must be positive.")
-        generator = self._generator(user.id, round_index, 17)
+            raise ValueError(
+                "Prompt-DP clipping and noise multiplier must be positive."
+            )
+        generator = private_generator(
+            self.device,
+            bool(self.config.get("reproducible_dp_noise", False)),
+            self.seed + 1000003 * user.id + 1009 * round_index + 17,
+        )
         for _ in range(user.local_epochs):
             for images, labels in user.trainloader:
                 images = images.to(self.device)
@@ -285,7 +367,9 @@ class DefenseController:
                 targets = _soft_targets(labels, logits.shape[1], true_probability)
                 soft_loss = _cross_entropy_with_soft_targets(logits, targets).mean()
                 probabilities = torch.softmax(logits, dim=1)
-                entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum(dim=1)
+                entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum(
+                    dim=1
+                )
                 loss = soft_loss - entropy_weight * entropy.mean()
                 if code_poison:
                     synthetic = generate_membership_encoding_samples(
@@ -301,13 +385,17 @@ class DefenseController:
                         synthetic_logits, synthetic_targets
                     ).mean()
                     synthetic_probability = torch.softmax(synthetic_logits, dim=1)
-                    synthetic_entropy = -(
-                        synthetic_probability
-                        * synthetic_probability.clamp_min(1e-12).log()
-                    ).sum(dim=1).mean()
-                    loss = loss + float(
-                        user.code_poison_config.get("weight", 1.0)
-                    ) * (synthetic_loss - entropy_weight * synthetic_entropy)
+                    synthetic_entropy = (
+                        -(
+                            synthetic_probability
+                            * synthetic_probability.clamp_min(1e-12).log()
+                        )
+                        .sum(dim=1)
+                        .mean()
+                    )
+                    loss = loss + float(user.code_poison_config.get("weight", 1.0)) * (
+                        synthetic_loss - entropy_weight * synthetic_entropy
+                    )
                 loss.backward()
                 optimizer.step()
                 self.steps[user.id] += 1
@@ -322,9 +410,11 @@ class DefenseController:
         # SOFT phase 1 is a warm-up pass. Later global rounds perform iterative
         # selection against a held-out validation-loss threshold.
         for epoch in range(user.local_epochs):
-            warmup = round_index == 0 and epoch == 0
-            threshold = math.inf if warmup else _mean_loader_loss(
-                model, user.testloader, self.device
+            warmup = round_index == 0
+            threshold = (
+                math.inf
+                if warmup
+                else _mean_loader_loss(model, user.testloader, self.device)
             )
             generator = self._generator(user.id, round_index, 101 + epoch)
             for images, labels in user.trainloader:
@@ -340,24 +430,33 @@ class DefenseController:
                         influential.zero_()
                 transformed = torch.flip(images, dims=(-1,))
                 if noise_std > 0:
-                    transformed = transformed + torch.randn(
-                        transformed.shape,
-                        generator=generator,
-                        device=transformed.device,
-                        dtype=transformed.dtype,
-                    ) * noise_std
+                    transformed = (
+                        transformed
+                        + torch.randn(
+                            transformed.shape,
+                            generator=generator,
+                            device=transformed.device,
+                            dtype=transformed.dtype,
+                        )
+                        * noise_std
+                    )
                 mask = influential.view(-1, *([1] * (images.ndim - 1)))
                 obfuscated = strength * transformed + (1.0 - strength) * images
                 defended_images = torch.where(mask, obfuscated, images)
                 loss = F.cross_entropy(model(defended_images), labels)
                 if code_poison:
-                    loss = loss + self._secret_losses(
-                        user, model, defended_images, labels
-                    ).mean()
+                    loss = (
+                        loss
+                        + self._secret_losses(
+                            user, model, defended_images, labels
+                        ).mean()
+                    )
                 loss.backward()
                 optimizer.step()
                 self.steps[user.id] += 1
-                self._record("soft_selected_fraction", float(influential.float().mean()))
+                self._record(
+                    "soft_selected_fraction", float(influential.float().mean())
+                )
 
     def _cofedmid_classes(self, client_id: int, round_index: int) -> set[int]:
         key = (client_id, round_index)
@@ -414,7 +513,9 @@ class DefenseController:
         generator = torch.Generator().manual_seed(
             self.seed + 1000003 * int(user.id) + 1009 * int(round_index) + 307
         )
-        selected_arm = int(torch.multinomial(probabilities.float(), 1, generator=generator))
+        selected_arm = int(
+            torch.multinomial(probabilities.float(), 1, generator=generator)
+        )
         before_validation = _mean_loader_loss(model, user.testloader, self.device)
 
         for _ in range(user.local_epochs):
@@ -448,9 +549,11 @@ class DefenseController:
                 if bool(recycled.any()):
                     recycled_logits = logits[recycled]
                     probabilities_out = torch.softmax(recycled_logits, dim=1)
-                    confidence = probabilities_out.gather(
-                        1, labels[recycled].view(-1, 1)
-                    ).detach().clamp(1.0 / self.num_classes, 0.999)
+                    confidence = (
+                        probabilities_out.gather(1, labels[recycled].view(-1, 1))
+                        .detach()
+                        .clamp(1.0 / self.num_classes, 0.999)
+                    )
                     targets = (1.0 - confidence) / max(1, self.num_classes - 1)
                     targets = targets.expand(-1, self.num_classes).clone()
                     targets.scatter_(1, labels[recycled].view(-1, 1), confidence)
@@ -459,14 +562,18 @@ class DefenseController:
                         targets,
                         reduction="batchmean",
                     )
-                    entropy = -(
-                        probabilities_out * probabilities_out.clamp_min(1e-12).log()
-                    ).sum(dim=1).mean()
+                    entropy = (
+                        -(probabilities_out * probabilities_out.clamp_min(1e-12).log())
+                        .sum(dim=1)
+                        .mean()
+                    )
                     loss = loss + cr - entropy_weight * entropy
                 loss.backward()
                 optimizer.step()
                 self.steps[user.id] += 1
-                self._record("cofedmid_selected_fraction", float(selected.float().mean()))
+                self._record(
+                    "cofedmid_selected_fraction", float(selected.float().mean())
+                )
 
         after_validation = _mean_loader_loss(model, user.testloader, self.device)
         reward = max(-1.0, min(1.0, before_validation - after_validation))
@@ -489,9 +596,49 @@ class DefenseController:
         round_index: int,
     ) -> None:
         if self.name == "mist":
-            self._mist_refinement(users, updated_states, selected_ids, round_index)
+            method = (
+                users[selected_ids[0]].federated_method if selected_ids else "fedavg"
+            )
+            if method in {"dpfpl", "fedask"}:
+                self._private_mist_refinement(
+                    users, updated_states, selected_ids, round_index
+                )
+            else:
+                self._mist_refinement(users, updated_states, selected_ids, round_index)
         elif self.name == "cofedmid":
             self._cofedmid_perturb(updated_states, selected_ids, round_index)
+
+    def _private_mist_refinement(
+        self,
+        users: list,
+        updated_states: dict[int, dict[str, torch.Tensor]],
+        selected_ids: list[int],
+        round_index: int,
+    ) -> None:
+        if len(selected_ids) < 2:
+            raise ValueError("MIST requires at least two selected client submodels.")
+        snapshots = {}
+        for user_id in selected_ids:
+            snapshot = copy.deepcopy(users[user_id].model).to(self.device)
+            snapshot.load_state_dict(updated_states[user_id], strict=False)
+            snapshot.eval()
+            for parameter in snapshot.parameters():
+                parameter.requires_grad_(False)
+            snapshots[user_id] = snapshot
+        for user_id in selected_ids:
+            user = users[user_id]
+            user.model.load_state_dict(updated_states[user_id], strict=False)
+            user.private_mist_refine(
+                snapshots,
+                round_index=round_index,
+                steps=int(self.config.get("mist_cross_steps", 1)),
+                weight=float(self.config.get("mist_cross_weight", 1.0)),
+            )
+            updated_states[user_id] = {
+                name: tensor.detach().clone()
+                for name, tensor in user.model.state_dict().items()
+                if name in updated_states[user_id]
+            }
 
     def after_probe_training(
         self,
@@ -507,7 +654,15 @@ class DefenseController:
         if sigma <= 0 or ratio <= 0:
             return
         with torch.no_grad():
-            for parameter_index, parameter in enumerate(_trainable_parameters(model)):
+            parameters = [
+                (name, parameter)
+                for name, parameter in model.named_parameters()
+                if parameter.requires_grad
+                and not (
+                    self.federated_method == "fedask" and name.endswith("fedask_A")
+                )
+            ]
+            for parameter_index, (_name, parameter) in enumerate(parameters):
                 count = parameter.numel()
                 perturb_count = max(1, min(count, int(math.floor(ratio * count))))
                 generator = self._generator(
@@ -515,12 +670,15 @@ class DefenseController:
                     round_index,
                     503 + 31 * parameter_index,
                 )
-                noise = torch.randn(
-                    perturb_count,
-                    generator=generator,
-                    device=parameter.device,
-                    dtype=parameter.dtype,
-                ) * sigma
+                noise = (
+                    torch.randn(
+                        perturb_count,
+                        generator=generator,
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    )
+                    * sigma
+                )
                 parameter.reshape(-1)[-perturb_count:].add_(noise)
 
     def _mist_refinement(
@@ -572,9 +730,9 @@ class DefenseController:
                     counterfactual = torch.stack(peer_confidence).mean(dim=0)
                 optimizer.zero_grad(set_to_none=True)
                 own_probability = torch.softmax(model(images), dim=1)
-                own_confidence = own_probability.gather(
-                    1, labels.view(-1, 1)
-                ).squeeze(1)
+                own_confidence = own_probability.gather(1, labels.view(-1, 1)).squeeze(
+                    1
+                )
                 cross_difference = (own_confidence - counterfactual).abs().mean()
                 (weight * cross_difference).backward()
                 optimizer.step()
@@ -605,6 +763,8 @@ class DefenseController:
         weight_norm_sq = float(weights.square().sum())
         parameter_names = list(updated_states[selected_ids[0]])
         for name_index, name in enumerate(parameter_names):
+            if self.federated_method == "fedask" and name.endswith("fedask_A"):
+                continue
             shape = updated_states[selected_ids[0]][name].shape
             count = updated_states[selected_ids[0]][name].numel()
             perturb_count = max(1, min(count, int(math.floor(ratio * count))))
@@ -619,16 +779,18 @@ class DefenseController:
                         generator=generator,
                         device=updated_states[user_id][name].device,
                         dtype=updated_states[user_id][name].dtype,
-                    ) * sigma
+                    )
+                    * sigma
                 )
             weighted_sum = sum(
                 float(weights[index]) * preliminary[index]
                 for index in range(len(selected_ids))
             )
             for index, user_id in enumerate(selected_ids):
-                projected = preliminary[index] - (
-                    float(weights[index]) / weight_norm_sq
-                ) * weighted_sum
+                projected = (
+                    preliminary[index]
+                    - (float(weights[index]) / weight_norm_sq) * weighted_sum
+                )
                 flat = updated_states[user_id][name].reshape(-1).clone()
                 flat[-perturb_count:] += projected
                 updated_states[user_id][name] = flat.view(shape)
@@ -637,13 +799,27 @@ class DefenseController:
         if self.name != "prompt_dp" or not self.steps:
             return None
         noise = float(self.config.get("dp_noise_multiplier", 1.0))
-        delta = float(self.config.get("dp_delta", 1e-5))
+        mechanisms = 1
+        if self.federated_method == "dpfpl":
+            noise = max(
+                noise,
+                float(self.method_config.get("local_noise_multiplier", 1.0)),
+            )
+            mechanisms = 2
+        elif self.federated_method == "fedask":
+            noise = max(
+                noise,
+                float(self.method_config.get("noise_multiplier", 1.0)),
+            )
+        delta = float(
+            self.method_config.get("delta", self.config.get("dp_delta", 1e-5))
+        )
         if noise <= 0:
             return math.inf
-        steps = max(self.steps.values())
+        steps = max(self.steps.values()) + int(self.additional_private_steps)
         candidates = []
         for order in (2, 3, 4, 8, 16, 32, 64):
-            rdp = steps * order / (2.0 * noise * noise)
+            rdp = mechanisms * steps * order / (2.0 * noise * noise)
             candidates.append(rdp + math.log(1.0 / delta) / (order - 1))
         return min(candidates)
 
@@ -662,8 +838,15 @@ class DefenseController:
         if epsilon is not None:
             summary["privacy_accounting"] = {
                 "epsilon_upper_bound": epsilon,
-                "delta": float(self.config.get("dp_delta", 1e-5)),
+                "delta": float(
+                    self.method_config.get("delta", self.config.get("dp_delta", 1e-5))
+                ),
                 "note": "Conservative full-participation Gaussian composition; no subsampling amplification claimed.",
+                "federated_method": self.federated_method,
+                "formal_dp_enabled": not bool(
+                    self.config.get("reproducible_dp_noise", False)
+                )
+                and not bool(self.method_config.get("reproducible_dp_noise", False)),
             }
         return summary
 

@@ -44,7 +44,7 @@ python main.py --config configs/fedprompt_privacy_quick.yaml --attack none --def
 - `cofedmid_entropy_weight`：回收样本置信度正则强度。
 - `cofedmid_exp3_gamma`：EXP3 探索强度。
 - `cofedmid_noise_std`：上传 prompt 的高斯扰动标准差。
-- `cofedmid_perturb_ratio`：从 prompt 尾部开始扰动的参数比例。扰动在 FedAvg 样本权重下严格抵消。
+- `cofedmid_perturb_ratio`：从 prompt 尾部开始扰动的参数比例。FedAvg 下扰动按样本权重严格抵消；FedASK 只扰动 `B`，保持客户端 `A` 固定。DP-FPL 的全局更新随后还会经过裁剪，因此不宣称扰动严格中性。
 
 ### Prompt-DP
 
@@ -52,7 +52,7 @@ python main.py --config configs/fedprompt_privacy_quick.yaml --attack none --def
 - `dp_noise_multiplier`：噪声标准差与裁剪阈值的比例。
 - `dp_delta`：隐私会计中的 δ。
 
-`defense_summary.json` 中的 `epsilon_upper_bound` 使用不声明子采样放大的保守高斯组合上界。它适合比较配置，但不会虚报更小的抽样 DP 预算。
+`defense_summary.json` 中的 `epsilon_upper_bound` 使用不声明子采样放大的保守高斯组合上界。它适合比较配置，但不会虚报更小的抽样 DP 预算；主动攻击对客户端发起的额外私有更新查询也计入组合次数。
 
 ### MIST
 

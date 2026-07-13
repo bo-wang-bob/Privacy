@@ -26,10 +26,12 @@ class Context:
         self.base_model_state: dict[int, dict[str, torch.Tensor]] = {}
         self.updated_model_state: dict[int, dict[str, torch.Tensor]] = {}
         self.new_model_state: dict[int, dict[str, torch.Tensor]] = {}
+        self.protocol_messages: dict[int, dict] = {}
         self.user_selected: list[int] = []
         self.samples_num: list[int] = []
         self.trainable_param_names = [
-            name for name, parameter in model.named_parameters()
+            name
+            for name, parameter in model.named_parameters()
             if parameter.requires_grad
         ]
         self.glob_iter = 0
@@ -59,3 +61,4 @@ class Context:
         self.new_model_state = {}
         self.updated_model_state = {}
         self.user_selected = []
+        self.protocol_messages = {}

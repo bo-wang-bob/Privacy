@@ -5,7 +5,9 @@ import torch.nn.functional as F
 
 
 def trainable_names(model: torch.nn.Module) -> list[str]:
-    return [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+    return [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    ]
 
 
 def clone_state(state: dict[str, torch.Tensor], cpu: bool = True):
@@ -21,7 +23,10 @@ def flatten_state_delta(
     names: Iterable[str],
 ) -> torch.Tensor:
     return torch.cat(
-        [(base_state[name] - updated_state[name]).detach().flatten().cpu() for name in names]
+        [
+            (base_state[name] - updated_state[name]).detach().flatten().cpu()
+            for name in names
+        ]
     )
 
 
@@ -60,9 +65,19 @@ def per_sample_prompt_gradients(
     model: torch.nn.Module,
     images: torch.Tensor,
     labels: torch.Tensor,
+    parameter_names: Iterable[str] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return flattened gradients, compact signatures, and losses per sample."""
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    allowed = None if parameter_names is None else set(parameter_names)
+    parameters = [
+        parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and (allowed is None or name in allowed)
+    ]
+    if not parameters:
+        raise ValueError(
+            "No observable trainable parameters are available for auditing."
+        )
     flattened = []
     signatures = []
     losses = []
@@ -72,7 +87,9 @@ def per_sample_prompt_gradients(
         logits = model(image.unsqueeze(0))
         loss = F.cross_entropy(logits, label.view(1))
         gradients = torch.autograd.grad(loss, parameters, retain_graph=False)
-        flattened.append(torch.cat([gradient.detach().flatten().cpu() for gradient in gradients]))
+        flattened.append(
+            torch.cat([gradient.detach().flatten().cpu() for gradient in gradients])
+        )
         signatures.append(gradient_signature(list(gradients)))
         losses.append(loss.detach().cpu())
     return torch.stack(flattened), torch.stack(signatures), torch.stack(losses)

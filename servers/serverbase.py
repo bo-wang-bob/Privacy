@@ -3,13 +3,18 @@ import logging
 import os
 import random
 import json
+import math
 
 import torch
 
 from aggregator.base_aggregator import BaseAggregator
 from context.context import Context
 from privacy_attacks.auditor import MembershipAuditor
-from privacy_defenses import DefenseController
+from privacy_defenses import DefenseController, attach_hamp_output_transform
+from utils.privacy_accounting import (
+    gaussian_rdp_epsilon,
+    planned_private_probe_steps,
+)
 from users.user import UserBase
 
 logger = logging.getLogger(__name__)
@@ -98,6 +103,13 @@ class ServerBase:
             num_classes=len(class_names),
             total_rounds=num_glob_iters,
         )
+        self.defense.federated_method = self.federated_method
+        self.defense.method_config = self.method_config
+        if self.defense.name == "hamp":
+            attach_hamp_output_transform(
+                model,
+                float(self.defense_config.get("hamp_output_temperature", 4.0)),
+            )
         for user_id in range(total_users):
             user = UserBase(
                 device=device,
@@ -117,6 +129,11 @@ class ServerBase:
                 method_config=self.method_config,
             )
             self.ctx.users.append(user)
+            if self.defense.name == "hamp":
+                attach_hamp_output_transform(
+                    user.model,
+                    float(self.defense_config.get("hamp_output_temperature", 4.0)),
+                )
             self.ctx.samples_num.append(user.train_samples)
         self.defense.samples_num = list(self.ctx.samples_num)
 
@@ -134,8 +151,17 @@ class ServerBase:
             collate_fn=collate_fn,
             config=self.audit_config,
             defense_config=self.defense_config,
+            federated_method=self.federated_method,
         )
         self.code_poison_enabled = "codepoison" in self.auditor.attacks
+        self.private_probe_steps = planned_private_probe_steps(self.audit_config)
+        if self.federated_method in {"dpfpl", "fedask"}:
+            self.defense.additional_private_steps = self.private_probe_steps
+        else:
+            target_user = self.ctx.users[self.target_client_id]
+            self.defense.additional_private_steps = self.private_probe_steps * (
+                target_user.local_epochs * len(target_user.trainloader)
+            )
 
     @staticmethod
     def _clone_state(state: dict[str, torch.Tensor], cpu: bool = False):
@@ -146,9 +172,12 @@ class ServerBase:
 
     def _sample_users(self) -> list[int]:
         if not self.ensure_target or self.user_per_round == self.total_users_num:
-            return sorted(random.sample(range(self.total_users_num), self.user_per_round))
+            return sorted(
+                random.sample(range(self.total_users_num), self.user_per_round)
+            )
         others = [
-            user_id for user_id in range(self.total_users_num)
+            user_id
+            for user_id in range(self.total_users_num)
             if user_id != self.target_client_id
         ]
         selected = random.sample(others, self.user_per_round - 1)
@@ -191,10 +220,21 @@ class ServerBase:
                 self._clone_state(state, cpu=True),
                 os.path.join(path, f"global_round_{round_index}.pt"),
             )
+        else:
+            for user_id in range(self.total_users_num):
+                state = self.ctx.new_model_state.get(
+                    user_id, self.ctx.base_model_state[user_id]
+                )
+                torch.save(
+                    self._clone_state(state, cpu=True),
+                    os.path.join(path, f"client_{user_id}_round_{round_index}.pt"),
+                )
 
     def train(self) -> list[dict]:
         for user in self.ctx.users:
-            self.ctx.set_base_model_state(user.id, self._clone_state(user.get_parameters()))
+            self.ctx.set_base_model_state(
+                user.id, self._clone_state(user.get_parameters())
+            )
 
         for round_index in range(self.num_glob_iters):
             if round_index > 0:
@@ -209,7 +249,10 @@ class ServerBase:
                 user_id: self._clone_state(self.ctx.get_base_model_state(user_id))
                 for user_id in selected_ids
             }
-            base_state = base_states[self.target_client_id]
+            base_state = base_states.get(
+                self.target_client_id,
+                self._clone_state(self.ctx.get_base_model_state(self.target_client_id)),
+            )
             for user_id in selected_ids:
                 user = self.ctx.users[user_id]
                 user.set_parameters(self.ctx.get_base_model_state(user_id))
@@ -232,16 +275,21 @@ class ServerBase:
                 round_index=round_index,
             )
 
+            self.aggregator.aggregate(self.ctx)
             self.auditor.observe_round(
                 round_index=round_index,
                 base_state=base_state,
                 updated_states=self.ctx.updated_model_state,
                 selected_ids=selected_ids,
                 base_states=base_states,
+                protocol_messages=self.ctx.protocol_messages,
+                released_states=self.ctx.new_model_state,
             )
-            self.aggregator.aggregate(self.ctx)
             self._save_round(round_index + 1)
-            if round_index % self.eval_interval == 0 or round_index == self.num_glob_iters - 1:
+            if (
+                round_index % self.eval_interval == 0
+                or round_index == self.num_glob_iters - 1
+            ):
                 self._evaluate(round_index)
 
         if self.train_mode == "centralized":
@@ -270,15 +318,103 @@ class ServerBase:
                 "global": "client update clipping and server Gaussian perturbation",
                 "delta": float(self.method_config.get("delta", 1e-5)),
             }
+            local_steps = self.num_glob_iters * int(
+                self.method_config.get("local_steps", 1)
+            )
+            if self.defense.name == "mist":
+                local_steps += self.num_glob_iters * int(
+                    self.defense_config.get("mist_cross_steps", 1)
+                )
+            local_steps += self.private_probe_steps
+            delta = float(self.method_config.get("delta", 1e-5))
+            local_epsilon = gaussian_rdp_epsilon(
+                float(self.method_config.get("local_noise_multiplier", 1.0)),
+                local_steps,
+                delta,
+                mechanisms_per_step=2,
+            )
+            global_epsilon = gaussian_rdp_epsilon(
+                float(self.method_config.get("global_noise_multiplier", 1.0)),
+                self.num_glob_iters,
+                delta,
+            )
+            method_summary["privacy_accounting"] = {
+                "local_epsilon_upper_bound": (
+                    local_epsilon if math.isfinite(local_epsilon) else None
+                ),
+                "global_epsilon_upper_bound": (
+                    global_epsilon if math.isfinite(global_epsilon) else None
+                ),
+                "delta": delta,
+                "formal_dp_enabled": bool(
+                    float(self.method_config.get("local_noise_multiplier", 1.0)) > 0
+                    and float(self.method_config.get("global_noise_multiplier", 1.0))
+                    > 0
+                    and not self.method_config.get("reproducible_dp_noise", False)
+                    and not self.defense_config.get("reproducible_dp_noise", False)
+                    and self.defense.name not in {"cofedmid", "soft"}
+                ),
+                "accountant": "conservative Gaussian RDP; no subsampling amplification",
+                "active_audit_probe_steps": self.private_probe_steps,
+                "formal_dp_caveat": (
+                    "SOFT/CoFedMID use data-dependent selection not covered by this accountant."
+                    if self.defense.name in {"cofedmid", "soft"}
+                    else None
+                ),
+            }
         elif self.federated_method == "fedask":
             method_summary["privacy_mechanisms"] = {
                 "local": "full-prompt per-sample clipping/noise followed by asymmetric B update",
                 "aggregation": "two-stage randomized sketch and SVD reconstruction",
                 "delta": float(self.method_config.get("delta", 1e-5)),
             }
+            local_steps = self.num_glob_iters * int(
+                self.method_config.get("local_steps", self.ctx.users[0].local_epochs)
+            )
+            if self.defense.name == "mist":
+                local_steps += self.num_glob_iters * int(
+                    self.defense_config.get("mist_cross_steps", 1)
+                )
+            local_steps += self.private_probe_steps
+            delta = float(self.method_config.get("delta", 1e-5))
+            epsilon = gaussian_rdp_epsilon(
+                float(self.method_config.get("noise_multiplier", 1.0)),
+                local_steps,
+                delta,
+            )
+            method_summary["privacy_accounting"] = {
+                "epsilon_upper_bound": epsilon if math.isfinite(epsilon) else None,
+                "delta": delta,
+                "formal_dp_enabled": bool(
+                    float(self.method_config.get("noise_multiplier", 1.0)) > 0
+                    and not self.method_config.get("reproducible_dp_noise", False)
+                    and not self.defense_config.get("reproducible_dp_noise", False)
+                    and self.defense.name not in {"cofedmid", "soft"}
+                ),
+                "accountant": "conservative Gaussian RDP; no client/data subsampling amplification",
+                "active_audit_probe_steps": self.private_probe_steps,
+                "formal_dp_caveat": (
+                    "SOFT/CoFedMID use data-dependent selection not covered by this accountant."
+                    if self.defense.name in {"cofedmid", "soft"}
+                    else None
+                ),
+            }
         if hasattr(self.aggregator, "last_reconstruction_error"):
             method_summary["last_reconstruction_error"] = float(
                 self.aggregator.last_reconstruction_error
+            )
+            method_summary["last_pretruncation_error"] = float(
+                self.aggregator.last_pretruncation_error
+            )
+            method_summary["last_subspace_rank"] = int(
+                self.aggregator.last_subspace_rank
+            )
+            method_summary["rank_based_minimum_oversampling"] = int(
+                self.aggregator.last_required_oversampling
+            )
+            method_summary["rank_based_width_condition_met"] = bool(
+                int(self.method_config.get("oversampling", 2))
+                >= self.aggregator.last_required_oversampling
             )
         if hasattr(self.aggregator, "last_clip_fraction"):
             method_summary["last_global_clip_fraction"] = float(
@@ -286,7 +422,8 @@ class ServerBase:
             )
         with open(
             os.path.join(self.results_dir, "federated_method_summary.json"),
-            "w", encoding="utf-8",
+            "w",
+            encoding="utf-8",
         ) as file:
             json.dump(method_summary, file, indent=2, allow_nan=False)
         return self.auditor.finalize(self.model, final_state)

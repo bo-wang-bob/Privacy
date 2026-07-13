@@ -1,4 +1,5 @@
 import argparse
+import copy
 import datetime
 import logging
 import os
@@ -13,6 +14,10 @@ from privacy_attacks.auditor import SUPPORTED_ATTACKS
 from privacy_defenses import SUPPORTED_DEFENSES
 from servers.serverbase import ServerBase
 from utils.data_loader import generate_dirichlet_split, generate_iid_split
+from utils.privacy_accounting import (
+    calibrate_gaussian_noise,
+    planned_private_probe_steps,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +54,8 @@ def validate_config(config: dict) -> None:
     method_config = config.get(method, {})
     if method in {"dpfpl", "fedask"} and int(method_config.get("rank", 4)) <= 0:
         raise ValueError(f"{method}.rank must be positive.")
+    if method in {"dpfpl", "fedask"} and int(method_config.get("local_steps", 1)) <= 0:
+        raise ValueError(f"{method}.local_steps must be positive.")
     if method == "dpfpl":
         for key in ("local_clip_norm", "global_clip_norm"):
             if float(method_config.get(key, 1.0)) <= 0:
@@ -56,28 +63,58 @@ def validate_config(config: dict) -> None:
         for key in ("local_noise_multiplier", "global_noise_multiplier"):
             if float(method_config.get(key, 1.0)) < 0:
                 raise ValueError(f"dpfpl.{key} must be non-negative.")
+        for key in ("local_target_epsilon", "global_target_epsilon"):
+            value = method_config.get(key)
+            if value is not None and float(value) <= 0:
+                raise ValueError(f"dpfpl.{key} must be positive when set.")
     if method == "fedask":
+        if float(method_config.get("scaling", 1.0)) <= 0:
+            raise ValueError("fedask.scaling must be positive.")
         if float(method_config.get("clip_norm", 1.0)) <= 0:
             raise ValueError("fedask.clip_norm must be positive.")
         if float(method_config.get("noise_multiplier", 1.0)) < 0:
             raise ValueError("fedask.noise_multiplier must be non-negative.")
         if int(method_config.get("oversampling", 2)) < 0:
             raise ValueError("fedask.oversampling must be non-negative.")
-    if method in {"dpfpl", "fedask"} and not 0 < float(
-        method_config.get("delta", 1e-5)
-    ) < 1:
+        target = method_config.get("target_epsilon")
+        if target is not None and float(target) <= 0:
+            raise ValueError("fedask.target_epsilon must be positive when set.")
+    if (
+        method in {"dpfpl", "fedask"}
+        and not 0 < float(method_config.get("delta", 1e-5)) < 1
+    ):
         raise ValueError(f"{method}.delta must be in (0, 1).")
     if config["total_users"] <= 1:
         raise ValueError("total_users must be greater than one.")
     if not 1 <= config["sample_users"] <= config["total_users"]:
         raise ValueError("sample_users must be in [1, total_users].")
     audit = config.get("audit", {})
+    if not 0 <= int(audit.get("target_client_id", 0)) < config["total_users"]:
+        raise ValueError("audit.target_client_id must identify an existing client.")
+    if str(audit.get("audit_view", "protocol_plus_released_prompts")).lower() not in {
+        "protocol_plus_released_prompts",
+        "protocol_plus_queries",
+        "full_whitebox",
+        "released_prompt",
+    }:
+        raise ValueError("Unknown audit.audit_view.")
     attacks = set(audit.get("attacks", []))
     unknown = sorted(attacks - SUPPORTED_ATTACKS)
     if unknown:
         raise ValueError(f"Unknown membership attacks: {', '.join(unknown)}")
     if audit.get("enabled", True) and not attacks:
         raise ValueError("audit.enabled=true requires at least one membership attack.")
+    if "nasr_active" in attacks and int(audit.get("active_max_samples", 16)) < 2:
+        raise ValueError("audit.active_max_samples must be at least 2.")
+    if "promptmia" in attacks and int(audit.get("promptmia_max_samples", 16)) < 2:
+        raise ValueError("audit.promptmia_max_samples must be at least 2.")
+    if str(
+        audit.get("audit_view", "protocol_plus_released_prompts")
+    ).lower() == "released_prompt" and attacks & {"nasr_passive", "fedmia_cosine"}:
+        raise ValueError(
+            "released_prompt audit view cannot run update-dependent attacks "
+            "nasr_passive or fedmia_cosine."
+        )
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in SUPPORTED_DEFENSES:
@@ -95,10 +132,16 @@ def validate_config(config: dict) -> None:
         raise ValueError("defense.cofedmid_recycle_ratio must be in [0, 1].")
     if not 0 <= float(defense.get("cofedmid_perturb_ratio", 0.1)) <= 1:
         raise ValueError("defense.cofedmid_perturb_ratio must be in [0, 1].")
+    if int(defense.get("cofedmid_intervals", 4)) <= 0:
+        raise ValueError("defense.cofedmid_intervals must be positive.")
+    if not 0 <= float(defense.get("cofedmid_exp3_gamma", 0.2)) <= 1:
+        raise ValueError("defense.cofedmid_exp3_gamma must be in [0, 1].")
     if not 0 <= float(defense.get("soft_obfuscation_strength", 0.5)) <= 1:
         raise ValueError("defense.soft_obfuscation_strength must be in [0, 1].")
     if float(defense.get("hamp_output_temperature", 4.0)) < 1:
         raise ValueError("defense.hamp_output_temperature must be at least one.")
+    if not 0 < float(defense.get("hamp_true_probability", 0.6)) < 1:
+        raise ValueError("defense.hamp_true_probability must be in (0, 1).")
     spatial = {
         "fedmia_loss",
         "fedmia_cosine",
@@ -126,6 +169,7 @@ def run(config: dict) -> list[dict]:
     from trainmodel.custom_clip import CustomCLIP, get_default_prompt_template
 
     validate_config(config)
+    config = copy.deepcopy(config)
     seed = int(config["seed"])
     random.seed(seed)
     np.random.seed(seed)
@@ -136,6 +180,58 @@ def run(config: dict) -> list[dict]:
     device = torch.device(
         f"cuda:{config['gpu']}" if torch.cuda.is_available() else "cpu"
     )
+    method = config["aggregator"].lower()
+    method_config = dict(config.get(method, {}))
+    method_config.setdefault("seed", seed)
+    extra_steps = (
+        int(config.get("defense", {}).get("mist_cross_steps", 1))
+        if str(config.get("defense", {}).get("name", "none")).lower() == "mist"
+        else 0
+    )
+    audit_probe_steps = planned_private_probe_steps(config.get("audit"))
+    delta = float(method_config.get("delta", 1e-5))
+    if method == "dpfpl":
+        local_steps = (
+            config["num_global_iters"]
+            * (int(method_config.get("local_steps", 1)) + extra_steps)
+            + audit_probe_steps
+        )
+        if method_config.get("local_target_epsilon") is not None:
+            method_config["local_noise_multiplier"] = calibrate_gaussian_noise(
+                float(method_config["local_target_epsilon"]),
+                local_steps,
+                delta,
+                mechanisms_per_step=2,
+            )
+        if method_config.get("global_target_epsilon") is not None:
+            method_config["global_noise_multiplier"] = calibrate_gaussian_noise(
+                float(method_config["global_target_epsilon"]),
+                config["num_global_iters"],
+                delta,
+            )
+    elif method == "fedask" and method_config.get("target_epsilon") is not None:
+        local_steps = (
+            config["num_global_iters"]
+            * (
+                int(method_config.get("local_steps", config["local_epochs"]))
+                + extra_steps
+            )
+            + audit_probe_steps
+        )
+        method_config["noise_multiplier"] = calibrate_gaussian_noise(
+            float(method_config["target_epsilon"]),
+            local_steps,
+            delta,
+        )
+    if method in {"dpfpl", "fedask"}:
+        config[method] = method_config
+    effective_train_mode = (
+        "local"
+        if method == "dpfpl"
+        else "centralized" if method == "fedask" else config["train_mode"]
+    )
+    config["effective_train_mode"] = effective_train_mode
+
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     configured_attacks = list(config.get("audit", {}).get("attacks", []))
     if not bool(config.get("audit", {}).get("enabled", True)) or not configured_attacks:
@@ -150,7 +246,9 @@ def run(config: dict) -> list[dict]:
         f"{config['dataset_name']}_{config['aggregator']}_{attack_label}_{defense_label}_{timestamp}",
     )
     os.makedirs(result_dir, exist_ok=True)
-    with open(os.path.join(result_dir, "run_config.yaml"), "w", encoding="utf-8") as file:
+    with open(
+        os.path.join(result_dir, "run_config.yaml"), "w", encoding="utf-8"
+    ) as file:
         yaml.safe_dump(config, file, sort_keys=False, allow_unicode=True)
     logging.basicConfig(
         level=logging.INFO,
@@ -179,12 +277,7 @@ def run(config: dict) -> list[dict]:
         )
 
     processor, clip_model = _load_local_clip(config["cache_dir"], device)
-    method = config["aggregator"].lower()
-    method_config = dict(config.get(method, {}))
-    method_config.setdefault("seed", seed)
-    parameterization = {
-        "fedavg": "full", "dpfpl": "dpfpl", "fedask": "fedask"
-    }[method]
+    parameterization = {"fedavg": "full", "dpfpl": "dpfpl", "fedask": "fedask"}[method]
     model = CustomCLIP(
         clip_model=clip_model,
         processor=processor,
@@ -195,6 +288,7 @@ def run(config: dict) -> list[dict]:
         class_specific_ctx=config["class_specific_ctx"],
         parameterization=parameterization,
         low_rank=int(method_config.get("rank", 4)),
+        low_rank_scaling=float(method_config.get("scaling", 1.0)),
     )
 
     def collate_fn(batch):
@@ -204,11 +298,6 @@ def run(config: dict) -> list[dict]:
 
     audit_config = dict(config.get("audit", {}))
     audit_config.setdefault("seed", seed)
-    effective_train_mode = (
-        "local" if method == "dpfpl"
-        else "centralized" if method == "fedask"
-        else config["train_mode"]
-    )
     server = ServerBase(
         train_mode=effective_train_mode,
         device=device,
@@ -234,6 +323,9 @@ def run(config: dict) -> list[dict]:
             global_clip_norm=float(method_config.get("global_clip_norm", 1.0)),
             global_noise_multiplier=float(
                 method_config.get("global_noise_multiplier", 1.0)
+            ),
+            reproducible_dp_noise=bool(
+                method_config.get("reproducible_dp_noise", False)
             ),
         ),
         model_load_path=config.get("model_load_path"),
@@ -263,18 +355,26 @@ def default_config() -> dict:
         "aggregator": "fedavg",
         "dpfpl": {
             "rank": 4,
+            "local_steps": 1,
             "local_clip_norm": 1.0,
             "local_noise_multiplier": 1.0,
+            "local_target_epsilon": None,
             "global_clip_norm": 1.0,
             "global_noise_multiplier": 1.0,
+            "global_target_epsilon": None,
             "delta": 1e-5,
+            "reproducible_dp_noise": False,
         },
         "fedask": {
             "rank": 4,
             "oversampling": 2,
+            "scaling": 1.0,
+            "local_steps": 2,
             "clip_norm": 1.0,
             "noise_multiplier": 1.0,
+            "target_epsilon": None,
             "delta": 1e-5,
+            "reproducible_dp_noise": False,
         },
         "dirichlet_alpha": 0.1,
         "gpu": 0,
@@ -289,6 +389,7 @@ def default_config() -> dict:
         "results_dir": "./results",
         "audit": {
             "enabled": True,
+            "audit_view": "protocol_plus_released_prompts",
             "strict": True,
             "target_client_id": 0,
             "ensure_target_participation": True,
@@ -355,6 +456,7 @@ def default_config() -> dict:
             "dp_max_grad_norm": 1.0,
             "dp_noise_multiplier": 1.0,
             "dp_delta": 1e-5,
+            "reproducible_dp_noise": False,
             "cofedmid_intervals": 4,
             "cofedmid_recycle_ratio": 0.1,
             "cofedmid_entropy_weight": 0.05,
@@ -405,7 +507,14 @@ def parse_args() -> dict:
         config.update(loaded)
         config["audit"] = audit
         config["defense"] = defense
-    for key in ("dataset_name", "gpu", "seed", "num_global_iters", "sample_users", "aggregator"):
+    for key in (
+        "dataset_name",
+        "gpu",
+        "seed",
+        "num_global_iters",
+        "sample_users",
+        "aggregator",
+    ):
         value = getattr(args, key)
         if value is not None:
             config[key] = value

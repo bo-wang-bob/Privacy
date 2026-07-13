@@ -4,9 +4,7 @@ from aggregator.base_aggregator import BaseAggregator
 from context.context import Context
 
 
-def aggregate_fedavg_model_states(
-    ctx: Context, aggregation_ids: list[int]
-) -> None:
+def aggregate_fedavg_model_states(ctx: Context, aggregation_ids: list[int]) -> None:
     """Sample-weighted FedAvg over prompt parameters only."""
     if not aggregation_ids:
         raise ValueError("FedAvg requires at least one client update.")
@@ -17,8 +15,7 @@ def aggregate_fedavg_model_states(
 
     first_state = ctx.updated_model_state[aggregation_ids[0]]
     aggregated = {
-        name: torch.zeros_like(first_state[name])
-        for name in ctx.trainable_param_names
+        name: torch.zeros_like(first_state[name]) for name in ctx.trainable_param_names
     }
     for user_id in aggregation_ids:
         weight = ctx.samples_num[user_id] / total_samples
@@ -35,6 +32,21 @@ class FedAvgAggregator(BaseAggregator):
 
     def _in_aggregation(self, ctx: Context):
         selected_ids = list(ctx.user_selected)
+        ctx.protocol_messages = {
+            user_id: {
+                "kind": "model_update",
+                "tensors": {
+                    name: (
+                        ctx.updated_model_state[user_id][name]
+                        - ctx.get_base_model_state(user_id)[name]
+                    )
+                    .detach()
+                    .clone()
+                    for name in ctx.trainable_param_names
+                },
+            }
+            for user_id in selected_ids
+        }
         if ctx.mode == "local":
             ctx.new_model_state = {
                 user_id: ctx.updated_model_state.get(
