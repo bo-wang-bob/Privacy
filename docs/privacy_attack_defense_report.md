@@ -118,7 +118,7 @@ messages, while the non-IID split increases membership separability.
 
 | Dataset / setting | Target | Attacks | Best TPR@1%FPR | Notes |
 |---|---:|---|---:|---|
-| CIFAR100, shots=16 | client 0 | FedMIA, RMIA, Canary, YOQO, Nasr passive | 0.60377 | Best current no-defense result, from FedMIA cosine with max round aggregation |
+| CIFAR100, shots=16 | client 0 | FedMIA, RMIA, Canary, YOQO, Nasr passive | 0.67925 | Best current no-defense result, from FedMIA joint loss/cosine evidence |
 | Flowers, shots=16 | client 0 | FedMIA, Canary, Nasr passive | 0.15094 | Weaker than CIFAR100 |
 | Caltech101, shots=16 | client 0 | FedMIA, Nasr passive | 0.41509 | FedMIA weaker than CIFAR100; Nasr passive reaches 0.37037 |
 | DTD, shots=16 | client 0 | FedMIA, Nasr passive | 0.03571 | Weaker than CIFAR100 |
@@ -130,6 +130,7 @@ Detailed 20-client CIFAR100 results:
 
 | Attack | TPR@1%FPR | AUC | Samples |
 |---|---:|---:|---:|
+| FedMIA joint | 0.67925 | 0.86645 | 117 |
 | FedMIA cosine | 0.60377 | 0.86350 | 117 |
 | FedMIA loss | 0.50943 | 0.84611 | 117 |
 | Canary | 0.37500 | 0.72168 | 64 |
@@ -137,10 +138,12 @@ Detailed 20-client CIFAR100 results:
 | RMIA | 0.03774 | 0.76445 | 85 |
 | YOQO | 0.00000 | 0.62500 | 64 |
 
-Current best no-defense attack success is therefore `TPR@1%FPR=0.60377` with
+Current best no-defense attack success is therefore `TPR@1%FPR=0.67925` with
 CIFAR100, 20 clients, Dirichlet `alpha=0.1`, `fpl_shots=16`, target client 0,
-and FedMIA cosine scoring with max round aggregation.  FedMIA loss remains best
-with mean round aggregation.
+and `fedmia_joint`.  The joint score is a fixed, non-oracle combination of
+FedMIA confidence and update-cosine evidence: mean confidence z-score, maximum
+cosine z-score, and late-3-round cosine z-score.  FedMIA loss remains best with
+mean round aggregation when reported alone.
 
 Result directories:
 
@@ -152,3 +155,4 @@ Result directories:
 - `results/dtd_fedavg_multi_attack_none_20260715_182636`
 - `results/tiny-imagenet-200_fedavg_multi_attack_none_20260715_182935`
 - `results/cifar100_fedavg_multi_attack_none_20260715_184338`
+- `results/cifar100_fedavg_fedmia_joint_none_20260715_185333`

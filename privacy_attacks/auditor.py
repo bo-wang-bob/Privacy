@@ -17,7 +17,7 @@ from privacy_attacks.features import (
     per_sample_prompt_gradients,
     trainable_names,
 )
-from privacy_attacks.fedmia import run_fedmia
+from privacy_attacks.fedmia import run_fedmia, run_fedmia_joint
 from privacy_attacks.imia import run_imia
 from privacy_attacks.model_utils import last_client_states
 from privacy_attacks.pipra import run_pipra
@@ -36,6 +36,7 @@ SUPPORTED_ATTACKS = {
     "nasr_active",
     "fedmia_loss",
     "fedmia_cosine",
+    "fedmia_joint",
     "transfer_representation",
     "codepoison",
     "pipra",
@@ -89,6 +90,7 @@ class MembershipAuditor:
                     "nasr_active",
                     "fedmia_loss",
                     "fedmia_cosine",
+                    "fedmia_joint",
                     "transfer_representation",
                     "codepoison",
                     "pipra",
@@ -359,6 +361,10 @@ class MembershipAuditor:
                 self.target_client_id,
                 "cosine",
                 str(self.config.get("fedmia_cosine_aggregation", "mean")),
+            )
+        if attack == "fedmia_joint":
+            return run_fedmia_joint(
+                self.observations, self.membership, self.target_client_id
             )
         if attack == "nasr_passive":
             return run_passive_whitebox(
