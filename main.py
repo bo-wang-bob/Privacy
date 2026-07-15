@@ -487,7 +487,12 @@ def parse_args() -> dict:
     parser.add_argument("--gpu", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--num_global_iters", type=int)
+    parser.add_argument("--total_users", type=int)
     parser.add_argument("--sample_users", type=int)
+    parser.add_argument("--local_epochs", type=int)
+    parser.add_argument("--fpl_shots", type=int)
+    parser.add_argument("--dirichlet_alpha", type=float)
+    parser.add_argument("--learning_rate", type=float)
     parser.add_argument("--aggregator", choices=["fedavg", "dpfpl", "fedask"])
     parser.add_argument("--target_client_id", type=int)
     parser.add_argument("--audit_attacks", help="Comma-separated attack names")
@@ -516,7 +521,12 @@ def parse_args() -> dict:
         "gpu",
         "seed",
         "num_global_iters",
+        "total_users",
         "sample_users",
+        "local_epochs",
+        "fpl_shots",
+        "dirichlet_alpha",
+        "learning_rate",
         "aggregator",
     ):
         value = getattr(args, key)

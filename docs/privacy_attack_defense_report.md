@@ -108,3 +108,41 @@ CodePoison in this setup.  MIST suppresses Nasr active and CodePoison, but
 Canary increases.  SOFT helps Canary, PromptMIA, and CodePoison, but leaves
 FedMIA/RMIA nonzero and has the largest runtime overhead when active prompt
 probes are included.
+
+## 20-client non-IID no-defense sweep
+
+The follow-up optimization changed the main effect config to 20 clients with
+Dirichlet `alpha=0.1`, full participation, and `fpl_shots=16`.  The larger
+client pool gives FedMIA and reference/query attacks more non-target protocol
+messages, while the non-IID split increases membership separability.
+
+| Dataset / setting | Target | Attacks | Best TPR@1%FPR | Notes |
+|---|---:|---|---:|---|
+| CIFAR100, shots=16 | client 0 | FedMIA, RMIA, Canary, YOQO, Nasr passive | 0.50943 | Best current no-defense result, from FedMIA loss |
+| Flowers, shots=16 | client 0 | FedMIA, Canary, Nasr passive | 0.15094 | Weaker than CIFAR100 |
+| Caltech101, shots=16 | client 0 | FedMIA, Nasr passive | 0.41509 | FedMIA weaker than CIFAR100; Nasr passive reaches 0.37037 |
+| CIFAR100, shots=32 | client 0 | FedMIA | 0.12500 | More shots reduced FedMIA low-FPR separation |
+| CIFAR100, shots=16 | client 3 | FedMIA | 0.10938 | Larger target client was less vulnerable |
+
+Detailed 20-client CIFAR100 results:
+
+| Attack | TPR@1%FPR | AUC | Samples |
+|---|---:|---:|---:|
+| FedMIA loss | 0.50943 | 0.84611 | 117 |
+| FedMIA cosine | 0.32075 | 0.83933 | 117 |
+| Canary | 0.37500 | 0.72168 | 64 |
+| Nasr passive | 0.18519 | 0.70370 | 59 |
+| RMIA | 0.03774 | 0.76445 | 85 |
+| YOQO | 0.00000 | 0.62500 | 64 |
+
+Current best no-defense attack success is therefore `TPR@1%FPR=0.50943` with
+CIFAR100, 20 clients, Dirichlet `alpha=0.1`, `fpl_shots=16`, target client 0,
+and FedMIA loss scoring.
+
+Result directories:
+
+- `results/cifar100_fedavg_multi_attack_none_20260715_173059`
+- `results/flowers_fedavg_multi_attack_none_20260715_174912`
+- `results/caltech101_fedavg_multi_attack_none_20260715_180906`
+- `results/cifar100_fedavg_multi_attack_none_20260715_181337`
+- `results/cifar100_fedavg_multi_attack_none_20260715_181916`
