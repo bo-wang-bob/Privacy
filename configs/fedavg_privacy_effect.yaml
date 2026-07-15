@@ -1,40 +1,19 @@
 train_mode: centralized
-dataset_name: caltech101
+dataset_name: cifar100
 batch_size: 16
-eval_batch_size: 64
-learning_rate: 0.001
-num_global_iters: 20
-local_epochs: 2
-total_users: 10
-sample_users: 10
+eval_batch_size: 128
+learning_rate: 0.005
+num_global_iters: 10
+local_epochs: 5
+total_users: 4
+sample_users: 4
 aggregator: fedavg
-dpfpl:
-  rank: 4
-  local_steps: 1
-  local_clip_norm: 1.0
-  local_noise_multiplier: 1.0
-  local_target_epsilon: null
-  global_clip_norm: 1.0
-  global_noise_multiplier: 1.0
-  global_target_epsilon: null
-  delta: 0.00001
-  reproducible_dp_noise: false
-fedask:
-  rank: 4
-  oversampling: 2
-  scaling: 1.0
-  local_steps: 2
-  clip_norm: 1.0
-  noise_multiplier: 1.0
-  target_epsilon: null
-  delta: 0.00001
-  reproducible_dp_noise: false
-dirichlet_alpha: 0.1
-gpu: 0
+dirichlet_alpha: 100
+gpu: 1
 seed: 42
-fpl_shots: 16
+fpl_shots: 4
 cache_dir: ./checkpoints/clip-vit-base-patch32
-n_ctx: 32
+n_ctx: 8
 class_specific_ctx: false
 model_load_path: null
 save_models: false
@@ -47,28 +26,15 @@ audit:
   strict: true
   target_client_id: 0
   ensure_target_participation: true
-  attacks:
-    - nasr_passive
-    - nasr_active
-    - fedmia_loss
-    - fedmia_cosine
-    - transfer_representation
-    - codepoison
-    - pipra
-    - rmia
-    - imia
-    - quantile_mia
-    - yoqo
-    - canary
-    - promptmia
+  attacks: [fedmia_loss]
   max_samples_per_group: 32
-  audit_interval: 2
+  audit_interval: 1
   calibration_fraction: 0.5
-  active_max_samples: 16
-  active_ascent_steps: 1
+  active_max_samples: 32
+  active_ascent_steps: 3
   active_ascent_lr: 0.01
   active_probe_cycles: 3
-  codepoison_weight: 1.0
+  codepoison_weight: 10.0
   synthetic_mean: 0.0
   synthetic_std: 0.1
   auxiliary_fraction: 0.5
@@ -90,7 +56,7 @@ audit:
   imia_learning_rate: 0.02
   imia_pivots_per_class: 4
   query_max_samples: 32
-  query_reference_models: 2
+  query_reference_models: 3
   query_epsilon: 0.1
   yoqo_steps: 50
   yoqo_learning_rate: 0.001

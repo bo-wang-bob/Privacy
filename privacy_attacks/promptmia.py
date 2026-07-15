@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import math
 
@@ -147,7 +149,12 @@ def run_promptmia(
         alignment = F.cosine_similarity(
             update.flatten(), candidate_gradient.detach().flatten(), dim=0
         )
-        scores.append(float((update_norm.mean() * (1.0 + alignment)).cpu()))
+        # In a shared CoOp prompt there is no discrete key-selection event.
+        # Membership is measured by the signed update mass in the
+        # candidate-gradient direction, which preserves the PromptMIA signal
+        # while avoiding an unsigned magnitude shortcut.
+        signed_projected_update = update_norm.mean() * alignment
+        scores.append(float(signed_projected_update.cpu()))
         observed_similarities.append(benign_maximum)
     return AttackResult(
         name="promptmia",
@@ -161,6 +168,7 @@ def run_promptmia(
             "isolated_probe": True,
             "paper_architecture": "keyed visual prompt pool",
             "adaptation": "shared CoOp text-prompt token update response",
+            "score": "signed_projected_client_update",
             "mean_benign_max_similarity": sum(observed_similarities)
             / max(1, len(observed_similarities)),
             "preprint": True,

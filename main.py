@@ -106,6 +106,8 @@ def validate_config(config: dict) -> None:
         raise ValueError("audit.enabled=true requires at least one membership attack.")
     if "nasr_active" in attacks and int(audit.get("active_max_samples", 16)) < 2:
         raise ValueError("audit.active_max_samples must be at least 2.")
+    if "nasr_active" in attacks and int(audit.get("active_probe_cycles", 3)) <= 0:
+        raise ValueError("audit.active_probe_cycles must be positive.")
     if "promptmia" in attacks and int(audit.get("promptmia_max_samples", 16)) < 2:
         raise ValueError("audit.promptmia_max_samples must be at least 2.")
     if str(
@@ -414,12 +416,13 @@ def default_config() -> dict:
             "active_max_samples": 16,
             "active_ascent_steps": 1,
             "active_ascent_lr": 0.01,
+            "active_probe_cycles": 3,
             "codepoison_weight": 1.0,
             "synthetic_mean": 0.0,
             "synthetic_std": 0.1,
             "auxiliary_fraction": 0.5,
             "rmia_offline_a": 0.3,
-            "rmia_gamma": 1.0,
+            "rmia_gamma": 2.0,
             "qmia_quantile": 0.9,
             "qmia_epochs": 200,
             "qmia_learning_rate": 0.01,
@@ -435,18 +438,19 @@ def default_config() -> dict:
             "imia_pivot_steps": 20,
             "imia_learning_rate": 0.02,
             "imia_pivots_per_class": 4,
-            "query_max_samples": 16,
+            "query_max_samples": 32,
             "query_reference_models": 2,
             "query_epsilon": 0.1,
-            "yoqo_steps": 20,
-            "yoqo_learning_rate": 0.01,
-            "yoqo_distortion_weight": 1.0,
+            "yoqo_steps": 50,
+            "yoqo_learning_rate": 0.001,
+            "yoqo_distortion_weight": 5.0,
+            "yoqo_loss_threshold": 0.4,
             "canary_num_queries": 2,
             "canary_steps": 20,
             "canary_shadow_steps": 3,
             "canary_learning_rate": 0.01,
             "canary_shadow_learning_rate": 0.02,
-            "promptmia_max_samples": 16,
+            "promptmia_max_samples": 32,
             "promptmia_keys": 4,
             "promptmia_delta_min": 0.02,
             "promptmia_similarity_span": 0.05,

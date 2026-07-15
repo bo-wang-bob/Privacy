@@ -1,6 +1,9 @@
 import torch
 
 
+PRIMARY_METRIC = "tpr_at_fpr_0.01"
+
+
 def roc_curve(labels: torch.Tensor, scores: torch.Tensor):
     labels = labels.detach().flatten().to(dtype=torch.long, device="cpu")
     scores = scores.detach().flatten().to(dtype=torch.float64, device="cpu")
@@ -25,12 +28,13 @@ def roc_curve(labels: torch.Tensor, scores: torch.Tensor):
 def membership_metrics(labels: torch.Tensor, scores: torch.Tensor) -> dict[str, float]:
     fpr, tpr = roc_curve(labels, scores)
     auc = float(torch.trapz(tpr, fpr).item())
-    result = {"auc": auc}
+    result = {}
     for target in (0.1, 0.01, 0.001):
         valid = tpr[fpr <= target]
         result[f"tpr_at_fpr_{target:g}"] = (
             float(valid.max().item()) if valid.numel() else 0.0
         )
+    result["auc"] = auc
     return result
 
 
@@ -82,3 +86,42 @@ def fit_linear_attack(
     with torch.no_grad():
         scores = torch.sigmoid(model(eval_x)).squeeze(1)
     return scores, labels[evaluation].long(), evaluation
+
+
+def fit_shrinkage_attack(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    calibration_fraction: float,
+    seed: int,
+    max_features: int = 16,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Fit a small-sample diagonal attack using class-mean shrinkage.
+
+    Prompt audits commonly have many fewer known member/non-member examples than
+    white-box features.  A dense learned head is then underdetermined.  This
+    attack standardizes on the calibration split, retains only the strongest
+    univariate membership effects, and scores their signed average.
+    """
+    features = features.detach().to(device="cpu", dtype=torch.float32)
+    labels = labels.detach().to(device="cpu", dtype=torch.long)
+    if features.ndim != 2 or features.shape[1] == 0:
+        raise ValueError("features must be a non-empty two-dimensional tensor.")
+    if max_features <= 0:
+        raise ValueError("max_features must be positive.")
+    calibration, evaluation = stratified_split(
+        labels, calibration_fraction, seed
+    )
+    train_x = features[calibration]
+    mean = train_x.mean(dim=0, keepdim=True)
+    std = train_x.std(dim=0, keepdim=True, unbiased=False).clamp_min(1e-6)
+    train_z = (train_x - mean) / std
+    eval_z = (features[evaluation] - mean) / std
+    train_labels = labels[calibration]
+    effect = train_z[train_labels == 1].mean(dim=0) - train_z[
+        train_labels == 0
+    ].mean(dim=0)
+    selected_count = min(max_features, effect.numel())
+    selected = torch.topk(effect.abs(), selected_count).indices
+    weights = effect[selected]
+    scores = (eval_z[:, selected] * weights).mean(dim=1)
+    return scores, labels[evaluation], evaluation, selected_count

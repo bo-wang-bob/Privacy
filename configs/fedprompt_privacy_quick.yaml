@@ -66,6 +66,7 @@ audit:
   query_max_samples: 4
   query_reference_models: 1
   yoqo_steps: 1
+  yoqo_loss_threshold: 0.5
   canary_num_queries: 1
   canary_steps: 1
   canary_shadow_steps: 1

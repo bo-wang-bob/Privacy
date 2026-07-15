@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from privacy_attacks.metrics import membership_metrics
+from privacy_attacks.metrics import PRIMARY_METRIC, membership_metrics
 
 
 @dataclass
@@ -17,6 +17,8 @@ class AttackResult:
         metrics = membership_metrics(self.labels, self.scores)
         return {
             "attack": self.name,
+            "primary_metric": PRIMARY_METRIC,
+            "primary_score": metrics[PRIMARY_METRIC],
             **metrics,
             "num_samples": int(self.labels.numel()),
             "metadata": self.metadata,

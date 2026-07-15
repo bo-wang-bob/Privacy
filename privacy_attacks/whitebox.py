@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from privacy_attacks.base import AttackResult
-from privacy_attacks.metrics import fit_linear_attack
+from privacy_attacks.metrics import fit_shrinkage_attack
 
 
 def run_passive_whitebox(
@@ -27,6 +27,16 @@ def run_passive_whitebox(
         entropy = -(probabilities * probabilities.clamp_min(1e-12).log()).sum(
             dim=1, keepdim=True
         )
+        candidate_labels = observation.get("candidate_labels")
+        if candidate_labels is None:
+            raise ValueError("Passive white-box observations need candidate labels.")
+        candidate_labels = candidate_labels.to(dtype=torch.long, device="cpu")
+        true_probability = probabilities.gather(
+            1, candidate_labels.view(-1, 1)
+        )
+        wrong_probabilities = probabilities.clone()
+        wrong_probabilities.scatter_(1, candidate_labels.view(-1, 1), -1.0)
+        max_wrong_probability = wrong_probabilities.max(dim=1, keepdim=True).values
         update_features = torch.stack(
             (
                 observation["cosine"][position],
@@ -39,7 +49,8 @@ def run_passive_whitebox(
                 (
                     loss,
                     entropy,
-                    probabilities,
+                    true_probability,
+                    max_wrong_probability,
                     observation["gradient_signature"],
                     update_features,
                 ),
@@ -52,15 +63,24 @@ def run_passive_whitebox(
     attack_features = torch.cat(
         (torch.stack(features).mean(dim=0), features[-1]), dim=1
     )
-    scores, labels, indices = fit_linear_attack(
-        attack_features, membership, calibration_fraction, seed
+    scores, labels, indices, selected_count = fit_shrinkage_attack(
+        attack_features,
+        membership,
+        calibration_fraction,
+        seed,
+        max_features=16,
     )
     return AttackResult(
         name="nasr_passive",
         scores=scores,
         labels=labels,
         sample_indices=indices,
-        metadata={"rounds": used_rounds, "feature_dim": attack_features.shape[1]},
+        metadata={
+            "rounds": used_rounds,
+            "feature_dim": attack_features.shape[1],
+            "selected_features": selected_count,
+            "attack_head": "diagonal_mean_shrinkage",
+        },
     )
 
 
@@ -85,13 +105,16 @@ def run_active_whitebox(
     max_samples: int,
     ascent_steps: int,
     ascent_lr: float,
+    probe_cycles: int = 1,
+    calibration_fraction: float = 0.5,
+    seed: int = 42,
 ) -> AttackResult:
-    """Isolated gradient-ascent probes from Nasr et al.; global training is untouched."""
+    """Isolated repeated gradient-ascent probes; global training is untouched."""
     member_indices = torch.nonzero(membership == 1, as_tuple=False).flatten()
     nonmember_indices = torch.nonzero(membership == 0, as_tuple=False).flatten()
     per_group = max(1, max_samples // 2)
     indices = torch.cat((member_indices[:per_group], nonmember_indices[:per_group]))
-    scores = []
+    candidate_features = []
     for index in indices.tolist():
         probe = copy.deepcopy(base_model).to(images.device)
         probe.load_state_dict(final_state, strict=False)
@@ -99,29 +122,54 @@ def run_active_whitebox(
         trainable = [parameter for parameter in probe.parameters() if parameter.requires_grad]
         image = images[index]
         label = labels[index]
-        for _ in range(ascent_steps):
-            probe.zero_grad(set_to_none=True)
-            loss = F.cross_entropy(probe(image.unsqueeze(0)), label.view(1))
-            gradients = torch.autograd.grad(loss, trainable)
-            with torch.no_grad():
-                for parameter, gradient in zip(trainable, gradients):
-                    parameter.add_(gradient, alpha=ascent_lr)
-        before_loss, before_norm = _loss_and_gradient_norm(probe, image, label)
-        target_user.train_model(
-            probe,
-            code_poison=False,
-            privacy_probe=True,
-        )
-        after_loss, after_norm = _loss_and_gradient_norm(probe, image, label)
-        scores.append((before_loss - after_loss) + (before_norm - after_norm))
+        trajectory = []
+        for _ in range(max(1, probe_cycles)):
+            for _ in range(max(1, ascent_steps)):
+                probe.zero_grad(set_to_none=True)
+                loss = F.cross_entropy(probe(image.unsqueeze(0)), label.view(1))
+                gradients = torch.autograd.grad(loss, trainable)
+                with torch.no_grad():
+                    for parameter, gradient in zip(trainable, gradients):
+                        parameter.add_(gradient, alpha=ascent_lr)
+            before_loss, before_norm = _loss_and_gradient_norm(probe, image, label)
+            target_user.train_model(
+                probe,
+                code_poison=False,
+                privacy_probe=True,
+            )
+            after_loss, after_norm = _loss_and_gradient_norm(probe, image, label)
+            trajectory.extend(
+                (
+                    before_loss,
+                    before_norm,
+                    after_loss,
+                    after_norm,
+                    (before_loss - after_loss) / max(abs(before_loss), 1e-12),
+                    (before_norm - after_norm) / max(abs(before_norm), 1e-12),
+                )
+            )
+        candidate_features.append(trajectory)
+    attack_features = torch.tensor(candidate_features, dtype=torch.float32)
+    scores, attack_labels, evaluation, selected_count = fit_shrinkage_attack(
+        attack_features,
+        membership[indices],
+        calibration_fraction,
+        seed,
+        max_features=4,
+    )
     return AttackResult(
         name="nasr_active",
-        scores=torch.tensor(scores),
-        labels=membership[indices].detach().cpu(),
-        sample_indices=indices.detach().cpu(),
+        scores=scores,
+        labels=attack_labels,
+        sample_indices=indices[evaluation].detach().cpu(),
         metadata={
             "ascent_steps": ascent_steps,
             "ascent_lr": ascent_lr,
+            "probe_cycles": max(1, probe_cycles),
+            "feature_dim": attack_features.shape[1],
+            "selected_features": selected_count,
+            "attack_head": "diagonal_mean_shrinkage",
+            "trajectory_features": "loss_gradient_norm_and_relative_recovery",
             "isolated_probe": True,
         },
     )

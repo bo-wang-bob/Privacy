@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 
 import torch
@@ -26,6 +28,13 @@ def _alternative_label(logits: torch.Tensor, true_label: int) -> int:
     return int(values.argmax())
 
 
+def _alternative_labels(logits: torch.Tensor, true_label: int) -> torch.Tensor:
+    """Choose each OUT model's nearest competing class, as in YOQO Eq. (4)."""
+    values = logits.clone()
+    values[:, true_label] = -torch.inf
+    return values.argmax(dim=1)
+
+
 def _project_query(
     query: torch.Tensor, original: torch.Tensor, epsilon: float
 ) -> None:
@@ -47,6 +56,7 @@ def run_yoqo(
     epsilon: float = 0.1,
     distortion_weight: float = 1.0,
     reference_models: int = 2,
+    loss_threshold: float | None = 0.5,
 ) -> AttackResult:
     """Offline YOQO: craft with OUT prompt models, query one target hard label."""
     target_state, reference_states, round_index = last_client_states(
@@ -56,34 +66,68 @@ def run_yoqo(
         raise ValueError("YOQO needs at least one non-target prompt model.")
     device = images.device
     target_model = model_from_state(base_model, target_state, device).eval()
-    references = [
+    out_models = [
         model_from_state(base_model, state, device).eval()
         for state in reference_states[: max(1, reference_models)]
     ]
     indices = _query_indices(membership, max_samples)
     scores = []
+    out_successes = []
+    steps_used = []
     for index in indices.tolist():
         original = images[index:index + 1].detach()
-        true_label = int(labels[index])
+        label = labels[index:index + 1]
+        true_label = int(label.item())
         with torch.no_grad():
-            reference_logits = torch.stack([model(original) for model in references])
-        alternative = _alternative_label(reference_logits[:, 0], true_label)
+            reference_logits = torch.stack(
+                [model(original)[0] for model in out_models]
+            )
+        alternative_labels = _alternative_labels(reference_logits, true_label)
         query = original.clone().requires_grad_(True)
         optimizer = torch.optim.Adam([query], lr=learning_rate)
-        alternative_label = torch.tensor([alternative], device=device)
-        for _ in range(max(1, steps)):
+        used = 0
+        for step in range(max(1, steps)):
             optimizer.zero_grad()
-            attack_loss = torch.stack(
-                [F.cross_entropy(model(query), alternative_label) for model in references]
+            for model in out_models:
+                model.zero_grad(set_to_none=True)
+            specificity_loss = torch.stack(
+                [
+                    F.cross_entropy(model(query), alternative.view(1))
+                    for model, alternative in zip(out_models, alternative_labels)
+                ]
             ).mean()
             distortion = F.mse_loss(query, original)
-            (attack_loss + distortion_weight * distortion).backward()
+            (specificity_loss + distortion_weight * distortion).backward()
             optimizer.step()
             _project_query(query, original, epsilon)
+            used = step + 1
+            if loss_threshold is not None:
+                with torch.no_grad():
+                    current_specificity = torch.stack(
+                        [
+                            F.cross_entropy(model(query), alternative.view(1))
+                            for model, alternative in zip(
+                                out_models, alternative_labels
+                            )
+                        ]
+                    ).mean()
+                    current_loss = current_specificity + distortion_weight * F.mse_loss(
+                        query, original
+                    )
+                if float(current_loss) <= loss_threshold:
+                    break
+        steps_used.append(used)
 
         # The target is queried exactly once and only its hard label is retained.
         with torch.no_grad():
+            out_predictions = torch.tensor(
+                [int(model(query).argmax(dim=1)) for model in out_models],
+                device=device,
+            )
             predicted_label = int(target_model(query).argmax(dim=1))
+        out_successes.append(
+            float((out_predictions == alternative_labels).float().mean())
+        )
         scores.append(float(predicted_label == true_label))
     return AttackResult(
         name="yoqo",
@@ -95,7 +139,13 @@ def run_yoqo(
             "target_queries_per_sample": 1,
             "hard_label_only": True,
             "optimization_steps": max(1, steps),
-            "reference_models": len(references),
+            "mean_optimization_steps": sum(steps_used) / len(steps_used),
+            "loss_threshold": loss_threshold,
+            "reference_models": len(out_models),
+            "variant": "offline",
+            "per_model_alternative_labels": True,
+            "out_specificity_rate": sum(out_successes) / len(out_successes),
+            "target_true_label_rate": sum(scores) / len(scores),
             "epsilon": epsilon,
         },
     )

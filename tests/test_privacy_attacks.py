@@ -1,5 +1,6 @@
 import json
 import copy
+import itertools
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from aggregator.aggregator_builder import build_aggregator
 from aggregator.fedavg_aggregator import aggregate_fedavg_model_states
 from main import default_config, validate_config
 from privacy_attacks.code_poison import generate_membership_encoding_samples
-from privacy_attacks.metrics import membership_metrics
+from privacy_attacks.metrics import fit_shrinkage_attack, membership_metrics
 from privacy_attacks.model_utils import scaled_confidence
 from privacy_attacks.promptmia import generate_key_with_similarity
 from privacy_defenses import DefenseController, attach_hamp_output_transform
@@ -71,13 +72,50 @@ def test_fedavg_uses_sample_weights_and_selected_clients_only():
 def test_membership_metrics_and_secret_samples_are_deterministic():
     labels = torch.tensor([1, 1, 0, 0])
     scores = torch.tensor([0.9, 0.8, 0.2, 0.1])
-    assert membership_metrics(labels, scores)["auc"] == 1.0
+    metrics = membership_metrics(labels, scores)
+    assert metrics["tpr_at_fpr_0.01"] == 1.0
+    assert metrics["auc"] == 1.0
 
     images = torch.randn(3, 3, 4, 4)
     first = generate_membership_encoding_samples(images)
     second = generate_membership_encoding_samples(images)
     assert torch.equal(first, second)
     assert not torch.equal(first[0], first[1])
+
+
+def test_cofedmid_class_partition_balances_overlap_and_coverage():
+    controller = DefenseController(
+        {"name": "cofedmid", "seed": 42},
+        device=torch.device("cpu"),
+        total_users=4,
+        num_classes=100,
+        total_rounds=10,
+        samples_num=[1, 1, 1, 1],
+    )
+    controller.prepare_round([0, 1, 2, 3], round_index=0)
+    class_sets = [controller._cofedmid_classes(client, 0) for client in range(4)]
+    assert [len(class_set) for class_set in class_sets] == [50, 50, 50, 50]
+    assert len(set().union(*class_sets)) == 100
+    assert (
+        max(
+            len(left & right)
+            for left, right in itertools.combinations(class_sets, 2)
+        )
+        == 17
+    )
+
+
+def test_small_sample_shrinkage_attack_ignores_distracting_dimensions():
+    labels = torch.tensor([1] * 8 + [0] * 8)
+    generator = torch.Generator().manual_seed(11)
+    distractors = torch.randn(16, 64, generator=generator)
+    signal = torch.cat((torch.ones(8), -torch.ones(8))).unsqueeze(1)
+    features = torch.cat((signal, distractors), dim=1)
+    scores, held_out, _, selected = fit_shrinkage_attack(
+        features, labels, calibration_fraction=0.5, seed=7, max_features=1
+    )
+    assert selected == 1
+    assert membership_metrics(held_out, scores)["auc"] == 1.0
 
 
 def test_private_noise_calibration_meets_requested_budget():
@@ -101,10 +139,11 @@ def test_active_client_update_queries_are_counted_in_privacy_budget():
                 "enabled": True,
                 "attacks": ["nasr_active", "promptmia", "fedmia_loss"],
                 "active_max_samples": 6,
+                "active_probe_cycles": 3,
                 "promptmia_max_samples": 4,
             }
         )
-        == 10
+        == 22
     )
     assert planned_private_probe_steps({"enabled": False}) == 0
 
@@ -588,6 +627,7 @@ def test_active_prompt_probe_runs_under_every_defense():
         server.auditor.config["promptmia_keys"] = 2
         summaries = server.train()
         assert [item["attack"] for item in summaries] == ["promptmia"]
+        assert summaries[0]["metadata"]["score"] == "signed_projected_client_update"
 
 
 def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
@@ -637,6 +677,7 @@ def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
             "calibration_fraction": 0.5,
             "active_max_samples": 4,
             "active_ascent_steps": 1,
+            "active_probe_cycles": 1,
             "auxiliary_fraction": 0.5,
             "qmia_epochs": 3,
             "pipra_shadow_prompts": 2,

@@ -7,7 +7,7 @@
 本仓库的 `privacy_attacks/whitebox.py` 针对参数高效提示微调作了两点调整：
 
 1. 冻结 CLIP 骨干不产生可观察训练梯度，因此白盒梯度组件仅分析 prompt 参数；完整高维梯度被转换为每个 prompt token 的梯度范数和全局统计量。
-2. 主动攻击以隔离 probe 实现：服务器先对候选样本执行 prompt 梯度上升，再让目标客户端执行真实本地训练，使用候选损失与梯度范数的下降作为分数。probe 不进入 FedAvg。
+2. 主动攻击以隔离 probe 实现：服务器对候选样本反复执行 prompt 梯度上升和目标客户端真实本地训练，以最后的候选 prompt 梯度范数作为成员信号。该实现保留论文的主动 ascent/train 轨迹，但按候选隔离，且 probe 不进入 FedAvg。
 
 参考工具：[Privacy Meter](https://github.com/privacytrustlab/ml_privacy_meter)。
 
@@ -52,7 +52,7 @@
 
 论文：[ICML 2024 / PMLR](https://proceedings.mlr.press/v235/zarifzadeh24a.html)。官方实现位于 [Privacy Meter](https://github.com/privacytrustlab/ml_privacy_meter/tree/master/research/2024_rmia)。
 
-`privacy_attacks/rmia.py` 使用同一通信轮的非目标客户端 prompts 作为 reference models，实现论文 offline marginal estimate 与 population likelihood-ratio dominance score。已知 OUT 辅助集与最终查询集严格拆分。
+`privacy_attacks/rmia.py` 使用同一通信轮的非目标客户端 prompts 作为 reference models，实现论文 offline marginal estimate 与 population likelihood-ratio dominance score，并采用论文低 FPR 实验常用的 `gamma=2`。已知 OUT 辅助集与最终查询集严格拆分。
 
 ## 7. IMIA
 
@@ -74,7 +74,7 @@
 
 论文：[ICLR 2024](https://proceedings.iclr.cc/paper_files/paper/2024/hash/b3edfc1950c30c42e2ecf6637ab7fb09-Abstract-Conference.html)，[官方代码](https://github.com/WU-YU-TONG/YOQO)。
 
-`privacy_attacks/query_attacks.py` 的 offline 适配使用非目标客户端 prompts 作为 OUT shadow models，选择最高概率错误类并优化受限扰动，使 OUT prompts 转向错误类。对目标 prompt 只执行一次查询，并仅保留 argmax hard label；预测仍保持真实类别时判为更可能是成员。
+`privacy_attacks/query_attacks.py` 的 offline 适配使用非目标客户端 prompts 作为 OUT shadow models，为每个 OUT prompt 分别选择最高概率错误类，并按论文式 (5) 优化错误类交叉熵与 MSE 距离。实现采用官方代码的归一化 loss threshold 早停；由于输入是 CLIP 归一化张量，步长缩放为 `0.001`。对目标 prompt 只执行一次查询，并仅保留 argmax hard label；预测仍保持真实类别时判为更可能是成员。
 
 ## 10. Canary in a Coalmine
 
@@ -92,4 +92,4 @@
 
 ## Shared evaluation
 
-所有攻击统一输出 ROC AUC、TPR@10% FPR、TPR@1% FPR 和 TPR@0.1% FPR。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。
+所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC、TPR@10% FPR 和 TPR@0.1% FPR 作为诊断信息。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。

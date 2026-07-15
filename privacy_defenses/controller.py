@@ -8,6 +8,7 @@ selects exactly one controller, so the methods are never silently combined.
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import math
 import os
@@ -468,34 +469,89 @@ class DefenseController:
         if client_id not in participants:
             participants = [client_id, *participants]
         coalition_size = max(1, len(participants))
+        coverage_floor = max(1, math.ceil(self.num_classes / coalition_size))
         maximum = int(
             self.config.get(
                 "cofedmid_max_classes",
-                max(1, math.ceil(self.num_classes / coalition_size) * 2),
+                coverage_floor * 2,
             )
         )
         minimum = int(
             self.config.get(
                 "cofedmid_min_classes",
-                max(1, math.ceil(self.num_classes / coalition_size)),
+                coverage_floor,
             )
         )
-        maximum = max(1, min(self.num_classes, maximum))
-        minimum = max(1, min(maximum, minimum))
+        maximum = max(coverage_floor, min(self.num_classes, maximum))
+        minimum = max(coverage_floor, min(maximum, minimum))
         progress = round_index / max(1, self.total_rounds - 1)
         size = max(minimum, round(maximum - (maximum - minimum) * progress))
+        self._assign_cofedmid_class_subsets(participants, size, round_index)
+        return self._class_assignments[key]
+
+    def _assign_cofedmid_class_subsets(
+        self, participants: list[int], size: int, round_index: int
+    ) -> None:
+        """Assign bounded-overlap class subsets for one CoFedMID round."""
         generator = torch.Generator().manual_seed(
             self.seed + 1009 * int(round_index) + 211
         )
+        coalition_size = len(participants)
         order = torch.randperm(self.num_classes, generator=generator).tolist()
-        repeated = order * max(1, math.ceil(coalition_size * size / self.num_classes))
+        total_slots = coalition_size * size
+        base_repeats = total_slots // self.num_classes
+        extra_repeats = total_slots % self.num_classes
+        subsets = [set() for _ in participants]
+        loads = [0 for _ in participants]
+        overlaps = torch.zeros(
+            (coalition_size, coalition_size), dtype=torch.int64
+        )
+        combinations_by_repeat = {
+            repeat: list(itertools.combinations(range(coalition_size), repeat))
+            for repeat in range(1, coalition_size + 1)
+        }
+
+        for position, class_id in enumerate(order):
+            repeat = base_repeats + int(position < extra_repeats)
+            if repeat <= 0:
+                continue
+            repeat = min(repeat, coalition_size)
+            best_combo = None
+            best_score = None
+            for combo in combinations_by_repeat[repeat]:
+                prospective_loads = list(loads)
+                over_capacity = 0
+                for client_position in combo:
+                    prospective_loads[client_position] += 1
+                    over_capacity += max(
+                        0, prospective_loads[client_position] - size
+                    )
+                prospective_overlaps = overlaps.clone()
+                for left, right in itertools.combinations(combo, 2):
+                    prospective_overlaps[left, right] += 1
+                    prospective_overlaps[right, left] += 1
+                score = (
+                    over_capacity,
+                    max(prospective_loads),
+                    max(prospective_loads) - min(prospective_loads),
+                    int(prospective_overlaps.max()),
+                    int(prospective_overlaps.sum()),
+                    combo,
+                )
+                if best_score is None or score < best_score:
+                    best_score = score
+                    best_combo = combo
+            if best_combo is None:
+                raise RuntimeError("CoFedMID could not assign class subset.")
+            for client_position in best_combo:
+                subsets[client_position].add(class_id)
+                loads[client_position] += 1
+            for left, right in itertools.combinations(best_combo, 2):
+                overlaps[left, right] += 1
+                overlaps[right, left] += 1
+
         for position, user_id in enumerate(participants):
-            start = position * size
-            chosen = {
-                repeated[(start + offset) % len(repeated)] for offset in range(size)
-            }
-            self._class_assignments[(user_id, round_index)] = chosen
-        return self._class_assignments[key]
+            self._class_assignments[(user_id, round_index)] = subsets[position]
 
     def _cofedmid_training(
         self, user, model, optimizer, round_index: int, code_poison: bool

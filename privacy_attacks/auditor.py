@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import csv
 import json
@@ -269,10 +271,17 @@ class MembershipAuditor:
                 and protocol_messages is not None
                 and user_id in protocol_messages
             ):
-                tensors = protocol_messages[user_id].get("tensors", {})
+                message = protocol_messages[user_id]
+                tensors = message.get("tensors", {})
                 update = torch.cat(
                     [tensor.detach().flatten().cpu() for tensor in tensors.values()]
                 )
+                if message.get("kind") == "model_update":
+                    # FedAvg uploads parameter deltas (updated - base), while
+                    # gradient-similarity attacks use the descent gradient
+                    # (base - updated). Keep the stored protocol message exact,
+                    # and normalize its sign only for gradient measurements.
+                    update = -update
             else:
                 update = flatten_state_delta(client_base, state, observable_names)
             compared_gradients = sample_gradients
@@ -306,6 +315,7 @@ class MembershipAuditor:
             "cosine": torch.stack(cosine),
             "gradient_difference": torch.stack(gradient_difference),
             "gradient_signature": signatures,
+            "candidate_labels": self.labels.detach().cpu().clone(),
             "probabilities": torch.stack(probabilities),
             "representations": torch.stack(representations),
             "client_states": {
@@ -361,6 +371,9 @@ class MembershipAuditor:
                 max_samples=int(self.config.get("active_max_samples", 16)),
                 ascent_steps=int(self.config.get("active_ascent_steps", 1)),
                 ascent_lr=float(self.config.get("active_ascent_lr", 0.01)),
+                probe_cycles=int(self.config.get("active_probe_cycles", 3)),
+                calibration_fraction=self.calibration_fraction,
+                seed=self.seed,
             )
         if attack == "transfer_representation":
             return run_transfer_representation_attack(
@@ -458,6 +471,11 @@ class MembershipAuditor:
                 epsilon=float(self.config.get("query_epsilon", 0.1)),
                 distortion_weight=float(self.config.get("yoqo_distortion_weight", 1.0)),
                 reference_models=int(self.config.get("query_reference_models", 2)),
+                loss_threshold=(
+                    None
+                    if self.config.get("yoqo_loss_threshold", 0.5) is None
+                    else float(self.config.get("yoqo_loss_threshold", 0.5))
+                ),
             )
         if attack == "canary":
             return run_canary(

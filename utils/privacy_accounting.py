@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import secrets
 
@@ -13,7 +15,8 @@ def planned_private_probe_steps(audit_config: dict | None) -> int:
     steps = 0
     if "nasr_active" in attacks:
         maximum = int(config.get("active_max_samples", 16))
-        steps += 2 * max(1, maximum // 2)
+        cycles = max(1, int(config.get("active_probe_cycles", 3)))
+        steps += 2 * max(1, maximum // 2) * cycles
     if "promptmia" in attacks:
         maximum = int(config.get("promptmia_max_samples", 16))
         steps += 2 * max(1, maximum // 2)
