@@ -346,11 +346,19 @@ class MembershipAuditor:
     def _run(self, attack: str, final_model, final_state):
         if attack == "fedmia_loss":
             return run_fedmia(
-                self.observations, self.membership, self.target_client_id, "confidence"
+                self.observations,
+                self.membership,
+                self.target_client_id,
+                "confidence",
+                str(self.config.get("fedmia_loss_aggregation", "mean")),
             )
         if attack == "fedmia_cosine":
             return run_fedmia(
-                self.observations, self.membership, self.target_client_id, "cosine"
+                self.observations,
+                self.membership,
+                self.target_client_id,
+                "cosine",
+                str(self.config.get("fedmia_cosine_aggregation", "mean")),
             )
         if attack == "nasr_passive":
             return run_passive_whitebox(

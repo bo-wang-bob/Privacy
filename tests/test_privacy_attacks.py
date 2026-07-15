@@ -13,6 +13,7 @@ from aggregator.aggregator_builder import build_aggregator
 from aggregator.fedavg_aggregator import aggregate_fedavg_model_states
 from main import default_config, validate_config
 from privacy_attacks.code_poison import generate_membership_encoding_samples
+from privacy_attacks.fedmia import run_fedmia
 from privacy_attacks.metrics import fit_shrinkage_attack, membership_metrics
 from privacy_attacks.model_utils import scaled_confidence
 from privacy_attacks.promptmia import generate_key_with_similarity
@@ -116,6 +117,39 @@ def test_small_sample_shrinkage_attack_ignores_distracting_dimensions():
     )
     assert selected == 1
     assert membership_metrics(held_out, scores)["auc"] == 1.0
+
+
+def test_fedmia_can_use_max_round_aggregation():
+    membership = torch.tensor([1, 1, 0, 0])
+    observations = [
+        {
+            "round": 0,
+            "client_ids": torch.tensor([0, 1, 2]),
+            "confidence": torch.tensor(
+                [
+                    [0.2, 0.1, 0.8, 0.7],
+                    [0.0, 0.0, 0.9, 0.8],
+                    [0.0, 0.0, 0.85, 0.75],
+                ]
+            ),
+        },
+        {
+            "round": 1,
+            "client_ids": torch.tensor([0, 1, 2]),
+            "confidence": torch.tensor(
+                [
+                    [2.0, 2.1, 0.1, 0.2],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                ]
+            ),
+        },
+    ]
+    mean_result = run_fedmia(observations, membership, 0, "confidence", "mean")
+    max_result = run_fedmia(observations, membership, 0, "confidence", "max")
+    assert max_result.metadata["round_aggregation"] == "max"
+    assert torch.all(max_result.scores >= mean_result.scores)
+    assert torch.any(max_result.scores > mean_result.scores)
 
 
 def test_private_noise_calibration_meets_requested_budget():

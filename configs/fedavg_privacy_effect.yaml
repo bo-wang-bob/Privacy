@@ -38,6 +38,8 @@ audit:
   synthetic_mean: 0.0
   synthetic_std: 0.1
   auxiliary_fraction: 0.5
+  fedmia_loss_aggregation: mean
+  fedmia_cosine_aggregation: max
   rmia_offline_a: 0.3
   rmia_gamma: 2.0
   qmia_quantile: 0.9

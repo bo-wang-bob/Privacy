@@ -29,6 +29,7 @@ def run_fedmia(
     membership: torch.Tensor,
     target_client_id: int,
     measurement: str,
+    aggregation: str = "mean",
 ) -> AttackResult:
     """FedMIA one-tailed null test using clients across rounds."""
     round_scores = []
@@ -49,7 +50,21 @@ def run_fedmia(
         used_rounds.append(int(observation["round"]))
     if not round_scores:
         raise ValueError("FedMIA needs a round containing the target and another client.")
-    scores = torch.stack(round_scores).mean(dim=0).to(torch.float32)
+    stacked = torch.stack(round_scores)
+    aggregation = aggregation.lower()
+    if aggregation == "mean":
+        scores = stacked.mean(dim=0)
+    elif aggregation == "max":
+        scores = stacked.max(dim=0).values
+    elif aggregation == "last":
+        scores = stacked[-1]
+    elif aggregation == "late3":
+        scores = stacked[-min(3, stacked.shape[0]) :].mean(dim=0)
+    else:
+        raise ValueError(
+            "FedMIA aggregation must be one of: mean, max, last, late3."
+        )
+    scores = scores.to(torch.float32)
     name = "fedmia_loss" if measurement == "confidence" else "fedmia_cosine"
     return AttackResult(
         name=name,
@@ -59,6 +74,7 @@ def run_fedmia(
         metadata={
             "rounds": used_rounds,
             "measurement": measurement,
+            "round_aggregation": aggregation,
             "null_filter": "upper_3_sigma",
             "filtered_measurements": filtered_values,
         },
