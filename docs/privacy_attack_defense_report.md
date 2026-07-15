@@ -124,7 +124,18 @@ messages, while the non-IID split increases membership separability.
 | DTD, shots=16 | client 0 | FedMIA, Nasr passive | 0.03571 | Weaker than CIFAR100 |
 | TinyImageNet-200, shots=16 | client 0 | FedMIA | 0.09375 | Weaker than CIFAR100 |
 | CIFAR100, shots=32 | client 0 | FedMIA | 0.12500 | More shots reduced FedMIA low-FPR separation |
+| CIFAR100, shots=8 | client 0 | FedMIA joint | 0.14815 | Smaller few-shot subset also reduced low-FPR separation |
 | CIFAR100, shots=16 | client 3 | FedMIA | 0.10938 | Larger target client was less vulnerable |
+| CIFAR100, shots=16 | client 1 | FedMIA joint | 0.12963 | Low-sample target did not improve over client 0 |
+| CIFAR100, shots=16 | client 7 | FedMIA joint | 0.05357 | Most class-concentrated small client was not vulnerable |
+| CIFAR100, shots=16 | client 18 | FedMIA joint | 0.18750 | Concentrated 65-sample target remained below client 0 |
+
+For the best CIFAR100 setting (`shots=16`), the deterministic Dirichlet split
+with seed 42 assigns these training sample counts by client:
+
+| Client | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16 | 17 | 18 | 19 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Samples | 53 | 54 | 72 | 102 | 107 | 84 | 78 | 56 | 73 | 87 | 84 | 88 | 83 | 66 | 109 | 84 | 63 | 106 | 65 | 86 |
 
 Detailed 20-client CIFAR100 results:
 
@@ -157,3 +168,8 @@ Result directories:
 - `results/cifar100_fedavg_multi_attack_none_20260715_184338`
 - `results/cifar100_fedavg_fedmia_joint_none_20260715_185333`
 - `results/cifar100_fedavg_fedmia_joint_none_20260715_190705`
+- `results/cifar100_fedavg_fedmia_joint_none_20260715_191713`
+- `results/cifar100_fedavg_fedmia_joint_none_20260715_191925`
+- `results/cifar100_fedavg_fedmia_joint_none_20260715_192400`
+- `results/cifar100_fedavg_fedmia_joint_none_20260715_192946`
+- `results/cifar100_fedavg_fedmia_joint_none_20260715_193315`
