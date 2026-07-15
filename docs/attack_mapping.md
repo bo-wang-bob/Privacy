@@ -22,7 +22,7 @@
 - 同一轮其他客户端构成 non-target/null 分布；
 - 对多个通信轮的单尾 CDF 分数支持 `mean`、`max`、`last` 与 `late3` 聚合。
 
-`fedmia_joint` 是面向低 FPR 的固定组合分数，不使用候选标签或成员标签先验：它将 FedMIA 置信度 z-score 的跨轮均值、FedMIA 余弦 z-score 的跨轮最大值、以及余弦 z-score 的后 3 轮均值标准化后相加。该组合只使用与 FedMIA-I/II 相同的协议观测和 null 分布。
+`fedmia_joint` 是面向低 FPR 的可配置固定组合分数，不使用候选标签或成员标签先验。当前主配置将 FedMIA 置信度 z-score 的前 3 轮均值与 FedMIA 余弦 z-score 的后 3 轮均值标准化后相加。该组合只使用与 FedMIA-I/II 相同的协议观测和 null 分布。
 
 参考仓库未附许可证，因此本仓库没有复制其源码。
 

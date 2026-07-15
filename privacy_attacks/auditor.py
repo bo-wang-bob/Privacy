@@ -363,8 +363,16 @@ class MembershipAuditor:
                 str(self.config.get("fedmia_cosine_aggregation", "mean")),
             )
         if attack == "fedmia_joint":
+            components = self.config.get("fedmia_joint_components")
+            if isinstance(components, str):
+                components = [
+                    item.strip() for item in components.split(",") if item.strip()
+                ]
             return run_fedmia_joint(
-                self.observations, self.membership, self.target_client_id
+                self.observations,
+                self.membership,
+                self.target_client_id,
+                components=components,
             )
         if attack == "nasr_passive":
             return run_passive_whitebox(

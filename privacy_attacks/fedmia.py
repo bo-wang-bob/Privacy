@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 
 import torch
@@ -114,25 +116,79 @@ def _standardize(scores: torch.Tensor) -> torch.Tensor:
     return (scores - scores.mean()) / scores.std(unbiased=False).clamp_min(1e-8)
 
 
+def _aggregate_evidence(round_z: torch.Tensor, aggregation: str) -> torch.Tensor:
+    aggregation = aggregation.lower()
+    if aggregation == "mean":
+        return round_z.mean(dim=0)
+    if aggregation == "max":
+        return round_z.max(dim=0).values
+    if aggregation == "last":
+        return round_z[-1]
+    if aggregation == "late3":
+        return round_z[-min(3, round_z.shape[0]) :].mean(dim=0)
+    if aggregation == "early3":
+        return round_z[: min(3, round_z.shape[0])].mean(dim=0)
+    if aggregation == "top2mean":
+        return round_z.topk(min(2, round_z.shape[0]), dim=0).values.mean(dim=0)
+    if aggregation == "top3mean":
+        return round_z.topk(min(3, round_z.shape[0]), dim=0).values.mean(dim=0)
+    raise ValueError(
+        "FedMIA joint component aggregation must be one of: "
+        "mean, max, last, late3, early3, top2mean, top3mean."
+    )
+
+
+def _parse_joint_component(component: str) -> tuple[str, str]:
+    parts = component.lower().split("_")
+    if len(parts) != 3 or parts[1] != "z":
+        raise ValueError(
+            "FedMIA joint components must look like '<measurement>_z_<aggregation>'."
+        )
+    measurement_alias = parts[0]
+    aggregation = parts[2]
+    measurements = {
+        "confidence": "confidence",
+        "loss": "confidence",
+        "cosine": "cosine",
+        "gradient": "gradient_difference",
+        "gradient_difference": "gradient_difference",
+    }
+    if measurement_alias not in measurements:
+        raise ValueError(f"Unknown FedMIA joint measurement: {measurement_alias}")
+    return measurements[measurement_alias], aggregation
+
+
 def run_fedmia_joint(
     observations: list[dict],
     membership: torch.Tensor,
     target_client_id: int,
+    components: list[str] | None = None,
 ) -> AttackResult:
     """FedMIA joint low-FPR score over loss and update-cosine evidence."""
-    confidence_z, confidence_rounds, confidence_filtered = _round_evidence(
-        observations, target_client_id, "confidence"
-    )
-    cosine_z, cosine_rounds, cosine_filtered = _round_evidence(
-        observations, target_client_id, "cosine"
-    )
-    confidence_mean = confidence_z.mean(dim=0)
-    cosine_max = cosine_z.max(dim=0).values
-    cosine_late3 = cosine_z[-min(3, cosine_z.shape[0]) :].mean(dim=0)
-    scores = (
-        _standardize(confidence_mean)
-        + _standardize(cosine_max)
-        + _standardize(cosine_late3)
+    components = components or [
+        "confidence_z_mean",
+        "cosine_z_max",
+        "cosine_z_late3",
+    ]
+    evidence_cache: dict[str, tuple[torch.Tensor, list[int], int]] = {}
+    component_scores = []
+    metadata_rounds = {}
+    filtered = {}
+    for component in components:
+        measurement, aggregation = _parse_joint_component(component)
+        if measurement not in evidence_cache:
+            evidence_cache[measurement] = _round_evidence(
+                observations, target_client_id, measurement
+            )
+        round_z, rounds, filtered_values = evidence_cache[measurement]
+        component_scores.append(
+            _standardize(_aggregate_evidence(round_z, aggregation))
+        )
+        metadata_rounds[measurement] = rounds
+        filtered[measurement] = filtered_values
+    scores = torch.stack(component_scores).sum(dim=0)
+    measurements = list(
+        dict.fromkeys(_parse_joint_component(component)[0] for component in components)
     )
     return AttackResult(
         name="fedmia_joint",
@@ -140,18 +196,10 @@ def run_fedmia_joint(
         labels=membership.detach().cpu(),
         sample_indices=torch.arange(membership.numel()),
         metadata={
-            "measurements": ["confidence", "cosine"],
-            "components": [
-                "confidence_z_mean",
-                "cosine_z_max",
-                "cosine_z_late3",
-            ],
-            "confidence_rounds": confidence_rounds,
-            "cosine_rounds": cosine_rounds,
+            "measurements": measurements,
+            "components": components,
+            "rounds": metadata_rounds,
             "null_filter": "upper_3_sigma",
-            "filtered_measurements": {
-                "confidence": confidence_filtered,
-                "cosine": cosine_filtered,
-            },
+            "filtered_measurements": filtered,
         },
     )
