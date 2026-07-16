@@ -2,38 +2,75 @@
 
 日期：2026-07-16
 
-## 比较口径
+## 最终结论
 
-本实验使用 `configs/flowers_fair_privacy_comparison.yaml` 作为唯一公共配置，
-只通过 `--aggregator` 和 `--defense` 切换方法。公共条件为：Flowers102、
-10 个客户端且全参与、Dirichlet `alpha=0.1`、每类 16-shot、5 个通信轮次、
-1 个本地 epoch、batch size 16、prompt length 16，以及同一个目标客户端 0。
-模型训练与 CLIP 前向分别在两张 NVIDIA RTX 4090 上并行完成；数据加载与小型
-指标汇总使用主机侧流水线。
+在五个独立 seed 的 Flowers102 同场景实验中，优化后的 Local-GGEUR 同时取得：
 
-审计统一使用 `protocol_plus_released_prompts`，包含 `fedmia_loss`、
-`fedmia_cosine`、`fedmia_joint`、`nasr_passive`、`rmia` 和
-`quantile_mia`。每组先取 64 个成员和 64 个非成员，校准比例为 0.5；因此
-FedMIA 使用 128 个候选，Nasr 的最终评估集为 64，RMIA/Quantile-MIA 为
-96。相较早期每组 32 的实验，这一设置降低了低 FPR 指标的离散误差。
+- 平均准确率 `0.6136`，高于 DP-FPL 的 `0.5628` 和 FedASK 的 `0.5420`；
+- 每次运行六种攻击中最强攻击的 `TPR@1%FPR` 均值 `0.0531`，低于
+  DP-FPL 和 FedASK 的 `0.0688`；
+- 六攻击简单平均 TPR `0.0146`，低于 DP-FPL 的 `0.0219` 和 FedASK 的
+  `0.0203`。
 
-三个 seed 的客户端训练/测试样本数如下。每个 seed 内四种方法使用完全相同
-的划分；跨 seed 改变划分用于检验稳健性。
+因此，以任务准确率、worst-attack TPR 和六攻击平均 TPR 衡量，Local-GGEUR
+在当前场景的五 seed 经验均值上均优于 DP-FPL 与 FedASK。它不是在每个 seed、
+每个攻击单项上都严格占优，五个 seed 也不足以支撑强统计显著性声明。
 
-| Seed | Train samples per client | Test samples per client |
-|---:|---|---|
-| 42 | `[151,212,189,186,136,196,158,103,206,95]` | `[437,636,635,499,667,779,541,501,745,709]` |
-| 43 | `[140,190,150,176,163,183,118,198,125,189]` | `[591,693,505,577,519,804,556,868,481,555]` |
-| 44 | `[153,187,181,101,166,142,175,153,153,221]` | `[680,514,619,428,880,587,520,701,533,687]` |
+无防御 FedAvg 的平均准确率为 `0.6621`，且本批有限候选审计得到更低的
+worst-attack TPR `0.0312`。因此不能宣称 Local-GGEUR 优于无防御 FedAvg，
+也不能把这些实验解释为已经证明形式化隐私保证；DP-FPL 的优势仍包括其
+差分隐私机制能够提供的理论保证。
 
-方法内部参数保留论文/官方仓库映射：DP-FPL 为 rank 4、每轮 1 个私有步骤、
-local/global noise multiplier `0.3/0.1`；FedASK 为 rank/sketch dimension 16、
-每轮 10 个私有步骤、noise multiplier 1.0。Local-GGEUR 使用 FedAvg prompt
-主干；这些是方法定义的一部分，而非公共场景变量。
+## 公平比较口径
+
+所有方法都使用 `configs/flowers_fair_privacy_comparison.yaml`，只通过
+`--aggregator` 和 `--defense` 切换方法。公共条件为：
+
+| Setting | Value |
+|---|---:|
+| Dataset | Flowers102 |
+| Clients / sampled | 10 / 10 |
+| Dirichlet alpha | 0.1 |
+| Few-shot | 16 per class，训练集共 1632 个样本 |
+| Global rounds | 5 |
+| Local epochs | 1 |
+| Batch size | 16 |
+| Prompt length | 16 |
+| Target client | 0 |
+| Seeds | 42, 43, 44, 45, 46 |
+
+训练和 CLIP 前向使用两张 NVIDIA RTX 4090 并行执行；数据加载与小型指标汇总
+使用主机侧流水线。CLIP 始终通过 `local_files_only=True` 从本地缓存加载。
+
+方法内部参数属于各算法定义，因此保留论文及官方仓库的更新规则：DP-FPL 使用
+rank 4、每轮 1 个私有步骤、local/global noise multiplier `0.3/0.1`；FedASK
+使用 rank/sketch dimension 16、每轮 10 个私有步骤、noise multiplier 1.0。
+Local-GGEUR 使用 FedAvg prompt 主干。公共数据、轮次和审计预算完全一致，
+算法内部步骤数和隐私机制不被强行改写为相同。
+
+## 消除审计偏差
+
+初始实验按数据集顺序抽取非成员。seed 43 中，64 个成员覆盖多个类别，而 64 个
+非成员中类别 7 占 53 个；Nasr 主要选择 loss 与 prompt-gradient norm，因而可能
+把类别差异误当作成员信号。该批旧结果不用于最终结论。
+
+最终审计设置 `audit.match_candidate_labels=true`，对成员和非成员使用完全相同的
+标签直方图。程序从目标客户端及其他客户端测试集构造匹配非成员集合；若任一
+类别数量不足则直接报错。审计摘要的 `candidate_sampling` 保存两组直方图，
+测试验证二者严格相等。
+
+候选 DataLoader 还使用独立且固定的 `torch.Generator`。即使审计关闭 shuffle，
+候选提取也不会推进训练使用的全局 PyTorch RNG，从而避免不同审计时机改变后续
+训练批次顺序。正式五 seed 结果均来自加入该隔离后的重新运行。
+
+统一攻击集合为：`fedmia_loss`、`fedmia_cosine`、`fedmia_joint`、
+`nasr_passive`、`rmia`、`quantile_mia`。每组先取 64 个成员和 64 个非成员，
+校准比例 0.5；FedMIA 使用 128 个候选，Nasr 最终评估 64 个候选，
+RMIA/Quantile-MIA 最终评估 96 个候选。
 
 ## 优化后的 Local-GGEUR
 
-在 seed 42 上进行开发搜索后固定如下配置，再用 seed 43/44 独立检验：
+开发搜索使用 seed 42/43；seed 44--46 用于固定配置后的外部复验。最终配置为：
 
 ```yaml
 local_ggeur_augments: 3
@@ -48,67 +85,68 @@ local_ggeur_upload_noise_std: 0.11
 ```
 
 相较此前 CIFAR100 推荐点，本配置将原样本分支改为直接类均值替换，并把上传
-噪声从 0.07 提高到 0.11。实现同时新增上传裁剪前范数统计，确认 Flowers102
-上平均原始上传范数约为 `0.056--0.077`；默认 0.5 阈值基本不触发裁剪，主要
-保护来自上传噪声和本地几何替代。
+噪声从 0.07 提高到 0.11。实现同时记录上传裁剪前范数；Flowers102 上该范数
+通常远低于 0.5，保护主要来自本地几何替代和上传噪声，而非大量裁剪。
 
-## 三 seed 结果
+## 五 seed 汇总
 
-下表前三个数值列为 mean +/- sample standard deviation，六个单项攻击列为
-三 seed 均值。`Worst TPR` 是每次运行六个攻击中最大的 `TPR@1%FPR`，
-`Mean TPR` 是六个攻击的平均值；两者越低越好。
+下表均为 `mean +/- sample standard deviation`。`Worst TPR` 是每次运行六种攻击
+中最大的 `TPR@1%FPR`，用于避免一种较强攻击被跨攻击平均数掩盖。
 
 | Method | Accuracy | Worst TPR@1%FPR | Mean TPR@1%FPR | FedMIA loss | FedMIA cosine | FedMIA joint | Nasr | RMIA | Quantile |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| DP-FPL | 0.5545 +/- 0.1053 | 0.1042 +/- 0.0651 | 0.0408 +/- 0.0278 | 0.0000 | 0.0625 | 0.0885 | 0.0729 | 0.0000 | 0.0208 |
-| FedASK | 0.5270 +/- 0.1425 | 0.0677 +/- 0.0631 | 0.0286 +/- 0.0256 | 0.0000 | 0.0365 | 0.0573 | 0.0625 | 0.0000 | 0.0156 |
-| FedAvg, no defense | 0.6632 +/- 0.0039 | 0.2083 +/- 0.1329 | 0.0964 +/- 0.0994 | 0.1406 | 0.1042 | 0.1042 | 0.1562 | 0.0052 | 0.0677 |
-| Local-GGEUR | **0.6229 +/- 0.0016** | 0.1354 +/- 0.1542 | 0.0321 +/- 0.0376 | 0.0417 | **0.0000** | **0.0052** | 0.1354 | 0.0052 | **0.0052** |
+| DP-FPL | 0.5628 +/- 0.0757 | 0.0688 +/- 0.0324 | 0.0219 +/- 0.0127 | 0.0000 +/- 0.0000 | 0.0219 +/- 0.0324 | 0.0281 +/- 0.0320 | 0.0437 +/- 0.0419 | 0.0000 +/- 0.0000 | 0.0375 +/- 0.0360 |
+| FedASK | 0.5420 +/- 0.1032 | 0.0688 +/- 0.0407 | 0.0203 +/- 0.0125 | 0.0000 +/- 0.0000 | 0.0281 +/- 0.0232 | 0.0125 +/- 0.0171 | 0.0375 +/- 0.0407 | 0.0000 +/- 0.0000 | 0.0437 +/- 0.0487 |
+| FedAvg, no defense | 0.6621 +/- 0.0034 | 0.0312 +/- 0.0292 | 0.0120 +/- 0.0108 | 0.0063 +/- 0.0086 | 0.0031 +/- 0.0070 | 0.0063 +/- 0.0140 | 0.0250 +/- 0.0261 | 0.0156 +/- 0.0349 | 0.0156 +/- 0.0156 |
+| Local-GGEUR | 0.6136 +/- 0.0090 | 0.0531 +/- 0.0178 | 0.0146 +/- 0.0070 | 0.0063 +/- 0.0086 | 0.0094 +/- 0.0140 | 0.0125 +/- 0.0204 | 0.0125 +/- 0.0171 | 0.0094 +/- 0.0210 | 0.0375 +/- 0.0360 |
 
-逐 seed 的主指标如下：
+相对 DP-FPL，Local-GGEUR 平均准确率高 5.08 个百分点，worst-attack TPR
+降低 22.7%，六攻击平均 TPR 降低 33.3%。相对 FedASK，准确率高 7.16 个
+百分点，worst-attack TPR 降低 22.7%，六攻击平均 TPR 降低 28.2%。
+
+逐 seed 主指标：
 
 | Seed | Method | Accuracy | Worst TPR | Mean TPR |
 |---:|---|---:|---:|---:|
-| 42 | DP-FPL | 0.6107 | 0.0312 | 0.0104 |
-| 42 | FedASK | 0.6097 | 0.0312 | 0.0078 |
-| 42 | Local-GGEUR | 0.6221 | 0.0625 | 0.0104 |
-| 43 | DP-FPL | 0.6198 | 0.1250 | 0.0469 |
-| 43 | FedASK | 0.6089 | 0.1406 | 0.0573 |
-| 43 | Local-GGEUR | 0.6247 | 0.3125 | 0.0755 |
-| 44 | DP-FPL | 0.4331 | 0.1562 | 0.0651 |
-| 44 | FedASK | 0.3625 | 0.0312 | 0.0208 |
-| 44 | Local-GGEUR | 0.6219 | 0.0312 | 0.0104 |
+| 42 | DP-FPL | 0.6108 | 0.0625 | 0.0182 |
+| 42 | FedASK | 0.6097 | 0.0625 | 0.0312 |
+| 42 | FedAvg | 0.6575 | 0.0781 | 0.0260 |
+| 42 | Local-GGEUR | 0.6216 | 0.0312 | 0.0052 |
+| 43 | DP-FPL | 0.6212 | 0.0938 | 0.0234 |
+| 43 | FedASK | 0.6089 | 0.0938 | 0.0339 |
+| 43 | FedAvg | 0.6621 | 0.0312 | 0.0182 |
+| 43 | Local-GGEUR | 0.6190 | 0.0625 | 0.0104 |
+| 44 | DP-FPL | 0.4336 | 0.0781 | 0.0365 |
+| 44 | FedASK | 0.3623 | 0.0312 | 0.0104 |
+| 44 | FedAvg | 0.6632 | 0.0312 | 0.0130 |
+| 44 | Local-GGEUR | 0.6198 | 0.0781 | 0.0182 |
+| 45 | DP-FPL | 0.5853 | 0.0938 | 0.0286 |
+| 45 | FedASK | 0.5755 | 0.1250 | 0.0208 |
+| 45 | FedAvg | 0.6608 | 0.0156 | 0.0026 |
+| 45 | Local-GGEUR | 0.6045 | 0.0469 | 0.0234 |
+| 46 | DP-FPL | 0.5629 | 0.0156 | 0.0026 |
+| 46 | FedASK | 0.5536 | 0.0312 | 0.0052 |
+| 46 | FedAvg | 0.6668 | 0.0000 | 0.0000 |
+| 46 | Local-GGEUR | 0.6032 | 0.0469 | 0.0156 |
 
-## 结论与边界
+Local-GGEUR 的任务准确率标准差明显小于两种私有训练方法；其聚合 worst-attack
+TPR 也更低、更稳定。不过单个 seed 仍有反例，例如 seed 44 的 FedASK 隐私
+指标低于 Local-GGEUR，因此结论限定为五 seed 聚合效果。
 
-优化后的 Local-GGEUR 在效用与稳定性上明显优于两种 DP 训练方式：平均准确率
-比 DP-FPL 高 6.84 个百分点、比 FedASK 高 9.59 个百分点，且三个 seed 的
-标准差只有 0.16 个百分点。相对无防御 FedAvg，它牺牲 4.03 个百分点准确率，
-把平均攻击 TPR 从 0.0964 降到 0.0321，降低 66.7%。
+## 优化消融
 
-隐私方面，Local-GGEUR 的六攻击平均 TPR 低于 DP-FPL (`0.0321 < 0.0408`)，
-与 FedASK 接近但略高 (`0.0321` 对 `0.0286`)；FedMIA cosine/joint 和
-Quantile-MIA 的均值优于两种方法。另一方面，seed 43 的 Nasr 尾部使
-Local-GGEUR 的 worst-attack 均值仍高于 DP-FPL/FedASK。因此当前证据支持
-“更好的整体隐私-效用折中和明显更稳定的任务效用”，但不支持“所有 seed、
-所有攻击单项都严格占优”。后续优化应优先针对公开 prompt 梯度的 Nasr 尾部，
-不能通过更换审计视角或仅做输出温度校准来规避该问题。
+- 上传噪声 0.11 是当前最佳折中；提高到 0.15/0.20 会使 Nasr、RMIA 或
+  Quantile-MIA 反弹。
+- 把 upload clip norm 降到 0.05 会裁剪约 54% 更新，但没有稳定降低 Nasr。
+- 类均值锚点噪声 0.005 不改变主要隐私指标；0.015 会明显降低准确率。
+- `class_mean_noise` 的样本级噪声 0.08/0.15 未优于直接 `class_mean`。
+- 几何增强数从 3 提到 6 增加计算量但未改善最坏攻击。
+- 类均衡抽样和完全移除原样本分支均未优于最终配置。
 
-## 失败消融
-
-- 上传噪声 0.07 提高到 0.11 后，seed 42 的五个非 Nasr 攻击全部降为 0，
-  准确率仍为 0.6221，因此选择 0.11。
-- 把上传 clip norm 降到 0.05 会裁剪约 54% 更新，但没有降低 Nasr。
-- 每轮类均值锚点噪声 0.005 不改变主隐私指标；0.015 把准确率降到 0.6079，
-  仍未降低 Nasr，因此推荐值保持 0。
-- `class_mean_noise` 的样本级噪声 0.08/0.15 在 seed 43 上使 Nasr 升到
-  0.3750/0.3125，没有优于直接 `class_mean` 的 0.3125。
-- 每个样本的几何增强数从 3 提到 6 未改善 seed 43，且计算开销显著增加。
-
-## 可复核命令
+## 复核命令
 
 ```bash
-# 单 seed 四方法；修改 --seed 为 43/44
+# 修改 seed 为 42--46；可在两张 GPU 上并行
 python main.py --config configs/flowers_fair_privacy_comparison.yaml \
   --seed 42 --gpu 0 --aggregator dpfpl --defense none
 python main.py --config configs/flowers_fair_privacy_comparison.yaml \
@@ -118,12 +156,10 @@ python main.py --config configs/flowers_fair_privacy_comparison.yaml \
 python main.py --config configs/flowers_fair_privacy_comparison.yaml \
   --seed 42 --gpu 1 --aggregator fedavg --defense local_ggeur
 
-# 校验公共配置完全一致并生成表格
+# 对结果目录进行公共配置一致性校验并输出汇总表
 python -m utils.fair_comparison RUN_DIR_1 RUN_DIR_2 RUN_DIR_3 RUN_DIR_4
 python -m utils.fair_comparison --aggregate-seeds RUN_DIRS...
 ```
 
-正式三 seed 结果目录未纳入 Git，符合仓库不提交 `results/` 的约束。对应目录
-时间戳分别为 seed 42: `171513/171955/172426`，seed 43:
-`173512/173938`，seed 44: `174954/175425`；完整目录可由上述命令或
-`run_config.yaml` 中的 seed 核验。
+`results/` 未纳入 Git。正式五 seed 结果可通过各目录 `run_config.yaml` 中的
+`seed`、`match_candidate_labels=true` 和方法配置核验。

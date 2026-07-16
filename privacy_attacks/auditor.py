@@ -8,7 +8,7 @@ import os
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from privacy_attacks.code_poison import run_code_poison_attack
 from privacy_attacks.features import (
@@ -31,6 +31,7 @@ from privacy_defenses import (
     attach_hamp_output_transform,
     attach_output_temperature_transform,
 )
+from utils.data_loader import group_idx_by_class
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,9 @@ class MembershipAuditor:
         self.seed = int(self.config.get("seed", 42))
         self.audit_interval = int(self.config.get("audit_interval", 1))
         self.calibration_fraction = float(self.config.get("calibration_fraction", 0.5))
+        self.match_candidate_labels = bool(
+            self.config.get("match_candidate_labels", False)
+        )
         if self.audit_interval <= 0:
             raise ValueError("audit_interval must be positive.")
         self.observations: list[dict] = []
@@ -156,9 +160,14 @@ class MembershipAuditor:
             nonmember_datasets = [target.test_data] + [
                 user.test_data for user in users if user.id != target_client_id
             ]
-            nonmember_images, nonmember_labels = self._collect_many(
-                nonmember_datasets, max_samples
-            )
+            if self.match_candidate_labels:
+                nonmember_images, nonmember_labels = self._collect_label_matched(
+                    nonmember_datasets, member_labels
+                )
+            else:
+                nonmember_images, nonmember_labels = self._collect_many(
+                    nonmember_datasets, max_samples
+                )
             self.images = torch.cat((member_images, nonmember_images)).to(device)
             self.labels = torch.cat((member_labels, nonmember_labels)).to(device)
             self.membership = torch.cat(
@@ -174,7 +183,10 @@ class MembershipAuditor:
         image_parts = []
         label_parts = []
         remaining = limit
-        for dataset in datasets:
+        for dataset_index, dataset in enumerate(datasets):
+            loader_generator = torch.Generator().manual_seed(
+                self.seed + 104729 * dataset_index
+            )
             if remaining == 0:
                 break
             loader = DataLoader(
@@ -182,6 +194,7 @@ class MembershipAuditor:
                 batch_size=min(remaining, 64),
                 shuffle=False,
                 collate_fn=self.collate_fn,
+                generator=loader_generator,
             )
             for images, labels in loader:
                 take = min(remaining, labels.numel())
@@ -195,6 +208,50 @@ class MembershipAuditor:
         if limit - remaining < 2:
             raise ValueError("Each membership group needs at least two candidates.")
         return torch.cat(image_parts), torch.cat(label_parts)
+
+    def _collect_label_matched(
+        self, datasets: list, target_labels: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Collect non-members with exactly the member-label histogram.
+
+        Class identity can otherwise dominate a non-IID membership audit even
+        when a method has not memorized an individual. Matching labels keeps
+        the audit focused on within-class membership evidence.
+        """
+        target_labels = target_labels.detach().cpu().long().flatten()
+        classes = len(getattr(self.model, "classnames", ()))
+        classes = max(classes, int(target_labels.max().item()) + 1)
+        remaining = torch.bincount(target_labels, minlength=classes).tolist()
+        selected = []
+        for dataset in datasets:
+            grouped = group_idx_by_class(dataset, classes)
+            indices = []
+            for class_id, needed in enumerate(remaining):
+                take = min(int(needed), len(grouped[class_id]))
+                if take:
+                    indices.extend(grouped[class_id][:take])
+                    remaining[class_id] -= take
+            if indices:
+                selected.append(Subset(dataset, indices))
+            if not any(remaining):
+                break
+        if any(remaining):
+            missing = {
+                class_id: count
+                for class_id, count in enumerate(remaining)
+                if count
+            }
+            raise ValueError(
+                "Cannot construct label-matched non-members; missing counts "
+                f"{missing}."
+            )
+        images, labels = self._collect_many(selected, target_labels.numel())
+        if not torch.equal(
+            torch.bincount(labels, minlength=classes),
+            torch.bincount(target_labels, minlength=classes),
+        ):
+            raise AssertionError("Label-matched membership collection drifted.")
+        return images, labels
 
     def should_observe(self, round_index: int) -> bool:
         return self.enabled and round_index % self.audit_interval == 0
@@ -583,6 +640,15 @@ class MembershipAuditor:
                 logger.exception("Membership attack %s failed", attack)
                 self.errors[attack] = f"{type(error).__name__}: {error}"
         summaries = [result.to_summary() for result in self.results]
+        candidate_labels = self.labels.detach().cpu().long()
+        candidate_membership = self.membership.detach().cpu().long()
+        histogram_width = int(candidate_labels.max().item()) + 1
+        member_histogram = torch.bincount(
+            candidate_labels[candidate_membership == 1], minlength=histogram_width
+        ).tolist()
+        nonmember_histogram = torch.bincount(
+            candidate_labels[candidate_membership == 0], minlength=histogram_width
+        ).tolist()
         with open(
             os.path.join(self.results_dir, "summary.json"), "w", encoding="utf-8"
         ) as file:
@@ -602,6 +668,12 @@ class MembershipAuditor:
                             "full_whitebox",
                         },
                         "raw_internal_client_state": self.audit_view == "full_whitebox",
+                        "candidate_label_histograms_matched": self.match_candidate_labels,
+                    },
+                    "candidate_sampling": {
+                        "label_histograms_matched": self.match_candidate_labels,
+                        "member_label_histogram": member_histogram,
+                        "nonmember_label_histogram": nonmember_histogram,
                     },
                     "attacks": summaries,
                     "errors": self.errors,

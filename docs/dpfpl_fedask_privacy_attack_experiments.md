@@ -1,5 +1,9 @@
 # DP-FPL 与 FedASK/FedSAK 隐私攻击实验记录
 
+> 注意：本页的早期结果使用顺序抽取的非成员候选，没有严格匹配成员与非成员
+> 的类别直方图。Flowers102 的最终公平比较应以
+> `docs/flowers_fair_method_comparison.md` 中的五 seed 标签匹配实验为准。
+
 日期：2026-07-16
 
 ## 目标

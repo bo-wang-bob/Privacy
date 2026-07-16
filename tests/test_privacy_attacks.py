@@ -13,6 +13,7 @@ from aggregator.aggregator_builder import build_aggregator
 from aggregator.fedavg_aggregator import aggregate_fedavg_model_states
 from main import default_config, validate_config
 from privacy_attacks.code_poison import generate_membership_encoding_samples
+from privacy_attacks.auditor import MembershipAuditor
 from privacy_attacks.fedmia import run_fedmia, run_fedmia_joint
 from privacy_attacks.metrics import fit_shrinkage_attack, membership_metrics
 from privacy_attacks.model_utils import scaled_confidence
@@ -448,6 +449,40 @@ def test_local_ggeur_mean_noise_is_local_deterministic_and_preserves_covariance(
         assert torch.allclose(first[class_id][0], second[class_id][0])
         assert not torch.allclose(first[class_id][0], clean[class_id][0])
         assert torch.allclose(first[class_id][1], clean[class_id][1])
+
+
+def test_membership_candidates_can_be_exactly_label_matched():
+    auditor = MembershipAuditor.__new__(MembershipAuditor)
+    auditor.model = SimpleNamespace(classnames=["zero", "one", "two"])
+    auditor.seed = 23
+    auditor.collate_fn = None
+    member_labels = torch.tensor([0, 0, 1, 2, 2, 2])
+    first = TensorDataset(
+        torch.arange(5, dtype=torch.float32).view(5, 1),
+        torch.tensor([2, 1, 2, 0, 1]),
+    )
+    second = TensorDataset(
+        torch.arange(5, 10, dtype=torch.float32).view(5, 1),
+        torch.tensor([0, 2, 0, 2, 1]),
+    )
+    _images, labels = auditor._collect_label_matched(
+        [first, second], member_labels
+    )
+    assert torch.equal(
+        torch.bincount(labels, minlength=3),
+        torch.bincount(member_labels, minlength=3),
+    )
+
+
+def test_membership_candidate_loading_does_not_advance_global_torch_rng():
+    auditor = MembershipAuditor.__new__(MembershipAuditor)
+    auditor.seed = 23
+    auditor.collate_fn = None
+    dataset = TensorDataset(torch.arange(8).view(8, 1), torch.arange(8) % 2)
+    torch.manual_seed(101)
+    before = torch.get_rng_state().clone()
+    auditor._collect_many([dataset], 6)
+    assert torch.equal(torch.get_rng_state(), before)
 
 
 def test_defense_only_mode_skips_attack_audit():

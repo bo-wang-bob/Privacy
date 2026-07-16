@@ -480,6 +480,7 @@ def default_config() -> dict:
             "max_samples_per_group": 32,
             "audit_interval": 2,
             "calibration_fraction": 0.5,
+            "match_candidate_labels": False,
             "active_max_samples": 16,
             "active_ascent_steps": 1,
             "active_ascent_lr": 0.01,

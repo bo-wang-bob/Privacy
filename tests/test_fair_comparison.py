@@ -37,6 +37,7 @@ def _config():
             "max_samples_per_group": 32,
             "audit_interval": 2,
             "calibration_fraction": 0.5,
+            "match_candidate_labels": True,
             "auxiliary_fraction": 0.5,
             "fedmia_loss_aggregation": "mean",
             "fedmia_cosine_aggregation": "mean",

@@ -36,6 +36,7 @@ FAIR_CONFIG_PATHS = (
     "audit.max_samples_per_group",
     "audit.audit_interval",
     "audit.calibration_fraction",
+    "audit.match_candidate_labels",
     "audit.auxiliary_fraction",
     "audit.fedmia_loss_aggregation",
     "audit.fedmia_cosine_aggregation",
@@ -48,6 +49,7 @@ FAIR_CONFIG_PATHS = (
 )
 
 FAIR_CONFIG_DEFAULTS = {
+    "audit.match_candidate_labels": False,
     "audit.fedmia_loss_aggregation": "mean",
     "audit.fedmia_cosine_aggregation": "mean",
     "audit.fedmia_joint_components": [
