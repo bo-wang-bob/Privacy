@@ -24,7 +24,15 @@ from privacy_attacks.code_poison import (
 )
 
 
-SUPPORTED_DEFENSES = {"none", "cofedmid", "prompt_dp", "mist", "soft", "hamp"}
+SUPPORTED_DEFENSES = {
+    "none",
+    "cofedmid",
+    "prompt_dp",
+    "mist",
+    "soft",
+    "hamp",
+    "local_ggeur",
+}
 
 
 def _trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
@@ -101,25 +109,81 @@ def _mean_loader_loss(model: torch.nn.Module, loader, device: torch.device) -> f
     return total / max(samples, 1)
 
 
-def _hamp_output_hook(_module, _inputs, output):
+def _normalize_features(features: torch.Tensor) -> torch.Tensor:
+    return features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+def _feature_logits(
+    model: torch.nn.Module,
+    image_features: torch.Tensor,
+    text_features: torch.Tensor,
+) -> torch.Tensor:
+    scale = 1.0
+    clip_model = getattr(model, "clip_model", None)
+    if clip_model is not None and hasattr(clip_model, "logit_scale"):
+        scale = clip_model.logit_scale.exp()
+    return scale * _normalize_features(image_features) @ _normalize_features(
+        text_features
+    ).t()
+
+
+def _cap_top_logit_margin(logits: torch.Tensor, margin: float) -> torch.Tensor:
+    if margin < 0 or logits.ndim < 2 or logits.shape[-1] < 2:
+        return logits
+    values, indices = logits.topk(2, dim=-1)
+    capped_top = torch.minimum(values[..., :1], values[..., 1:2] + margin)
+    return logits.scatter(-1, indices[..., :1], capped_top)
+
+
+def _output_temperature_hook(_module, _inputs, output):
     if _module.training:
         return output
-    temperature = float(getattr(_module, "_hamp_output_temperature", 1.0))
+    temperature = float(
+        getattr(
+            _module,
+            "_privacy_output_temperature",
+            getattr(_module, "_hamp_output_temperature", 1.0),
+        )
+    )
+    margin = getattr(_module, "_privacy_output_margin", None)
+    margin = None if margin is None else float(margin)
     if isinstance(output, tuple):
-        return (output[0] / temperature, *output[1:])
-    return output / temperature
+        logits = output[0] / temperature
+        if margin is not None:
+            logits = _cap_top_logit_margin(logits, margin)
+        return (logits, *output[1:])
+    logits = output / temperature
+    if margin is not None:
+        logits = _cap_top_logit_margin(logits, margin)
+    return logits
+
+
+def attach_output_temperature_transform(
+    model: torch.nn.Module,
+    temperature: float,
+    margin: float | None = None,
+) -> None:
+    """Attach a differentiable, label-preserving low-confidence output map."""
+    if temperature < 1.0:
+        raise ValueError("output_temperature must be at least one.")
+    if margin is not None and margin < 0.0:
+        raise ValueError("output margin must be non-negative.")
+    model._privacy_output_temperature = float(temperature)  # type: ignore[attr-defined]
+    model._privacy_output_margin = None if margin is None else float(margin)  # type: ignore[attr-defined]
+    if bool(getattr(model, "_supports_native_hamp_output", False)):
+        model._hamp_output_temperature = float(temperature)  # type: ignore[attr-defined]
+        return
+    if not bool(getattr(model, "_privacy_output_hook_attached", False)):
+        model.register_forward_hook(_output_temperature_hook)
+        model._privacy_output_hook_attached = True  # type: ignore[attr-defined]
 
 
 def attach_hamp_output_transform(model: torch.nn.Module, temperature: float) -> None:
-    """Attach a differentiable, label-preserving low-confidence output map."""
+    """Attach HAMP's differentiable, label-preserving low-confidence output map."""
     if temperature < 1.0:
         raise ValueError("HAMP output_temperature must be at least one.")
     model._hamp_output_temperature = float(temperature)  # type: ignore[attr-defined]
-    if bool(getattr(model, "_supports_native_hamp_output", False)):
-        return
-    if not bool(getattr(model, "_hamp_output_hook_attached", False)):
-        model.register_forward_hook(_hamp_output_hook)
-        model._hamp_output_hook_attached = True  # type: ignore[attr-defined]
+    attach_output_temperature_transform(model, temperature)
 
 
 class DefenseController:
@@ -267,6 +331,8 @@ class DefenseController:
             self._soft_training(user, model, optimizer, round_index, code_poison)
         elif self.name == "cofedmid":
             self._cofedmid_training(user, model, optimizer, round_index, code_poison)
+        elif self.name == "local_ggeur":
+            self._local_ggeur_training(user, model, optimizer, round_index)
         else:
             self._standard_training(
                 user, model, optimizer, round_index, code_poison=code_poison
@@ -457,6 +523,261 @@ class DefenseController:
                 self.steps[user.id] += 1
                 self._record(
                     "soft_selected_fraction", float(influential.float().mean())
+                )
+
+    def _local_feature_bank(self, user, model) -> tuple[torch.Tensor, torch.Tensor]:
+        was_training = model.training
+        model.eval()
+        feature_parts = []
+        label_parts = []
+        with torch.no_grad():
+            for images, labels in user.trainloader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                output = model(images, return_intermediate=True)
+                if not isinstance(output, tuple) or len(output) < 3:
+                    raise ValueError(
+                        "local_ggeur requires a model that returns image and text "
+                        "features when return_intermediate=True."
+                    )
+                _logits, image_features, _text_features = output
+                feature_parts.append(_normalize_features(image_features.detach()))
+                label_parts.append(labels.detach())
+        model.train(was_training)
+        if not feature_parts:
+            raise ValueError("local_ggeur requires at least one local training batch.")
+        return torch.cat(feature_parts, dim=0), torch.cat(label_parts, dim=0)
+
+    def _local_geometry(
+        self, features: torch.Tensor, labels: torch.Tensor
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        geometry = {}
+        for class_id in labels.unique(sorted=True).tolist():
+            mask = labels == int(class_id)
+            class_features = features[mask]
+            mean = class_features.mean(dim=0)
+            centered = class_features - mean
+            geometry[int(class_id)] = (mean, centered)
+        return geometry
+
+    def _local_ggeur_private_originals(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        geometry: dict[int, tuple[torch.Tensor, torch.Tensor]],
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        mode = str(
+            self.config.get("local_ggeur_original_mode", "class_mean_noise")
+        ).lower()
+        if mode == "drop":
+            return features.new_empty((0, features.shape[1]))
+        noise_std = max(0.0, float(self.config.get("local_ggeur_original_noise", 0.03)))
+        mix = max(0.0, min(1.0, float(self.config.get("local_ggeur_mean_mix", 0.8))))
+        private = []
+        for index, label in enumerate(labels.tolist()):
+            mean, _centered = geometry[int(label)]
+            if mode in {"class_mean", "class_mean_noise"}:
+                base = mean
+            elif mode in {"mean_mix", "blur"}:
+                base = (1.0 - mix) * features[index] + mix * mean
+            elif mode == "noise":
+                base = features[index]
+            else:
+                raise ValueError(
+                    "local_ggeur_original_mode must be one of: "
+                    "drop, class_mean, class_mean_noise, mean_mix, blur, noise."
+                )
+            if noise_std > 0 and mode != "class_mean":
+                base = base + torch.randn(
+                    base.shape,
+                    generator=generator,
+                    device=base.device,
+                    dtype=base.dtype,
+                ) * noise_std
+            private.append(base)
+        return _normalize_features(torch.stack(private)) if private else features[:0]
+
+    def _local_ggeur_augmented_features(
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        geometry: dict[int, tuple[torch.Tensor, torch.Tensor]],
+        generator: torch.Generator,
+        copies_override: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if copies_override is None:
+            copies = max(0, int(self.config.get("local_ggeur_augments", 2)))
+        else:
+            copies = max(0, int(copies_override))
+        if copies == 0:
+            return features[:0], labels[:0]
+        scale = max(0.0, float(self.config.get("local_ggeur_geometry_scale", 0.45)))
+        fallback_std = max(
+            0.0, float(self.config.get("local_ggeur_fallback_std", 0.02))
+        )
+        anchor_mode = str(
+            self.config.get("local_ggeur_anchor_mode", "class_mean")
+        ).lower()
+        augmented = []
+        augmented_labels = []
+        for index, label in enumerate(labels.tolist()):
+            mean, centered = geometry[int(label)]
+            if anchor_mode == "sample":
+                anchor = features[index]
+            elif anchor_mode == "class_mean":
+                anchor = mean
+            else:
+                raise ValueError(
+                    "local_ggeur_anchor_mode must be either 'sample' or 'class_mean'."
+                )
+            if centered.shape[0] >= 2 and float(centered.norm()) > 0:
+                eps = torch.randn(
+                    (copies, centered.shape[0]),
+                    generator=generator,
+                    device=features.device,
+                    dtype=features.dtype,
+                )
+                perturbation = eps @ centered / math.sqrt(centered.shape[0] - 1)
+                perturbation = perturbation * scale
+            elif fallback_std > 0:
+                perturbation = torch.randn(
+                    (copies, features.shape[1]),
+                    generator=generator,
+                    device=features.device,
+                    dtype=features.dtype,
+                ) * fallback_std
+            else:
+                perturbation = torch.zeros(
+                    (copies, features.shape[1]),
+                    device=features.device,
+                    dtype=features.dtype,
+                )
+            augmented.append(anchor.unsqueeze(0) + perturbation)
+            augmented_labels.append(
+                torch.full((copies,), int(label), device=labels.device, dtype=labels.dtype)
+            )
+        if not augmented:
+            return features[:0], labels[:0]
+        return _normalize_features(torch.cat(augmented, dim=0)), torch.cat(
+            augmented_labels, dim=0
+        )
+
+    def _local_ggeur_class_balanced_features(
+        self,
+        geometry: dict[int, tuple[torch.Tensor, torch.Tensor]],
+        batch_size: int,
+        generator: torch.Generator,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draw class-level representatives uniformly over local classes."""
+        class_ids = torch.tensor(
+            sorted(geometry),
+            device=self.device,
+            dtype=torch.long,
+        )
+        if class_ids.numel() == 0:
+            raise ValueError("local_ggeur requires at least one local class.")
+        indices = torch.randint(
+            class_ids.numel(),
+            (max(1, int(batch_size)),),
+            generator=generator,
+            device=self.device,
+        )
+        labels = class_ids[indices]
+        features = torch.stack([geometry[int(label.item())][0] for label in labels])
+        return _normalize_features(features), labels
+
+    def _local_ggeur_training(
+        self, user, model, optimizer, round_index: int
+    ) -> None:
+        """Train on local distribution samples instead of raw member images.
+
+        The geometry factor is a low-rank covariance factor: drawing
+        eps @ centered / sqrt(n-1) is equivalent to sampling from the local
+        empirical covariance without sharing per-class means or covariances.
+        """
+        bank_features, bank_labels = self._local_feature_bank(user, model)
+        geometry = self._local_geometry(bank_features, bank_labels)
+        base_entropy_weight = max(
+            0.0, float(self.config.get("local_ggeur_entropy_weight", 0.0))
+        )
+        entropy_rounds = self.config.get("local_ggeur_entropy_rounds")
+        if entropy_rounds is None:
+            entropy_weight = base_entropy_weight
+        else:
+            entropy_weight = (
+                base_entropy_weight if round_index < max(0, int(entropy_rounds)) else 0.0
+            )
+        late_start = self.config.get("local_ggeur_late_start_round")
+        late_augments = self.config.get("local_ggeur_late_augments")
+        if late_start is not None and late_augments is not None:
+            copies_override = (
+                int(late_augments)
+                if round_index >= max(0, int(late_start))
+                else None
+            )
+        else:
+            copies_override = None
+        class_balanced = bool(self.config.get("local_ggeur_class_balanced", False))
+        for epoch in range(user.local_epochs):
+            generator = self._generator(user.id, round_index, 901 + epoch)
+            for images, labels in user.trainloader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                optimizer.zero_grad(set_to_none=True)
+                output = model(images, return_intermediate=True)
+                if not isinstance(output, tuple) or len(output) < 3:
+                    raise ValueError(
+                        "local_ggeur requires return_intermediate=True features."
+                    )
+                _logits, image_features, text_features = output
+                image_features = _normalize_features(image_features.detach())
+                if class_balanced:
+                    image_features, labels = self._local_ggeur_class_balanced_features(
+                        geometry, labels.numel(), generator
+                    )
+                private_originals = self._local_ggeur_private_originals(
+                    image_features, labels, geometry, generator
+                )
+                private_labels = labels[: private_originals.shape[0]]
+                augmented, augmented_labels = self._local_ggeur_augmented_features(
+                    image_features,
+                    labels,
+                    geometry,
+                    generator,
+                    copies_override=copies_override,
+                )
+                defended_features = torch.cat((private_originals, augmented), dim=0)
+                defended_labels = torch.cat((private_labels, augmented_labels), dim=0)
+                if defended_features.numel() == 0:
+                    raise ValueError(
+                        "local_ggeur produced no training features; increase "
+                        "local_ggeur_augments or change original_mode."
+                    )
+                logits = _feature_logits(model, defended_features, text_features)
+                loss = F.cross_entropy(logits, defended_labels)
+                if entropy_weight > 0:
+                    probabilities = torch.softmax(logits, dim=1)
+                    entropy = -(
+                        probabilities * probabilities.clamp_min(1e-12).log()
+                    ).sum(dim=1)
+                    loss = loss - entropy_weight * entropy.mean()
+                    self._record("local_ggeur_entropy", float(entropy.detach().mean()))
+                    self._record("local_ggeur_entropy_weight", float(entropy_weight))
+                loss.backward()
+                optimizer.step()
+                self.steps[user.id] += 1
+                self._record(
+                    "local_ggeur_augmented_per_private_original",
+                    float(augmented.shape[0] / max(1, private_originals.shape[0])),
+                )
+                self._record(
+                    "local_ggeur_private_feature_count",
+                    float(defended_features.shape[0]),
+                )
+                self._record(
+                    "local_ggeur_class_balanced",
+                    1.0 if class_balanced else 0.0,
                 )
 
     def _cofedmid_classes(self, client_id: int, round_index: int) -> set[int]:
@@ -663,6 +984,57 @@ class DefenseController:
                 self._mist_refinement(users, updated_states, selected_ids, round_index)
         elif self.name == "cofedmid":
             self._cofedmid_perturb(updated_states, selected_ids, round_index)
+        elif self.name == "local_ggeur":
+            self._local_ggeur_upload_smoothing(
+                base_state, updated_states, selected_ids, round_index
+            )
+
+    def _local_ggeur_upload_smoothing(
+        self,
+        base_state: dict[str, torch.Tensor],
+        updated_states: dict[int, dict[str, torch.Tensor]],
+        selected_ids: list[int],
+        round_index: int,
+    ) -> None:
+        clip_norm = self.config.get("local_ggeur_upload_clip_norm")
+        clip_norm = None if clip_norm is None else float(clip_norm)
+        noise_std = float(self.config.get("local_ggeur_upload_noise_std", 0.0))
+        if (clip_norm is None or clip_norm <= 0) and noise_std <= 0:
+            return
+        for position, user_id in enumerate(selected_ids):
+            state = updated_states[user_id]
+            deltas = []
+            names = []
+            for name, tensor in state.items():
+                if name not in base_state:
+                    continue
+                delta = tensor.detach() - base_state[name].to(tensor.device)
+                deltas.append(delta.reshape(-1))
+                names.append(name)
+            if not deltas:
+                continue
+            flat = torch.cat(deltas)
+            norm = flat.norm().clamp_min(1e-12)
+            if clip_norm is not None and clip_norm > 0:
+                flat = flat * min(1.0, clip_norm / float(norm))
+                self._record("local_ggeur_upload_clip_fraction", float(norm > clip_norm))
+            if noise_std > 0:
+                generator = self._generator(user_id, round_index, 1301 + position)
+                scale = noise_std if clip_norm is None or clip_norm <= 0 else noise_std * clip_norm
+                flat = flat + torch.randn(
+                    flat.shape,
+                    generator=generator,
+                    device=flat.device,
+                    dtype=flat.dtype,
+                ) * scale
+            offset = 0
+            for name in names:
+                tensor = state[name]
+                count = tensor.numel()
+                delta = flat[offset : offset + count].view_as(tensor)
+                updated_states[user_id][name] = base_state[name].to(tensor.device) + delta
+                offset += count
+            self._record("local_ggeur_upload_delta_norm", float(flat.norm().detach()))
 
     def _private_mist_refinement(
         self,

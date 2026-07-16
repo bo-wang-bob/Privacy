@@ -94,3 +94,20 @@ defense:
   hamp_true_probability: 0.6
   hamp_entropy_weight: 0.05
   hamp_output_temperature: 4.0
+  local_ggeur_augments: 3
+  local_ggeur_geometry_scale: 0.6
+  local_ggeur_anchor_mode: class_mean
+  local_ggeur_original_mode: class_mean_noise
+  local_ggeur_original_noise: 0.08
+  local_ggeur_mean_mix: 0.8
+  local_ggeur_fallback_std: 0.02
+  local_ggeur_entropy_weight: 0.0
+  local_ggeur_entropy_rounds: null
+  local_ggeur_late_start_round: null
+  local_ggeur_late_augments: null
+  local_ggeur_output_temperature: 4.0
+  local_ggeur_output_margin: null
+  local_ggeur_calibrate_observations: false
+  local_ggeur_class_balanced: false
+  local_ggeur_upload_clip_norm: 0.5
+  local_ggeur_upload_noise_std: 0.07

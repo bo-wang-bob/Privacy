@@ -27,7 +27,10 @@ from privacy_attacks.query_attacks import run_canary, run_yoqo
 from privacy_attacks.rmia import run_rmia
 from privacy_attacks.transfer import run_transfer_representation_attack
 from privacy_attacks.whitebox import run_active_whitebox, run_passive_whitebox
-from privacy_defenses import attach_hamp_output_transform
+from privacy_defenses import (
+    attach_hamp_output_transform,
+    attach_output_temperature_transform,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +121,15 @@ class MembershipAuditor:
             attach_hamp_output_transform(
                 self.model,
                 float(self.defense_config.get("hamp_output_temperature", 4.0)),
+            )
+        elif self.defense_name == "local_ggeur" and bool(
+            self.defense_config.get("local_ggeur_calibrate_observations", False)
+        ):
+            margin = self.defense_config.get("local_ggeur_output_margin")
+            attach_output_temperature_transform(
+                self.model,
+                float(self.defense_config.get("local_ggeur_output_temperature", 4.0)),
+                margin=None if margin is None else float(margin),
             )
         self.users = users
         self.target_client_id = target_client_id
@@ -551,10 +563,23 @@ class MembershipAuditor:
                 final_model,
                 float(self.defense_config.get("hamp_output_temperature", 4.0)),
             )
+        elif self.defense_name == "local_ggeur":
+            margin = self.defense_config.get("local_ggeur_output_margin")
+            attach_output_temperature_transform(
+                final_model,
+                float(self.defense_config.get("local_ggeur_output_temperature", 4.0)),
+                margin=None if margin is None else float(margin),
+            )
         for attack in self.attacks:
             try:
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
                 self.results.append(self._run(attack, final_model, final_state))
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
             except Exception as error:
+                if self.device.type == "cuda":
+                    torch.cuda.empty_cache()
                 logger.exception("Membership attack %s failed", attack)
                 self.errors[attack] = f"{type(error).__name__}: {error}"
         summaries = [result.to_summary() for result in self.results]

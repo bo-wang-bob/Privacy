@@ -17,7 +17,11 @@ from privacy_attacks.fedmia import run_fedmia, run_fedmia_joint
 from privacy_attacks.metrics import fit_shrinkage_attack, membership_metrics
 from privacy_attacks.model_utils import scaled_confidence
 from privacy_attacks.promptmia import generate_key_with_similarity
-from privacy_defenses import DefenseController, attach_hamp_output_transform
+from privacy_defenses import (
+    DefenseController,
+    attach_hamp_output_transform,
+    attach_output_temperature_transform,
+)
 from servers.serverbase import ServerBase
 from utils.privacy_accounting import (
     calibrate_gaussian_noise,
@@ -295,6 +299,26 @@ def test_defense_primitives_preserve_required_invariants():
         < torch.softmax(original_logits, dim=1).amax(dim=1).mean()
     )
 
+    local_model = ToyPromptModel()
+    attach_output_temperature_transform(local_model, temperature=3.0)
+    local_model.eval()
+    local_logits = local_model(images)
+    assert torch.equal(original_logits.argmax(dim=1), local_logits.argmax(dim=1))
+    assert (
+        torch.softmax(local_logits, dim=1).amax(dim=1).mean()
+        < torch.softmax(original_logits, dim=1).amax(dim=1).mean()
+    )
+
+    capped_model = ToyPromptModel()
+    attach_output_temperature_transform(capped_model, temperature=1.0, margin=0.01)
+    capped_model.eval()
+    capped_logits = capped_model(images)
+    assert torch.equal(original_logits.argmax(dim=1), capped_logits.argmax(dim=1))
+    assert (
+        torch.softmax(capped_logits, dim=1).amax(dim=1).mean()
+        < torch.softmax(original_logits, dim=1).amax(dim=1).mean()
+    )
+
     controller = DefenseController(
         {
             "name": "cofedmid",
@@ -368,13 +392,21 @@ def _defended_server(
             "hamp_true_probability": 0.6,
             "hamp_entropy_weight": 0.05,
             "hamp_output_temperature": 3.0,
+            "local_ggeur_augments": 1,
+            "local_ggeur_geometry_scale": 0.2,
+            "local_ggeur_anchor_mode": "class_mean",
+            "local_ggeur_original_mode": "class_mean_noise",
+            "local_ggeur_original_noise": 0.01,
+            "local_ggeur_mean_mix": 0.8,
+            "local_ggeur_fallback_std": 0.01,
+            "local_ggeur_output_temperature": 3.0,
         },
     )
 
 
 def test_each_defense_runs_independently_with_one_attack():
     root = Path(".test_artifacts") / "defenses"
-    for defense in ("cofedmid", "prompt_dp", "mist", "soft", "hamp"):
+    for defense in ("cofedmid", "prompt_dp", "mist", "soft", "hamp", "local_ggeur"):
         path = root / defense
         path.mkdir(parents=True, exist_ok=True)
         summaries = _defended_server(path, defense).train()
@@ -383,6 +415,8 @@ def test_each_defense_runs_independently_with_one_attack():
             (path / "defense_summary.json").read_text(encoding="utf-8")
         )
         assert summary["defense"] == defense
+        if defense == "local_ggeur":
+            assert summary["metrics"]["local_ggeur_private_feature_count"] > 0
         assert (path / "privacy_audit" / "summary.json").exists()
 
 

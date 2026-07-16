@@ -9,10 +9,12 @@ The primary metric is `TPR@1%FPR`; AUC is treated as diagnostic only.  With 16
 to 32 nonmember evaluation samples, 1% FPR means a zero-false-positive threshold,
 so a single high-scoring nonmember can move `TPR@1%FPR` to zero.
 
-All runs used the GPU-enabled `pfedba` environment.  PyTorch reported CUDA
-available with two NVIDIA GeForce RTX 4090 devices.  The experiment config was
-`configs/fedavg_privacy_effect.yaml`: CIFAR100, 4 clients, 10 FedAvg rounds,
-5 local epochs, 4-shot FPL subset, seed 42, and `gpu: 1`.
+All full Local-GGEUR runs used the GPU-enabled `pfedba` environment.  PyTorch
+reported CUDA available with two NVIDIA GeForce RTX 4090 devices.  The main
+effect config is `configs/fedavg_privacy_effect.yaml`: CIFAR100, 20 clients,
+Dirichlet `alpha=0.1`, 10 FedAvg rounds, 5 local epochs, `fpl_shots=16`, seed
+42, and `gpu: 1`.  Earlier quick defense-screening tables used the smaller
+4-client/4-shot configuration noted by their result directories.
 
 ## Attack adaptation status
 
@@ -173,3 +175,182 @@ Result directories:
 - `results/cifar100_fedavg_fedmia_joint_none_20260715_192400`
 - `results/cifar100_fedavg_fedmia_joint_none_20260715_192946`
 - `results/cifar100_fedavg_fedmia_joint_none_20260715_193315`
+
+## Local-GGEUR defense sweep
+
+Local-GGEUR implements the new distribution-level defense: each client keeps
+class-wise CLIP feature geometry local, trains on class-mean anchored geometric
+features, and replaces original member features with noisy class-mean features.
+
+The strongest no-defense reference remains CIFAR100, 20 clients, Dirichlet
+`alpha=0.1`, `fpl_shots=16`, target client 0.  Under the same setting, the
+current recommended cross-attack Local-GGEUR configuration is:
+
+- `local_ggeur_augments=3`
+- `local_ggeur_geometry_scale=0.60`
+- `local_ggeur_anchor_mode=class_mean`
+- `local_ggeur_original_mode=class_mean_noise`
+- `local_ggeur_original_noise=0.08`
+- `local_ggeur_entropy_weight=0.00`
+- `local_ggeur_output_temperature=4.0`
+- `local_ggeur_upload_clip_norm=0.50`
+- `local_ggeur_upload_noise_std=0.07`
+
+| Attack | No defense TPR@1%FPR | Local-GGEUR+Smooth TPR@1%FPR | AUC | Notes |
+|---|---:|---:|---:|---|
+| FedMIA loss | 0.50943 | 0.13208 | 0.67364 | Confidence evidence reduced |
+| FedMIA cosine | 0.60377 | 0.26415 | 0.74263 | Update-alignment evidence reduced |
+| FedMIA joint | 0.69811 | 0.16981 | 0.69723 | Dominant no-defense attack reduced by 75.7% |
+| Canary | 0.37500 | 0.00000 | 0.41016 | Zero at the low-FPR operating point |
+| Nasr passive | 0.18519 | 0.18519 | 0.67130 | No low-FPR rebound |
+| RMIA | 0.03774 | 0.00000 | 0.41038 | Zero at the low-FPR operating point |
+| YOQO | 0.00000 | 0.00000 | 0.50000 | Matches no-defense low-FPR floor |
+| Quantile-MIA | n/a | 0.00000 | 0.46521 | Zero at the low-FPR operating point |
+
+Upload smoothing trades some utility for much stronger protocol-side and query
+privacy: final accuracy is `0.6448` versus `0.6708` without defense.  The
+FedMIA-first `noise_std=0.05` setting reaches `0.6430` accuracy and lowers
+FedMIA joint further to `0.13208`, but the broad `noise_std=0.07` setting is
+preferred for the main paper table because it drives Canary, RMIA, YOQO, and
+Quantile-MIA to the low-FPR floor.  The pure balanced data-replacement baseline, without
+upload smoothing, reaches `0.6576` accuracy and gives
+FedMIA-joint/Canary/RMIA/YOQO/Quantile of
+`0.33962/0.21875/0.11321/0.00000/0.05660`.
+
+Seed robustness for the default `noise_std=0.07` setting:
+
+| Seed | FedMIA loss | FedMIA cosine | FedMIA joint | Nasr | RMIA | Quantile | Accuracy |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 42 | 0.13208 | 0.26415 | 0.16981 | 0.18519 | 0.00000 | 0.00000 | 0.6448 |
+| 43 | 0.01562 | 0.01562 | 0.09375 | 0.00000 | 0.00000 | 0.06250 | 0.6370 |
+
+For a narrower FedMIA/Canary setting, entropy regularization gives stronger
+suppression:
+
+| Attack | No defense TPR@1%FPR | Entropy Local-GGEUR TPR@1%FPR | Entropy AUC |
+|---|---:|---:|---:|
+| FedMIA loss | 0.50943 | 0.05660 | 0.77299 |
+| FedMIA cosine | 0.60377 | 0.22642 | 0.74204 |
+| FedMIA joint | 0.69811 | 0.26415 | 0.77978 |
+| Canary | 0.37500 | 0.15625 | 0.64648 |
+| Nasr passive | 0.18519 | 0.22222 | 0.62616 |
+| RMIA | 0.03774 | 0.30189 | 0.66156 |
+| YOQO | 0.00000 | 0.25000 | 0.62500 |
+| Quantile-MIA | n/a | 0.05660 | 0.53125 |
+
+This entropy setting keeps final accuracy at `0.6646`, but it is not the
+default because RMIA and YOQO rebound.
+
+Ablations:
+
+| Variant | FedMIA loss | FedMIA cosine | FedMIA joint | Accuracy |
+|---|---:|---:|---:|---:|
+| No defense | 0.50943 | 0.60377 | 0.69811 | 0.6708 |
+| Local-GGEUR, no entropy | 0.22642 | 0.30189 | 0.41509 | 0.6692 |
+| Local-GGEUR, entropy `0.05` | 0.05660 | 0.22642 | 0.26415 | 0.6646 |
+| Local-GGEUR, entropy `0.10` | 0.49057 | 0.24528 | 0.41509 | 0.6586 |
+| Local-GGEUR, entropy `0.02` | 0.26415 | 0.00000 | 0.49057 | 0.6558 |
+| Local-GGEUR, balanced no entropy | 0.37736 | 0.22642 | 0.33962 | 0.6576 |
+| + upload smoothing, noise `0.02` | 0.35849 | 0.20755 | 0.26415 | 0.6480 |
+| + upload smoothing, noise `0.04` | 0.37736 | 0.13208 | 0.37736 | 0.6456 |
+| + upload smoothing, noise `0.05` | 0.13208 | 0.16981 | 0.13208 | 0.6430 |
+| + upload smoothing, noise `0.055` | 0.05660 | 0.43396 | 0.24528 | 0.6374 |
+| + upload smoothing, noise `0.06` | 0.22642 | 0.28302 | 0.22642 | 0.6410 |
+| + upload smoothing, noise `0.07` | 0.13208 | 0.26415 | 0.16981 | 0.6448 |
+| + softer clipping, clip `0.4`/noise `0.05` | 0.28302 | 0.09434 | 0.24528 | 0.6540 |
+| + stronger clipping, clip `0.3`/noise `0.05` | 0.24528 | 0.24528 | 0.33962 | 0.6468 |
+| + calibrate round observations | 0.26415 | 0.33962 | 0.11321 | 0.6430 |
+| Local-GGEUR, `aug=1` | 0.33962 | 0.30189 | 0.37736 | 0.6594 |
+| Early entropy, first 3 rounds | 0.24528 | 0.43396 | 0.39623 | 0.6494 |
+| Late aug anneal, rounds 7--9 use aug=0 | 0.20755 | 0.13208 | 0.35849 | 0.5740 |
+| Posterior margin cap | 0.37736 | 0.22642 | 0.33962 | 0.6576 |
+| Class-balanced local sampling | 0.30189 | 0.22642 | 0.47170 | 0.6452 |
+| Class-mean original replacement | 0.39623 | 0.18868 | 0.37736 | 0.6660 |
+| No private replacement branch | 0.41509 | 0.33962 | 0.52830 | 0.6684 |
+| No geometric generation | 0.32075 | 0.30189 | 0.35849 | 0.6252 |
+| No geometric generation + upload smoothing | 0.24528 | 0.09434 | 0.15094 | 0.5674 |
+
+Additional reference/query attack ablations:
+
+| Variant | RMIA | YOQO | Quantile-MIA | Accuracy |
+|---|---:|---:|---:|---:|
+| Local-GGEUR, entropy `0.05` | 0.30189 | 0.25000 | 0.05660 | 0.6646 |
+| Local-GGEUR, balanced no entropy | 0.11321 | 0.00000 | 0.05660 | 0.6576 |
+| + upload smoothing, noise `0.02` | 0.01887 | n/a | 0.07547 | 0.6480 |
+| + upload smoothing, noise `0.04` | 0.09434 | n/a | 0.03774 | 0.6456 |
+| + upload smoothing, noise `0.05` | 0.05660 | 0.03125 | 0.11321 | 0.6430 |
+| + upload smoothing, noise `0.055` | 0.01887 | n/a | 0.09434 | 0.6374 |
+| + upload smoothing, noise `0.06` | 0.00000 | n/a | 0.07547 | 0.6410 |
+| + upload smoothing, noise `0.07` | 0.00000 | 0.00000 | 0.00000 | 0.6448 |
+| + softer clipping, clip `0.4`/noise `0.05` | 0.11321 | n/a | 0.18868 | 0.6540 |
+| + stronger clipping, clip `0.3`/noise `0.05` | 0.03774 | n/a | 0.07547 | 0.6468 |
+| + calibrate round observations | 0.01887 | n/a | 0.00000 | 0.6430 |
+| Local-GGEUR, `aug=1` | 0.03774 | n/a | 0.20755 | 0.6594 |
+| Early entropy, first 3 rounds | 0.26415 | n/a | 0.20755 | 0.6494 |
+| Late aug anneal, rounds 7--9 use aug=0 | 0.24528 | n/a | 0.26415 | 0.5740 |
+| Posterior margin cap | 0.11321 | n/a | 0.05660 | 0.6576 |
+| Class-balanced local sampling | 0.28302 | n/a | 0.16981 | 0.6452 |
+| Class-mean original replacement | 0.16981 | n/a | 0.11321 | 0.6660 |
+| No geometric generation | 0.00000 | 0.00000 | 0.00000 | 0.6252 |
+| No geometric generation + upload smoothing | 0.22642 | n/a | 0.05660 | 0.5674 |
+
+The upload-noise and clipping sweeps motivate the selected broad default.
+Raising `noise_std` to `0.055` suppresses FedMIA loss and RMIA, but FedMIA
+cosine rebounds to `0.43396`.  Raising it to `0.06` drives RMIA to zero and
+lowers Canary/Nasr/Quantile, but FedMIA joint remains higher than the
+FedMIA-first `0.05` setting at `0.22642`.  Raising it to `0.07` gives the best
+broad setting: Canary, RMIA, YOQO, and Quantile-MIA all reach zero at 1% FPR
+while FedMIA joint remains far below no defense.  Changing only
+`local_ggeur_output_temperature` from 4 to 8 leaves the ranking-based low-FPR
+metrics unchanged.  Applying output calibration to round-level observations
+improves FedMIA joint, RMIA, and Quantile-MIA, but FedMIA loss/cosine and Nasr
+passive rebound, so this is retained as a tradeoff
+ablation rather than the default.  The `clip_norm=0.4` trial is utility-biased:
+it reaches `0.6540` accuracy and lowers FedMIA cosine to `0.09434`, but FedMIA
+loss/joint rebound to `0.28302/0.24528`, RMIA rises to `0.11321`, and
+Quantile-MIA rises to `0.18868`.  The stronger `clip_norm=0.3` trial recovers
+only 0.38 points of clean accuracy relative to the current default, while FedMIA
+joint rebounds to `0.33962` and Nasr passive rises to `0.22222`.
+
+Result directories:
+
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_002031`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_002451`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_002851`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_003316`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_003723`
+- `results/cifar100_fedavg_canary_local_ggeur_20260716_004158`
+- `results/cifar100_fedavg_nasr_passive_local_ggeur_20260716_005454`
+- `results/cifar100_fedavg_nasr_passive_local_ggeur_20260716_005855`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_010554`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_011006`
+- `results/cifar100_fedavg_canary_local_ggeur_20260716_011504`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_013912`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_015828`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_021519`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_021920`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_022408`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_022830`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_030024`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_030519`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_031049`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_031717`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_032116`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_032606`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_033015`
+- `results/cifar100_fedavg_canary_local_ggeur_20260716_033721`
+- `results/cifar100_fedavg_yoqo_local_ggeur_20260716_034954`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_102624`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_103215`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_103954`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_104702`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_105112`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_105508`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_105922`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_110834`
+- `results/cifar100_fedavg_canary_local_ggeur_20260716_111408`
+- `results/cifar100_fedavg_yoqo_local_ggeur_20260716_112646`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_114725`
+- `results/cifar100_fedavg_canary_local_ggeur_20260716_120714`
+- `results/cifar100_fedavg_yoqo_local_ggeur_20260716_124141`
+- `results/cifar100_fedavg_multi_attack_local_ggeur_20260716_132733`
