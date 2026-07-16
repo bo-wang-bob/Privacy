@@ -1,11 +1,10 @@
 # VEIL AAAI 2027 paper artifact
 
-The primary deliverable is `veil.tex`, written as a single-file anonymous
-submission using the official AAAI 2027 author kit from
-<https://aaai.org/authorkit27/> (retrieved 2026-07-16). The unmodified official
-`aaai2027.sty` and `aaai2027.bst` files are included beside the manuscript.
-Per request, no LaTeX distribution is installed and the paper is not compiled
-inside this repository.
+The primary source is `veil.tex`, written as a single-file anonymous submission
+using the official AAAI 2027 author kit from <https://aaai.org/authorkit27/>
+(retrieved 2026-07-16). The unmodified official `aaai2027.sty` and
+`aaai2027.bst` files are included beside the manuscript, and the validated
+compiled artifact is `veil.pdf`.
 
 ## Evidence contract
 
@@ -27,16 +26,14 @@ inside this repository.
 
 | Paper section | Question | Form | Evidence | Output |
 |---|---|---|---|---|
-| FedAvg defenses | Which defense has the best privacy--utility position per dataset? | Three-panel scatter with x/y uncertainty | `evidence/aggregate.csv` | `figures/fedavg_privacy_utility.pdf` |
-| Private mechanisms | Which attacks remain strongest under DP-FPL and FedASK? | Three-panel grouped bars | `evidence/attack_aggregate.csv` | `figures/private_methods_attack_profile.pdf` |
-| Cross-dataset surface | Does an aggregate hide attack-specific failures? | Annotated heatmap | `evidence/attack_aggregate.csv` | `figures/attack_defense_heatmap.pdf` |
-| Ablation | Which VEIL components drive privacy and utility? | Aligned bars, no dual axis | validated Flowers102 ablation runs | `figures/veil_ablation.pdf` |
+| Private-mechanism comparison | How does VEIL compare with DP-FPL and FedASK under every attack? | Three-panel annotated heatmap with one shared scale | `evidence/attack_aggregate.csv` | `figures/private_methods_attack_profile.pdf` |
 
-All plotting defaults in `analysis_scripts/plot_veil_paper.py` use at least
-28-point source typography, a zero baseline for absolute comparisons, explicit
-colors, and non-color marker/hatch encodings. PDF fonts are exported as TrueType
-outlines (`pdf.fonttype=42`) and are intended to remain above the AAAI 9-point
-minimum after placement.
+The manuscript uses grouped tables for FedAvg results, private-mechanism
+summaries, and component analysis because exact values are clearer than
+additional chart forms.  The one retained diagnostic figure uses at least
+25-point source typography, a zero-anchored shared scale, embedded serif fonts,
+numeric annotations, and a non-color outline for VEIL.  At its full-width paper
+placement, labels remain approximately 9 points or larger.
 
 ## Exact training commands
 
@@ -76,8 +73,9 @@ python -m analysis_scripts.veil_paper_results
 python -m analysis_scripts.veil_ablation_results
 python -m analysis_scripts.plot_veil_paper
 python -m analysis_scripts.check_veil_paper
+cd paper/aaai2027 && latexmk -pdf -interaction=nonstopmode -halt-on-error veil.tex
 ```
 
 The generated CSVs and figures are then checked against the values embedded in
-the single manuscript source. The final paper must contain no placeholder
-dashes or template text.
+the single manuscript source. The final paper contains no placeholder dashes or
+template text and compiles without overfull boxes or unresolved references.

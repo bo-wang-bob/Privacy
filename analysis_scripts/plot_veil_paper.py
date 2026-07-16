@@ -1,10 +1,9 @@
-"""Generate AAAI-style VEIL experiment figures from validated CSV tables."""
+"""Generate the paper's focused AAAI-style attack comparison figure."""
 
 from __future__ import annotations
 
 import csv
 import os
-from collections import defaultdict
 from pathlib import Path
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-veil-paper")
@@ -12,18 +11,21 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-veil-paper")
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import Rectangle
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "paper" / "aaai2027" / "evidence"
 FIGURES = ROOT / "paper" / "aaai2027" / "figures"
+
 DATASETS = ("flowers", "caltech101", "dtd")
 DATASET_LABELS = {
     "flowers": "Flowers102",
     "caltech101": "Caltech101",
     "dtd": "DTD",
 }
-METHODS = ("FedAvg", "Prompt-DP", "HAMP", "VEIL", "DP-FPL", "FedASK")
+METHODS = ("VEIL", "DP-FPL", "FedASK")
 ATTACKS = (
     "fedmia_loss",
     "fedmia_cosine",
@@ -32,256 +34,178 @@ ATTACKS = (
     "rmia",
     "quantile_mia",
 )
-ATTACK_LABELS = ("Loss", "Cosine", "Joint", "Nasr", "RMIA", "Quantile")
-COLORS = {
-    "FedAvg": "#4B5563",
-    "Prompt-DP": "#D97706",
-    "HAMP": "#7C3AED",
-    "VEIL": "#0369A1",
-    "DP-FPL": "#9A3412",
-    "FedASK": "#3F6212",
-}
-MARKERS = {
-    "FedAvg": "o",
-    "Prompt-DP": "s",
-    "HAMP": "^",
-    "VEIL": "D",
-    "DP-FPL": "P",
-    "FedASK": "X",
-}
-
-
-mpl.rcParams.update(
-    {
-        "font.family": "DejaVu Sans",
-        "font.size": 28,
-        "axes.titlesize": 32,
-        "axes.labelsize": 29,
-        "xtick.labelsize": 28,
-        "ytick.labelsize": 28,
-        "legend.fontsize": 28,
-        "figure.titlesize": 34,
-        "pdf.fonttype": 42,
-        "ps.fonttype": 42,
-        "axes.edgecolor": "#374151",
-        "axes.labelcolor": "#111827",
-        "text.color": "#111827",
-        "xtick.color": "#374151",
-        "ytick.color": "#374151",
-        "axes.grid": True,
-        "grid.color": "#D1D5DB",
-        "grid.linewidth": 1.2,
-        "grid.alpha": 0.75,
-    }
+ATTACK_LABELS = (
+    "Loss",
+    "Cos.",
+    "Joint",
+    "Nasr",
+    "RMIA",
+    "Quant.",
 )
-for _font_key in (
-    "font.size",
-    "axes.titlesize",
-    "axes.labelsize",
-    "xtick.labelsize",
-    "ytick.labelsize",
-    "legend.fontsize",
-    "figure.titlesize",
-):
-    if float(mpl.rcParams[_font_key]) < 28:
-        raise RuntimeError(f"Paper figure font {_font_key} is below 28 pt.")
+TEXT_COLOR = "#252525"
+VEIL_COLOR = "#1F5F8B"
+PALETTE = ("#F7FAFC", "#BFD8E8", "#2F6FA3")
 
 
-def read_csv(name: str) -> list[dict[str, str]]:
-    with (DATA / name).open(encoding="utf-8", newline="") as file:
+def setup_style() -> None:
+    """Match the serif typography and restrained palette of the reference plot."""
+
+    from matplotlib import font_manager
+
+    for style in ("Regular", "Bold", "Italic", "BoldItalic"):
+        path = Path(f"/usr/share/fonts/truetype/croscore/Tinos-{style}.ttf")
+        if path.exists():
+            font_manager.fontManager.addfont(str(path))
+    mpl.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.serif": ["Times New Roman", "Tinos", "DejaVu Serif"],
+            "mathtext.fontset": "stix",
+            "font.size": 25,
+            "axes.titlesize": 30,
+            "axes.labelsize": 27,
+            "xtick.labelsize": 25,
+            "ytick.labelsize": 27,
+            "figure.titlesize": 32,
+            "text.color": TEXT_COLOR,
+            "axes.labelcolor": TEXT_COLOR,
+            "axes.titlecolor": TEXT_COLOR,
+            "xtick.color": TEXT_COLOR,
+            "ytick.color": TEXT_COLOR,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+    checked = (
+        "font.size",
+        "axes.titlesize",
+        "axes.labelsize",
+        "xtick.labelsize",
+        "ytick.labelsize",
+        "figure.titlesize",
+    )
+    for key in checked:
+        if float(mpl.rcParams[key]) < 25:
+            raise RuntimeError(f"Paper figure font {key} is below 25 pt.")
+
+
+def read_attack_rows() -> list[dict[str, str]]:
+    path = DATA / "attack_aggregate.csv"
+    with path.open(encoding="utf-8", newline="") as file:
         return list(csv.DictReader(file))
 
 
-def save(fig: plt.Figure, name: str) -> None:
-    FIGURES.mkdir(parents=True, exist_ok=True)
-    fig.savefig(FIGURES / name, bbox_inches="tight", facecolor="white")
-    plt.close(fig)
+def comparison_heatmaps(rows: list[dict[str, str]]) -> None:
+    """Plot VEIL, DP-FPL, and FedASK under every audited attack."""
 
-
-def privacy_utility(rows: list[dict[str, str]]) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6.8), sharey=True)
-    shown = ("FedAvg", "Prompt-DP", "HAMP", "VEIL")
-    global_ymax = 0.0
-    for ax, dataset in zip(axes, DATASETS):
-        x_low = float("inf")
-        x_high = float("-inf")
-        for method in shown:
-            row = next(
-                item
-                for item in rows
-                if item["dataset"] == dataset and item["method"] == method
-            )
-            ax.errorbar(
-                float(row["accuracy_mean"]),
-                float(row["worst_tpr_mean"]),
-                xerr=float(row["accuracy_std"]),
-                yerr=float(row["worst_tpr_std"]),
-                fmt=MARKERS[method],
-                markersize=16,
-                markerfacecolor="white" if method != "VEIL" else COLORS[method],
-                markeredgecolor=COLORS[method],
-                markeredgewidth=3,
-                ecolor=COLORS[method],
-                elinewidth=2.4,
-                capsize=7,
-                label=method,
-            )
-            accuracy = float(row["accuracy_mean"])
-            accuracy_std = float(row["accuracy_std"])
-            x_low = min(x_low, accuracy - accuracy_std)
-            x_high = max(x_high, accuracy + accuracy_std)
-            global_ymax = max(
-                global_ymax,
-                float(row["worst_tpr_mean"]) + float(row["worst_tpr_std"]),
-            )
-        ax.set_title(DATASET_LABELS[dataset])
-        ax.set_xlabel("Accuracy")
-        margin = max(0.025, (x_high - x_low) * 0.12)
-        ax.set_xlim(max(0.0, x_low - margin), min(1.0, x_high + margin))
-    axes[0].set_ylim(0.0, global_ymax * 1.08)
-    axes[0].set_ylabel("Worst-attack TPR@1%FPR")
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
-    fig.subplots_adjust(top=0.76, wspace=0.18)
-    save(fig, "fedavg_privacy_utility.pdf")
-
-
-def private_attack_profile(rows: list[dict[str, str]]) -> None:
     lookup = {
         (row["dataset"], row["method"], row["attack"]): float(row["tpr_mean"])
         for row in rows
     }
-    x = np.arange(len(ATTACKS))
-    width = 0.36
-    fig, axes = plt.subplots(1, 3, figsize=(20, 7.2), sharey=True)
-    for ax, dataset in zip(axes, DATASETS):
-        for offset, method, hatch in (
-            (-width / 2, "DP-FPL", "//"),
-            (width / 2, "FedASK", "\\\\"),
-        ):
-            values = [lookup[(dataset, method, attack)] for attack in ATTACKS]
-            ax.bar(
-                x + offset,
-                values,
-                width,
-                label=method,
-                color=COLORS[method],
-                edgecolor="#111827",
-                linewidth=1.5,
-                hatch=hatch,
+    matrices = {
+        dataset: np.asarray(
+            [
+                [lookup[(dataset, method, attack)] for attack in ATTACKS]
+                for method in METHODS
+            ]
+        )
+        for dataset in DATASETS
+    }
+    vmax = max(float(matrix.max()) for matrix in matrices.values())
+    cmap = LinearSegmentedColormap.from_list("veil_blue", PALETTE, N=256)
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(18.0, 5.8),
+        sharey=True,
+        facecolor="white",
+        constrained_layout=True,
+    )
+    image = None
+    for panel_index, (axis, dataset) in enumerate(zip(axes, DATASETS)):
+        matrix = matrices[dataset]
+        percentage_matrix = 100.0 * matrix
+        image = axis.imshow(
+            percentage_matrix,
+            cmap=cmap,
+            vmin=0.0,
+            vmax=100.0 * vmax,
+            interpolation="nearest",
+            aspect="auto",
+        )
+        axis.set_title(DATASET_LABELS[dataset], pad=12, fontweight="normal")
+        axis.set_xticks(np.arange(len(ATTACKS)), ATTACK_LABELS)
+        axis.set_yticks(np.arange(len(METHODS)), METHODS)
+        axis.tick_params(axis="both", length=0)
+        axis.tick_params(
+            axis="y",
+            labelleft=panel_index == 0,
+            pad=10,
+        )
+        if panel_index == 0:
+            axis.set_ylabel("Training mechanism")
+
+        # A blue outline identifies our method without distorting the color scale.
+        axis.add_patch(
+            Rectangle(
+                (-0.5, -0.5),
+                len(ATTACKS),
+                1.0,
+                fill=False,
+                edgecolor=VEIL_COLOR,
+                linewidth=3.0,
+                clip_on=False,
             )
-        ax.set_title(DATASET_LABELS[dataset])
-        ax.set_xticks(x, ATTACK_LABELS, rotation=38, ha="right")
-        ax.set_xlabel("Attack")
-        ax.set_ylim(bottom=0)
-    axes[0].set_ylabel("TPR@1%FPR")
-    handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=2, frameon=False)
-    fig.subplots_adjust(top=0.78, bottom=0.25, wspace=0.16)
-    save(fig, "private_methods_attack_profile.pdf")
+        )
+        if panel_index == 0:
+            axis.get_yticklabels()[0].set_color(VEIL_COLOR)
+            axis.get_yticklabels()[0].set_fontweight("bold")
 
+        minima = matrix.min(axis=0)
+        for row_index in range(matrix.shape[0]):
+            for column_index in range(matrix.shape[1]):
+                value = matrix[row_index, column_index]
+                normalized = value / vmax if vmax > 0 else 0.0
+                color = "white" if normalized > 0.58 else TEXT_COLOR
+                best = np.isclose(value, minima[column_index], atol=5e-8)
+                axis.text(
+                    column_index,
+                    row_index,
+                    f"{100.0 * value:.1f}",
+                    ha="center",
+                    va="center",
+                    color=color,
+                    fontsize=25,
+                    fontweight="bold" if best else "normal",
+                )
+        for spine in axis.spines.values():
+            spine.set_linewidth(0.8)
+            spine.set_edgecolor("#4A4A4A")
 
-def attack_heatmap(rows: list[dict[str, str]]) -> None:
-    grouped: dict[tuple[str, str], list[float]] = defaultdict(list)
-    for row in rows:
-        grouped[(row["method"], row["attack"])].append(float(row["tpr_mean"]))
-    matrix = np.array(
-        [
-            [np.mean(grouped[(method, attack)]) for attack in ATTACKS]
-            for method in METHODS
-        ]
+    if image is None:
+        raise RuntimeError("No attack-comparison panels were generated.")
+    colorbar = fig.colorbar(
+        image,
+        ax=axes,
+        location="right",
+        fraction=0.028,
+        pad=0.02,
     )
-    fig, ax = plt.subplots(figsize=(18, 9.5))
-    image = ax.imshow(matrix, cmap="Blues", vmin=0.0, vmax=max(0.04, matrix.max()))
-    ax.grid(False)
-    ax.set_xticks(np.arange(len(ATTACKS)), ATTACK_LABELS, rotation=30, ha="right")
-    ax.set_yticks(np.arange(len(METHODS)), METHODS)
-    ax.set_xlabel("Membership attack")
-    ax.set_ylabel("Training / defense mechanism")
-    for i in range(matrix.shape[0]):
-        for j in range(matrix.shape[1]):
-            red, green, blue, _alpha = image.cmap(image.norm(matrix[i, j]))
-            luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-            color = "white" if luminance < 0.52 else "#111827"
-            ax.text(j, i, f"{matrix[i, j]:.3f}", ha="center", va="center", color=color)
-    colorbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.03)
-    colorbar.set_label("Mean TPR@1%FPR")
-    save(fig, "attack_defense_heatmap.pdf")
+    colorbar.set_label("TPR@1% FPR (%)")
+    colorbar.ax.tick_params(labelsize=25, width=1.0)
+    colorbar.outline.set_linewidth(0.7)
 
-
-def ablation(rows: list[dict[str, str]]) -> None:
-    variants = [row["variant"] for row in rows]
-    accuracy = [float(row["accuracy"]) for row in rows]
-    worst = [float(row["worst_tpr"]) for row in rows]
-    mean_tpr = [float(row["mean_tpr"]) for row in rows]
-    y = np.arange(len(variants))
-    fig, axes = plt.subplots(3, 1, figsize=(10, 12), sharey=True)
-    accuracy_bars = axes[0].barh(
-        y,
-        accuracy,
-        color="#0369A1",
-        edgecolor="#111827",
-        linewidth=1.5,
-    )
-    axes[0].set_xlabel("Accuracy")
-    axes[0].set_xlim(0, max(accuracy) * 1.18)
-    axes[0].bar_label(
-        accuracy_bars,
-        labels=[f"{value:.3f}" for value in accuracy],
-        padding=6,
-        fontsize=28,
-    )
-    axes[0].set_yticks(y, variants)
-    axes[0].invert_yaxis()
-    privacy_bars = axes[1].barh(
-        y,
-        worst,
-        color="#D97706",
-        edgecolor="#111827",
-        linewidth=1.5,
-        hatch="//",
-    )
-    axes[1].set_xlabel("Worst-attack TPR@1%FPR")
-    axes[1].set_xlim(0, max(worst) * 1.30 if max(worst) > 0 else 1.0)
-    axes[1].bar_label(
-        privacy_bars,
-        labels=[f"{value:.3f}" for value in worst],
-        padding=6,
-        fontsize=28,
-    )
-    axes[1].set_yticks(y, variants)
-    axes[1].invert_yaxis()
-    mean_bars = axes[2].barh(
-        y,
-        mean_tpr,
-        color="#7C3AED",
-        edgecolor="#111827",
-        linewidth=1.5,
-        hatch="xx",
-    )
-    axes[2].set_xlabel("Mean TPR@1%FPR")
-    axes[2].set_xlim(0, max(mean_tpr) * 1.30 if max(mean_tpr) > 0 else 1.0)
-    axes[2].bar_label(
-        mean_bars,
-        labels=[f"{value:.3f}" for value in mean_tpr],
-        padding=6,
-        fontsize=28,
-    )
-    axes[2].set_yticks(y, variants)
-    axes[2].invert_yaxis()
-    fig.subplots_adjust(left=0.42, hspace=0.48)
-    save(fig, "veil_ablation.pdf")
+    FIGURES.mkdir(parents=True, exist_ok=True)
+    output = FIGURES / "private_methods_attack_profile.pdf"
+    fig.savefig(output, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"Wrote {output}")
 
 
 def main() -> None:
-    aggregate = read_csv("aggregate.csv")
-    attacks = read_csv("attack_aggregate.csv")
-    ablations = read_csv("ablation.csv")
-    privacy_utility(aggregate)
-    private_attack_profile(attacks)
-    attack_heatmap(attacks)
-    ablation(ablations)
-    print(f"Wrote paper figures to {FIGURES}")
+    setup_style()
+    comparison_heatmaps(read_attack_rows())
 
 
 if __name__ == "__main__":

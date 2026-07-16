@@ -11,6 +11,8 @@
 \usepackage{algorithm}
 \usepackage{algorithmic}
 \usepackage{booktabs}
+\usepackage{colortbl}
+\usepackage{multirow}
 \frenchspacing
 
 \pdfinfo{/TemplateVersion (2027.1)}
@@ -19,6 +21,7 @@
 \newcommand{\method}{\textsc{Veil}}
 \newcommand{\tpr}{\ensuremath{\mathrm{TPR}@1\%\mathrm{FPR}}}
 \newcommand{\norm}[1]{\left\lVert #1 \right\rVert_2}
+\definecolor{veilshade}{RGB}{232,241,247}
 
 \title{VEIL: Variance-Echoed Instance-Less Prompt Learning for Membership-Resistant Federated Vision--Language Models}
 \author{Anonymous Submission}
@@ -28,29 +31,24 @@
 \maketitle
 
 \begin{abstract}
-Federated prompt learning adapts a frozen vision--language model by exchanging
-only compact prompt updates, but compactness does not imply membership privacy:
-confidence trajectories, update alignment, and released prompts can still
-separate members from non-members.  We introduce \method{} (Variance-Echoed
-Instance-Less Prompt Learning), a client-local defense
-that prevents individual examples from serving as direct prompt-training
-anchors.  Each client estimates class-conditional geometry in the frozen CLIP
-embedding space, replaces each private feature with its class prototype, and
-generates covariance-shaped ``echoes'' without transmitting features, means, or
-covariances.  A clipping-and-perturbation step further smooths the
-prompt delta before FedAvg aggregation, and a label-preserving temperature map
-moderates confidence from the released model.  We evaluate a protocol-aware attacker
-with six membership attacks at the stringent true-positive rate at 1\% false-
-positive rate (\tpr{}) operating point.  Our benchmark uses label-matched
-member/non-member candidates, audit-specific random generators, three image
-datasets, and repeated non-IID partitions.  Averaged over datasets, \method{}
-obtains the lowest six-attack mean \tpr{} among the evaluated FedAvg defenses
-(0.0145), 15.3\% and 24.2\% relatively below Prompt-DP and HAMP, while matching
-Prompt-DP mean accuracy within 0.12 percentage points.  It improves both privacy
-summaries on Caltech101 but not on DTD, so we do not claim universal dominance.
-The private-mechanism study further exposes attack-specific failures hidden by
-one aggregate score.  Local distributional surrogates are thus an empirical
-complement to formal privacy mechanisms, not a differential-privacy guarantee.
+Federated prompt learning adapts frozen vision--language models through compact
+updates, yet those updates can preserve instance-specific membership traces.
+We introduce \method{} (Variance-Echoed Instance-Less Prompt Learning), a
+three-stage client mechanism that converts private embeddings into local
+class-distribution surrogates before prompt optimization and sanitizes only the
+resulting prompt delta.  Its central operation samples covariance-shaped echoes
+around class prototypes without forming or communicating a full covariance
+matrix.  We audit six complementary membership attacks at the stringent
+true-positive rate at 1\% false-positive rate (\tpr{}) using label-matched
+candidates, isolated audit randomness, three datasets, and repeated non-IID
+partitions.  Against FedAvg defenses, \method{} attains the lowest cross-dataset
+mean attack leakage (0.0145) while matching Prompt-DP mean accuracy within 0.12
+percentage points.  Under the same six attacks, it also exceeds DP-FPL and
+FedASK accuracy on every dataset and reduces their cross-dataset mean leakage by
+3.8\% and 36.7\%, respectively.  DP-FPL remains better on DTD and slightly
+better in cross-dataset worst-attack leakage, exposing a genuine transfer
+boundary rather than universal dominance.  \method{} is therefore an empirical
+membership defense, not a differential-privacy guarantee.
 \end{abstract}
 
 \section{Introduction}
@@ -83,27 +81,23 @@ Our answer is \method{}.  Like a veil that preserves a silhouette while hiding
 identity, the client presents the prompt optimizer with variance-shaped echoes
 of its class distribution: the semantic outline remains recognizable, but the
 individual that generated it is obscured.
-The method operates entirely in the frozen image-embedding space.  It replaces
-raw instance anchors with local class prototypes, samples low-rank covariance-
-shaped echoes, smooths only the trainable prompt delta before upload, and
-tempers final released logits without changing their predicted class.
+The method operates entirely in the frozen image-embedding space.  It compresses
+local class geometry into an implicit low-rank sampler, learns the prompt from
+distributional surrogates rather than raw instance anchors, and releases a
+norm-controlled prompt delta.  These three stages target the representation and
+protocol channels without changing the frozen backbone or server optimizer.
 
-Our contributions are fourfold:
+Our contributions are threefold:
 \begin{itemize}
-    \item We formulate instance-anchor exposure as a distinct membership channel
-    in federated soft-prompt tuning and introduce class-geometry echo training to
-    reduce that channel without sharing auxiliary client statistics.
-    \item We develop \method{}, combining prototype replacement, implicit
-    covariance sampling, prompt-update smoothing, and label-preserving output
-    tempering while keeping CLIP frozen and aggregating only trainable parameters.
-    \item We construct a strict protocol-aware audit covering FedMIA confidence,
-    FedMIA update alignment, their fixed joint score, Nasr-style passive white-box
-    inference, RMIA, and quantile-regression MIA.  Candidate label histograms are
-    exactly matched and audit loading is isolated from the training RNG.
-    \item We organize a multi-dataset evaluation into two complementary studies:
-    defenses under a common FedAvg backbone, and attack behavior under DP-FPL and
-    FedASK.  We report clean accuracy, per-attack \tpr{}, worst-attack \tpr{},
-    and variation across seeds.
+    \item We identify direct instance anchoring as a membership channel in
+    federated soft-prompt tuning and derive an implicit class-geometry sampler
+    that retains local semantic variation without communicating client statistics.
+    \item We develop the three-stage \method{} mechanism: private geometry
+    estimation, instance-obscured surrogate learning, and structured prompt
+    release, while keeping CLIP frozen and aggregating only trainable parameters.
+    \item We provide a protocol-aware benchmark that compares \method{}, DP-FPL,
+    and FedASK under six attacks with exactly label-matched candidates and reports
+    both per-attack leakage and utility across three non-IID datasets.
 \end{itemize}
 
 \section{Related Work}
@@ -159,13 +153,11 @@ local examples, so indiscriminate noise can remove useful directions and cause
 large seed-to-seed utility variation.  Our working hypothesis is that prompt
 learning primarily needs class-level semantic position and local variation,
 whereas repeatable instance-level directions form an avoidable membership
-channel.  This motivates the
-following design requirements: (i) no raw member feature acts as an optimization
-anchor; (ii) local class variation is preserved without exporting statistics;
-(iii) the upload is smoothed because representation replacement alone cannot
-remove all update-side evidence; (iv) confidence from the final released model
-is moderated without changing its decision; and (v) the mechanism remains
-compatible with a frozen backbone and standard FedAvg.
+channel.  This yields three design requirements: preserve local class geometry
+without exporting statistics, remove raw member features from the prompt
+objective, and control the residual prompt update before aggregation.  The
+mechanism must satisfy all three while keeping the backbone frozen and the
+standard FedAvg server unchanged.
 
 \section{Problem Formulation and Threat Model}
 
@@ -190,126 +182,144 @@ $(\epsilon,\delta)$-DP bound.
 
 \section{VEIL}
 
-Here, ``instance-less'' qualifies the prompt-optimization anchors: clients still
-use their instances locally to estimate class geometry, but no individual image
-embedding is supplied directly to the prompt loss.
+``Instance-less'' refers to the optimization interface, not to data disposal:
+private examples are used locally to estimate class geometry, but their
+individual embeddings never enter the prompt loss.  Algorithm~\ref{alg:veil}
+summarizes the complete mechanism in three stages.
 
-\subsection{Local Class Geometry}
+\subsection{Stage I: Private Semantic Geometry}
 
-Each client first builds a detached feature bank using the frozen image encoder:
+Client $k$ first encodes each local image with the frozen image tower and detaches
+the normalized representation from the computation graph:
 \begin{equation}
-z_i=\frac{\phi(x_i)}{\norm{\phi(x_i)}},\qquad
-F_{k,c}=\{z_i:y_i=c\}.
+z_i=\frac{\phi(x_i)}{\norm{\phi(x_i)}}.
+\label{eq:normalized-feature}
 \end{equation}
-For every observed local class, it computes
+For an observed class $c$, the local semantic center is
 \begin{equation}
-\mu_{k,c}=\frac{1}{n_{k,c}}\sum_{z\in F_{k,c}}z,
-\quad
-Z_{k,c}=\begin{bmatrix}(z_1-\mu_{k,c})^\top\\\cdots\\
-(z_{n_{k,c}}-\mu_{k,c})^\top\end{bmatrix}.
+\mu_{k,c}=\frac{1}{n_{k,c}}\sum_{i:y_i=c}z_i.
+\label{eq:class-mean}
 \end{equation}
-No quantity in $F_{k,c}$, $\mu_{k,c}$, or $Z_{k,c}$ is transmitted.
-
-\subsection{Prototype Replacement and Geometric Echoes}
-
-For every label in a local batch, \method{} replaces the corresponding private
-image feature by the normalized class prototype
+For $n_{k,c}\geq2$, rather than forming a dense $d\times d$ covariance,
+\method{} stores the low-rank centered factor
 \begin{equation}
-z^{\mathrm{proto}}_{k,c}=\frac{\mu_{k,c}}{\norm{\mu_{k,c}}}.
+G_{k,c}=\frac{1}{\sqrt{n_{k,c}-1}}
+\begin{bmatrix}
+(z_1-\mu_{k,c})^\top\\
+\vdots\\
+(z_{n_{k,c}}-\mu_{k,c})^\top
+\end{bmatrix}.
+\label{eq:geometry-factor}
 \end{equation}
-It then draws $m$ geometric echoes.  With
-$e\sim\mathcal{N}(0,I_{n_{k,c}})$, define
+Its Gram matrix exactly recovers the empirical covariance in feature space:
 \begin{equation}
-\beta_{k,c}=\frac{e^\top Z_{k,c}}{\sqrt{n_{k,c}-1}},\qquad
-\tilde z_{k,c}=\frac{\mu_{k,c}+s\beta_{k,c}}
-{\norm{\mu_{k,c}+s\beta_{k,c}}}.
+G_{k,c}^{\top}G_{k,c}=\widehat{\Sigma}_{k,c}.
+\label{eq:implicit-covariance}
+\end{equation}
+The feature bank, class means, and factors remain client-local throughout the
+round.  This stage therefore extracts the class-level signal needed by the
+prompt while defining an explicit boundary around private instance geometry.
+
+\subsection{Stage II: Instance-Obscured Surrogate Learning}
+
+For each class label encountered in a mini-batch, the direct image anchor is
+replaced by its normalized prototype:
+\begin{equation}
+p_{k,c}=\frac{\mu_{k,c}}{\norm{\mu_{k,c}}}.
+\label{eq:prototype}
+\end{equation}
+To avoid collapsing a heterogeneous class to one point, \method{} draws $m$
+geometric echoes.  For a fresh standard Gaussian vector
+$\varepsilon\in\mathbb{R}^{n_{k,c}}$, an echo is
+\begin{equation}
+\widetilde z_{k,c}=\frac{\mu_{k,c}+s\varepsilon^\top G_{k,c}}
+{\norm{\mu_{k,c}+s\varepsilon^\top G_{k,c}}}.
 \label{eq:echo}
 \end{equation}
-Conditioned on the local bank, $\beta_{k,c}$ has the empirical class covariance
-without explicitly forming or decomposing a $d\times d$ covariance matrix.  If
-$n_{k,c}<2$, we use isotropic noise with standard deviation 0.02.  Anchoring at $\mu_{k,c}$ is crucial:
-anchoring at $z_i$ would preserve the individual direction we seek to suppress.
-
-\subsection{Prompt Objective}
-
-Let $B_k^{\mathrm{echo}}$ contain one prototype and $m$ echoes for every batch
-label.  Text features remain differentiable with respect to $\theta$ while all
-image features are detached.  With CLIP logit scale $\tau$, client $k$ minimizes
+Conditioned on the local bank, the perturbation has covariance proportional to
+$\widehat{\Sigma}_{k,c}$, so it follows the observed class subspace without
+selecting any member as its center.  Classes with fewer than two examples use
+isotropic noise with standard deviation 0.02.  Let $\widetilde B_k$ contain one
+prototype and $m$ echoes for every batch label.  Only the text prompt remains
+differentiable, and the client minimizes
 \begin{equation}
-\mathcal{L}_k(\theta)=\frac{1}{|B_k^{\mathrm{echo}}|}
-\sum_{(z,y)\in B_k^{\mathrm{echo}}}
--\log\frac{\exp(\tau z^\top\psi(y;\theta))}
-{\sum_{c'}\exp(\tau z^\top\psi(c';\theta))}.
+\mathcal{L}_{k}(\theta)=\frac{1}{|\widetilde B_k|}
+\sum_{(z,y)\in\widetilde B_k}
+-\log\frac{\exp\!\left(\tau z^\top\psi(y;\theta)\right)}
+{\sum_{c'}\exp\!\left(\tau z^\top\psi(c';\theta)\right)}.
 \label{eq:objective}
 \end{equation}
-The selected operating point uses $m=3$, $s=0.6$, and no entropy penalty.
+This objective preserves discriminative class geometry while removing the
+repeatable instance direction exploited by loss- and update-based auditors.  We
+use $m=3$ and $s=0.6$ at the selected operating point.
 
-\subsection{Prompt-Delta Smoothing}
+\subsection{Stage III: Structured Prompt Release}
 
-Representation replacement targets instance anchors, but an update can still
-encode rare class structure.  For local prompt delta
-$\Delta_k=\theta_k^{t+1}-\theta^t$, we apply
-\begin{align}
-\Delta_k^{\mathrm{clip}}&=\Delta_k\min\left(1,
-\frac{C}{\norm{\Delta_k}}\right),\\
-\bar\Delta_k&=\Delta_k^{\mathrm{clip}}+\xi_k,
-\quad \xi_k\sim\mathcal{N}(0,(\rho C)^2I).
-\end{align}
-The client uploads $\theta^t+\bar\Delta_k$.  We use $C=0.5$ and $\rho=0.11$.
-The randomness is client-, round-, and purpose-specific, and each released state
-is a detached tensor copy.
-
-\subsection{Released-Output Tempering}
-
-The released model maps logits $\ell(x;\theta)$ to
+Surrogate learning suppresses direct anchors but does not prevent a rare local
+class from shaping the prompt update.  Let the trainable local delta be
 \begin{equation}
-\ell^{\mathrm{rel}}(x;\theta)=\ell(x;\theta)/T,
-\qquad T=4.
+\Delta_k^t=\theta_k^{t+1}-\theta^t.
+\label{eq:local-delta}
 \end{equation}
-This deterministic map preserves the top-1 prediction and hence clean accuracy,
-but reduces the scale of released confidence.  It is applied only to final-model
-queries: with \texttt{calibrate\_observations=false}, the round-level confidence
-and update signals remain unmodified.  We use no logit-margin cap.
+\method{} first applies global norm control:
+\begin{equation}
+\mathcal{C}_C(\Delta_k^t)=\Delta_k^t
+\min\left(1,\frac{C}{\norm{\Delta_k^t}}\right).
+\label{eq:delta-clip}
+\end{equation}
+It then releases the perturbed update
+\begin{equation}
+\widehat{\Delta}_k^t=\mathcal{C}_C(\Delta_k^t)+\xi_k^t.
+\label{eq:delta-release}
+\end{equation}
+The release noise follows
+\begin{equation}
+\xi_k^t\sim\mathcal{N}\!\left(0,(\rho C)^2I\right).
+\label{eq:release-noise}
+\end{equation}
+The unchanged server aggregates only these detached trainable deltas:
+\begin{equation}
+\theta^{t+1}=\theta^t+
+\sum_{k\in S_t}\frac{n_k}{\sum_{j\in S_t}n_j}\widehat{\Delta}_k^t.
+\label{eq:veil-aggregation}
+\end{equation}
+We use $C=0.5$ and $\rho=0.11$.  Randomness is keyed by client, round, and
+purpose, and every released state is a detached tensor copy.  The evaluation
+protocol additionally applies a fixed temperature $T=4$ to final-query logits;
+because positive scaling preserves score order, we treat this as release
+calibration rather than a distinct methodological contribution.  The ablation
+confirms that it does not change the reported rank-based metrics.
 
 \begin{algorithm}[t]
-\caption{One \method{} Client Update}
+\caption{Three-Stage \method{} Client Update}
 \label{alg:veil}
 \begin{algorithmic}[1]
 \REQUIRE Frozen image encoder $\phi$, prompt $\theta^t$, local data $D_k$
-\STATE Encode detached normalized features and construct $(\mu_{k,c},Z_{k,c})$
-\FOR{each local mini-batch}
-  \STATE Replace every image feature by its normalized class prototype
-  \STATE Draw $m$ covariance-shaped echoes using Eq.~\eqref{eq:echo}
-  \STATE Update only $\theta$ using Eq.~\eqref{eq:objective}
-\ENDFOR
-\STATE Clip $\theta_k^{t+1}-\theta^t$ to norm $C$ and add $\mathcal{N}(0,(\rho C)^2I)$
-\RETURN Detached prompt state $\theta^t+\bar\Delta_k$
+\STATE \textbf{Geometry:} build detached $(\mu_{k,c},G_{k,c})$ using
+Eqs.~\eqref{eq:class-mean}--\eqref{eq:geometry-factor}
+\STATE \textbf{Surrogates:} optimize only $\theta$ on prototypes and echoes
+using Eqs.~\eqref{eq:echo}--\eqref{eq:objective}
+\STATE \textbf{Release:} upload detached $\theta^t+\widehat{\Delta}_k^t$ using
+Eqs.~\eqref{eq:delta-clip}--\eqref{eq:delta-release}
 \end{algorithmic}
 \end{algorithm}
 
-\subsection{Privacy--Utility Interpretation and Cost}
-
-Prototype replacement removes direct instance anchors; geometric echoes restore
-class-conditioned diversity; upload smoothing targets the residual protocol
-channel; and output tempering moderates the final-query channel.  These roles
-target distinct information paths, but their empirical contributions need not
-be equal.  In the current implementation,
-the feature-bank pass costs one frozen image-encoder evaluation per local example
-per round.
-For embedding dimension $d$, storing the detached bank costs $O(n_kd)$ and
-generating $m$ echoes costs $O(mn_bd)$ for batch size $n_b$.  No extra server
-state or communication is introduced beyond the prompt update.
+The additional feature-bank pass requires one frozen image-encoder evaluation per local
+example per round.  For embedding dimension $d$, the detached bank costs
+$O(n_kd)$ memory and echo generation costs $O(mn_bd)$ per batch of size $n_b$.
+No class statistic, extra server state, or additional communication is required.
+The mechanism therefore changes what supervises the prompt and how its delta is
+released, while preserving the original federated interface.
 
 \section{Experimental Methodology}
 
 \subsection{Research Questions}
 
-We organize the study around four questions.  \textbf{RQ1:} Under a common
-FedAvg backbone, how does \method{} compare with no defense, Prompt-DP, and
-HAMP across attacks and datasets?  \textbf{RQ2:} Which attacks remain effective
-when the training mechanism is DP-FPL or FedASK?  \textbf{RQ3:} What utility is
-paid for lower worst-attack leakage?  \textbf{RQ4:} Which components of
-\method{} account for the observed trade-off?
+We ask three questions.  \textbf{RQ1:} Does \method{} improve the privacy--utility
+trade-off over defenses attached to the same FedAvg backbone?  \textbf{RQ2:}
+How does \method{} compare with DP-FPL and FedASK/FedSAK under each of six
+membership attacks?  \textbf{RQ3:} Which of the three stages controls the
+observed trade-off?
 
 \subsection{Datasets and Federated Protocol}
 
@@ -351,16 +361,11 @@ evaluation partitions.}
 \label{tab:datasets}
 \end{table}
 
-We tune \method{} on Flowers102 seeds 42--43 and reserve seed 44 as a held-out
-replication.  The development sweep covers echo counts $m\in\{0,3,6\}$,
-geometry scales $s\in\{0.45,0.60\}$, class-mean versus individual anchors,
-prototype/drop/noisy-prototype replacement, clipping thresholds
-$C\in\{0.05,0.5\}$, and upload noise ratios
-$\rho\in\{0.07,0.11,0.15,0.20\}$.  The release temperature is $T=4$ unless
-ablated.  We select the point with the lowest
-worst-attack \tpr{} among configurations whose mean development accuracy is at
-least 0.60, breaking ties by higher accuracy.  The selected parameters are then
-frozen for Caltech101 and DTD.
+We tune \method{} on Flowers102 seeds 42--43 and reserve seed 44 for replication.
+The selection rule minimizes worst-attack \tpr{} subject to mean development
+accuracy of at least 0.60, with accuracy breaking ties.  We then freeze all
+hyperparameters for Caltech101 and DTD; the complete sweep is provided in the
+artifact rather than repeated in the main text.
 All split, initialization, client, and audit generators are keyed by the reported
 seed.  DP mechanisms keep \texttt{reproducible\_dp\_noise=false}; their Gaussian
 draws intentionally use a private non-deterministic generator, so seed labels
@@ -368,14 +373,12 @@ identify the repeated scenario rather than fixing privacy noise byte-for-byte.
 
 \subsection{Baselines}
 
-The FedAvg defense study includes: no defense; Prompt-DP with per-example prompt
-gradient clipping at 1.0 and Gaussian noise multiplier 1.0; HAMP with true-class
-soft-target mass 0.6, entropy weight 0.05, and output temperature 4; and
-\method{}.  The private-training study evaluates DP-FPL with rank 4, one local
-private step, local/global clipping 1.0, and noise multipliers 0.3/0.1; and
-FedASK with rank/sketch size 16, ten local private steps, clipping 1.0, and noise
-multiplier 1.0.  Method-specific update rules follow their respective public
-implementations; all scenario and audit fields remain fixed.
+The shared-backbone study compares no defense, Prompt-DP, HAMP, and \method{}.
+The private-mechanism study compares \method{} with DP-FPL and FedASK (named
+FedSAK in some project documentation).  Method-specific clipping, noise, local
+steps, and factor ranks follow the aligned public-repository configurations;
+data, optimization budget, candidate construction, and audit fields remain
+fixed.
 Prompt-DP is applied only to trainable CLIP prompt tensors.  Because a
 non-differentiable randomized HAMP release would make gradient-based auditors
 undefined, we use its high-entropy training objective and a deterministic,
@@ -391,23 +394,18 @@ would no longer reproduce its stated algorithm.
 
 \subsection{Attacks and Metrics}
 
-We evaluate FedMIA-I (confidence), FedMIA-II (gradient--update cosine), a fixed
-joint z-score of their non-label-tuned components, Nasr-style passive white-box
-inference over prompt statistics, offline RMIA using non-target prompts as
-references, and quantile-regression MIA.  Signals are collected after rounds
-0, 2, and 4.  Confidence and cosine observations use mean round aggregation;
-the fixed joint score uses confidence mean, maximum cosine, and late-three-round
-cosine z-scores with an upper-three-standard-deviation null filter.  The
-Nasr-style head retains at most 16 features after a 50\% stratified calibration
-split.  RMIA uses offline coefficient 0.3 and $\gamma=2$; quantile MIA uses the
-0.9 quantile, 200 epochs, learning rate 0.01, and an auxiliary fraction of 0.5.
+We evaluate FedMIA confidence, FedMIA gradient--update cosine, their fixed joint
+score, Nasr-style passive white-box inference, offline RMIA, and quantile-
+regression MIA.  Together they cover output confidence, update alignment,
+white-box prompt statistics, reference-model likelihood ratios, and learned
+input-dependent thresholds.  Exact attack parameters are fixed before the main
+matrix and recorded in the artifact.
 Each audit begins with 64 members and 64 non-members.  Their label
 histograms are exactly equal.  Non-members are drawn first from held-out client
 test partitions and, if a class is under-supplied, from other clients' training
 partitions; both are non-members with respect to the target client.  A run fails
 if this combined pool cannot meet the constraint.  A separate generator is
-supplied to every audit DataLoader, so
-auditing cannot advance the training RNG.
+supplied to every audit DataLoader, so auditing cannot advance the training RNG.
 
 Our primary privacy metric is \tpr{} (lower is better).  We additionally report
 the maximum \tpr{} over attacks for each run, the unweighted mean over attacks,
@@ -423,114 +421,121 @@ metric for comparability but interpret exact zeros cautiously.
 
 \subsection{FedAvg Defense Comparison}
 
-Figure~\ref{fig:fedavg} and Table~\ref{tab:fedavg} compare the privacy--utility
-trade-off under the shared FedAvg backbone.  The final multi-dataset values are
-generated directly from completed result directories; the table is retained in
-the single submission source as required by the AAAI author kit.
+Table~\ref{tab:fedavg} answers RQ1 under a shared training backbone.  We use a
+single table because it exposes the exact utility and both leakage summaries
+more directly than a redundant privacy--utility scatter plot.
+
+\begin{table*}[t]
+\centering
+\begin{tabular}{llccc}
+\toprule
+& & \multicolumn{1}{c}{Utility $\uparrow$} &
+\multicolumn{2}{c}{Membership leakage $\downarrow$}\\
+\cmidrule(lr){3-3}\cmidrule(lr){4-5}
+Dataset & Defense & Accuracy & Worst \tpr{} & Mean \tpr{}\\
+\midrule
+\multirow{4}{*}{Flowers102}
+& No defense & \textbf{0.6609} $\pm$ 0.0030 & 0.0469 $\pm$ 0.0271 & 0.0191 $\pm$ 0.0066\\
+& Prompt-DP & 0.6170 $\pm$ 0.0207 & 0.0573 $\pm$ 0.0090 & 0.0191 $\pm$ 0.0080\\
+& HAMP & 0.5471 $\pm$ 0.0120 & \textbf{0.0313} $\pm$ 0.0271 & 0.0122 $\pm$ 0.0143\\
+\rowcolor{veilshade}
+& \method{} & 0.6201 $\pm$ 0.0013 & 0.0573 $\pm$ 0.0239 & \textbf{0.0113} $\pm$ 0.0066\\
+\midrule
+\multirow{4}{*}{Caltech101}
+& No defense & \textbf{0.8677} $\pm$ 0.0037 & 0.0573 $\pm$ 0.0738 & 0.0148 $\pm$ 0.0157\\
+& Prompt-DP & 0.8112 $\pm$ 0.0382 & 0.0781 $\pm$ 0.0716 & 0.0278 $\pm$ 0.0330\\
+& HAMP & 0.7971 $\pm$ 0.0115 & 0.1042 $\pm$ 0.1273 & 0.0321 $\pm$ 0.0296\\
+\rowcolor{veilshade}
+& \method{} & 0.8040 $\pm$ 0.0070 & \textbf{0.0417} $\pm$ 0.0451 & \textbf{0.0130} $\pm$ 0.0158\\
+\midrule
+\multirow{4}{*}{DTD}
+& No defense & \textbf{0.4672} $\pm$ 0.0093 & 0.0365 $\pm$ 0.0090 & 0.0130 $\pm$ 0.0045\\
+& Prompt-DP & 0.3755 $\pm$ 0.0289 & \textbf{0.0156} $\pm$ 0.0000 & \textbf{0.0043} $\pm$ 0.0015\\
+& HAMP & 0.4323 $\pm$ 0.0027 & 0.0312 $\pm$ 0.0000 & 0.0130 $\pm$ 0.0026\\
+\rowcolor{veilshade}
+& \method{} & 0.3762 $\pm$ 0.0231 & 0.0417 $\pm$ 0.0090 & 0.0191 $\pm$ 0.0030\\
+\bottomrule
+\end{tabular}
+\caption{FedAvg defenses under identical data, optimization, participation, and
+audit settings.  Values are mean $\pm$ sample standard deviation over seeds
+42--44.  Bold marks the best value within each dataset; shaded rows denote our
+method.}
+\label{tab:fedavg}
+\end{table*}
+
+\method{} yields the lowest mean leakage on Flowers102 and both best privacy
+summaries on Caltech101, while retaining substantially more utility than HAMP on
+Flowers102.  DTD is the counterexample: Prompt-DP is better on both privacy
+summaries, and \method{} loses 9.10 accuracy points relative to no defense.
+Averaged equally over datasets, \method{} reaches 0.6001 accuracy and 0.0145 mean
+\tpr{}, 15.3\% and 24.2\% below Prompt-DP and HAMP in mean leakage.  The
+dataset-level reversal is why we avoid a universal superiority claim.
+
+\subsection{Comparison with DP-FPL and FedASK under Six Attacks}
+
+RQ2 compares all three private training mechanisms under the same attacks.
+Figure~\ref{fig:private} retains the full attack vector, while
+Table~\ref{tab:private} summarizes the associated privacy--utility trade-off.
 
 \begin{figure*}[t]
 \centering
-\includegraphics[width=0.96\textwidth]{figures/fedavg_privacy_utility.pdf}
-\caption{FedAvg privacy--utility comparison across Flowers102, Caltech101, and
-DTD.  Points report seed means; horizontal and vertical bars show one sample
-standard deviation.  The vertical scale is shared; horizontal ranges are
-panel-specific and explicitly labeled.  Lower worst-attack \tpr{} and higher
-accuracy are better.}
-\label{fig:fedavg}
+\includegraphics[width=0.96\textwidth]{figures/private_methods_attack_profile.pdf}
+\caption{Attack-specific comparison of \method{}, DP-FPL, and FedASK, averaged
+over seeds 42--44.  All panels share one zero-anchored color scale; lower is
+better, and cell values are percentages.  Bold cells mark the lowest value per
+attack (including ties), and the outlined row denotes our method.}
+\label{fig:private}
 \end{figure*}
 
 \begin{table*}[t]
 \centering
 \begin{tabular}{llccc}
 \toprule
-Dataset & Defense & Accuracy $\uparrow$ & Worst \tpr{} $\downarrow$ & Mean \tpr{} $\downarrow$\\
+& & \multicolumn{1}{c}{Utility $\uparrow$} &
+\multicolumn{2}{c}{Membership leakage $\downarrow$}\\
+\cmidrule(lr){3-3}\cmidrule(lr){4-5}
+Dataset & Method & Accuracy & Worst \tpr{} & Mean \tpr{}\\
 \midrule
-Flowers102 & No defense & 0.6609 $\pm$ 0.0030 & 0.0469 $\pm$ 0.0271 & 0.0191 $\pm$ 0.0066\\
-Flowers102 & Prompt-DP & 0.6170 $\pm$ 0.0207 & 0.0573 $\pm$ 0.0090 & 0.0191 $\pm$ 0.0080\\
-Flowers102 & HAMP & 0.5471 $\pm$ 0.0120 & 0.0313 $\pm$ 0.0271 & 0.0122 $\pm$ 0.0143\\
-Flowers102 & \method{} & 0.6201 $\pm$ 0.0013 & 0.0573 $\pm$ 0.0239 & 0.0113 $\pm$ 0.0066\\
-Caltech101 & No defense & 0.8677 $\pm$ 0.0037 & 0.0573 $\pm$ 0.0738 & 0.0148 $\pm$ 0.0157\\
-Caltech101 & Prompt-DP & 0.8112 $\pm$ 0.0382 & 0.0781 $\pm$ 0.0716 & 0.0278 $\pm$ 0.0330\\
-Caltech101 & HAMP & 0.7971 $\pm$ 0.0115 & 0.1042 $\pm$ 0.1273 & 0.0321 $\pm$ 0.0296\\
-Caltech101 & \method{} & 0.8040 $\pm$ 0.0070 & 0.0417 $\pm$ 0.0451 & 0.0130 $\pm$ 0.0158\\
-DTD & No defense & 0.4672 $\pm$ 0.0093 & 0.0365 $\pm$ 0.0090 & 0.0130 $\pm$ 0.0045\\
-DTD & Prompt-DP & 0.3755 $\pm$ 0.0289 & 0.0156 $\pm$ 0.0000 & 0.0043 $\pm$ 0.0015\\
-DTD & HAMP & 0.4323 $\pm$ 0.0027 & 0.0312 $\pm$ 0.0000 & 0.0130 $\pm$ 0.0026\\
-DTD & \method{} & 0.3762 $\pm$ 0.0231 & 0.0417 $\pm$ 0.0090 & 0.0191 $\pm$ 0.0030\\
+\multirow{3}{*}{Flowers102}
+& DP-FPL & 0.5552 $\pm$ 0.1055 & 0.0781 $\pm$ 0.0156 & 0.0260 $\pm$ 0.0094\\
+& FedASK & 0.5270 $\pm$ 0.1426 & 0.0625 $\pm$ 0.0312 & 0.0252 $\pm$ 0.0128\\
+\rowcolor{veilshade}
+& \method{} & \textbf{0.6201} $\pm$ 0.0013 & \textbf{0.0573} $\pm$ 0.0239 & \textbf{0.0113} $\pm$ 0.0066\\
+\midrule
+\multirow{3}{*}{Caltech101}
+& DP-FPL & 0.7428 $\pm$ 0.0486 & \textbf{0.0365} $\pm$ 0.0090 & \textbf{0.0130} $\pm$ 0.0052\\
+& FedASK & 0.6063 $\pm$ 0.2308 & 0.0781 $\pm$ 0.0413 & 0.0260 $\pm$ 0.0156\\
+\rowcolor{veilshade}
+& \method{} & \textbf{0.8040} $\pm$ 0.0070 & 0.0417 $\pm$ 0.0451 & \textbf{0.0130} $\pm$ 0.0158\\
+\midrule
+\multirow{3}{*}{DTD}
+& DP-FPL & 0.3557 $\pm$ 0.0272 & \textbf{0.0208} $\pm$ 0.0239 & \textbf{0.0061} $\pm$ 0.0066\\
+& FedASK & 0.3330 $\pm$ 0.0268 & 0.0521 $\pm$ 0.0549 & 0.0174 $\pm$ 0.0183\\
+\rowcolor{veilshade}
+& \method{} & \textbf{0.3762} $\pm$ 0.0231 & 0.0417 $\pm$ 0.0090 & 0.0191 $\pm$ 0.0030\\
 \bottomrule
 \end{tabular}
-\caption{FedAvg defenses under identical data, optimization, participation, and
-audit settings.  Values are mean $\pm$ sample standard deviation over seeds
-42--44.}
-\label{tab:fedavg}
-\end{table*}
-
-On Flowers102, \method{} retains the highest accuracy among the three defenses
-(0.6201), narrowly above Prompt-DP and substantially above HAMP.  HAMP attains
-the lowest worst-attack TPR, whereas \method{} attains the lowest six-attack
-mean.  The undefended model nevertheless has both higher accuracy and a lower
-measured worst-attack TPR than \method{} on this dataset.  This counterexample
-underscores that a finite empirical audit is neither monotone in defense
-strength nor a proxy for formal privacy: VEIL suppresses leakage on average but
-does not dominate every attack realization.  We therefore interpret the full
-per-attack, cross-dataset profile rather than declaring a universal winner.
-
-On Caltech101, \method{} gives the strongest privacy summary among the three
-defenses: worst-attack and mean \tpr{} are 0.0417 and 0.0130, compared with
-0.0781/0.0278 for Prompt-DP and 0.1042/0.0321 for HAMP.  Its 0.8040 accuracy is
-6.38 percentage points below the undefended model, but is comparable to the two
-defenses.  DTD reverses the conclusion.  Prompt-DP reaches the lowest worst and
-mean \tpr{} (0.0156/0.0043), whereas \method{} reaches 0.0417/0.0191 and loses
-9.10 accuracy points relative to no defense.  Averaged equally over datasets,
-\method{} has accuracy 0.6001, worst-attack \tpr{} 0.0469, and mean \tpr{}
-0.0145.  The latter is 15.3\% and 24.2\% relatively below Prompt-DP and HAMP,
-but the DTD failure rules out a dataset-independent superiority claim.
-
-\subsection{Attack Profiles under DP-FPL and FedASK}
-
-The second study holds the audit fixed and changes the federated training
-mechanism.  Figure~\ref{fig:private} shows that a single aggregate privacy score
-can hide attack-specific failures; we therefore retain all six columns in
-Table~\ref{tab:private}.
-
-\begin{figure*}[t]
-\centering
-\includegraphics[width=0.96\textwidth]{figures/private_methods_attack_profile.pdf}
-\caption{Per-attack \tpr{} for DP-FPL and FedASK, averaged over seeds 42--44.
-Panels share a common zero-based scale; lower bars indicate less empirical
-membership leakage.}
-\label{fig:private}
-\end{figure*}
-
-\begin{table*}[t]
-\centering
-\begin{tabular}{llcccccc}
-\toprule
-Dataset & Method & Loss & Cosine & Joint & Nasr & RMIA & Quantile\\
-\midrule
-Flowers102 & DP-FPL & 0.0000 & 0.0260 & 0.0260 & 0.0729 & 0.0000 & 0.0312\\
-Flowers102 & FedASK & 0.0000 & 0.0365 & 0.0208 & 0.0625 & 0.0000 & 0.0312\\
-Caltech101 & DP-FPL & 0.0000 & 0.0312 & 0.0104 & 0.0000 & 0.0104 & 0.0260\\
-Caltech101 & FedASK & 0.0000 & 0.0312 & 0.0208 & 0.0208 & 0.0156 & 0.0677\\
-DTD & DP-FPL & 0.0000 & 0.0104 & 0.0208 & 0.0000 & 0.0000 & 0.0052\\
-DTD & FedASK & 0.0000 & 0.0365 & 0.0417 & 0.0000 & 0.0104 & 0.0156\\
-\bottomrule
-\end{tabular}
-\caption{Attack-specific \tpr{} under private federated training mechanisms.
-Values are seed means.  ``Loss'', ``Cosine'', and ``Joint'' denote the three
-FedMIA variants.}
+\caption{Utility and aggregate leakage for the three mechanisms in
+Figure~\ref{fig:private}.  Values are mean $\pm$ sample standard deviation over
+seeds 42--44.  Bold marks the best value within each dataset; shaded rows denote
+our method.}
 \label{tab:private}
 \end{table*}
 
-Nasr is the strongest mean attack on Flowers102 for both DP-FPL (0.0729) and
-FedASK (0.0625).  The ordering changes with the dataset: on Caltech101,
-FedMIA-Cosine is largest for DP-FPL (0.0312), while Quantile MIA is largest for
-FedASK (0.0677); on DTD, FedMIA-Joint is largest for both mechanisms
-(0.0208/0.0417).  DP-FPL also has higher mean accuracy than FedASK on all three
-datasets---0.5552 versus 0.5270, 0.7428 versus 0.6063, and 0.3557 versus
-0.3330.  Both mechanisms show substantial seed variability; for example,
-FedASK's Caltech101 accuracy has sample standard deviation 0.2308.  Changes in
-the strongest attacker motivate retaining the full attack profile.
+On Flowers102, \method{} is best or tied on five of six attacks and improves all
+three table metrics.  On Caltech101, it is best on FedMIA-Cosine, FedMIA-Joint,
+and RMIA; it matches DP-FPL's mean leakage while adding 6.12 accuracy points.
+Across datasets, \method{} averages 0.6001 accuracy, compared with 0.5512 for
+DP-FPL and 0.4888 for FedASK.  Its mean attack leakage is 3.8\% below DP-FPL and
+36.7\% below FedASK.  These are the principal advantages over the two private
+baselines.
+
+The full profile also reveals the boundary.  On DTD, DP-FPL has lower mean and
+worst leakage; \method{} wins only FedMIA-Joint and is particularly exposed to
+RMIA.  Accordingly, DP-FPL's cross-dataset worst leakage (0.0451) is slightly
+below \method{} (0.0469), even though \method{} has the stronger utility and
+mean-leakage averages.  This attack-dependent result would disappear in a
+single scalar ranking.
 
 \begin{table}[t]
 \centering
@@ -552,47 +557,40 @@ settings.}
 \label{tab:accounting}
 \end{table}
 
-\subsection{Cross-Dataset Attack Surface}
-
-Figure~\ref{fig:heatmap} provides a compact attack-by-method view.  The shared
-color scale is anchored at zero and the numeric labels prevent color-only
-interpretation.  This view is diagnostic: the worst-attack aggregation remains
-the decision metric because a defense should not be selected by averaging away
-one effective attacker.
-
-\begin{figure*}[t]
-\centering
-\includegraphics[width=0.96\textwidth]{figures/attack_defense_heatmap.pdf}
-\caption{Cross-dataset mean \tpr{} by attack and training/defense mechanism.
-Every cell is the unweighted mean over the three datasets and three seeds.}
-\label{fig:heatmap}
-\end{figure*}
-
 \subsection{Component Analysis}
 
-The Flowers102 seed-42 component study varies one design choice at a time.  Full
-\method{} obtains accuracy 0.6216, worst-attack \tpr{} 0.0312, and mean \tpr{}
-0.0052.  Removing upload smoothing raises accuracy to 0.6515 but doubles the
-worst statistic to 0.0625 and increases the attack mean to 0.0182, making
-smoothing the clearest privacy--utility lever in this diagnostic.  Replacing the
-class anchor by an individual feature doubles mean \tpr{} to 0.0104; removing
-echoes raises it to 0.0078.  Removing the prototype branch, or removing output
-tempering, leaves both privacy summaries unchanged at this resolution.  The
-latter is expected for rank-based ROC metrics when positive temperature scaling
-does not change score order.  Adding noise to the prototype also leaves the
-privacy summaries unchanged while reducing accuracy to 0.6154.  Because this is
-a single-seed diagnostic, these equalities should not be generalized beyond the
-measured operating point.
+The focused RQ3 ablation is clearer as exact values than as three stacked bar
+plots.  Table~\ref{tab:ablation} varies one component at a time on Flowers102
+seed 42.
 
-\begin{figure}[t]
+\begin{table}[t]
 \centering
-\includegraphics[width=0.96\columnwidth]{figures/veil_ablation.pdf}
-\caption{\method{} component ablation on Flowers102 seed 42.  Accuracy,
-worst-attack \tpr{}, and six-attack mean \tpr{} are shown on separate aligned
-panels rather than a dual axis; this diagnostic is not presented as a
-repeated-seed estimate.}
-\label{fig:ablation}
-\end{figure}
+\begin{tabular}{lccc}
+\toprule
+Variant & Acc. $\uparrow$ & Worst $\downarrow$ & Mean $\downarrow$\\
+\midrule
+\rowcolor{veilshade}
+Full \method{} & 0.6216 & \textbf{0.0313} & \textbf{0.0052}\\
+Individual anchor & 0.6209 & \textbf{0.0313} & 0.0104\\
+No echoes & 0.6209 & \textbf{0.0313} & 0.0078\\
+No prototype branch & 0.6212 & \textbf{0.0313} & \textbf{0.0052}\\
+No upload smoothing & \textbf{0.6515} & 0.0625 & 0.0182\\
+No output calib. & 0.6216 & \textbf{0.0313} & \textbf{0.0052}\\
+\bottomrule
+\end{tabular}
+\caption{Component analysis on Flowers102 seed 42.  Privacy columns report
+\tpr{}.  Bold marks the best value including ties; the shaded row is the full
+method.}
+\label{tab:ablation}
+\end{table}
+
+Upload smoothing is the clearest trade-off lever: removing it adds 2.99 accuracy
+points but doubles worst leakage and more than triples mean leakage.  Returning
+to individual anchors doubles mean leakage, while removing geometric echoes
+raises it by 50\%.  Removing output calibration changes no rank-based metric,
+supporting its treatment as protocol calibration rather than a fourth method
+stage.  Because this is a single-seed diagnostic, it identifies mechanisms but
+does not support a significance claim.
 
 \section{Limitations}
 
@@ -620,19 +618,16 @@ that federated learning alone guarantees privacy.
 
 \section{Conclusion}
 
-We presented \method{}, a local geometric-echo defense for federated CLIP
-prompt learning.  By replacing individual image anchors with class prototypes,
-sampling local covariance-shaped echoes, and smoothing only the uploaded prompt
-delta, then tempering released logits, \method{} targets representation-,
-protocol-, and final-query-side membership
-signals without transmitting additional client statistics.  A label-matched,
-RNG-isolated audit across multiple attacks and datasets provides a stricter basis
-for comparison than accuracy or AUC alone.  VEIL gives the lowest cross-dataset
-mean attack TPR among the evaluated FedAvg defenses, yet its DTD failure shows
-that the trade-off is data dependent.  Distributional surrogate training is
-therefore a practical empirical complement to DP-FPL, FedASK, and output-centered
-defenses, while formal guarantees remain the domain of explicitly accounted
-mechanisms.
+We presented \method{}, a three-stage defense for federated CLIP prompt learning:
+estimate private semantic geometry, optimize on instance-obscured surrogates,
+and release a norm-controlled prompt delta.  This interface removes individual
+embeddings from the prompt loss without communicating class statistics or
+changing the FedAvg server.  Under six label-matched attacks, \method{} provides
+the strongest cross-dataset accuracy and mean-leakage averages among \method{},
+DP-FPL, and FedASK, while DP-FPL remains preferable on DTD privacy and slightly
+better in worst-attack leakage overall.  The result supports distributional
+surrogate learning as a practical empirical complement to formally accounted
+mechanisms, not as a substitute for differential privacy.
 
 \bibliography{veil}
 

@@ -1,7 +1,6 @@
 # VEIL paper validation
 
-Status: ready as a source-and-evidence artifact. Per the project request, the
-paper was not compiled and no LaTeX distribution was installed.
+Status: validated source, evidence, figure, and compiled PDF artifact.
 
 ## Experimental evidence
 
@@ -22,18 +21,24 @@ paper was not compiled and no LaTeX distribution was installed.
 
 ## Artifact checks
 
-- `python -m pytest -q -ra` reports `31 passed in 28.74s`; none requires a
+- `python -m pytest -q -ra` reports `31 passed in 27.84s`; none requires a
   dataset or CLIP checkpoint.
 - All changed Python modules pass `py_compile`, and `git diff --check` reports no
   whitespace errors.
 - `python -m analysis_scripts.check_veil_paper` passes brace/environment,
-  citation, AAAI package/command, anonymity, placeholder, figure, result-data,
-  and reproducibility-checklist checks.
-- Plotting code asserts every source typography setting is at least 28 points.
-  Visual inspection covered all four rendered figures. `pdffonts` reports only
-  embedded CID TrueType DejaVu Sans fonts and no Type 3 fonts.
+  citation, AAAI package/command, anonymity, placeholder, three-stage method,
+  grouped-table styling, figure, result-data, and reproducibility-checklist
+  checks.
+- `latexmk -pdf -interaction=nonstopmode -halt-on-error veil.tex` produces the
+  eight-page anonymous artifact (main text, references, and checklist) with no
+  overfull boxes, unresolved citations, or unresolved references.
+- Plotting code asserts every source typography setting is at least 25 points.
+  Visual inspection covered the focused three-panel attack heatmap at original
+  resolution. `pdffonts` reports embedded CID TrueType Tinos fonts and no Type 3
+  fonts.
 - Raw datasets, result directories, logs, checkpoints, and saved models remain
-  excluded from Git. Only aggregate CSV evidence and paper figures are retained.
+  excluded from Git. Only aggregate CSV evidence, the focused paper figure, and
+  the compiled paper are retained.
 
 ## Interpretation limits
 

@@ -204,24 +204,9 @@ def check_result_tables(text: str) -> None:
         "Prompt-DP": "Prompt-DP",
         "HAMP": "HAMP",
         r"\method{}": "VEIL",
+        "DP-FPL": "DP-FPL",
+        "FedASK": "FedASK",
     }
-    fedavg_block = re.search(
-        r"\\begin\{tabular\}\{llccc\}(.*?)\\end\{tabular\}",
-        text,
-        flags=re.DOTALL,
-    )
-    if fedavg_block is None:
-        raise AssertionError("Could not locate the FedAvg result table.")
-    pattern = re.compile(
-        r"^(Flowers102|Caltech101|DTD) & (No defense|Prompt-DP|HAMP|\\method\{\}) "
-        r"& ([0-9.]+) \$\\pm\$ ([0-9.]+) "
-        r"& ([0-9.]+) \$\\pm\$ ([0-9.]+) "
-        r"& ([0-9.]+) \$\\pm\$ ([0-9.]+)\\\\$",
-        flags=re.MULTILINE,
-    )
-    parsed = pattern.findall(fedavg_block.group(1))
-    if len(parsed) != 12:
-        raise AssertionError(f"Expected 12 FedAvg table rows, parsed {len(parsed)}.")
     fields = (
         "accuracy_mean",
         "accuracy_std",
@@ -230,57 +215,193 @@ def check_result_tables(text: str) -> None:
         "mean_tpr_mean",
         "mean_tpr_std",
     )
-    for dataset_label, method_label, *printed in parsed:
-        key = (dataset_names[dataset_label], method_names[method_label])
-        evidence = aggregates.get(key)
-        if evidence is None:
-            raise AssertionError(f"No aggregate evidence for {key}.")
-        for field, value in zip(fields, printed):
-            if not close_to_printed(float(evidence[field]), value):
+
+    def table_block(label: str) -> str:
+        label_token = rf"\label{{{label}}}"
+        label_index = text.find(label_token)
+        if label_index < 0:
+            raise AssertionError(f"Could not locate table label {label}.")
+        plain_start = text.rfind(r"\begin{table}", 0, label_index)
+        star_start = text.rfind(r"\begin{table*}", 0, label_index)
+        start = max(plain_start, star_start)
+        if start < 0:
+            raise AssertionError(f"Could not locate table start for {label}.")
+        end_token = r"\end{table*}" if start == star_start else r"\end{table}"
+        end = text.find(end_token, label_index)
+        if end < 0:
+            raise AssertionError(f"Could not locate table end for {label}.")
+        return text[start : end + len(end_token)]
+
+    def parse_grouped_table(
+        block: str,
+        allowed_methods: set[str],
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        current_dataset: str | None = None
+        shaded = False
+        for raw_line in block.splitlines():
+            line = raw_line.strip()
+            if line == r"\rowcolor{veilshade}":
+                shaded = True
+                continue
+            dataset_match = re.search(
+                r"\\multirow\{\d+\}\{\*\}\{(Flowers102|Caltech101|DTD)\}",
+                line,
+            )
+            if dataset_match:
+                current_dataset = dataset_match.group(1)
+            if "&" not in line or not line.endswith(r"\\"):
+                continue
+            cells = [cell.strip() for cell in line[:-2].split("&")]
+            if len(cells) != 5:
+                shaded = False
+                continue
+            method_label = cells[1]
+            if method_label not in allowed_methods:
+                shaded = False
+                continue
+            if current_dataset is None:
+                raise AssertionError(f"Missing multirow dataset before {line}")
+            printed: list[str] = []
+            for metric_cell in cells[2:]:
+                numbers = re.findall(r"[0-9]+\.[0-9]+", metric_cell)
+                if len(numbers) != 2:
+                    raise AssertionError(f"Expected mean and std in cell {metric_cell}")
+                printed.extend(numbers)
+            rows.append(
+                {
+                    "dataset_label": current_dataset,
+                    "method_label": method_label,
+                    "printed": printed,
+                    "bold": tuple(r"\textbf{" in cell for cell in cells[2:]),
+                    "shaded": shaded,
+                }
+            )
+            shaded = False
+        return rows
+
+    def validate_grouped_table(
+        label: str,
+        allowed_methods: set[str],
+        expected_count: int,
+    ) -> None:
+        block = table_block(label)
+        if len(re.findall(r"\\multirow\{\d+\}\{\*\}\{", block)) != 3:
+            raise AssertionError(f"{label} must merge its three dataset columns.")
+        parsed = parse_grouped_table(block, allowed_methods)
+        if len(parsed) != expected_count:
+            raise AssertionError(
+                f"Expected {expected_count} rows in {label}, parsed {len(parsed)}."
+            )
+        table_methods = {method_names[item] for item in allowed_methods}
+        metric_fields = ("accuracy_mean", "worst_tpr_mean", "mean_tpr_mean")
+        reducers = (max, min, min)
+        for row in parsed:
+            dataset = dataset_names[str(row["dataset_label"])]
+            method = method_names[str(row["method_label"])]
+            evidence = aggregates[(dataset, method)]
+            for field, value in zip(fields, row["printed"]):
+                if not close_to_printed(float(evidence[field]), str(value)):
+                    raise AssertionError(
+                        f"{label} mismatch for {(dataset, method)} {field}: "
+                        f"paper={value}, evidence={evidence[field]}"
+                    )
+            expected_bold = []
+            for field, reducer in zip(metric_fields, reducers):
+                values = [
+                    float(aggregates[(dataset, candidate)][field])
+                    for candidate in table_methods
+                ]
+                best = reducer(values)
+                expected_bold.append(
+                    math.isclose(
+                        float(evidence[field]), best, rel_tol=0.0, abs_tol=5.1e-5
+                    )
+                )
+            if tuple(expected_bold) != row["bold"]:
                 raise AssertionError(
-                    f"FedAvg table mismatch for {key} {field}: "
-                    f"paper={value}, evidence={evidence[field]}"
+                    f"Incorrect bolding in {label} for {(dataset, method)}: "
+                    f"shown={row['bold']}, expected={tuple(expected_bold)}"
+                )
+            if bool(row["shaded"]) != (method == "VEIL"):
+                raise AssertionError(
+                    f"Only VEIL rows must be shaded in {label}: {(dataset, method)}"
                 )
 
-    attacks = {
-        (row["dataset"], row["method"], row["attack"]): float(row["tpr_mean"])
-        for row in csv_rows("attack_aggregate.csv")
+    validate_grouped_table(
+        "tab:fedavg",
+        {"No defense", "Prompt-DP", "HAMP", r"\method{}"},
+        12,
+    )
+    validate_grouped_table(
+        "tab:private",
+        {"DP-FPL", "FedASK", r"\method{}"},
+        9,
+    )
+
+    ablation_source = {row["variant"]: row for row in csv_rows("ablation.csv")}
+    ablation_names = {
+        r"Full \method{}": "Full VEIL",
+        "Individual anchor": "Individual anchor",
+        "No echoes": "No echoes",
+        "No prototype branch": "No prototype",
+        "No upload smoothing": "No upload smoothing",
+        "No output calib.": "No output tempering",
     }
-    attack_order = (
-        "fedmia_loss",
-        "fedmia_cosine",
-        "fedmia_joint",
-        "nasr_passive",
-        "rmia",
-        "quantile_mia",
-    )
-    private_block = re.search(
-        r"\\begin\{tabular\}\{llcccccc\}(.*?)\\end\{tabular\}",
-        text,
-        flags=re.DOTALL,
-    )
-    if private_block is None:
-        raise AssertionError("Could not locate the private-mechanism result table.")
-    private_pattern = re.compile(
-        r"^(Flowers102|Caltech101|DTD) & (DP-FPL|FedASK) & "
-        r"([0-9.]+) & ([0-9.]+) & ([0-9.]+) & ([0-9.]+) & "
-        r"([0-9.]+) & ([0-9.]+)\\\\$",
-        flags=re.MULTILINE,
-    )
-    private_rows = private_pattern.findall(private_block.group(1))
-    if len(private_rows) != 6:
-        raise AssertionError(
-            f"Expected 6 private-mechanism table rows, parsed {len(private_rows)}."
+    ablation_block = table_block("tab:ablation")
+    parsed_ablation: list[tuple[str, list[str], tuple[bool, ...], bool]] = []
+    shaded = False
+    for raw_line in ablation_block.splitlines():
+        line = raw_line.strip()
+        if line == r"\rowcolor{veilshade}":
+            shaded = True
+            continue
+        if "&" not in line or not line.endswith(r"\\"):
+            continue
+        cells = [cell.strip() for cell in line[:-2].split("&")]
+        if len(cells) != 4 or cells[0] not in ablation_names:
+            shaded = False
+            continue
+        values = []
+        for cell in cells[1:]:
+            numbers = re.findall(r"[0-9]+\.[0-9]+", cell)
+            if len(numbers) != 1:
+                raise AssertionError(f"Malformed ablation cell: {cell}")
+            values.append(numbers[0])
+        parsed_ablation.append(
+            (
+                ablation_names[cells[0]],
+                values,
+                tuple(r"\textbf{" in cell for cell in cells[1:]),
+                shaded,
+            )
         )
-    for dataset_label, method, *printed in private_rows:
-        dataset = dataset_names[dataset_label]
-        for attack, value in zip(attack_order, printed):
-            actual = attacks[(dataset, method, attack)]
-            if not close_to_printed(actual, value):
-                raise AssertionError(
-                    f"Private table mismatch for {(dataset, method, attack)}: "
-                    f"paper={value}, evidence={actual}"
-                )
+        shaded = False
+    if len(parsed_ablation) != 6:
+        raise AssertionError(f"Expected 6 focused ablations, found {len(parsed_ablation)}.")
+    displayed = [ablation_source[name] for name, *_rest in parsed_ablation]
+    ablation_fields = ("accuracy", "worst_tpr", "mean_tpr")
+    ablation_reducers = (max, min, min)
+    for name, printed, bold, row_shaded in parsed_ablation:
+        evidence = ablation_source[name]
+        for field, value in zip(ablation_fields, printed):
+            if not close_to_printed(float(evidence[field]), value):
+                raise AssertionError(f"Ablation mismatch for {name} {field}.")
+        expected_bold = tuple(
+            math.isclose(
+                float(evidence[field]),
+                reducer([float(item[field]) for item in displayed]),
+                rel_tol=0.0,
+                abs_tol=5.1e-5,
+            )
+            for field, reducer in zip(ablation_fields, ablation_reducers)
+        )
+        if bold != expected_bold:
+            raise AssertionError(
+                f"Incorrect ablation bolding for {name}: {bold} vs {expected_bold}."
+            )
+        if row_shaded != (name == "Full VEIL"):
+            raise AssertionError(f"Only Full VEIL may be shaded in the ablation.")
 
     accounting = {
         (row["method"], row["scope"]): row
@@ -328,6 +449,41 @@ def check_result_tables(text: str) -> None:
             raise AssertionError(f"Accounting delta mismatch for {source_key}.")
 
 
+def check_focused_structure(text: str) -> None:
+    """Enforce the requested three-stage method and non-redundant result design."""
+
+    method_match = re.search(
+        r"\\section\{VEIL\}(.*?)\\section\{Experimental Methodology\}",
+        text,
+        flags=re.DOTALL,
+    )
+    if method_match is None:
+        raise AssertionError("Could not isolate the VEIL method section.")
+    method = method_match.group(1)
+    subsections = re.findall(r"\\subsection\{([^}]+)\}", method)
+    expected = [
+        "Stage I: Private Semantic Geometry",
+        "Stage II: Instance-Obscured Surrogate Learning",
+        "Stage III: Structured Prompt Release",
+    ]
+    if subsections != expected:
+        raise AssertionError(f"VEIL must have exactly three stages: {subsections}")
+    if r"\begin{align}" in method or r"\begin{aligned}" in method:
+        raise AssertionError("Method equations must not place multiple formulas per row.")
+    algorithm = re.search(
+        r"\\begin\{algorithmic\}\[1\](.*?)\\end\{algorithmic\}",
+        method,
+        flags=re.DOTALL,
+    )
+    if algorithm is None or len(re.findall(r"\\STATE\b", algorithm.group(1))) != 3:
+        raise AssertionError("The VEIL algorithm must contain exactly three steps.")
+    figures = re.findall(r"\\includegraphics(?:\[[^]]*\])?\{([^}]+)\}", text)
+    if figures != ["figures/private_methods_attack_profile.pdf"]:
+        raise AssertionError(f"Expected one focused attack figure, found {figures}.")
+    if text.count(r"\rowcolor{veilshade}") < 7:
+        raise AssertionError("VEIL rows are not consistently shaded in result tables.")
+
+
 def main() -> None:
     source = PAPER.read_text(encoding="utf-8")
     bib = BIB.read_text(encoding="utf-8")
@@ -351,6 +507,7 @@ def main() -> None:
     check_figures(text)
     check_derived_data()
     check_result_tables(text)
+    check_focused_structure(text)
     checklist_source = CHECKLIST.read_text(encoding="utf-8")
     check_braces(uncommented(checklist_source))
     check_environments(uncommented(checklist_source))
@@ -367,8 +524,8 @@ def main() -> None:
             f"{answer_count} answers."
         )
     print(
-        "Static AAAI syntax, citation, package, placeholder, figure, result-data, "
-        "and reproducibility-checklist checks passed."
+        "Static AAAI syntax, three-stage structure, table styling, citation, "
+        "figure, result-data, and reproducibility-checklist checks passed."
     )
 
 
