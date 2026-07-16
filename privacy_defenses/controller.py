@@ -549,15 +549,31 @@ class DefenseController:
         return torch.cat(feature_parts, dim=0), torch.cat(label_parts, dim=0)
 
     def _local_geometry(
-        self, features: torch.Tensor, labels: torch.Tensor
+        self,
+        features: torch.Tensor,
+        labels: torch.Tensor,
+        generator: torch.Generator | None = None,
+        mean_noise_std: float = 0.0,
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
         geometry = {}
         for class_id in labels.unique(sorted=True).tolist():
             mask = labels == int(class_id)
             class_features = features[mask]
-            mean = class_features.mean(dim=0)
-            centered = class_features - mean
-            geometry[int(class_id)] = (mean, centered)
+            empirical_mean = class_features.mean(dim=0)
+            centered = class_features - empirical_mean
+            private_mean = empirical_mean
+            if mean_noise_std > 0:
+                if generator is None:
+                    raise ValueError(
+                        "local_ggeur mean noise requires a private generator."
+                    )
+                private_mean = private_mean + torch.randn(
+                    private_mean.shape,
+                    generator=generator,
+                    device=private_mean.device,
+                    dtype=private_mean.dtype,
+                ) * mean_noise_std
+            geometry[int(class_id)] = (private_mean, centered)
         return geometry
 
     def _local_ggeur_private_originals(
@@ -697,7 +713,16 @@ class DefenseController:
         empirical covariance without sharing per-class means or covariances.
         """
         bank_features, bank_labels = self._local_feature_bank(user, model)
-        geometry = self._local_geometry(bank_features, bank_labels)
+        mean_noise_std = max(
+            0.0, float(self.config.get("local_ggeur_mean_noise_std", 0.0))
+        )
+        geometry = self._local_geometry(
+            bank_features,
+            bank_labels,
+            generator=self._generator(user.id, round_index, 877),
+            mean_noise_std=mean_noise_std,
+        )
+        self._record("local_ggeur_mean_noise_std", mean_noise_std)
         base_entropy_weight = max(
             0.0, float(self.config.get("local_ggeur_entropy_weight", 0.0))
         )
@@ -1015,6 +1040,9 @@ class DefenseController:
                 continue
             flat = torch.cat(deltas)
             norm = flat.norm().clamp_min(1e-12)
+            self._record(
+                "local_ggeur_upload_preclip_norm", float(norm.detach())
+            )
             if clip_norm is not None and clip_norm > 0:
                 flat = flat * min(1.0, clip_norm / float(norm))
                 self._record("local_ggeur_upload_clip_fraction", float(norm > clip_norm))

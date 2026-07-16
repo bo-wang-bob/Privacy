@@ -11,12 +11,15 @@
 - `fedask`：适配 NeurIPS 2025 FedASK。soft prompt 被参数化为冻结初始提示加 `B·A`；客户端固定 `A`，对完整 prompt 梯度做逐样本裁剪和扰动后更新 `B`，服务器执行两阶段随机草图、QR 与 SVD 重构 `A/B`。
 
 方法细节和论文对应关系见 [docs/federated_methods.md](docs/federated_methods.md)。
+Flowers102 三 seed 同场景公平比较和 Local-GGEUR 优化结果见
+[docs/flowers_fair_method_comparison.md](docs/flowers_fair_method_comparison.md)。
 
 ## 攻击与防御
 
 成员推理攻击包括 Nasr 被动/主动攻击、FedMIA、表示迁移、CodePoison、PIPRA、RMIA、IMIA、Quantile-MIA、YOQO、Canary 和 PromptMIA。映射说明见 [docs/attack_mapping.md](docs/attack_mapping.md)。
 
-可独立选择 `cofedmid`、`prompt_dp`、`mist`、`soft`、`hamp` 五种防御，见 [docs/defenses.md](docs/defenses.md)。一次运行可指定：
+可独立选择 `cofedmid`、`prompt_dp`、`mist`、`soft`、`hamp`、`local_ggeur`
+六种防御，见 [docs/defenses.md](docs/defenses.md)。一次运行可指定：
 
 ```bash
 # 一个方法 + 一个攻击 + 一个防御

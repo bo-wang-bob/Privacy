@@ -99,6 +99,7 @@ defense:
   local_ggeur_anchor_mode: class_mean
   local_ggeur_original_mode: class_mean_noise
   local_ggeur_original_noise: 0.08
+  local_ggeur_mean_noise_std: 0.0
   local_ggeur_mean_mix: 0.8
   local_ggeur_fallback_std: 0.02
   local_ggeur_entropy_weight: 0.0

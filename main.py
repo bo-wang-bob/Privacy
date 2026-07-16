@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import copy
 import datetime
@@ -20,6 +22,14 @@ from utils.privacy_accounting import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _result_run_id(
+    now: datetime.datetime | None = None, process_id: int | None = None
+) -> str:
+    now = datetime.datetime.now() if now is None else now
+    process_id = os.getpid() if process_id is None else int(process_id)
+    return now.strftime("%Y%m%d_%H%M%S_%f") + f"_{process_id}"
 
 
 def _load_local_clip(cache_dir: str, device: torch.device):
@@ -154,6 +164,8 @@ def validate_config(config: dict) -> None:
         raise ValueError("defense.local_ggeur_geometry_scale must be non-negative.")
     if float(defense.get("local_ggeur_original_noise", 0.03)) < 0:
         raise ValueError("defense.local_ggeur_original_noise must be non-negative.")
+    if float(defense.get("local_ggeur_mean_noise_std", 0.0)) < 0:
+        raise ValueError("defense.local_ggeur_mean_noise_std must be non-negative.")
     if float(defense.get("local_ggeur_output_temperature", 4.0)) < 1:
         raise ValueError(
             "defense.local_ggeur_output_temperature must be at least one."
@@ -286,7 +298,9 @@ def run(config: dict) -> list[dict]:
     )
     config["effective_train_mode"] = effective_train_mode
 
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Include microseconds and the process id so concurrent sweeps of the same
+    # method/defense cannot write into one directory and corrupt each other.
+    timestamp = _result_run_id()
     configured_attacks = list(config.get("audit", {}).get("attacks", []))
     if not bool(config.get("audit", {}).get("enabled", True)) or not configured_attacks:
         attack_label = "no_attack"
@@ -532,6 +546,7 @@ def default_config() -> dict:
             "local_ggeur_anchor_mode": "class_mean",
             "local_ggeur_original_mode": "class_mean_noise",
             "local_ggeur_original_noise": 0.08,
+            "local_ggeur_mean_noise_std": 0.0,
             "local_ggeur_mean_mix": 0.8,
             "local_ggeur_fallback_std": 0.02,
             "local_ggeur_entropy_weight": 0.0,
@@ -581,6 +596,7 @@ def parse_args() -> dict:
     parser.add_argument("--local_ggeur_anchor_mode")
     parser.add_argument("--local_ggeur_original_mode")
     parser.add_argument("--local_ggeur_original_noise", type=float)
+    parser.add_argument("--local_ggeur_mean_noise_std", type=float)
     parser.add_argument("--local_ggeur_mean_mix", type=float)
     parser.add_argument("--local_ggeur_fallback_std", type=float)
     parser.add_argument("--local_ggeur_entropy_weight", type=float)
@@ -645,6 +661,7 @@ def parse_args() -> dict:
         "local_ggeur_anchor_mode",
         "local_ggeur_original_mode",
         "local_ggeur_original_noise",
+        "local_ggeur_mean_noise_std",
         "local_ggeur_mean_mix",
         "local_ggeur_fallback_std",
         "local_ggeur_entropy_weight",

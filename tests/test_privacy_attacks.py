@@ -420,6 +420,36 @@ def test_each_defense_runs_independently_with_one_attack():
         assert (path / "privacy_audit" / "summary.json").exists()
 
 
+def test_local_ggeur_mean_noise_is_local_deterministic_and_preserves_covariance():
+    features = torch.tensor(
+        [[1.0, 0.0], [0.8, 0.2], [0.0, 1.0], [0.2, 0.8]]
+    )
+    labels = torch.tensor([0, 0, 1, 1])
+
+    def geometry(noise):
+        controller = DefenseController(
+            {"name": "local_ggeur", "seed": 17},
+            torch.device("cpu"),
+            total_users=2,
+            num_classes=2,
+            total_rounds=1,
+        )
+        return controller._local_geometry(
+            features,
+            labels,
+            generator=controller._generator(0, 0, 877),
+            mean_noise_std=noise,
+        )
+
+    clean = geometry(0.0)
+    first = geometry(0.03)
+    second = geometry(0.03)
+    for class_id in (0, 1):
+        assert torch.allclose(first[class_id][0], second[class_id][0])
+        assert not torch.allclose(first[class_id][0], clean[class_id][0])
+        assert torch.allclose(first[class_id][1], clean[class_id][1])
+
+
 def test_defense_only_mode_skips_attack_audit():
     path = Path(".test_artifacts") / "defense_only"
     path.mkdir(parents=True, exist_ok=True)

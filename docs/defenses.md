@@ -90,6 +90,7 @@ Local-GGEUR 是面向联邦提示学习成员推理防御的本地数据替代�
 - `local_ggeur_anchor_mode`：`class_mean` 或 `sample`。默认 `class_mean`，避免单个原样本直接作为增强锚点；`sample` 用于论文消融。
 - `local_ggeur_original_mode`：`drop`、`class_mean`、`class_mean_noise`、`mean_mix`、`blur` 或 `noise`。默认 `class_mean_noise`。
 - `local_ggeur_original_noise`：原样本私有化分支的 feature 噪声标准差。
+- `local_ggeur_mean_noise_std`：每个客户端、每轮对各类别几何均值锚点加入一次的本地 feature 噪声；默认 0，实验调优时用于削弱单个成员对类别中心的影响。
 - `local_ggeur_mean_mix`：`mean_mix`/`blur` 模式下向类均值收缩的比例。
 - `local_ggeur_fallback_std`：单样本类别无法估计协方差时的各向同性 fallback 噪声。
 - `local_ggeur_entropy_weight`：可选预测熵正则；默认 0，避免无必要地牺牲任务效用。
