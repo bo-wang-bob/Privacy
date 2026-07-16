@@ -18,7 +18,7 @@
 - `delta`；
 - `reproducible_dp_noise`：仅测试时使用。默认 `false`，使用不写入结果文件的 OS 随机种子。
 
-论文：[ICLR Proceedings](https://proceedings.iclr.cc/paper_files/paper/2025/hash/4431224d3762aa655f0aee4eaf04ff16-Abstract-Conference.html)。未发现作者公开代码，本实现依据论文算法和公式适配。
+论文：[ICLR Proceedings](https://proceedings.iclr.cc/paper_files/paper/2025/hash/4431224d3762aa655f0aee4eaf04ff16-Abstract-Conference.html)。官方代码：[Privacy-Preserving-Paper1](https://github.com/coderanik/Privacy-Preserving-Paper1)。本仓库依据论文算法及该实现，将个性化全局/本地提示和 RGP 私有更新适配到冻结 CLIP soft prompt。
 
 ## FedASK (`aggregator: fedask`)
 
@@ -36,7 +36,7 @@
 - `target_epsilon`：可选目标预算；
 - `delta`、`reproducible_dp_noise`。
 
-论文：[NeurIPS Proceedings](https://papers.nips.cc/paper_files/paper/2025/hash/a686ddca183f72ee9f3f04896eb11bcb-Abstract-Conference.html)。官方代码：[PrivacyFedLLM](https://github.com/SII-FLEEECERmw/PrivacyFedLLM)。两阶段草图和 SVD 恢复遵循官方实现。
+论文：[NeurIPS Proceedings](https://papers.nips.cc/paper_files/paper/2025/hash/a686ddca183f72ee9f3f04896eb11bcb-Abstract-Conference.html)。官方代码：[PrivacyFedLLM](https://github.com/FLEECERmw/PrivacyFedLLM)。两阶段草图和 SVD 恢复遵循官方实现。
 
 ## 隐私会计
 

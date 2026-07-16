@@ -240,11 +240,16 @@ def run(config: dict) -> list[dict]:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
+    cuda_available = torch.cuda.is_available()
+    if bool(config.get("require_cuda", False)) and not cuda_available:
+        raise RuntimeError(
+            "This experiment requires CUDA, but torch.cuda.is_available() is false."
+        )
+    if cuda_available:
         torch.cuda.manual_seed_all(seed)
 
     device = torch.device(
-        f"cuda:{config['gpu']}" if torch.cuda.is_available() else "cpu"
+        f"cuda:{config['gpu']}" if cuda_available else "cpu"
     )
     method = config["aggregator"].lower()
     method_config = dict(config.get(method, {}))
@@ -326,6 +331,11 @@ def run(config: dict) -> list[dict]:
         ],
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         force=True,
+    )
+    logging.getLogger(__name__).info(
+        "Using device %s (require_cuda=%s)",
+        device,
+        bool(config.get("require_cuda", False)),
     )
 
     if float(config["dirichlet_alpha"]) >= 10:
@@ -446,6 +456,7 @@ def default_config() -> dict:
         },
         "dirichlet_alpha": 0.1,
         "gpu": 0,
+        "require_cuda": False,
         "seed": 42,
         "fpl_shots": 16,
         "cache_dir": "./checkpoints/clip-vit-base-patch32",

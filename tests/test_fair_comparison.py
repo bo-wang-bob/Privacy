@@ -9,6 +9,10 @@ from utils.fair_comparison import (
     validate_fair_configs,
 )
 from main import _result_run_id
+from analysis_scripts.veil_paper_results import (
+    OFFICIAL_CONFIG,
+    matches_official_method,
+)
 
 
 def _config():
@@ -120,3 +124,22 @@ def test_aggregate_markdown_table_reports_mean_and_sample_std():
     table = aggregate_markdown_table([base, other])
     assert "| Local-GGEUR | 2 |" in table
     assert "0.6300 +/- 0.0141" in table
+
+
+def test_paper_selector_accepts_full_veil_and_rejects_ablation():
+    config = copy.deepcopy(OFFICIAL_CONFIG)
+    config["gpu"] = 0
+    config["aggregator"] = "fedavg"
+    config["defense"]["name"] = "veil"
+    assert matches_official_method(config, "VEIL")
+    config["defense"]["local_ggeur_augments"] = 0
+    assert not matches_official_method(config, "VEIL")
+
+
+def test_paper_selector_allows_runtime_seed_in_private_method_config():
+    config = copy.deepcopy(OFFICIAL_CONFIG)
+    config["gpu"] = 1
+    config["aggregator"] = "dpfpl"
+    config["defense"]["name"] = "none"
+    config["dpfpl"]["seed"] = 42
+    assert matches_official_method(config, "DP-FPL")

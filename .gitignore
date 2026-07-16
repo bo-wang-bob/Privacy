@@ -12,4 +12,11 @@ __pycache__/
 .ruff_cache/
 .idea/
 .vscode/
-paper/
+paper/**/*.aux
+paper/**/*.bbl
+paper/**/*.blg
+paper/**/*.fdb_latexmk
+paper/**/*.fls
+paper/**/*.log
+paper/**/*.out
+paper/**/*.synctex.gz

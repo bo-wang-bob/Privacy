@@ -407,7 +407,16 @@ def _defended_server(
 
 def test_each_defense_runs_independently_with_one_attack():
     root = Path(".test_artifacts") / "defenses"
-    for defense in ("cofedmid", "prompt_dp", "mist", "soft", "hamp", "local_ggeur"):
+    for defense in (
+        "cofedmid",
+        "prompt_dp",
+        "mist",
+        "soft",
+        "hamp",
+        "local_ggeur",
+        "mirage",
+        "veil",
+    ):
         path = root / defense
         path.mkdir(parents=True, exist_ok=True)
         summaries = _defended_server(path, defense).train()
@@ -416,7 +425,7 @@ def test_each_defense_runs_independently_with_one_attack():
             (path / "defense_summary.json").read_text(encoding="utf-8")
         )
         assert summary["defense"] == defense
-        if defense == "local_ggeur":
+        if defense in {"local_ggeur", "mirage", "veil"}:
             assert summary["metrics"]["local_ggeur_private_feature_count"] > 0
         assert (path / "privacy_audit" / "summary.json").exists()
 
@@ -863,3 +872,19 @@ def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
     assert (tmp_path / "privacy_audit" / "summary.json").exists()
     assert (tmp_path / "privacy_audit" / "predictions.csv").exists()
     assert (tmp_path / "final_prompt.pt").exists()
+
+
+def test_veil_and_mirage_are_backward_compatible_local_ggeur_aliases():
+    config = default_config()
+    for alias in ("mirage", "veil"):
+        config["defense"]["name"] = alias
+        validate_config(config)
+        controller = DefenseController(
+            config["defense"],
+            device=torch.device("cpu"),
+            total_users=2,
+            num_classes=3,
+            total_rounds=1,
+        )
+        assert controller.name == alias
+        assert controller.enabled

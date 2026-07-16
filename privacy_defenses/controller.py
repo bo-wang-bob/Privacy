@@ -32,6 +32,8 @@ SUPPORTED_DEFENSES = {
     "soft",
     "hamp",
     "local_ggeur",
+    "mirage",
+    "veil",
 }
 
 
@@ -331,7 +333,7 @@ class DefenseController:
             self._soft_training(user, model, optimizer, round_index, code_poison)
         elif self.name == "cofedmid":
             self._cofedmid_training(user, model, optimizer, round_index, code_poison)
-        elif self.name == "local_ggeur":
+        elif self.name in {"local_ggeur", "mirage", "veil"}:
             self._local_ggeur_training(user, model, optimizer, round_index)
         else:
             self._standard_training(
@@ -1009,7 +1011,7 @@ class DefenseController:
                 self._mist_refinement(users, updated_states, selected_ids, round_index)
         elif self.name == "cofedmid":
             self._cofedmid_perturb(updated_states, selected_ids, round_index)
-        elif self.name == "local_ggeur":
+        elif self.name in {"local_ggeur", "mirage", "veil"}:
             self._local_ggeur_upload_smoothing(
                 base_state, updated_states, selected_ids, round_index
             )

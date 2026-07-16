@@ -1,0 +1,104 @@
+train_mode: centralized
+dataset_name: flowers
+batch_size: 16
+eval_batch_size: 64
+learning_rate: 0.001
+num_global_iters: 5
+local_epochs: 1
+total_users: 10
+sample_users: 10
+aggregator: fedavg
+
+dpfpl:
+  rank: 4
+  local_steps: 1
+  local_clip_norm: 1.0
+  local_noise_multiplier: 0.3
+  local_target_epsilon: null
+  global_clip_norm: 1.0
+  global_noise_multiplier: 0.1
+  global_target_epsilon: null
+  delta: 0.00001
+  reproducible_dp_noise: false
+
+fedask:
+  rank: 16
+  oversampling: 0
+  scaling: 1.0
+  local_steps: 10
+  clip_norm: 1.0
+  noise_multiplier: 1.0
+  target_epsilon: null
+  delta: 0.00001
+  reproducible_dp_noise: false
+
+dirichlet_alpha: 0.1
+gpu: 0
+require_cuda: true
+seed: 42
+fpl_shots: 16
+cache_dir: ./checkpoints/clip-vit-base-patch32
+n_ctx: 16
+class_specific_ctx: false
+model_load_path: null
+save_models: false
+eval_interval: 5
+results_dir: ./results
+
+audit:
+  enabled: true
+  audit_view: protocol_plus_released_prompts
+  strict: true
+  target_client_id: 0
+  ensure_target_participation: true
+  attacks:
+    - fedmia_loss
+    - fedmia_cosine
+    - fedmia_joint
+    - nasr_passive
+    - rmia
+    - quantile_mia
+  max_samples_per_group: 64
+  audit_interval: 2
+  calibration_fraction: 0.5
+  match_candidate_labels: true
+  auxiliary_fraction: 0.5
+  fedmia_loss_aggregation: mean
+  fedmia_cosine_aggregation: mean
+  fedmia_joint_components:
+    - confidence_z_mean
+    - cosine_z_max
+    - cosine_z_late3
+  rmia_offline_a: 0.3
+  rmia_gamma: 2.0
+  qmia_quantile: 0.9
+  qmia_epochs: 200
+  qmia_learning_rate: 0.01
+
+defense:
+  name: none
+  dp_max_grad_norm: 1.0
+  dp_noise_multiplier: 1.0
+  dp_delta: 0.00001
+  reproducible_dp_noise: false
+  hamp_true_probability: 0.6
+  hamp_entropy_weight: 0.05
+  hamp_output_temperature: 4.0
+  local_ggeur_augments: 3
+  local_ggeur_geometry_scale: 0.60
+  local_ggeur_anchor_mode: class_mean
+  local_ggeur_original_mode: class_mean
+  local_ggeur_original_noise: 0.0
+  local_ggeur_mean_noise_std: 0.0
+  local_ggeur_mean_mix: 0.8
+  local_ggeur_fallback_std: 0.02
+  local_ggeur_entropy_weight: 0.0
+  local_ggeur_entropy_rounds: null
+  local_ggeur_late_start_round: null
+  local_ggeur_late_augments: null
+  local_ggeur_output_temperature: 4.0
+  local_ggeur_output_margin: null
+  local_ggeur_calibrate_observations: false
+  local_ggeur_class_balanced: false
+  local_ggeur_upload_clip_norm: 0.5
+  local_ggeur_upload_noise_std: 0.11

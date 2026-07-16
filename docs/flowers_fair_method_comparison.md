@@ -1,5 +1,10 @@
 # Flowers102 同场景公平比较与 Local-GGEUR 优化
 
+> 论文阶段本方法正式更名为 **VEIL**（Variance-Echoed Instance-Less Prompt
+> Learning）；`local_ggeur` 是同一实现的历史配置名。本文记录的是五 seed
+> 开发阶段证据，不应与 AAAI 论文固定 seeds 42--44 的正式三数据集主表混用；
+> 论文数值由 `analysis_scripts/veil_paper_results.py` 另行严格选择和聚合。
+
 日期：2026-07-16
 
 ## 最终结论

@@ -123,7 +123,7 @@ class MembershipAuditor:
                 self.model,
                 float(self.defense_config.get("hamp_output_temperature", 4.0)),
             )
-        elif self.defense_name == "local_ggeur" and bool(
+        elif self.defense_name in {"local_ggeur", "mirage", "veil"} and bool(
             self.defense_config.get("local_ggeur_calibrate_observations", False)
         ):
             margin = self.defense_config.get("local_ggeur_output_margin")
@@ -159,6 +159,8 @@ class MembershipAuditor:
             )
             nonmember_datasets = [target.test_data] + [
                 user.test_data for user in users if user.id != target_client_id
+            ] + [
+                user.train_data for user in users if user.id != target_client_id
             ]
             if self.match_candidate_labels:
                 nonmember_images, nonmember_labels = self._collect_label_matched(
@@ -620,7 +622,7 @@ class MembershipAuditor:
                 final_model,
                 float(self.defense_config.get("hamp_output_temperature", 4.0)),
             )
-        elif self.defense_name == "local_ggeur":
+        elif self.defense_name in {"local_ggeur", "mirage", "veil"}:
             margin = self.defense_config.get("local_ggeur_output_margin")
             attach_output_temperature_transform(
                 final_model,
@@ -672,6 +674,11 @@ class MembershipAuditor:
                     },
                     "candidate_sampling": {
                         "label_histograms_matched": self.match_candidate_labels,
+                        "nonmember_source_priority": [
+                            "target_test",
+                            "other_client_test",
+                            "other_client_train",
+                        ],
                         "member_label_histogram": member_histogram,
                         "nonmember_label_histogram": nonmember_histogram,
                     },
