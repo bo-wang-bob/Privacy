@@ -38,17 +38,17 @@ three-stage client mechanism that converts private embeddings into local
 class-distribution surrogates before prompt optimization and sanitizes only the
 resulting prompt delta.  Its central operation samples covariance-shaped echoes
 around class prototypes without forming or communicating a full covariance
-matrix.  We audit six complementary membership attacks at the stringent
+matrix.  We audit five published membership attacks at the stringent
 true-positive rate at 1\% false-positive rate (\tpr{}) using label-matched
 candidates, isolated audit randomness, three datasets, and repeated non-IID
 partitions.  Against FedAvg defenses, \method{} attains the lowest cross-dataset
-mean attack leakage (0.0145) while matching Prompt-DP mean accuracy within 0.12
-percentage points.  Under the same six attacks, it also exceeds DP-FPL and
-FedASK accuracy on every dataset and reduces their cross-dataset mean leakage by
-3.8\% and 36.7\%, respectively.  DP-FPL remains better on DTD and slightly
-better in cross-dataset worst-attack leakage, exposing a genuine transfer
-boundary rather than universal dominance.  \method{} is therefore an empirical
-membership defense, not a differential-privacy guarantee.
+mean attack leakage (0.0160) while matching Prompt-DP mean accuracy within 0.12
+percentage points.  Under the same five attacks, it also exceeds DP-FPL and
+FedASK accuracy on every dataset and reduces FedASK's cross-dataset mean leakage
+by 27.0\%.  DP-FPL retains lower mean and worst-attack leakage, exposing a
+genuine privacy--utility tradeoff rather than universal dominance.  \method{}
+is therefore an empirical membership defense, not a differential-privacy
+guarantee.
 \end{abstract}
 
 \section{Introduction}
@@ -71,8 +71,7 @@ formal guarantee, but noise can destabilize prompt learning in strongly non-IID,
 few-shot regimes \citep{abadi2016dpsgd,duan2023privateprompt}.  Output-centered
 methods such as HAMP reduce overconfidence, yet do not directly erase update
 alignment \citep{chen2024hamp}.  Private federated prompt and low-rank training
-mechanisms, including DP-FPL and FedASK (also called FedSAK in some project
-documentation), change the communicated parameterization
+mechanisms, including DP-FPL and FedASK, change the communicated parameterization
 but remain subject to empirical auditing \citep{dpfpl2025,fedask2025}.
 
 We ask whether the client can preserve the class structure needed for prompt
@@ -96,7 +95,7 @@ Our contributions are threefold:
     estimation, instance-obscured surrogate learning, and structured prompt
     release, while keeping CLIP frozen and aggregating only trainable parameters.
     \item We provide a protocol-aware benchmark that compares \method{}, DP-FPL,
-    and FedASK under six attacks with exactly label-matched candidates and reports
+    and FedASK under five attacks with exactly label-matched candidates and reports
     both per-attack leakage and utility across three non-IID datasets.
 \end{itemize}
 
@@ -294,7 +293,7 @@ $n_b$.  No class statistic or auxiliary message crosses the client boundary.
 
 The evaluation answers three focused questions.  \textbf{RQ1} asks whether
 \method{} improves attack-specific leakage under a common FedAvg backbone.
-\textbf{RQ2} compares \method{} with DP-FPL and FedASK/FedSAK under the same six
+\textbf{RQ2} compares \method{} with DP-FPL and FedASK under the same five
 attacks.  \textbf{RQ3} measures the contribution of each \method{} stage.
 
 \subsection{Datasets and Federated Protocol}
@@ -344,7 +343,7 @@ no defense, Prompt-DP, HAMP, and \method{}, with method-specific settings listed
 in the artifact.
 
 The second comparison changes the private training mechanism.  It evaluates
-\method{}, DP-FPL, and FedASK (called FedSAK in some project documentation) using
+\method{}, DP-FPL, and FedASK using
 configurations aligned with their public repositories while fixing the data,
 optimization budget, and audit.
 
@@ -356,11 +355,11 @@ the other mechanisms release one shared prompt.
 
 \subsection{Attacks and Metrics}
 
-The attack suite spans six complementary membership signals.  We evaluate
-FedMIA loss, FedMIA update cosine, their fixed joint score, Nasr-style passive
-white-box inference, offline RMIA, and quantile-regression MIA.  These attacks
-cover confidence, update alignment, prompt statistics, reference likelihoods,
-and input-dependent thresholds.
+The attack suite spans five published membership signals.  We evaluate FedMIA-I
+with model loss, FedMIA-II with gradient--update cosine similarity, Nasr-style
+passive white-box inference, offline RMIA, and quantile-regression MIA.  These
+attacks cover confidence, update alignment, prompt statistics, reference
+likelihoods, and input-dependent thresholds.
 
 The audit prevents label-distribution shortcuts.  Each run uses 64 members and
 64 non-members with exactly matched label histograms, and audit loading has an
@@ -384,35 +383,34 @@ and the remaining columns report attack TPR on the same trained model.
 \begin{table*}[t]
 \centering
 \small
-\setlength{\tabcolsep}{3.8pt}
-\begin{tabular}{llrrrrrrr}
+\setlength{\tabcolsep}{5.0pt}
+\begin{tabular}{llrrrrrr}
 \toprule
 & & \multicolumn{1}{c}{No attack} &
-\multicolumn{3}{c}{FedMIA \tpr{} $\downarrow$} &
-\multicolumn{3}{c}{Other \tpr{} $\downarrow$}\\
-\cmidrule(lr){3-3}\cmidrule(lr){4-6}\cmidrule(lr){7-9}
-Dataset & Defense & Acc. $\uparrow$ & Loss & Cos. & Joint & Nasr & RMIA & Quant.\\
+\multicolumn{5}{c}{Membership attack \tpr{} $\downarrow$}\\
+\cmidrule(lr){3-3}\cmidrule(lr){4-8}
+Dataset & Defense & Acc. $\uparrow$ & FedMIA-I & FedMIA-II & Nasr & RMIA & Quant.\\
 \midrule
 \multirow{4}{*}{Flowers102}
-& No defense & 66.1 & 0.5 & 0.5 & 1.0 & 4.2 & 2.6 & 2.6\\
-& Prompt-DP & 61.7 & 0.5 & 1.6 & 1.6 & 4.2 & \textbf{0.0} & 3.6\\
-& HAMP & 54.7 & 2.6 & 1.6 & \textbf{0.5} & \textbf{0.0} & 0.5 & \textbf{2.1}\\
+& No defense & 66.1 & 0.5 & 0.5 & 4.2 & 2.6 & 2.6\\
+& Prompt-DP & 61.7 & 0.5 & 1.6 & 4.2 & \textbf{0.0} & 3.6\\
+& HAMP & 54.7 & 2.6 & 1.6 & \textbf{0.0} & 0.5 & \textbf{2.1}\\
 \rowcolor{veilshade}
-& \method{} & \textbf{62.0} & \textbf{0.0} & \textbf{0.5} & \textbf{0.5} & 1.0 & \textbf{0.0} & 4.7\\
+& \method{} & \textbf{62.0} & \textbf{0.0} & \textbf{0.5} & 1.0 & \textbf{0.0} & 4.7\\
 \midrule
 \multirow{4}{*}{Caltech101}
-& No defense & 86.8 & 2.1 & 0.0 & 1.6 & 0.0 & 0.0 & 5.2\\
-& Prompt-DP & \textbf{81.1} & 3.1 & 3.1 & 2.6 & 5.2 & \textbf{0.0} & \textbf{2.6}\\
-& HAMP & 79.7 & \textbf{1.0} & 3.6 & 4.2 & \textbf{1.0} & 0.5 & 8.9\\
+& No defense & 86.8 & 2.1 & 0.0 & 0.0 & 0.0 & 5.2\\
+& Prompt-DP & \textbf{81.1} & 3.1 & 3.1 & 5.2 & \textbf{0.0} & \textbf{2.6}\\
+& HAMP & 79.7 & \textbf{1.0} & 3.6 & \textbf{1.0} & 0.5 & 8.9\\
 \rowcolor{veilshade}
-& \method{} & 80.4 & \textbf{1.0} & \textbf{2.1} & \textbf{0.5} & \textbf{1.0} & \textbf{0.0} & 3.1\\
+& \method{} & 80.4 & \textbf{1.0} & \textbf{2.1} & \textbf{1.0} & \textbf{0.0} & 3.1\\
 \midrule
 \multirow{4}{*}{DTD}
-& No defense & 46.7 & 1.6 & 1.6 & 1.0 & 1.0 & 0.5 & 2.1\\
-& Prompt-DP & 37.6 & 1.0 & \textbf{1.6} & \textbf{0.0} & \textbf{0.0} & \textbf{0.0} & \textbf{0.0}\\
-& HAMP & \textbf{43.2} & 2.6 & 2.1 & 1.0 & 1.0 & 0.5 & 0.5\\
+& No defense & 46.7 & 1.6 & 1.6 & 1.0 & 0.5 & 2.1\\
+& Prompt-DP & 37.6 & 1.0 & \textbf{1.6} & \textbf{0.0} & \textbf{0.0} & \textbf{0.0}\\
+& HAMP & \textbf{43.2} & 2.6 & 2.1 & 1.0 & 0.5 & 0.5\\
 \rowcolor{veilshade}
-& \method{} & 37.6 & \textbf{0.5} & 3.1 & 1.0 & 2.1 & 3.6 & 1.0\\
+& \method{} & 37.6 & \textbf{0.5} & 3.1 & 2.1 & 3.6 & 1.0\\
 \bottomrule
 \end{tabular}
 \caption{FedAvg defense comparison.  All values are percentages averaged over
@@ -422,16 +420,16 @@ value among the three defenses, including ties.  Shaded rows denote our method.}
 \end{table*}
 
 \method{} is the most consistent defense on Flowers102 and Caltech101.  It is
-best or tied among defenses on four attacks for Flowers102 and five attacks for
+best or tied among defenses on three attacks for Flowers102 and four attacks for
 Caltech101, while achieving the highest defended accuracy on Flowers102 and
 remaining within 0.7 points of the best defended Caltech101 accuracy.
 
 DTD exposes the transfer limit of the fixed operating point.  Prompt-DP is best
-on five attack columns, whereas \method{} is best only on the loss attack and
+on four attack columns, whereas \method{} is best only on FedMIA-I and
 loses 9.1 clean-accuracy points relative to no defense.  This reversal motivates
 reporting the complete attack vector instead of one aggregate score.
 
-\subsection{Comparison with DP-FPL and FedASK under Six Attacks}
+\subsection{Comparison with DP-FPL and FedASK under Five Attacks}
 
 Table~\ref{tab:private} answers RQ2 with the same clean-and-attack layout as
 Table~\ref{tab:fedavg}.  Figure~\ref{fig:private} provides a low-density visual
@@ -440,32 +438,31 @@ summary; exact values remain in the table.
 \begin{table*}[t]
 \centering
 \small
-\setlength{\tabcolsep}{3.8pt}
-\begin{tabular}{llrrrrrrr}
+\setlength{\tabcolsep}{5.0pt}
+\begin{tabular}{llrrrrrr}
 \toprule
 & & \multicolumn{1}{c}{No attack} &
-\multicolumn{3}{c}{FedMIA \tpr{} $\downarrow$} &
-\multicolumn{3}{c}{Other \tpr{} $\downarrow$}\\
-\cmidrule(lr){3-3}\cmidrule(lr){4-6}\cmidrule(lr){7-9}
-Dataset & Method & Acc. $\uparrow$ & Loss & Cos. & Joint & Nasr & RMIA & Quant.\\
+\multicolumn{5}{c}{Membership attack \tpr{} $\downarrow$}\\
+\cmidrule(lr){3-3}\cmidrule(lr){4-8}
+Dataset & Method & Acc. $\uparrow$ & FedMIA-I & FedMIA-II & Nasr & RMIA & Quant.\\
 \midrule
 \multirow{3}{*}{Flowers102}
-& DP-FPL & 55.5 & \textbf{0.0} & 2.6 & 2.6 & 7.3 & \textbf{0.0} & \textbf{3.1}\\
-& FedASK & 52.7 & \textbf{0.0} & 3.6 & 2.1 & 6.2 & \textbf{0.0} & \textbf{3.1}\\
+& DP-FPL & 55.5 & \textbf{0.0} & 2.6 & 7.3 & \textbf{0.0} & \textbf{3.1}\\
+& FedASK & 52.7 & \textbf{0.0} & 3.6 & 6.2 & \textbf{0.0} & \textbf{3.1}\\
 \rowcolor{veilshade}
-& \method{} & \textbf{62.0} & \textbf{0.0} & \textbf{0.5} & \textbf{0.5} & \textbf{1.0} & \textbf{0.0} & 4.7\\
+& \method{} & \textbf{62.0} & \textbf{0.0} & \textbf{0.5} & \textbf{1.0} & \textbf{0.0} & 4.7\\
 \midrule
 \multirow{3}{*}{Caltech101}
-& DP-FPL & 74.3 & \textbf{0.0} & 3.1 & 1.0 & \textbf{0.0} & 1.0 & \textbf{2.6}\\
-& FedASK & 60.6 & \textbf{0.0} & 3.1 & 2.1 & 2.1 & 1.6 & 6.8\\
+& DP-FPL & 74.3 & \textbf{0.0} & 3.1 & \textbf{0.0} & 1.0 & \textbf{2.6}\\
+& FedASK & 60.6 & \textbf{0.0} & 3.1 & 2.1 & 1.6 & 6.8\\
 \rowcolor{veilshade}
-& \method{} & \textbf{80.4} & 1.0 & \textbf{2.1} & \textbf{0.5} & 1.0 & \textbf{0.0} & 3.1\\
+& \method{} & \textbf{80.4} & 1.0 & \textbf{2.1} & 1.0 & \textbf{0.0} & 3.1\\
 \midrule
 \multirow{3}{*}{DTD}
-& DP-FPL & 35.6 & \textbf{0.0} & \textbf{1.0} & 2.1 & \textbf{0.0} & \textbf{0.0} & \textbf{0.5}\\
-& FedASK & 33.3 & \textbf{0.0} & 3.6 & 4.2 & \textbf{0.0} & 1.0 & 1.6\\
+& DP-FPL & 35.6 & \textbf{0.0} & \textbf{1.0} & \textbf{0.0} & \textbf{0.0} & \textbf{0.5}\\
+& FedASK & 33.3 & \textbf{0.0} & 3.6 & \textbf{0.0} & 1.0 & 1.6\\
 \rowcolor{veilshade}
-& \method{} & \textbf{37.6} & 0.5 & 3.1 & \textbf{1.0} & 2.1 & 3.6 & 1.0\\
+& \method{} & \textbf{37.6} & 0.5 & 3.1 & 2.1 & 3.6 & 1.0\\
 \bottomrule
 \end{tabular}
 \caption{Attack-specific comparison with private training mechanisms.  All
@@ -479,7 +476,8 @@ value within each dataset, including ties; shaded rows denote our method.}
 \includegraphics[width=0.96\textwidth]{figures/private_methods_attack_profile.pdf}
 \caption{Attack surface of \method{}, DP-FPL, and FedASK.  Panels share one
 zero-anchored scale, darker cells indicate higher leakage, and the outlined row
-denotes our method.  Numeric values are reported in Table~\ref{tab:private}.}
+denotes our method.  F-I and F-II denote FedMIA-I and FedMIA-II; numeric values
+are reported in Table~\ref{tab:private}.}
 \label{fig:private}
 \end{figure*}
 
@@ -487,14 +485,14 @@ denotes our method.  Numeric values are reported in Table~\ref{tab:private}.}
 DP-FPL and FedASK on every dataset, averaging 60.0\% versus 55.1\% and 48.9\%.
 
 The Flowers102 attack profile shows the strongest privacy advantage.  \method{}
-is best or tied on five attacks and reduces Nasr TPR from 7.3\%/6.2\% to 1.0\%.
-On Caltech101, it is best on cosine, joint, and RMIA while adding 6.1 accuracy
+is best or tied on four attacks and reduces Nasr TPR from 7.3\%/6.2\% to 1.0\%.
+On Caltech101, it is best on FedMIA-II and RMIA while adding 6.1 accuracy
 points over DP-FPL.
 
-DTD remains the principal limitation.  DP-FPL is best on five attack columns,
-while \method{} is best only on the joint attack.  Across all datasets and
-attacks, \method{} still reduces mean leakage by 3.8\% relative to DP-FPL and
-36.7\% relative to FedASK.
+DTD remains the principal limitation.  DP-FPL is best or tied on all five attack
+columns, while \method{} is not best on any.  Across all datasets and attacks,
+DP-FPL has the lowest mean leakage at 1.42\%, followed by \method{} at 1.60\%
+and FedASK at 2.19\%.
 
 Formal accounting remains conservative.  Without claiming client or example
 subsampling amplification, Gaussian-RDP upper bounds span
@@ -511,21 +509,20 @@ individual anchors, and removing Stage III disables update clipping and noise.
 \centering
 \small
 \setlength{\tabcolsep}{2.1pt}
-\begin{tabular}{lrrrrrrr}
+\begin{tabular}{lrrrrrr}
 \toprule
-Variant & Acc. $\uparrow$ & L & C & J & N & R & Q\\
+Variant & Acc. $\uparrow$ & F-I & F-II & N & R & Q\\
 \midrule
 \rowcolor{veilshade}
-Full \method{} & 62.2 & \textbf{0.0} & \textbf{0.0} & \textbf{0.0} & \textbf{3.1} & \textbf{0.0} & \textbf{0.0}\\
-w/o S-I & 62.1 & \textbf{0.0} & \textbf{0.0} & \textbf{0.0} & \textbf{3.1} & 1.6 & \textbf{0.0}\\
-w/o S-II & 62.1 & \textbf{0.0} & \textbf{0.0} & \textbf{0.0} & \textbf{3.1} & 1.6 & 1.6\\
-w/o S-III & \textbf{65.1} & \textbf{0.0} & \textbf{0.0} & \textbf{0.0} & 6.2 & 1.6 & 3.1\\
+Full \method{} & 62.2 & \textbf{0.0} & \textbf{0.0} & \textbf{3.1} & \textbf{0.0} & \textbf{0.0}\\
+w/o S-I & 62.1 & \textbf{0.0} & \textbf{0.0} & \textbf{3.1} & 1.6 & \textbf{0.0}\\
+w/o S-II & 62.1 & \textbf{0.0} & \textbf{0.0} & \textbf{3.1} & 1.6 & 1.6\\
+w/o S-III & \textbf{65.1} & \textbf{0.0} & \textbf{0.0} & 6.2 & 1.6 & 3.1\\
 \bottomrule
 \end{tabular}
-\caption{Stage-level ablation on Flowers102.  All values are percentages.  L,
-C, J, N, R, and Q denote FedMIA loss, cosine, joint, Nasr, RMIA, and Quantile
-MIA, respectively.  Bold marks the best value including ties; the shaded row
-is the full method.}
+\caption{Stage-level ablation on Flowers102.  All values are percentages.  F-I,
+F-II, N, R, and Q denote FedMIA-I, FedMIA-II, Nasr, RMIA, and Quantile MIA.
+Bold marks the best value including ties; the shaded row is the full method.}
 \label{tab:ablation}
 \end{table}
 
@@ -566,10 +563,10 @@ We presented \method{}, a three-stage defense for federated CLIP prompt learning
 estimate private semantic geometry, optimize on instance-obscured surrogates,
 and release a norm-controlled prompt delta.  This interface removes individual
 embeddings from the prompt loss without communicating class statistics or
-changing the FedAvg server.  Under six label-matched attacks, \method{} provides
-the strongest cross-dataset accuracy and mean-leakage averages among \method{},
-DP-FPL, and FedASK, while DP-FPL remains preferable on DTD privacy and slightly
-better in worst-attack leakage overall.  The result supports distributional
+changing the FedAvg server.  Under five label-matched attacks, \method{} provides
+the strongest cross-dataset accuracy among \method{}, DP-FPL, and FedASK and
+improves mean leakage over FedASK, while DP-FPL remains stronger on aggregate
+privacy.  The result supports distributional
 surrogate learning as a practical empirical complement to formally accounted
 mechanisms, not as a substitute for differential privacy.
 

@@ -1,4 +1,4 @@
-# DP-FPL 与 FedASK/FedSAK 隐私攻击实验记录
+# DP-FPL 与 FedASK 隐私攻击实验记录
 
 > 注意：本页的早期结果使用顺序抽取的非成员候选，没有严格匹配成员与非成员
 > 的类别直方图。Flowers102 的最终公平比较应以
@@ -8,12 +8,12 @@
 
 ## 目标
 
-评估当前仓库中已有 membership privacy attacks 在 DP-FPL 与 FedASK/FedSAK 上的攻击效果，并尽量对齐以下论文及其官方仓库：
+评估当前仓库中已有 membership privacy attacks 在 DP-FPL 与 FedASK 上的攻击效果，并尽量对齐以下论文及其官方仓库：
 
 - DP-FPL: *Privacy-Preserving Personalized Federated Prompt Learning for Multimodal Large Language Models*，官方仓库：https://github.com/coderanik/Privacy-Preserving-Paper1
-- FedASK/FedSAK: *Differentially Private Federated Low Rank Adaptation Beyond Fixed-Matrix*，官方仓库：https://github.com/FLEECERmw/PrivacyFedLLM
+- FedASK: *Differentially Private Federated Low Rank Adaptation Beyond Fixed-Matrix*，官方仓库：https://github.com/FLEECERmw/PrivacyFedLLM
 
-本轮实验使用 membership privacy attacks。第一批为低成本被动审计：`fedmia_loss`、`fedmia_cosine`、`fedmia_joint`、`nasr_passive`、`rmia`、`quantile_mia`。第二批为其余合规隐私攻击：`nasr_active`、`transfer_representation`、`pipra`、`imia`、`yoqo`、`canary`、`promptmia`。未运行 `codepoison`，因为它会改变目标客户端训练路径并带投毒语义。
+本轮实验使用 membership privacy attacks。论文报告的被动审计包括 `fedmia_loss`、`fedmia_cosine`、`nasr_passive`、`rmia`、`quantile_mia`。第二批为其余合规隐私攻击：`nasr_active`、`transfer_representation`、`pipra`、`imia`、`yoqo`、`canary`、`promptmia`。
 
 ## 官方实现核对
 
@@ -39,7 +39,7 @@
 - 官方 notebook 使用 CPU 和自动下载模型/数据；本仓库按要求使用本地 CLIP 缓存与 GPU。
 - 官方 notebook 的 DP 逻辑较简化；本仓库额外记录 conservative RDP accounting 和协议可见消息。
 
-### FedASK/FedSAK
+### FedASK
 
 官方 FedASK 仓库是 LLM LoRA 框架，不是 CLIP prompt 框架。关键实现要点：
 
@@ -132,13 +132,11 @@ FedASK official-style 采用官方配置中的 rank/sketch 映射：`rank=16, ov
 |---|---|---:|---:|---:|---:|
 | DP-FPL | fedmia_loss | 0.0000 | 0.0000 | 0.5000 | 64 |
 | DP-FPL | fedmia_cosine | 0.2188 | 0.3125 | 0.4834 | 64 |
-| DP-FPL | fedmia_joint | 0.2500 | 0.2812 | 0.5205 | 64 |
 | DP-FPL | nasr_passive | 0.2500 | 0.3125 | 0.7070 | 32 |
 | DP-FPL | rmia | 0.0000 | 0.0000 | 0.5000 | 48 |
 | DP-FPL | quantile_mia | 0.0000 | 0.0000 | 0.1465 | 48 |
 | FedASK | fedmia_loss | 0.0000 | 0.0000 | 0.5000 | 64 |
 | FedASK | fedmia_cosine | 0.1562 | 0.2812 | 0.5703 | 64 |
-| FedASK | fedmia_joint | 0.0000 | 0.0625 | 0.3291 | 64 |
 | FedASK | nasr_passive | 0.5000 | 0.5000 | 0.6250 | 32 |
 | FedASK | rmia | 0.0000 | 0.0000 | 0.5000 | 48 |
 | FedASK | quantile_mia | 0.0312 | 0.0312 | 0.2461 | 48 |
@@ -170,13 +168,11 @@ FedASK official-style 采用官方配置中的 rank/sketch 映射：`rank=16, ov
 |---|---|---:|---:|---:|---:|
 | DP-FPL | fedmia_loss | 0.0000 | 0.0000 | 0.5000 | 64 |
 | DP-FPL | fedmia_cosine | 0.0000 | 0.0938 | 0.5820 | 64 |
-| DP-FPL | fedmia_joint | 0.0000 | 0.0312 | 0.5088 | 64 |
 | DP-FPL | nasr_passive | 0.1875 | 0.1875 | 0.4766 | 32 |
 | DP-FPL | rmia | 0.0000 | 0.0000 | 0.5000 | 48 |
 | DP-FPL | quantile_mia | 0.0625 | 0.2188 | 0.4883 | 48 |
 | FedASK | fedmia_loss | 0.0000 | 0.0000 | 0.5000 | 64 |
 | FedASK | fedmia_cosine | 0.0000 | 0.1250 | 0.6924 | 64 |
-| FedASK | fedmia_joint | 0.0000 | 0.0938 | 0.6885 | 64 |
 | FedASK | nasr_passive | 0.1875 | 0.1875 | 0.4805 | 32 |
 | FedASK | rmia | 0.0000 | 0.0000 | 0.5000 | 48 |
 | FedASK | quantile_mia | 0.0625 | 0.1250 | 0.5059 | 48 |
@@ -225,7 +221,7 @@ FedASK official-style 采用官方配置中的 rank/sketch 映射：`rank=16, ov
 
 1. 在更贴近 DP-FPL 官方 notebook 的 Flowers102 / 5 round / prompt length 16 设置下，第一批被动攻击在 `TPR@1%FPR` 上整体较弱；最高为 `nasr_passive` 与 `quantile_mia` 的 0.1875 与 0.0625。
 
-2. 在 official-style FedASK 映射下，`fedmia_cosine` 与 `fedmia_joint` 的 AUC 分别达到 0.6924 和 0.6885，说明存在一定排序信号；但在严格低误报约束下 `TPR@1%FPR` 仍为 0。这表示攻击者能部分排序成员/非成员，但不能在 1% FPR 下稳定抓到成员。
+2. 在 official-style FedASK 映射下，FedMIA-II 的 AUC 达到 0.6924，说明存在一定排序信号；但在严格低误报约束下 `TPR@1%FPR` 仍为 0。这表示攻击者能部分排序成员/非成员，但不能在 1% FPR 下稳定抓到成员。
 
 3. 扩展攻击中，DP-FPL 对 `imia` 和 `promptmia` 有更明显响应：`imia` 达到 `TPR@1%FPR=0.3438/AUC=0.5859`，`promptmia` 达到 `TPR@1%FPR=0.125/AUC=0.6445`。FedASK 中除 `nasr_active` 外，其余扩展攻击基本接近随机或低 TPR。
 
@@ -255,7 +251,7 @@ micromamba run -n pfedba python main.py \
   --target_client_id 0 \
   --aggregator dpfpl \
   --defense none \
-  --audit_attacks fedmia_loss,fedmia_cosine,fedmia_joint,nasr_passive,rmia,quantile_mia
+  --audit_attacks fedmia_loss,fedmia_cosine,nasr_passive,rmia,quantile_mia
 
 micromamba run -n pfedba python main.py \
   --config configs/fedprompt_privacy.yaml \
@@ -265,7 +261,7 @@ micromamba run -n pfedba python main.py \
   --target_client_id 0 \
   --aggregator fedask \
   --defense none \
-  --audit_attacks fedmia_loss,fedmia_cosine,fedmia_joint,nasr_passive,rmia,quantile_mia
+  --audit_attacks fedmia_loss,fedmia_cosine,nasr_passive,rmia,quantile_mia
 
 micromamba run -n pfedba python main.py \
   --config configs/dpfpl_official_repo_aligned.yaml

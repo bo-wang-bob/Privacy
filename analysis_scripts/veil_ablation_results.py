@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "results"
 OUTPUT = ROOT / "paper" / "aaai2027" / "evidence" / "ablation.csv"
 ALIASES = {"local_ggeur", "mirage", "veil"}
-ATTACKS = (
+LEGACY_ATTACKS = (
     "fedmia_loss",
     "fedmia_cosine",
     "fedmia_joint",
@@ -24,6 +24,7 @@ ATTACKS = (
     "rmia",
     "quantile_mia",
 )
+PAPER_ATTACKS = tuple(attack for attack in LEGACY_ATTACKS if attack != "fedmia_joint")
 BASE = {
     "local_ggeur_augments": 3,
     "local_ggeur_geometry_scale": 0.60,
@@ -68,7 +69,8 @@ def valid_summary(path: Path) -> bool:
         and sum(member_histogram) == 64
         and candidate.get("nonmember_source_priority")
         == ["target_test", "other_client_test", "other_client_train"]
-        and [item.get("attack") for item in attacks] == list(ATTACKS)
+        and [item.get("attack") for item in attacks]
+        in (list(PAPER_ATTACKS), list(LEGACY_ATTACKS))
         and all(
             0.0 <= float(item.get("tpr_at_fpr_0.01", -1.0)) <= 1.0
             and 0.0 <= float(item.get("auc", -1.0)) <= 1.0
@@ -115,13 +117,14 @@ def main() -> None:
         attack_values = {
             item["attack"]: item["tpr_at_fpr_0.01"] for item in summary["attacks"]
         }
+        paper_values = {attack: attack_values[attack] for attack in PAPER_ATTACKS}
         rows.append(
             {
                 "variant": name,
                 "accuracy": run["accuracy"],
-                **{attack: attack_values[attack] for attack in ATTACKS},
-                "worst_tpr": run["worst_tpr_at_fpr_0.01"],
-                "mean_tpr": run["mean_tpr_at_fpr_0.01"],
+                **paper_values,
+                "worst_tpr": max(paper_values.values()),
+                "mean_tpr": sum(paper_values.values()) / len(paper_values),
                 "result_dir": selected.name,
             }
         )
@@ -132,7 +135,7 @@ def main() -> None:
             fieldnames=(
                 "variant",
                 "accuracy",
-                *ATTACKS,
+                *PAPER_ATTACKS,
                 "worst_tpr",
                 "mean_tpr",
                 "result_dir",

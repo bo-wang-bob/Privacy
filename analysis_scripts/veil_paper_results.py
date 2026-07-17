@@ -25,7 +25,7 @@ RESULTS = ROOT / "results"
 OUTPUT = ROOT / "paper" / "aaai2027" / "evidence"
 DATASETS = ("flowers", "caltech101", "dtd")
 SEEDS = (42, 43, 44)
-ATTACKS = (
+LEGACY_ATTACKS = (
     "fedmia_loss",
     "fedmia_cosine",
     "fedmia_joint",
@@ -33,6 +33,7 @@ ATTACKS = (
     "rmia",
     "quantile_mia",
 )
+PAPER_ATTACKS = tuple(attack for attack in LEGACY_ATTACKS if attack != "fedmia_joint")
 METHOD_ORDER = (
     "FedAvg",
     "Prompt-DP",
@@ -153,7 +154,8 @@ def audit_is_valid(summary_path: Path) -> bool:
         # the same target/other-test pools and passed exact histogram matching.
         and candidate.get("nonmember_source_priority")
         in (None, ["target_test", "other_client_test", "other_client_train"])
-        and [item.get("attack") for item in attacks] == list(ATTACKS)
+        and [item.get("attack") for item in attacks]
+        in (list(PAPER_ATTACKS), list(LEGACY_ATTACKS))
         and all(
             0.0 <= float(item.get("tpr_at_fpr_0.01", -1.0)) <= 1.0
             and 0.0 <= float(item.get("auc", -1.0)) <= 1.0
@@ -239,18 +241,20 @@ def build_outputs(runs: list[dict[str, Any]]) -> None:
     run_rows = []
     accounting_rows = []
     for run in runs:
+        attack_values = {
+            attack: float(run["attacks"][attack]["tpr_at_fpr_0.01"])
+            for attack in PAPER_ATTACKS
+        }
         row = {
             "dataset": run["dataset"],
             "seed": run["seed"],
             "method": run["method"],
             "accuracy": run["accuracy"],
-            "worst_tpr": run["worst_tpr_at_fpr_0.01"],
-            "mean_tpr": run["mean_tpr_at_fpr_0.01"],
+            "worst_tpr": max(attack_values.values()),
+            "mean_tpr": statistics.mean(attack_values.values()),
             "result_dir": Path(run["path"]).name,
         }
-        row.update(
-            {attack: run["attacks"][attack]["tpr_at_fpr_0.01"] for attack in ATTACKS}
-        )
+        row.update(attack_values)
         run_rows.append(row)
         result_dir = Path(run["path"])
         defense_summary = json.loads(
@@ -297,7 +301,7 @@ def build_outputs(runs: list[dict[str, Any]]) -> None:
             "accuracy",
             "worst_tpr",
             "mean_tpr",
-            *ATTACKS,
+            *PAPER_ATTACKS,
             "result_dir",
         ],
         run_rows,
@@ -378,7 +382,7 @@ def build_outputs(runs: list[dict[str, Any]]) -> None:
                     "mean_tpr_std": privacy_std,
                 }
             )
-            for attack in ATTACKS:
+            for attack in PAPER_ATTACKS:
                 attack_mean, attack_std = mean_std([row[attack] for row in group])
                 attack_rows.append(
                     {

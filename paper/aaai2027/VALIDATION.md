@@ -6,7 +6,7 @@ Status: validated source, evidence, figure, and compiled PDF artifact.
 
 - The main matrix contains 54 unique runs: three datasets, three independent
   repetitions, and six mechanisms. Every selected run has 64 members and 64
-  non-members with exactly equal label histograms, all six attacks in the fixed
+  non-members with exactly equal label histograms, all five reported attacks in the fixed
   order, finite metrics, and no audit errors.
 - All Caltech101 and DTD formal runs set `require_cuda: true`; formal commands
   logged `cuda:0` or `cuda:1`. Flowers102 runs specify a GPU, and the four
@@ -16,7 +16,7 @@ Status: validated source, evidence, figure, and compiled PDF artifact.
   configuration plus the corresponding stage override, preventing earlier
   development sweeps from entering the table.
 - `run_level.csv` was independently regrouped to reproduce all 18 dataset-method
-  aggregates and all 108 attack aggregates. The manuscript's FedAvg, private-
+  aggregates and all 90 attack aggregates. The manuscript's FedAvg, private-
   mechanism, stage-ablation, and concise privacy-accounting results were then
   checked against these CSVs at their displayed precision.
 

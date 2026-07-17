@@ -11,7 +11,7 @@ compiled artifact is `veil.pdf`.
 - The paper-level comparison uses Flowers102, Caltech101, and DTD; three
   independent repetitions; 10 clients with full participation; Dirichlet alpha
   0.1; 16 shots per class; five rounds; and one local epoch.
-- Every formal run uses six attacks, 64 member and 64 non-member candidates,
+- Every formal run reports five published attacks, 64 member and 64 non-member candidates,
   exact candidate-label histogram matching, and an audit-specific RNG.
 - `configs/veil_multidataset.yaml` sets `require_cuda: true`, so a formal run
   fails rather than silently falling back to CPU.

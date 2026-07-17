@@ -111,6 +111,8 @@ def check_derived_data() -> None:
     """Independently recompute every aggregate from the selected run-level CSV."""
 
     runs = csv_rows("run_level.csv")
+    if any("fedmia_joint" in row for row in runs):
+        raise AssertionError("FedMIA joint must not appear in paper run-level evidence.")
     keys = {(row["dataset"], row["seed"], row["method"]) for row in runs}
     if len(runs) != 54 or len(keys) != 54:
         raise AssertionError(
@@ -148,14 +150,13 @@ def check_derived_data() -> None:
     attack_fields = (
         "fedmia_loss",
         "fedmia_cosine",
-        "fedmia_joint",
         "nasr_passive",
         "rmia",
         "quantile_mia",
     )
     attack_rows = csv_rows("attack_aggregate.csv")
-    if len(attack_rows) != 108:
-        raise AssertionError(f"Expected 108 attack aggregates, found {len(attack_rows)}.")
+    if len(attack_rows) != 90:
+        raise AssertionError(f"Expected 90 attack aggregates, found {len(attack_rows)}.")
     for row in attack_rows:
         key = (row["dataset"], row["method"])
         attack = row["attack"]
@@ -217,7 +218,6 @@ def check_result_tables(text: str) -> None:
     attack_fields = (
         "fedmia_loss",
         "fedmia_cosine",
-        "fedmia_joint",
         "nasr_passive",
         "rmia",
         "quantile_mia",
@@ -267,7 +267,7 @@ def check_result_tables(text: str) -> None:
             if "&" not in line or not line.endswith(r"\\"):
                 continue
             cells = [cell.strip() for cell in line[:-2].split("&")]
-            if len(cells) != 9:
+            if len(cells) != 8:
                 shaded = False
                 continue
             method_label = cells[1]
@@ -301,8 +301,8 @@ def check_result_tables(text: str) -> None:
         expected_count: int,
     ) -> None:
         block = table_block(label)
-        if r"FedMIA \tpr{} $\downarrow$" not in block:
-            raise AssertionError(f"{label} must name the FedMIA attack family.")
+        if "FedMIA-I" not in block or "FedMIA-II" not in block:
+            raise AssertionError(f"{label} must name both published FedMIA attacks.")
         if len(re.findall(r"\\multirow\{\d+\}\{\*\}\{", block)) != 3:
             raise AssertionError(f"{label} must merge its three dataset columns.")
         parsed = parse_grouped_table(block, allowed_methods)
@@ -369,6 +369,29 @@ def check_result_tables(text: str) -> None:
         9,
     )
 
+    cross_dataset = {
+        method: statistics.mean(
+            float(row["mean_tpr_mean"])
+            for (dataset, candidate), row in aggregates.items()
+            if candidate == method
+        )
+        for method in ("DP-FPL", "FedASK", "VEIL")
+    }
+    fedask_reduction = (
+        cross_dataset["FedASK"] - cross_dataset["VEIL"]
+    ) / cross_dataset["FedASK"]
+    expected_claims = (
+        f"mean attack leakage ({cross_dataset['VEIL']:.4f})",
+        f"FedASK's cross-dataset mean leakage\nby {100.0 * fedask_reduction:.1f}\\%",
+        "DP-FPL has the lowest mean leakage at "
+        f"{100.0 * cross_dataset['DP-FPL']:.2f}\\%, followed by \\method{{}} at "
+        f"{100.0 * cross_dataset['VEIL']:.2f}\\%\nand FedASK at "
+        f"{100.0 * cross_dataset['FedASK']:.2f}\\%",
+    )
+    for claim in expected_claims:
+        if claim not in text:
+            raise AssertionError(f"Missing or stale aggregate claim: {claim!r}")
+
     ablation_source = {row["variant"]: row for row in csv_rows("ablation.csv")}
     ablation_names = {
         r"Full \method{}": "Full VEIL",
@@ -387,7 +410,7 @@ def check_result_tables(text: str) -> None:
         if "&" not in line or not line.endswith(r"\\"):
             continue
         cells = [cell.strip() for cell in line[:-2].split("&")]
-        if len(cells) != 8 or cells[0] not in ablation_names:
+        if len(cells) != 7 or cells[0] not in ablation_names:
             shaded = False
             continue
         values = []
@@ -409,7 +432,7 @@ def check_result_tables(text: str) -> None:
         raise AssertionError(f"Expected 4 stage rows, found {len(parsed_ablation)}.")
     displayed = [ablation_source[name] for name, *_rest in parsed_ablation]
     ablation_fields = ("accuracy", *attack_fields)
-    ablation_reducers = (max, min, min, min, min, min, min)
+    ablation_reducers = (max, min, min, min, min, min)
     for name, printed, bold, row_shaded in parsed_ablation:
         evidence = ablation_source[name]
         for field, value in zip(ablation_fields, printed):
@@ -484,6 +507,10 @@ def check_focused_structure(text: str) -> None:
     plot_source = PLOT_SCRIPT.read_text(encoding="utf-8")
     if "axis.text(" in plot_source or "bar_label(" in plot_source:
         raise AssertionError("The attack figure must not contain crowded cell annotations.")
+    if "fedmia_joint" in plot_source or "fedmia_joint" in text.lower():
+        raise AssertionError("The unpublished FedMIA joint score must not enter the paper.")
+    if "FedSAK" in text:
+        raise AssertionError("The paper baseline is FedASK; FedSAK is a different method.")
     if text.count(r"\rowcolor{veilshade}") < 7:
         raise AssertionError("VEIL rows are not consistently shaded in result tables.")
     if re.search(r"\bseed(?:s|ed|ing)?\b", text, flags=re.IGNORECASE):

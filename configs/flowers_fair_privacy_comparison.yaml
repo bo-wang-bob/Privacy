@@ -54,7 +54,6 @@ audit:
   attacks:
     - fedmia_loss
     - fedmia_cosine
-    - fedmia_joint
     - nasr_passive
     - rmia
     - quantile_mia
@@ -67,10 +66,6 @@ audit:
   auxiliary_fraction: 0.5
   fedmia_loss_aggregation: mean
   fedmia_cosine_aggregation: mean
-  fedmia_joint_components:
-    - confidence_z_mean
-    - cosine_z_max
-    - cosine_z_late3
   rmia_offline_a: 0.3
   rmia_gamma: 2.0
   qmia_quantile: 0.9

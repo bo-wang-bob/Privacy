@@ -29,15 +29,13 @@ METHODS = ("VEIL", "DP-FPL", "FedASK")
 ATTACKS = (
     "fedmia_loss",
     "fedmia_cosine",
-    "fedmia_joint",
     "nasr_passive",
     "rmia",
     "quantile_mia",
 )
 ATTACK_LABELS = (
-    "Loss",
-    "Cos.",
-    "Joint",
+    "F-I",
+    "F-II",
     "Nasr",
     "RMIA",
     "Quant.",
@@ -137,9 +135,9 @@ def comparison_heatmaps(rows: list[dict[str, str]]) -> None:
         axis.set_title(DATASET_LABELS[dataset], pad=12, fontweight="normal")
         axis.set_xticks(np.arange(len(ATTACKS)), ATTACK_LABELS)
         axis.set_yticks(np.arange(len(METHODS)), METHODS)
-        axis.tick_params(axis="x", length=0, rotation=22)
+        axis.tick_params(axis="x", length=0, rotation=0, pad=8)
         for label in axis.get_xticklabels():
-            label.set_horizontalalignment("right")
+            label.set_horizontalalignment("center")
         axis.tick_params(
             axis="y",
             length=0,
