@@ -1,5 +1,9 @@
 # Privacy attack and defense reproduction report
 
+> Historical reproduction log. Its tables include a retired, unpublished
+> composite diagnostic and must not be used as current paper evidence. The
+> validated five-attack results are in `paper/aaai2027/veil.pdf`.
+
 Date: 2026-07-15
 
 ## Scope

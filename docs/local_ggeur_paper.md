@@ -1,5 +1,9 @@
 # Method
 
+> Historical development draft. Its tables include a retired, unpublished
+> composite diagnostic and must not be used as current paper evidence. The
+> validated five-attack results are in `paper/aaai2027/veil.pdf`.
+
 ## Problem Setting
 
 We consider membership inference attacks against federated CLIP soft-prompt

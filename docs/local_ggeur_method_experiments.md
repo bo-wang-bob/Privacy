@@ -1,5 +1,9 @@
 # Method
 
+> Historical development log. Its tables include a retired, unpublished
+> composite diagnostic and must not be used as current paper evidence. The
+> validated five-attack results are in `paper/aaai2027/veil.pdf`.
+
 ## Local-GGEUR for Membership-Private Federated Prompt Learning
 
 We study membership inference defenses for federated CLIP soft-prompt tuning.

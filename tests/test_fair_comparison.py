@@ -45,11 +45,6 @@ def _config():
             "auxiliary_fraction": 0.5,
             "fedmia_loss_aggregation": "mean",
             "fedmia_cosine_aggregation": "mean",
-            "fedmia_joint_components": [
-                "confidence_z_mean",
-                "cosine_z_max",
-                "cosine_z_late3",
-            ],
             "rmia_offline_a": 0.3,
             "rmia_gamma": 2.0,
             "qmia_quantile": 0.9,
@@ -79,7 +74,6 @@ def test_validate_fair_configs_normalizes_known_audit_defaults():
     second = copy.deepcopy(first)
     del second["audit"]["fedmia_loss_aggregation"]
     del second["audit"]["fedmia_cosine_aggregation"]
-    del second["audit"]["fedmia_joint_components"]
     validate_fair_configs([first, second])
 
 

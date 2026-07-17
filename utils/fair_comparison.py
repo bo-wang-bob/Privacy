@@ -40,7 +40,6 @@ FAIR_CONFIG_PATHS = (
     "audit.auxiliary_fraction",
     "audit.fedmia_loss_aggregation",
     "audit.fedmia_cosine_aggregation",
-    "audit.fedmia_joint_components",
     "audit.rmia_offline_a",
     "audit.rmia_gamma",
     "audit.qmia_quantile",
@@ -52,11 +51,6 @@ FAIR_CONFIG_DEFAULTS = {
     "audit.match_candidate_labels": False,
     "audit.fedmia_loss_aggregation": "mean",
     "audit.fedmia_cosine_aggregation": "mean",
-    "audit.fedmia_joint_components": [
-        "confidence_z_mean",
-        "cosine_z_max",
-        "cosine_z_late3",
-    ],
 }
 
 
@@ -122,6 +116,7 @@ def load_run(result_dir: str | Path) -> dict[str, Any]:
             "num_samples": int(item["num_samples"]),
         }
         for item in audit["attacks"]
+        if item["attack"] != "fedmia_joint"
     }
     last = training[-1]
     return {

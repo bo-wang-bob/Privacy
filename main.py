@@ -125,11 +125,10 @@ def validate_config(config: dict) -> None:
     ).lower() == "released_prompt" and attacks & {
         "nasr_passive",
         "fedmia_cosine",
-        "fedmia_joint",
     }:
         raise ValueError(
             "released_prompt audit view cannot run update-dependent attacks "
-            "nasr_passive, fedmia_cosine, or fedmia_joint."
+            "nasr_passive or fedmia_cosine."
         )
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
@@ -210,7 +209,6 @@ def validate_config(config: dict) -> None:
     spatial = {
         "fedmia_loss",
         "fedmia_cosine",
-        "fedmia_joint",
         "transfer_representation",
         "rmia",
         "yoqo",
@@ -477,7 +475,6 @@ def default_config() -> dict:
                 "nasr_active",
                 "fedmia_loss",
                 "fedmia_cosine",
-                "fedmia_joint",
                 "transfer_representation",
                 "codepoison",
                 "pipra",

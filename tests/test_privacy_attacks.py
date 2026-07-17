@@ -14,7 +14,7 @@ from aggregator.fedavg_aggregator import aggregate_fedavg_model_states
 from main import default_config, validate_config
 from privacy_attacks.code_poison import generate_membership_encoding_samples
 from privacy_attacks.auditor import MembershipAuditor
-from privacy_attacks.fedmia import run_fedmia, run_fedmia_joint
+from privacy_attacks.fedmia import run_fedmia
 from privacy_attacks.metrics import fit_shrinkage_attack, membership_metrics
 from privacy_attacks.model_utils import scaled_confidence
 from privacy_attacks.promptmia import generate_key_with_similarity
@@ -156,18 +156,6 @@ def test_fedmia_can_use_max_round_aggregation():
     assert torch.all(max_result.scores >= mean_result.scores)
     assert torch.any(max_result.scores > mean_result.scores)
 
-    joint_result = run_fedmia_joint(
-        observations,
-        membership,
-        0,
-        components=["confidence_z_early3", "confidence_z_late3"],
-    )
-    assert joint_result.metadata["components"] == [
-        "confidence_z_early3",
-        "confidence_z_late3",
-    ]
-    assert joint_result.scores.numel() == membership.numel()
-
 
 def test_private_noise_calibration_meets_requested_budget():
     multiplier = calibrate_gaussian_noise(
@@ -221,6 +209,15 @@ def test_configuration_rejects_removed_backdoor_and_defense_names():
         assert "Unknown membership attacks" in str(error)
     else:
         raise AssertionError("Removed backdoor attack unexpectedly accepted")
+
+    config = default_config()
+    config["audit"]["attacks"] = ["fedmia_joint"]
+    try:
+        validate_config(config)
+    except ValueError as error:
+        assert "Unknown membership attacks" in str(error)
+    else:
+        raise AssertionError("Unpublished composite attack unexpectedly accepted")
 
     config = default_config()
     config["aggregator"] = "seismograph"
@@ -816,7 +813,6 @@ def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
                 "nasr_active",
                 "fedmia_loss",
                 "fedmia_cosine",
-                "fedmia_joint",
                 "transfer_representation",
                 "codepoison",
                 "pipra",
@@ -858,7 +854,6 @@ def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
         "nasr_active",
         "fedmia_loss",
         "fedmia_cosine",
-        "fedmia_joint",
         "transfer_representation",
         "codepoison",
         "pipra",
