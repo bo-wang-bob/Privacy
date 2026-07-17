@@ -1,6 +1,6 @@
 # 联邦 soft-prompt 成员隐私防御
 
-仓库支持六种彼此独立的防御。一次实验只能选择一个 `defense.name`，不会在后台组合其他防御。
+仓库支持十二种彼此独立的防御。一次实验只能选择一个 `defense.name`，不会在后台组合其他防御。
 
 | 运行名 | 方法 | 当前联邦 prompt 适配 |
 |---|---|---|
@@ -10,6 +10,12 @@
 | `soft` | [SOFT](https://www.usenix.org/conference/usenixsecurity25/presentation/zhang-kaiyuan)，USENIX Security 2025 | 第一轮 warm-up；随后用客户端验证损失均值选择低损失高风险样本，并以视觉翻转和噪声替代文本 paraphrase |
 | `hamp` | [HAMP](https://www.ndss-symposium.org/wp-content/uploads/2024-14-paper.pdf)，NDSS 2024 | 高熵软标签、预测熵正则，以及可微且保持 `argmax` 的温度输出映射 |
 | `veil`（兼容旧名 `local_ggeur`、`mirage`） | VEIL，本仓库防御方案 | 客户端不共享统计量；只在本地 CLIP embedding 空间估计类均值/协方差，用几何回声替代个体锚点后训练 prompt |
+| `perturb` | FedMIA Perturb 基线 | 裁剪客户端可训练 prompt delta，并在上传前加入高斯噪声 |
+| `sparse` | FedMIA Sparse 基线 | 上传前按绝对值保留最大的 prompt delta 元素，其余置零 |
+| `mixup` | FedMIA Mixup 基线 | 本地 prompt 训练使用 Beta 系数混合图像和标签损失 |
+| `sampling` | FedMIA Data Sampling 基线 | 每个本地 batch 无放回抽取固定比例样本参与训练 |
+| `data_aug` | FedMIA Data Aug 基线 | 对已经预处理的 CLIP 张量做翻转、平移和颜色扰动 |
+| `data_aug_sampling` | FedMIA Data Aug + Sampling 基线 | 在同一本地训练分支中先抽样再增强 |
 
 这些实现是针对“冻结 CLIP、只训练共享 CoOp prompt”的场景适配。SOFT 原论文处理文本，因此本仓库使用保持图像语义的视觉混淆；HAMP 原论文测试阶段使用随机低置信度分数重排，本仓库使用可微温度映射，使主动梯度攻击仍能正常运行并得到分数，而不是因输出不可导而失败。
 
@@ -36,6 +42,18 @@ python main.py --config configs/fedprompt_privacy_quick.yaml --attack none --def
 ## 常用防御参数
 
 参数放在 YAML 的 `defense:` 节点中；命令行 `--defense` 只覆盖方法名。
+
+### FedMIA 比较基线
+
+这六个基线只允许在共享模型的集中式 `FedAvg` 协议下单独运行；代码会拒绝把它们叠加到 DP-FPL、FedASK 或每客户端独立模型上，以免改变论文比较方法的含义。所有更新操作仅处理 `requires_grad=True` 的 prompt 参数，冻结的 CLIP 权重不会训练、稀疏化或加噪。
+
+- `perturb_clip_norm`：上传前 prompt delta 的全局 L2 裁剪阈值；`perturb_noise_std`：裁剪后加入的高斯噪声绝对标准差。FedMIA 报告的噪声标准差范围为 0.01–0.5。
+- `sparse_ratio`：按绝对值从小到大置零的比例，取值 `[0, 1)`；论文考察 0.1–0.99。
+- `mixup_alpha`：对称 Beta 分布的参数，必须为正。
+- `sampling_ratio`：每批保留的数据比例，取值 `(0, 1]`；论文考察 0.1–1.0。
+- `data_aug_strength`：随机平移幅度；`data_aug_flip_probability`：水平翻转概率；`data_aug_color_jitter`：亮度与对比度扰动强度。
+
+`data_aug` 没有重新调用图像处理器，而是在已归一化的 NCHW CLIP 输入上实施确定性可复现的张量变换，因此不需要数据集或模型特定的反归一化逻辑。正式比较配置见 `configs/fedmia_prompt_benchmark.yaml`。
 
 ### CoFedMID
 

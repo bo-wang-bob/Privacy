@@ -18,6 +18,7 @@ from privacy_attacks.features import (
     trainable_names,
 )
 from privacy_attacks.fedmia import run_fedmia
+from privacy_attacks.fedmia_baselines import run_fedmia_baseline
 from privacy_attacks.imia import run_imia
 from privacy_attacks.model_utils import last_client_states
 from privacy_attacks.pipra import run_pipra
@@ -36,6 +37,10 @@ from utils.data_loader import group_idx_by_class
 logger = logging.getLogger(__name__)
 
 SUPPORTED_ATTACKS = {
+    "blackbox_loss",
+    "loss_series",
+    "grad_cosine",
+    "avg_cosine",
     "nasr_passive",
     "nasr_active",
     "fedmia_loss",
@@ -89,6 +94,10 @@ class MembershipAuditor:
             self.config.get(
                 "attacks",
                 [
+                    "blackbox_loss",
+                    "loss_series",
+                    "grad_cosine",
+                    "avg_cosine",
                     "nasr_passive",
                     "nasr_active",
                     "fedmia_loss",
@@ -148,25 +157,41 @@ class MembershipAuditor:
         self.errors: dict[str, str] = {}
 
         if self.enabled:
-            max_samples = int(self.config.get("max_samples_per_group", 32))
-            if max_samples < 2:
-                raise ValueError("max_samples_per_group must be at least 2.")
+            legacy_max = int(self.config.get("max_samples_per_group", 32))
+            max_members = int(self.config.get("max_member_samples", legacy_max))
+            max_nonmembers = int(
+                self.config.get("max_nonmember_samples", legacy_max)
+            )
+            if max_members < 2 or max_nonmembers < 2:
+                raise ValueError(
+                    "max_member_samples and max_nonmember_samples must be at least 2."
+                )
             target = users[target_client_id]
             member_images, member_labels = self._collect_many(
-                [target.train_data], max_samples
+                [target.train_data], max_members
             )
-            nonmember_datasets = [target.test_data] + [
+            unused_training_pool = self._unused_few_shot_training_pool(users)
+            nonmember_datasets = [target.test_data]
+            self.nonmember_source_priority = ["target_test"]
+            if unused_training_pool is not None:
+                nonmember_datasets.append(unused_training_pool)
+                self.nonmember_source_priority.append("unused_training_pool")
+            nonmember_datasets += [
                 user.test_data for user in users if user.id != target_client_id
             ] + [
                 user.train_data for user in users if user.id != target_client_id
             ]
+            self.nonmember_source_priority += [
+                "other_client_test",
+                "other_client_train",
+            ]
             if self.match_candidate_labels:
                 nonmember_images, nonmember_labels = self._collect_label_matched(
-                    nonmember_datasets, member_labels
+                    nonmember_datasets, member_labels, max_nonmembers
                 )
             else:
                 nonmember_images, nonmember_labels = self._collect_many(
-                    nonmember_datasets, max_samples
+                    nonmember_datasets, max_nonmembers
                 )
             self.images = torch.cat((member_images, nonmember_images)).to(device)
             self.labels = torch.cat((member_labels, nonmember_labels)).to(device)
@@ -176,6 +201,29 @@ class MembershipAuditor:
                     torch.zeros(nonmember_labels.numel(), dtype=torch.long),
                 )
             )
+
+    @staticmethod
+    def _unused_few_shot_training_pool(users) -> Subset | None:
+        """Recover examples excluded before the federated few-shot split.
+
+        Federated user datasets are Subsets of one shared few-shot Subset. Its
+        parent contains same-domain training examples that were never assigned
+        to any client, making them valid non-member audit candidates.
+        """
+        if not users:
+            return None
+        outer_datasets = [user.train_data for user in users]
+        if not all(isinstance(dataset, Subset) for dataset in outer_datasets):
+            return None
+        few_shot_dataset = outer_datasets[0].dataset
+        if not all(dataset.dataset is few_shot_dataset for dataset in outer_datasets):
+            return None
+        if not isinstance(few_shot_dataset, Subset):
+            return None
+        parent = few_shot_dataset.dataset
+        used = {int(index) for index in few_shot_dataset.indices}
+        unused = [index for index in range(len(parent)) if index not in used]
+        return Subset(parent, unused) if unused else None
 
     def _collect_many(
         self, datasets: list, limit: int
@@ -210,21 +258,63 @@ class MembershipAuditor:
         return torch.cat(image_parts), torch.cat(label_parts)
 
     def _collect_label_matched(
-        self, datasets: list, target_labels: torch.Tensor
+        self,
+        datasets: list,
+        target_labels: torch.Tensor,
+        limit: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Collect non-members with exactly the member-label histogram.
+        """Collect non-members with the member-label distribution.
 
         Class identity can otherwise dominate a non-IID membership audit even
         when a method has not memorized an individual. Matching labels keeps
-        the audit focused on within-class membership evidence.
+        the audit focused on within-class membership evidence. When the group
+        sizes differ, deterministic proportional apportionment replaces exact
+        histogram equality.
         """
         target_labels = target_labels.detach().cpu().long().flatten()
         classes = len(getattr(self.model, "classnames", ()))
         classes = max(classes, int(target_labels.max().item()) + 1)
-        remaining = torch.bincount(target_labels, minlength=classes).tolist()
+        member_counts = torch.bincount(target_labels, minlength=classes).long()
+        grouped_by_dataset = [
+            group_idx_by_class(dataset, classes) for dataset in datasets
+        ]
+        availability = torch.tensor(
+            [
+                sum(len(grouped[class_id]) for grouped in grouped_by_dataset)
+                for class_id in range(classes)
+            ],
+            dtype=torch.long,
+        )
+        requested = target_labels.numel() if limit is None else int(limit)
+        requested = min(
+            requested,
+            int(availability[member_counts > 0].sum().item()),
+        )
+        if requested < 2:
+            raise ValueError(
+                "Cannot construct at least two label-matched non-members."
+            )
+        if requested == target_labels.numel() and bool(
+            torch.all(availability >= member_counts)
+        ):
+            desired = member_counts.clone()
+        else:
+            desired = torch.zeros(classes, dtype=torch.long)
+            for _ in range(requested):
+                eligible = (member_counts > 0) & (desired < availability)
+                if not bool(eligible.any()):
+                    break
+                priorities = member_counts.to(torch.float64) / (
+                    desired.to(torch.float64) + 1.0
+                )
+                priorities[~eligible] = -1.0
+                desired[int(priorities.argmax().item())] += 1
+        if int(desired.sum().item()) < 2:
+            raise ValueError("Label-matched non-member allocation is too small.")
+
+        remaining = desired.tolist()
         selected = []
-        for dataset in datasets:
-            grouped = group_idx_by_class(dataset, classes)
+        for dataset, grouped in zip(datasets, grouped_by_dataset):
             indices = []
             for class_id, needed in enumerate(remaining):
                 take = min(int(needed), len(grouped[class_id]))
@@ -245,11 +335,8 @@ class MembershipAuditor:
                 "Cannot construct label-matched non-members; missing counts "
                 f"{missing}."
             )
-        images, labels = self._collect_many(selected, target_labels.numel())
-        if not torch.equal(
-            torch.bincount(labels, minlength=classes),
-            torch.bincount(target_labels, minlength=classes),
-        ):
+        images, labels = self._collect_many(selected, int(desired.sum().item()))
+        if not torch.equal(torch.bincount(labels, minlength=classes), desired):
             raise AssertionError("Label-matched membership collection drifted.")
         return images, labels
 
@@ -415,6 +502,19 @@ class MembershipAuditor:
         logger.info("Collected privacy signals for round %s", round_index)
 
     def _run(self, attack: str, final_model, final_state):
+        if attack in {
+            "blackbox_loss",
+            "loss_series",
+            "grad_cosine",
+            "avg_cosine",
+        }:
+            return run_fedmia_baseline(
+                self.observations,
+                self.membership,
+                self.target_client_id,
+                attack,
+                self.config.get("fedmia_baseline_single_round", "last"),
+            )
         if attack == "fedmia_loss":
             return run_fedmia(
                 self.observations,
@@ -637,6 +737,7 @@ class MembershipAuditor:
         nonmember_histogram = torch.bincount(
             candidate_labels[candidate_membership == 0], minlength=histogram_width
         ).tolist()
+        histograms_exactly_matched = member_histogram == nonmember_histogram
         with open(
             os.path.join(self.results_dir, "summary.json"), "w", encoding="utf-8"
         ) as file:
@@ -656,15 +757,27 @@ class MembershipAuditor:
                             "full_whitebox",
                         },
                         "raw_internal_client_state": self.audit_view == "full_whitebox",
-                        "candidate_label_histograms_matched": self.match_candidate_labels,
+                        "candidate_label_histograms_matched": (
+                            self.match_candidate_labels
+                            and histograms_exactly_matched
+                        ),
+                        "candidate_label_distributions_matched": (
+                            self.match_candidate_labels
+                        ),
                     },
                     "candidate_sampling": {
-                        "label_histograms_matched": self.match_candidate_labels,
-                        "nonmember_source_priority": [
-                            "target_test",
-                            "other_client_test",
-                            "other_client_train",
-                        ],
+                        "label_histograms_matched": (
+                            self.match_candidate_labels
+                            and histograms_exactly_matched
+                        ),
+                        "label_matching_mode": (
+                            "proportional"
+                            if self.match_candidate_labels
+                            else "disabled"
+                        ),
+                        "member_count": int((candidate_membership == 1).sum()),
+                        "nonmember_count": int((candidate_membership == 0).sum()),
+                        "nonmember_source_priority": self.nonmember_source_priority,
                         "member_label_histogram": member_histogram,
                         "nonmember_label_histogram": nonmember_histogram,
                     },

@@ -1,4 +1,4 @@
-"""Training and update hooks for five independent membership defenses.
+"""Training and update hooks for independent membership defenses.
 
 The implementations retain the defining mechanism of each paper while adapting
 it to a frozen backbone whose only trainable tensors are soft prompts.  A run
@@ -26,6 +26,12 @@ from privacy_attacks.code_poison import (
 
 SUPPORTED_DEFENSES = {
     "none",
+    "perturb",
+    "sparse",
+    "mixup",
+    "sampling",
+    "data_aug",
+    "data_aug_sampling",
     "cofedmid",
     "prompt_dp",
     "mist",
@@ -34,6 +40,15 @@ SUPPORTED_DEFENSES = {
     "local_ggeur",
     "mirage",
     "veil",
+}
+
+FEDMIA_BASELINE_DEFENSES = {
+    "perturb",
+    "sparse",
+    "mixup",
+    "sampling",
+    "data_aug",
+    "data_aug_sampling",
 }
 
 
@@ -335,6 +350,10 @@ class DefenseController:
             self._cofedmid_training(user, model, optimizer, round_index, code_poison)
         elif self.name in {"local_ggeur", "mirage", "veil"}:
             self._local_ggeur_training(user, model, optimizer, round_index)
+        elif self.name in {"mixup", "sampling", "data_aug", "data_aug_sampling"}:
+            self._fedmia_data_training(
+                user, model, optimizer, round_index, code_poison
+            )
         else:
             self._standard_training(
                 user, model, optimizer, round_index, code_poison=code_poison
@@ -370,6 +389,156 @@ class DefenseController:
                     )
                 else:
                     loss = F.cross_entropy(model(images), labels)
+                loss.backward()
+                optimizer.step()
+                self.steps[user.id] += 1
+
+    @staticmethod
+    def _sample_beta(
+        alpha: float,
+        generator: torch.Generator,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        if alpha <= 0:
+            raise ValueError("MixUp alpha must be positive.")
+        concentration = torch.tensor(alpha, device=device, dtype=dtype)
+        left = torch._standard_gamma(concentration, generator=generator)
+        right = torch._standard_gamma(concentration, generator=generator)
+        return left / (left + right).clamp_min(torch.finfo(dtype).tiny)
+
+    def _augment_images(
+        self,
+        images: torch.Tensor,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Tensor-space augmentation safe for preprocessed CLIP inputs."""
+        if images.ndim != 4:
+            raise ValueError("Data augmentation expects NCHW image tensors.")
+        strength = float(self.config.get("data_aug_strength", 0.1))
+        flip_probability = float(self.config.get("data_aug_flip_probability", 0.5))
+        shortest_side = min(images.shape[-2:])
+        maximum_shift = min(
+            int(round(strength * shortest_side)),
+            max(0, shortest_side - 1),
+        )
+        augmented = images.clone()
+        flip = torch.rand(
+            images.shape[0], generator=generator, device=images.device
+        ) < flip_probability
+        if bool(flip.any()):
+            augmented[flip] = torch.flip(augmented[flip], dims=(-1,))
+        if maximum_shift > 0:
+            padded = F.pad(
+                augmented,
+                (maximum_shift,) * 4,
+                mode="reflect",
+            )
+            offsets = torch.randint(
+                -maximum_shift,
+                maximum_shift + 1,
+                (images.shape[0], 2),
+                generator=generator,
+                device=images.device,
+            )
+            shifted = []
+            height, width = images.shape[-2:]
+            for sample, (dy, dx) in zip(padded, offsets.tolist()):
+                top = maximum_shift - int(dy)
+                left = maximum_shift - int(dx)
+                shifted.append(sample[:, top : top + height, left : left + width])
+            augmented = torch.stack(shifted)
+        jitter = float(self.config.get("data_aug_color_jitter", 0.1))
+        if jitter > 0:
+            mean = augmented.mean(dim=(-2, -1), keepdim=True)
+            contrast = 1.0 + (
+                2.0
+                * torch.rand(
+                    (images.shape[0], 1, 1, 1),
+                    generator=generator,
+                    device=images.device,
+                    dtype=images.dtype,
+                )
+                - 1.0
+            ) * jitter
+            brightness = (
+                2.0
+                * torch.rand(
+                    (images.shape[0], 1, 1, 1),
+                    generator=generator,
+                    device=images.device,
+                    dtype=images.dtype,
+                )
+                - 1.0
+            ) * jitter
+            augmented = (augmented - mean) * contrast + mean + brightness
+        return augmented
+
+    def _fedmia_data_training(
+        self,
+        user,
+        model: torch.nn.Module,
+        optimizer,
+        round_index: int,
+        code_poison: bool,
+    ) -> None:
+        """FedMIA data-replacement baselines adapted to prompt-only training."""
+        use_mixup = self.name == "mixup"
+        use_sampling = self.name in {"sampling", "data_aug_sampling"}
+        use_augmentation = self.name in {"data_aug", "data_aug_sampling"}
+        sampling_ratio = float(self.config.get("sampling_ratio", 0.5))
+        mixup_alpha = float(self.config.get("mixup_alpha", 1.0))
+        for epoch in range(user.local_epochs):
+            generator = self._generator(user.id, round_index, 1701 + epoch)
+            for images, labels in user.trainloader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                original_count = labels.numel()
+                if use_sampling and sampling_ratio < 1.0:
+                    selected_count = max(
+                        1, min(original_count, int(round(sampling_ratio * original_count)))
+                    )
+                    selected = torch.randperm(
+                        original_count,
+                        generator=generator,
+                        device=labels.device,
+                    )[:selected_count]
+                    images = images[selected]
+                    labels = labels[selected]
+                    self._record("sampling_fraction", selected_count / original_count)
+                if use_augmentation:
+                    images = self._augment_images(images, generator)
+                    self._record("data_aug_fraction", 1.0)
+                optimizer.zero_grad(set_to_none=True)
+                if use_mixup:
+                    permutation = torch.randperm(
+                        labels.numel(), generator=generator, device=labels.device
+                    )
+                    coefficient = self._sample_beta(
+                        mixup_alpha, generator, images.device, images.dtype
+                    )
+                    mixed = (
+                        coefficient * images
+                        + (1.0 - coefficient) * images[permutation]
+                    )
+                    logits = model(mixed)
+                    loss = (
+                        coefficient
+                        * F.cross_entropy(logits, labels, reduction="none")
+                        + (1.0 - coefficient)
+                        * F.cross_entropy(
+                            logits, labels[permutation], reduction="none"
+                        )
+                    ).mean()
+                    self._record("mixup_lambda", float(coefficient.detach()))
+                    defended_images = mixed
+                else:
+                    defended_images = images
+                    loss = F.cross_entropy(model(defended_images), labels)
+                if code_poison:
+                    loss = loss + self._secret_losses(
+                        user, model, defended_images, labels
+                    ).mean()
                 loss.backward()
                 optimizer.step()
                 self.steps[user.id] += 1
@@ -1014,6 +1183,95 @@ class DefenseController:
         elif self.name in {"local_ggeur", "mirage", "veil"}:
             self._local_ggeur_upload_smoothing(
                 base_state, updated_states, selected_ids, round_index
+            )
+        elif self.name == "perturb":
+            self._fedmia_perturb_updates(
+                base_state, updated_states, selected_ids, round_index
+            )
+        elif self.name == "sparse":
+            self._fedmia_sparse_updates(base_state, updated_states, selected_ids)
+
+    @staticmethod
+    def _flatten_client_delta(
+        base_state: dict[str, torch.Tensor],
+        state: dict[str, torch.Tensor],
+    ) -> tuple[list[str], torch.Tensor]:
+        names = [name for name in state if name in base_state]
+        if not names:
+            raise ValueError("Update defense found no trainable prompt tensors.")
+        flat = torch.cat(
+            [
+                (state[name].detach() - base_state[name].to(state[name].device)).reshape(
+                    -1
+                )
+                for name in names
+            ]
+        )
+        return names, flat
+
+    @staticmethod
+    def _assign_client_delta(
+        base_state: dict[str, torch.Tensor],
+        state: dict[str, torch.Tensor],
+        names: list[str],
+        flat: torch.Tensor,
+    ) -> None:
+        offset = 0
+        for name in names:
+            tensor = state[name]
+            count = tensor.numel()
+            delta = flat[offset : offset + count].view_as(tensor)
+            state[name] = base_state[name].to(tensor.device) + delta
+            offset += count
+        if offset != flat.numel():
+            raise ValueError("Defended update does not match prompt tensor sizes.")
+
+    def _fedmia_perturb_updates(
+        self,
+        base_state: dict[str, torch.Tensor],
+        updated_states: dict[int, dict[str, torch.Tensor]],
+        selected_ids: list[int],
+        round_index: int,
+    ) -> None:
+        """Client-level clipping and Gaussian perturbation from FedMIA."""
+        clip_norm = float(self.config.get("perturb_clip_norm", 1.0))
+        noise_std = float(self.config.get("perturb_noise_std", 0.05))
+        for position, user_id in enumerate(selected_ids):
+            state = updated_states[user_id]
+            names, flat = self._flatten_client_delta(base_state, state)
+            norm = flat.norm().clamp_min(1e-12)
+            flat = flat * min(1.0, clip_norm / float(norm))
+            generator = self._generator(user_id, round_index, 1801 + position)
+            if noise_std > 0:
+                flat = flat + torch.randn(
+                    flat.shape,
+                    generator=generator,
+                    device=flat.device,
+                    dtype=flat.dtype,
+                ) * noise_std
+            self._assign_client_delta(base_state, state, names, flat)
+            self._record("perturb_preclip_norm", float(norm))
+            self._record("perturb_upload_norm", float(flat.norm()))
+
+    def _fedmia_sparse_updates(
+        self,
+        base_state: dict[str, torch.Tensor],
+        updated_states: dict[int, dict[str, torch.Tensor]],
+        selected_ids: list[int],
+    ) -> None:
+        """Zero the configured fraction of smallest prompt-update elements."""
+        ratio = float(self.config.get("sparse_ratio", 0.9))
+        for user_id in selected_ids:
+            state = updated_states[user_id]
+            names, flat = self._flatten_client_delta(base_state, state)
+            keep = max(1, int(math.ceil((1.0 - ratio) * flat.numel())))
+            indices = flat.abs().topk(keep, sorted=False).indices
+            sparse = torch.zeros_like(flat)
+            sparse[indices] = flat[indices]
+            self._assign_client_delta(base_state, state, names, sparse)
+            self._record(
+                "sparse_zero_fraction",
+                float((sparse == 0).float().mean()),
             )
 
     def _local_ggeur_upload_smoothing(

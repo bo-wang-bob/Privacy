@@ -28,6 +28,22 @@
 
 参考仓库未附许可证，因此本仓库没有复制其源码。
 
+### FedMIA 实验中的四个基线
+
+FedMIA 官方仓库将四个相关基线按“度量、时间信息、空间信息”区分：
+
+| 运行名 | 度量 | 时间信息 | 空间信息 | 当前适配 |
+|---|---|---|---|---|
+| `blackbox_loss` | 候选负交叉熵 | 单轮 | 仅目标客户端 | 默认使用最后一个已审计轮次；可通过 `audit.fedmia_baseline_single_round` 固定为 `first` 或具体轮次 |
+| `loss_series` | 候选负交叉熵 | 多轮 | 仅目标客户端 | 对目标客户端逐轮分数取均值，与官方代码的 temporal average 一致 |
+| `grad_cosine` | 候选 prompt 梯度与目标客户端 prompt update 的余弦 | 单轮 | 仅目标客户端 | 默认使用最后一个已审计轮次 |
+| `avg_cosine` | 同上 | 多轮 | 仅目标客户端 | 对逐轮余弦取均值 |
+
+官方绘图代码还会查看每一轮的攻击效果并报告其中的最大 TPR。那种选择依赖
+真实成员标签，不能作为部署时可实现的攻击规则，因此本仓库的单轮基线使用预先
+固定的轮次，而不实现 oracle best-round。四个基线都只使用目标客户端，不使用
+FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II 的对照意义。
+
 ## 3. Rethinking Membership Inference Attacks Against Transfer Learning
 
 检索时未发现作者发布的官方实现，因此 `privacy_attacks/transfer.py` 按论文描述实现。

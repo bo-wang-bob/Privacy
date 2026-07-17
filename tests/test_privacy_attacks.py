@@ -15,6 +15,7 @@ from main import default_config, validate_config
 from privacy_attacks.code_poison import generate_membership_encoding_samples
 from privacy_attacks.auditor import MembershipAuditor
 from privacy_attacks.fedmia import run_fedmia
+from privacy_attacks.fedmia_baselines import run_fedmia_baseline
 from privacy_attacks.metrics import fit_shrinkage_attack, membership_metrics
 from privacy_attacks.model_utils import scaled_confidence
 from privacy_attacks.promptmia import generate_key_with_similarity
@@ -157,6 +158,50 @@ def test_fedmia_can_use_max_round_aggregation():
     assert torch.any(max_result.scores > mean_result.scores)
 
 
+def test_fedmia_baselines_preserve_single_and_multi_round_definitions():
+    membership = torch.tensor([1, 1, 0, 0])
+    observations = [
+        {
+            "round": 2,
+            "client_ids": torch.tensor([0, 1]),
+            "confidence": torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.0] * 4]),
+            "cosine": torch.tensor([[0.4, 0.3, 0.2, 0.1], [0.0] * 4]),
+        },
+        {
+            "round": 5,
+            "client_ids": torch.tensor([0, 1]),
+            "confidence": torch.tensor([[0.9, 0.8, 0.7, 0.6], [0.0] * 4]),
+            "cosine": torch.tensor([[0.6, 0.7, 0.8, 0.9], [0.0] * 4]),
+        },
+    ]
+    blackbox = run_fedmia_baseline(
+        observations, membership, 0, "blackbox_loss", "last"
+    )
+    loss_series = run_fedmia_baseline(
+        observations, membership, 0, "loss_series"
+    )
+    grad_cosine = run_fedmia_baseline(
+        observations, membership, 0, "grad_cosine", 2
+    )
+    avg_cosine = run_fedmia_baseline(
+        observations, membership, 0, "avg_cosine"
+    )
+    assert torch.allclose(blackbox.scores, observations[1]["confidence"][0])
+    assert torch.allclose(
+        loss_series.scores,
+        torch.stack([item["confidence"][0] for item in observations]).mean(0),
+    )
+    assert torch.allclose(grad_cosine.scores, observations[0]["cosine"][0])
+    assert torch.allclose(
+        avg_cosine.scores,
+        torch.stack([item["cosine"][0] for item in observations]).mean(0),
+    )
+    assert blackbox.metadata["temporal_information"] == "single"
+    assert loss_series.metadata["temporal_information"] == "multi"
+    assert grad_cosine.metadata["rounds"] == [2]
+    assert avg_cosine.metadata["rounds"] == [2, 5]
+
+
 def test_private_noise_calibration_meets_requested_budget():
     multiplier = calibrate_gaussian_noise(
         target_epsilon=3.0,
@@ -236,6 +281,38 @@ def test_configuration_rejects_removed_backdoor_and_defense_names():
         assert "Unknown privacy defense" in str(error)
     else:
         raise AssertionError("Removed SEISMOGRAPH defense unexpectedly accepted")
+
+
+def test_fedmia_baseline_defenses_reject_private_method_stacking():
+    config = default_config()
+    config["aggregator"] = "dpfpl"
+    config["defense"]["name"] = "mixup"
+    try:
+        validate_config(config)
+    except ValueError as error:
+        assert "centralized FedAvg" in str(error)
+    else:
+        raise AssertionError("MixUp unexpectedly stacked with DP-FPL.")
+
+    config = default_config()
+    config["train_mode"] = "local"
+    config["defense"]["name"] = "sampling"
+    try:
+        validate_config(config)
+    except ValueError as error:
+        assert "centralized FedAvg" in str(error)
+    else:
+        raise AssertionError("Sampling unexpectedly accepted independent local models.")
+
+    config = default_config()
+    config["defense"]["name"] = "sparse"
+    config["defense"]["sparse_ratio"] = 1.0
+    try:
+        validate_config(config)
+    except ValueError as error:
+        assert "sparse_ratio" in str(error)
+    else:
+        raise AssertionError("An all-zero sparse upload was unexpectedly accepted.")
 
 
 class ToyPromptLearner(nn.Module):
@@ -339,6 +416,81 @@ def test_defense_primitives_preserve_required_invariants():
     assert torch.allclose(weighted, torch.zeros_like(weighted), atol=1e-6)
 
 
+def test_fedmia_defense_primitives_modify_only_prompt_training_or_uploads():
+    base = {"prompt": torch.zeros(8)}
+    original = {0: {"prompt": torch.arange(1, 9, dtype=torch.float32)}}
+
+    sparse = DefenseController(
+        {"name": "sparse", "sparse_ratio": 0.75},
+        torch.device("cpu"),
+        total_users=2,
+        num_classes=2,
+        total_rounds=1,
+    )
+    sparse_states = copy.deepcopy(original)
+    sparse._fedmia_sparse_updates(base, sparse_states, [0])
+    assert int((sparse_states[0]["prompt"] != 0).sum()) == 2
+    assert torch.equal(sparse_states[0]["prompt"][-2:], torch.tensor([7.0, 8.0]))
+
+    def perturbed_state():
+        controller = DefenseController(
+            {
+                "name": "perturb",
+                "perturb_clip_norm": 1.0,
+                "perturb_noise_std": 0.05,
+                "seed": 19,
+            },
+            torch.device("cpu"),
+            total_users=2,
+            num_classes=2,
+            total_rounds=1,
+        )
+        states = copy.deepcopy(original)
+        controller._fedmia_perturb_updates(base, states, [0], round_index=0)
+        return states[0]["prompt"]
+
+    first = perturbed_state()
+    second = perturbed_state()
+    assert torch.equal(first, second)
+    assert not torch.equal(first, original[0]["prompt"])
+
+    augmentation = DefenseController(
+        {
+            "name": "data_aug",
+            "data_aug_strength": 0.25,
+            "data_aug_flip_probability": 1.0,
+            "data_aug_color_jitter": 0.1,
+            "seed": 23,
+        },
+        torch.device("cpu"),
+        total_users=2,
+        num_classes=2,
+        total_rounds=1,
+    )
+    images = torch.arange(2 * 3 * 4 * 4, dtype=torch.float32).reshape(2, 3, 4, 4)
+    augmented = augmentation._augment_images(
+        images, augmentation._generator(0, 0, 99)
+    )
+    repeated = augmentation._augment_images(
+        images,
+        DefenseController(
+            augmentation.config,
+            torch.device("cpu"),
+            total_users=2,
+            num_classes=2,
+            total_rounds=1,
+        )._generator(0, 0, 99),
+    )
+    assert torch.equal(augmented, repeated)
+    assert not torch.equal(augmented, images)
+
+    augmentation.config["data_aug_strength"] = 1.0
+    maximum_strength = augmentation._augment_images(
+        images, augmentation._generator(0, 0, 100)
+    )
+    assert maximum_strength.shape == images.shape
+
+
 def _defended_server(
     tmp_path: Path,
     defense: str,
@@ -377,6 +529,14 @@ def _defended_server(
         defense_config={
             "name": defense,
             "seed": 13,
+            "perturb_clip_norm": 0.5,
+            "perturb_noise_std": 0.02,
+            "sparse_ratio": 0.75,
+            "mixup_alpha": 1.0,
+            "sampling_ratio": 0.5,
+            "data_aug_strength": 0.25,
+            "data_aug_flip_probability": 0.5,
+            "data_aug_color_jitter": 0.05,
             "dp_max_grad_norm": 0.5,
             "dp_noise_multiplier": 0.2,
             "dp_delta": 1e-5,
@@ -405,6 +565,12 @@ def _defended_server(
 def test_each_defense_runs_independently_with_one_attack():
     root = Path(".test_artifacts") / "defenses"
     for defense in (
+        "perturb",
+        "sparse",
+        "mixup",
+        "sampling",
+        "data_aug",
+        "data_aug_sampling",
         "cofedmid",
         "prompt_dp",
         "mist",
@@ -424,6 +590,16 @@ def test_each_defense_runs_independently_with_one_attack():
         assert summary["defense"] == defense
         if defense in {"local_ggeur", "mirage", "veil"}:
             assert summary["metrics"]["local_ggeur_private_feature_count"] > 0
+        if defense == "perturb":
+            assert summary["metrics"]["perturb_upload_norm"] > 0
+        if defense == "sparse":
+            assert summary["metrics"]["sparse_zero_fraction"] >= 0.75
+        if defense == "mixup":
+            assert 0 <= summary["metrics"]["mixup_lambda"] <= 1
+        if defense in {"sampling", "data_aug_sampling"}:
+            assert summary["metrics"]["sampling_fraction"] == 0.5
+        if defense in {"data_aug", "data_aug_sampling"}:
+            assert summary["metrics"]["data_aug_fraction"] == 1.0
         assert (path / "privacy_audit" / "summary.json").exists()
 
 
@@ -478,6 +654,38 @@ def test_membership_candidates_can_be_exactly_label_matched():
         torch.bincount(labels, minlength=3),
         torch.bincount(member_labels, minlength=3),
     )
+
+
+def test_membership_candidates_support_larger_proportionally_matched_nonmembers():
+    auditor = MembershipAuditor.__new__(MembershipAuditor)
+    auditor.model = SimpleNamespace(classnames=["zero", "one"])
+    auditor.seed = 29
+    auditor.collate_fn = None
+    member_labels = torch.tensor([0, 0, 1])
+    dataset = TensorDataset(
+        torch.arange(12, dtype=torch.float32).view(12, 1),
+        torch.tensor([0, 1] * 6),
+    )
+    _images, labels = auditor._collect_label_matched(
+        [dataset], member_labels, limit=9
+    )
+    assert labels.numel() == 9
+    assert torch.equal(torch.bincount(labels, minlength=2), torch.tensor([6, 3]))
+
+
+def test_auditor_recovers_training_examples_excluded_by_few_shot_selection():
+    parent = TensorDataset(
+        torch.arange(10, dtype=torch.float32).view(10, 1),
+        torch.arange(10) % 2,
+    )
+    few_shot = torch.utils.data.Subset(parent, [0, 2, 4, 6])
+    users = [
+        SimpleNamespace(train_data=torch.utils.data.Subset(few_shot, [0, 1])),
+        SimpleNamespace(train_data=torch.utils.data.Subset(few_shot, [2, 3])),
+    ]
+    unused = MembershipAuditor._unused_few_shot_training_pool(users)
+    assert unused is not None
+    assert unused.indices == [1, 3, 5, 7, 8, 9]
 
 
 def test_membership_candidate_loading_does_not_advance_global_torch_rng():
@@ -809,6 +1017,10 @@ def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
             "target_client_id": 0,
             "ensure_target_participation": True,
             "attacks": [
+                "blackbox_loss",
+                "loss_series",
+                "grad_cosine",
+                "avg_cosine",
                 "nasr_passive",
                 "nasr_active",
                 "fedmia_loss",
@@ -850,6 +1062,10 @@ def test_all_attacks_run_in_a_toy_federated_prompt_experiment():
     )
     summaries = server.train()
     assert {item["attack"] for item in summaries} == {
+        "blackbox_loss",
+        "loss_series",
+        "grad_cosine",
+        "avg_cosine",
         "nasr_passive",
         "nasr_active",
         "fedmia_loss",

@@ -13,7 +13,7 @@ import yaml
 
 from aggregator.aggregator_builder import build_aggregator
 from privacy_attacks.auditor import SUPPORTED_ATTACKS
-from privacy_defenses import SUPPORTED_DEFENSES
+from privacy_defenses import FEDMIA_BASELINE_DEFENSES, SUPPORTED_DEFENSES
 from servers.serverbase import ServerBase
 from utils.data_loader import generate_dirichlet_split, generate_iid_split
 from utils.privacy_accounting import (
@@ -120,20 +120,35 @@ def validate_config(config: dict) -> None:
         raise ValueError("audit.active_probe_cycles must be positive.")
     if "promptmia" in attacks and int(audit.get("promptmia_max_samples", 16)) < 2:
         raise ValueError("audit.promptmia_max_samples must be at least 2.")
+    legacy_candidates = int(audit.get("max_samples_per_group", 32))
+    if int(audit.get("max_member_samples", legacy_candidates)) < 2:
+        raise ValueError("audit.max_member_samples must be at least 2.")
+    if int(audit.get("max_nonmember_samples", legacy_candidates)) < 2:
+        raise ValueError("audit.max_nonmember_samples must be at least 2.")
     if str(
         audit.get("audit_view", "protocol_plus_released_prompts")
     ).lower() == "released_prompt" and attacks & {
         "nasr_passive",
         "fedmia_cosine",
+        "grad_cosine",
+        "avg_cosine",
     }:
         raise ValueError(
             "released_prompt audit view cannot run update-dependent attacks "
-            "nasr_passive or fedmia_cosine."
+            "nasr_passive, fedmia_cosine, grad_cosine, or avg_cosine."
         )
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
+    if defense_name in FEDMIA_BASELINE_DEFENSES and (
+        method != "fedavg" or config["train_mode"] != "centralized"
+    ):
+        raise ValueError(
+            "FedMIA baseline defenses require centralized FedAvg and must be "
+            "evaluated as standalone comparisons, not stacked with DP-FPL or "
+            "FedASK."
+        )
     if defense_name == "mist" and config["sample_users"] < 2:
         raise ValueError("MIST requires at least two selected client submodels.")
     if not 0 < float(defense.get("dp_delta", 1e-5)) < 1:
@@ -143,6 +158,22 @@ def validate_config(config: dict) -> None:
             raise ValueError("defense.dp_max_grad_norm must be positive.")
         if float(defense.get("dp_noise_multiplier", 1.0)) <= 0:
             raise ValueError("defense.dp_noise_multiplier must be positive.")
+    if float(defense.get("perturb_clip_norm", 1.0)) <= 0:
+        raise ValueError("defense.perturb_clip_norm must be positive.")
+    if float(defense.get("perturb_noise_std", 0.05)) < 0:
+        raise ValueError("defense.perturb_noise_std must be non-negative.")
+    if not 0 <= float(defense.get("sparse_ratio", 0.9)) < 1:
+        raise ValueError("defense.sparse_ratio must be in [0, 1).")
+    if float(defense.get("mixup_alpha", 1.0)) <= 0:
+        raise ValueError("defense.mixup_alpha must be positive.")
+    if not 0 < float(defense.get("sampling_ratio", 0.5)) <= 1:
+        raise ValueError("defense.sampling_ratio must be in (0, 1].")
+    if not 0 <= float(defense.get("data_aug_strength", 0.1)) <= 1:
+        raise ValueError("defense.data_aug_strength must be in [0, 1].")
+    if not 0 <= float(defense.get("data_aug_flip_probability", 0.5)) <= 1:
+        raise ValueError("defense.data_aug_flip_probability must be in [0, 1].")
+    if not 0 <= float(defense.get("data_aug_color_jitter", 0.1)) <= 1:
+        raise ValueError("defense.data_aug_color_jitter must be in [0, 1].")
     if not 0 <= float(defense.get("cofedmid_recycle_ratio", 0.1)) <= 1:
         raise ValueError("defense.cofedmid_recycle_ratio must be in [0, 1].")
     if not 0 <= float(defense.get("cofedmid_perturb_ratio", 0.1)) <= 1:
@@ -340,6 +371,7 @@ def run(config: dict) -> list[dict]:
         train_sets, test_sets, class_names = generate_iid_split(
             config["dataset_name"],
             num_users=config["total_users"],
+            root_dir=config.get("data_root", "./data"),
             fpl=True,
             fpl_shots=config["fpl_shots"],
         )
@@ -348,6 +380,7 @@ def run(config: dict) -> list[dict]:
             config["dataset_name"],
             config["total_users"],
             config["dirichlet_alpha"],
+            root_dir=config.get("data_root", "./data"),
             fpl=True,
             fpl_shots=config["fpl_shots"],
         )
@@ -421,6 +454,7 @@ def default_config() -> dict:
     return {
         "train_mode": "centralized",
         "dataset_name": "caltech101",
+        "data_root": "./data",
         "batch_size": 16,
         "eval_batch_size": 64,
         "learning_rate": 0.001,
@@ -471,6 +505,10 @@ def default_config() -> dict:
             "target_client_id": 0,
             "ensure_target_participation": True,
             "attacks": [
+                "blackbox_loss",
+                "loss_series",
+                "grad_cosine",
+                "avg_cosine",
                 "nasr_passive",
                 "nasr_active",
                 "fedmia_loss",
@@ -533,6 +571,14 @@ def default_config() -> dict:
         },
         "defense": {
             "name": "none",
+            "perturb_clip_norm": 1.0,
+            "perturb_noise_std": 0.05,
+            "sparse_ratio": 0.9,
+            "mixup_alpha": 1.0,
+            "sampling_ratio": 0.5,
+            "data_aug_strength": 0.1,
+            "data_aug_flip_probability": 0.5,
+            "data_aug_color_jitter": 0.1,
             "dp_max_grad_norm": 1.0,
             "dp_noise_multiplier": 1.0,
             "dp_delta": 1e-5,
@@ -578,6 +624,8 @@ def parse_args() -> dict:
     )
     parser.add_argument("--config", default="configs/fedprompt_privacy.yaml")
     parser.add_argument("--dataset_name")
+    parser.add_argument("--data_root")
+    parser.add_argument("--cache_dir")
     parser.add_argument("--gpu", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--num_global_iters", type=int)
@@ -600,6 +648,14 @@ def parse_args() -> dict:
         choices=sorted(SUPPORTED_DEFENSES),
         help="Run one independent defense; use 'none' for attack-only or plain training.",
     )
+    parser.add_argument("--perturb_clip_norm", type=float)
+    parser.add_argument("--perturb_noise_std", type=float)
+    parser.add_argument("--sparse_ratio", type=float)
+    parser.add_argument("--mixup_alpha", type=float)
+    parser.add_argument("--sampling_ratio", type=float)
+    parser.add_argument("--data_aug_strength", type=float)
+    parser.add_argument("--data_aug_flip_probability", type=float)
+    parser.add_argument("--data_aug_color_jitter", type=float)
     parser.add_argument("--local_ggeur_augments", type=int)
     parser.add_argument("--local_ggeur_geometry_scale", type=float)
     parser.add_argument("--local_ggeur_anchor_mode")
@@ -638,6 +694,8 @@ def parse_args() -> dict:
         config["defense"] = defense
     for key in (
         "dataset_name",
+        "data_root",
+        "cache_dir",
         "gpu",
         "seed",
         "num_global_iters",
@@ -665,6 +723,14 @@ def parse_args() -> dict:
     if args.defense is not None:
         config["defense"]["name"] = args.defense
     for key in (
+        "perturb_clip_norm",
+        "perturb_noise_std",
+        "sparse_ratio",
+        "mixup_alpha",
+        "sampling_ratio",
+        "data_aug_strength",
+        "data_aug_flip_probability",
+        "data_aug_color_jitter",
         "local_ggeur_augments",
         "local_ggeur_geometry_scale",
         "local_ggeur_anchor_mode",

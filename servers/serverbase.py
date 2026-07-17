@@ -12,7 +12,11 @@ import torch
 from aggregator.base_aggregator import BaseAggregator
 from context.context import Context
 from privacy_attacks.auditor import MembershipAuditor
-from privacy_defenses import DefenseController, attach_hamp_output_transform
+from privacy_defenses import (
+    FEDMIA_BASELINE_DEFENSES,
+    DefenseController,
+    attach_hamp_output_transform,
+)
 from utils.privacy_accounting import (
     gaussian_rdp_epsilon,
     planned_private_probe_steps,
@@ -107,6 +111,18 @@ class ServerBase:
         )
         self.defense.federated_method = self.federated_method
         self.defense.method_config = self.method_config
+        if (
+            self.defense.name in FEDMIA_BASELINE_DEFENSES
+            and (
+                self.federated_method != "fedavg"
+                or self.train_mode != "centralized"
+            )
+        ):
+            raise ValueError(
+                "FedMIA baseline defenses require centralized FedAvg and are "
+                "standalone comparisons; stacking them with DP-FPL or FedASK "
+                "would change both mechanisms."
+            )
         if self.defense.name == "hamp":
             attach_hamp_output_transform(
                 model,
