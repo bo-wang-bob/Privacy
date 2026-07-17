@@ -117,7 +117,7 @@ def comparison_heatmaps(rows: list[dict[str, str]]) -> None:
     fig, axes = plt.subplots(
         1,
         3,
-        figsize=(18.0, 5.8),
+        figsize=(17.0, 5.2),
         sharey=True,
         facecolor="white",
         constrained_layout=True,
@@ -137,12 +137,19 @@ def comparison_heatmaps(rows: list[dict[str, str]]) -> None:
         axis.set_title(DATASET_LABELS[dataset], pad=12, fontweight="normal")
         axis.set_xticks(np.arange(len(ATTACKS)), ATTACK_LABELS)
         axis.set_yticks(np.arange(len(METHODS)), METHODS)
-        axis.tick_params(axis="both", length=0)
+        axis.tick_params(axis="x", length=0, rotation=22)
+        for label in axis.get_xticklabels():
+            label.set_horizontalalignment("right")
         axis.tick_params(
             axis="y",
+            length=0,
             labelleft=panel_index == 0,
             pad=10,
         )
+        axis.set_xticks(np.arange(-0.5, len(ATTACKS), 1.0), minor=True)
+        axis.set_yticks(np.arange(-0.5, len(METHODS), 1.0), minor=True)
+        axis.grid(which="minor", color="white", linewidth=1.4)
+        axis.tick_params(which="minor", bottom=False, left=False)
         if panel_index == 0:
             axis.set_ylabel("Training mechanism")
 
@@ -162,23 +169,6 @@ def comparison_heatmaps(rows: list[dict[str, str]]) -> None:
             axis.get_yticklabels()[0].set_color(VEIL_COLOR)
             axis.get_yticklabels()[0].set_fontweight("bold")
 
-        minima = matrix.min(axis=0)
-        for row_index in range(matrix.shape[0]):
-            for column_index in range(matrix.shape[1]):
-                value = matrix[row_index, column_index]
-                normalized = value / vmax if vmax > 0 else 0.0
-                color = "white" if normalized > 0.58 else TEXT_COLOR
-                best = np.isclose(value, minima[column_index], atol=5e-8)
-                axis.text(
-                    column_index,
-                    row_index,
-                    f"{100.0 * value:.1f}",
-                    ha="center",
-                    va="center",
-                    color=color,
-                    fontsize=25,
-                    fontweight="bold" if best else "normal",
-                )
         for spine in axis.spines.values():
             spine.set_linewidth(0.8)
             spine.set_edgecolor("#4A4A4A")

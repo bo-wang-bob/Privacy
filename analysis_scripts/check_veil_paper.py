@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PAPER = ROOT / "paper" / "aaai2027" / "veil.tex"
 BIB = ROOT / "paper" / "aaai2027" / "veil.bib"
 CHECKLIST = ROOT / "paper" / "aaai2027" / "veil_reproducibility.tex"
+PLOT_SCRIPT = ROOT / "analysis_scripts" / "plot_veil_paper.py"
 DATA = ROOT / "paper" / "aaai2027" / "evidence"
 FORBIDDEN_PACKAGES = {
     "authblk",
@@ -183,8 +184,14 @@ def check_derived_data() -> None:
         raise AssertionError("Expected four privacy-accounting method/scope rows.")
     ablations = csv_rows("ablation.csv")
     variants = {row["variant"] for row in ablations}
-    if len(ablations) != 7 or len(variants) != 7:
-        raise AssertionError("Expected seven unique VEIL component ablations.")
+    expected_variants = {"Full VEIL", "w/o Stage I", "w/o Stage II", "w/o Stage III"}
+    if len(ablations) != 4 or variants != expected_variants:
+        raise AssertionError("Expected the full method and exactly three stage ablations.")
+    for row in ablations:
+        for attack in attack_fields:
+            value = float(row[attack])
+            if not 0.0 <= value <= 1.0:
+                raise AssertionError(f"Invalid ablation attack value {row['variant']} {attack}.")
 
 
 def check_result_tables(text: str) -> None:
@@ -207,14 +214,21 @@ def check_result_tables(text: str) -> None:
         "DP-FPL": "DP-FPL",
         "FedASK": "FedASK",
     }
-    fields = (
-        "accuracy_mean",
-        "accuracy_std",
-        "worst_tpr_mean",
-        "worst_tpr_std",
-        "mean_tpr_mean",
-        "mean_tpr_std",
+    attack_fields = (
+        "fedmia_loss",
+        "fedmia_cosine",
+        "fedmia_joint",
+        "nasr_passive",
+        "rmia",
+        "quantile_mia",
     )
+    attacks = {
+        (row["dataset"], row["method"], row["attack"]): float(row["tpr_mean"])
+        for row in csv_rows("attack_aggregate.csv")
+    }
+
+    def close_percent(actual: float, printed: str) -> bool:
+        return math.isclose(100.0 * actual, float(printed), rel_tol=0.0, abs_tol=0.051)
 
     def table_block(label: str) -> str:
         label_token = rf"\label{{{label}}}"
@@ -253,7 +267,7 @@ def check_result_tables(text: str) -> None:
             if "&" not in line or not line.endswith(r"\\"):
                 continue
             cells = [cell.strip() for cell in line[:-2].split("&")]
-            if len(cells) != 5:
+            if len(cells) != 9:
                 shaded = False
                 continue
             method_label = cells[1]
@@ -265,9 +279,9 @@ def check_result_tables(text: str) -> None:
             printed: list[str] = []
             for metric_cell in cells[2:]:
                 numbers = re.findall(r"[0-9]+\.[0-9]+", metric_cell)
-                if len(numbers) != 2:
-                    raise AssertionError(f"Expected mean and std in cell {metric_cell}")
-                printed.extend(numbers)
+                if len(numbers) != 1:
+                    raise AssertionError(f"Expected one percentage in cell {metric_cell}")
+                printed.append(numbers[0])
             rows.append(
                 {
                     "dataset_label": current_dataset,
@@ -283,6 +297,7 @@ def check_result_tables(text: str) -> None:
     def validate_grouped_table(
         label: str,
         allowed_methods: set[str],
+        bold_methods: set[str],
         expected_count: int,
     ) -> None:
         block = table_block(label)
@@ -293,31 +308,42 @@ def check_result_tables(text: str) -> None:
             raise AssertionError(
                 f"Expected {expected_count} rows in {label}, parsed {len(parsed)}."
             )
-        table_methods = {method_names[item] for item in allowed_methods}
-        metric_fields = ("accuracy_mean", "worst_tpr_mean", "mean_tpr_mean")
-        reducers = (max, min, min)
+        candidate_methods = {method_names[item] for item in bold_methods}
         for row in parsed:
             dataset = dataset_names[str(row["dataset_label"])]
             method = method_names[str(row["method_label"])]
             evidence = aggregates[(dataset, method)]
-            for field, value in zip(fields, row["printed"]):
-                if not close_to_printed(float(evidence[field]), str(value)):
+            actual_values = [float(evidence["accuracy_mean"])] + [
+                attacks[(dataset, method, attack)] for attack in attack_fields
+            ]
+            for actual, value in zip(actual_values, row["printed"]):
+                if not close_percent(actual, str(value)):
                     raise AssertionError(
-                        f"{label} mismatch for {(dataset, method)} {field}: "
-                        f"paper={value}, evidence={evidence[field]}"
+                        f"{label} mismatch for {(dataset, method)}: "
+                        f"paper={value}, evidence={actual}"
                     )
-            expected_bold = []
-            for field, reducer in zip(metric_fields, reducers):
-                values = [
-                    float(aggregates[(dataset, candidate)][field])
-                    for candidate in table_methods
-                ]
-                best = reducer(values)
-                expected_bold.append(
-                    math.isclose(
-                        float(evidence[field]), best, rel_tol=0.0, abs_tol=5.1e-5
-                    )
+            if method not in candidate_methods:
+                expected_bold = [False] * len(actual_values)
+            else:
+                best_accuracy = max(
+                    float(aggregates[(dataset, candidate)]["accuracy_mean"])
+                    for candidate in candidate_methods
                 )
+                best_attacks = [
+                    min(
+                        attacks[(dataset, candidate, attack)]
+                        for candidate in candidate_methods
+                    )
+                    for attack in attack_fields
+                ]
+                expected_bold = [
+                    math.isclose(
+                        actual_values[0], best_accuracy, rel_tol=0.0, abs_tol=5.1e-5
+                    )
+                ] + [
+                    math.isclose(actual, best, rel_tol=0.0, abs_tol=5.1e-5)
+                    for actual, best in zip(actual_values[1:], best_attacks)
+                ]
             if tuple(expected_bold) != row["bold"]:
                 raise AssertionError(
                     f"Incorrect bolding in {label} for {(dataset, method)}: "
@@ -331,10 +357,12 @@ def check_result_tables(text: str) -> None:
     validate_grouped_table(
         "tab:fedavg",
         {"No defense", "Prompt-DP", "HAMP", r"\method{}"},
+        {"Prompt-DP", "HAMP", r"\method{}"},
         12,
     )
     validate_grouped_table(
         "tab:private",
+        {"DP-FPL", "FedASK", r"\method{}"},
         {"DP-FPL", "FedASK", r"\method{}"},
         9,
     )
@@ -342,11 +370,9 @@ def check_result_tables(text: str) -> None:
     ablation_source = {row["variant"]: row for row in csv_rows("ablation.csv")}
     ablation_names = {
         r"Full \method{}": "Full VEIL",
-        "Individual anchor": "Individual anchor",
-        "No echoes": "No echoes",
-        "No prototype branch": "No prototype",
-        "No upload smoothing": "No upload smoothing",
-        "No output calib.": "No output tempering",
+        "w/o S-I": "w/o Stage I",
+        "w/o S-II": "w/o Stage II",
+        "w/o S-III": "w/o Stage III",
     }
     ablation_block = table_block("tab:ablation")
     parsed_ablation: list[tuple[str, list[str], tuple[bool, ...], bool]] = []
@@ -359,7 +385,7 @@ def check_result_tables(text: str) -> None:
         if "&" not in line or not line.endswith(r"\\"):
             continue
         cells = [cell.strip() for cell in line[:-2].split("&")]
-        if len(cells) != 4 or cells[0] not in ablation_names:
+        if len(cells) != 8 or cells[0] not in ablation_names:
             shaded = False
             continue
         values = []
@@ -377,15 +403,15 @@ def check_result_tables(text: str) -> None:
             )
         )
         shaded = False
-    if len(parsed_ablation) != 6:
-        raise AssertionError(f"Expected 6 focused ablations, found {len(parsed_ablation)}.")
+    if len(parsed_ablation) != 4:
+        raise AssertionError(f"Expected 4 stage rows, found {len(parsed_ablation)}.")
     displayed = [ablation_source[name] for name, *_rest in parsed_ablation]
-    ablation_fields = ("accuracy", "worst_tpr", "mean_tpr")
-    ablation_reducers = (max, min, min)
+    ablation_fields = ("accuracy", *attack_fields)
+    ablation_reducers = (max, min, min, min, min, min, min)
     for name, printed, bold, row_shaded in parsed_ablation:
         evidence = ablation_source[name]
         for field, value in zip(ablation_fields, printed):
-            if not close_to_printed(float(evidence[field]), value):
+            if not close_percent(float(evidence[field]), value):
                 raise AssertionError(f"Ablation mismatch for {name} {field}.")
         expected_bold = tuple(
             math.isclose(
@@ -403,50 +429,21 @@ def check_result_tables(text: str) -> None:
         if row_shaded != (name == "Full VEIL"):
             raise AssertionError(f"Only Full VEIL may be shaded in the ablation.")
 
-    accounting = {
-        (row["method"], row["scope"]): row
-        for row in csv_rows("privacy_accounting_summary.csv")
-    }
-    expected_accounting = {
-        ("Prompt-DP", "prompt update"): ("Prompt-DP", "epsilon"),
-        ("DP-FPL", "local"): ("DP-FPL", "local_epsilon"),
-        ("DP-FPL", "global"): ("DP-FPL", "global_epsilon"),
-        ("FedASK", "local"): ("FedASK", "epsilon"),
-    }
-    accounting_block = re.search(
-        r"\\begin\{tabular\}\{llcc\}(.*?)\\end\{tabular\}",
+    accounting = csv_rows("privacy_accounting_summary.csv")
+    epsilon_min = min(float(row["epsilon_min"]) for row in accounting)
+    epsilon_max = max(float(row["epsilon_max"]) for row in accounting)
+    accounting_claim = re.search(
+        r"Gaussian-RDP upper bounds span\s*\$\\epsilon=([0-9.]+)\$--"
+        r"\$([0-9.]+)\$ at \$\\delta=10\^\{-5\}\$",
         text,
-        flags=re.DOTALL,
     )
-    if accounting_block is None:
-        raise AssertionError("Could not locate the privacy-accounting table.")
-    accounting_pattern = re.compile(
-        r"^(Prompt-DP|DP-FPL|FedASK) & (prompt update|local|global) & "
-        r"([0-9.]+)(?:--([0-9.]+))? & \$10\^\{-5\}\$\\\\$",
-        flags=re.MULTILINE,
-    )
-    accounting_rows = accounting_pattern.findall(accounting_block.group(1))
-    if len(accounting_rows) != 4:
-        raise AssertionError(
-            f"Expected 4 privacy-accounting rows, parsed {len(accounting_rows)}."
-        )
-    for method, scope, printed_min, printed_max in accounting_rows:
-        source_key = expected_accounting[(method, scope)]
-        evidence = accounting[source_key]
-        if not math.isclose(
-            float(evidence["epsilon_min"]),
-            float(printed_min),
-            rel_tol=0.0,
-            abs_tol=5.1e-3,
-        ):
-            raise AssertionError(f"Accounting minimum mismatch for {source_key}.")
-        shown_max = float(printed_max or printed_min)
-        if not math.isclose(
-            float(evidence["epsilon_max"]), shown_max, rel_tol=0.0, abs_tol=5.1e-3
-        ):
-            raise AssertionError(f"Accounting maximum mismatch for {source_key}.")
-        if not math.isclose(float(evidence["delta"]), 1e-5, rel_tol=0.0, abs_tol=0.0):
-            raise AssertionError(f"Accounting delta mismatch for {source_key}.")
+    if accounting_claim is None:
+        raise AssertionError("Could not locate the concise privacy-accounting claim.")
+    printed_min, printed_max = map(float, accounting_claim.groups())
+    if not math.isclose(epsilon_min, printed_min, rel_tol=0.0, abs_tol=5.1e-3):
+        raise AssertionError("Privacy-accounting minimum does not match evidence.")
+    if not math.isclose(epsilon_max, printed_max, rel_tol=0.0, abs_tol=5.1e-3):
+        raise AssertionError("Privacy-accounting maximum does not match evidence.")
 
 
 def check_focused_structure(text: str) -> None:
@@ -470,6 +467,8 @@ def check_focused_structure(text: str) -> None:
         raise AssertionError(f"VEIL must have exactly three stages: {subsections}")
     if r"\begin{align}" in method or r"\begin{aligned}" in method:
         raise AssertionError("Method equations must not place multiple formulas per row.")
+    if method.count(r"\begin{equation}") > 4:
+        raise AssertionError("The method section must use at most four display equations.")
     algorithm = re.search(
         r"\\begin\{algorithmic\}\[1\](.*?)\\end\{algorithmic\}",
         method,
@@ -480,8 +479,13 @@ def check_focused_structure(text: str) -> None:
     figures = re.findall(r"\\includegraphics(?:\[[^]]*\])?\{([^}]+)\}", text)
     if figures != ["figures/private_methods_attack_profile.pdf"]:
         raise AssertionError(f"Expected one focused attack figure, found {figures}.")
+    plot_source = PLOT_SCRIPT.read_text(encoding="utf-8")
+    if "axis.text(" in plot_source or "bar_label(" in plot_source:
+        raise AssertionError("The attack figure must not contain crowded cell annotations.")
     if text.count(r"\rowcolor{veilshade}") < 7:
         raise AssertionError("VEIL rows are not consistently shaded in result tables.")
+    if re.search(r"\bseed(?:s|ed|ing)?\b", text, flags=re.IGNORECASE):
+        raise AssertionError("The manuscript must not mention experiment seeds.")
 
 
 def main() -> None:
@@ -509,6 +513,8 @@ def main() -> None:
     check_result_tables(text)
     check_focused_structure(text)
     checklist_source = CHECKLIST.read_text(encoding="utf-8")
+    if re.search(r"\bseed(?:s|ed|ing)?\b", checklist_source, flags=re.IGNORECASE):
+        raise AssertionError("The compiled checklist must not mention experiment seeds.")
     check_braces(uncommented(checklist_source))
     check_environments(uncommented(checklist_source))
     checklist = checklist_source.split(

@@ -4,20 +4,21 @@ Status: validated source, evidence, figure, and compiled PDF artifact.
 
 ## Experimental evidence
 
-- The main matrix contains 54 unique runs: three datasets, seeds 42--44, and six
-  mechanisms. Every selected run has 64 members and 64 non-members with exactly
-  equal label histograms, all six attacks in the fixed order, finite metrics,
-  and no audit errors.
+- The main matrix contains 54 unique runs: three datasets, three independent
+  repetitions, and six mechanisms. Every selected run has 64 members and 64
+  non-members with exactly equal label histograms, all six attacks in the fixed
+  order, finite metrics, and no audit errors.
 - All Caltech101 and DTD formal runs set `require_cuda: true`; formal commands
-  logged `cuda:0` or `cuda:1`. Flowers102 runs specify a GPU, and the seven new
-  component runs additionally enforce `require_cuda: true`.
-- The component study contains seven uniquely matched Flowers102 seed-42 runs.
-  Its selector matches the complete formal configuration plus exactly one
-  override, preventing earlier development sweeps from entering the figure.
+  logged `cuda:0` or `cuda:1`. Flowers102 runs specify a GPU, and the four
+  component configurations additionally enforce `require_cuda: true`.
+- The component study contains the full Flowers102 configuration and exactly
+  three stage-level ablations. Its selector matches the complete formal
+  configuration plus the corresponding stage override, preventing earlier
+  development sweeps from entering the table.
 - `run_level.csv` was independently regrouped to reproduce all 18 dataset-method
   aggregates and all 108 attack aggregates. The manuscript's FedAvg, private-
-  mechanism, and privacy-accounting tables were then checked against these CSVs
-  at their displayed precision.
+  mechanism, stage-ablation, and concise privacy-accounting results were then
+  checked against these CSVs at their displayed precision.
 
 ## Artifact checks
 
@@ -43,8 +44,8 @@ Status: validated source, evidence, figure, and compiled PDF artifact.
 ## Interpretation limits
 
 - With at most 64 evaluated non-members, TPR@1%FPR is a zero-false-positive
-  operating point and is visibly quantized. Three seeds do not justify strong
-  significance claims.
+  operating point and is visibly quantized. Three repetitions do not justify
+  strong significance claims.
 - VEIL is an empirical defense, not a differential-privacy mechanism. The
   reported conservative epsilon upper bounds are large at the selected noise
   settings.

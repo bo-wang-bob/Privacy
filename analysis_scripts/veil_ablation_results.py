@@ -1,4 +1,4 @@
-"""Select validated Flowers102 VEIL ablations and emit a compact CSV."""
+"""Select the three stage-level VEIL ablations and emit attack-level evidence."""
 
 from __future__ import annotations
 
@@ -42,17 +42,11 @@ BASE = {
 }
 OVERRIDES: dict[str, dict[str, Any]] = {
     "Full VEIL": {},
-    "Individual anchor": {"local_ggeur_anchor_mode": "sample"},
-    "No echoes": {"local_ggeur_augments": 0},
-    "No prototype": {"local_ggeur_original_mode": "drop"},
-    "No upload smoothing": {
+    "w/o Stage I": {"local_ggeur_augments": 0},
+    "w/o Stage II": {"local_ggeur_anchor_mode": "sample"},
+    "w/o Stage III": {
         "local_ggeur_upload_clip_norm": 0.0,
         "local_ggeur_upload_noise_std": 0.0,
-    },
-    "No output tempering": {"local_ggeur_output_temperature": 1.0},
-    "Noisy prototype": {
-        "local_ggeur_original_mode": "class_mean_noise",
-        "local_ggeur_original_noise": 0.08,
     },
 }
 VARIANTS = {name: BASE | override for name, override in OVERRIDES.items()}
@@ -115,10 +109,17 @@ def main() -> None:
             key=lambda path: (path / "privacy_audit" / "summary.json").stat().st_mtime,
         )
         run = load_run(selected)
+        summary = json.loads(
+            (selected / "privacy_audit" / "summary.json").read_text(encoding="utf-8")
+        )
+        attack_values = {
+            item["attack"]: item["tpr_at_fpr_0.01"] for item in summary["attacks"]
+        }
         rows.append(
             {
                 "variant": name,
                 "accuracy": run["accuracy"],
+                **{attack: attack_values[attack] for attack in ATTACKS},
                 "worst_tpr": run["worst_tpr_at_fpr_0.01"],
                 "mean_tpr": run["mean_tpr_at_fpr_0.01"],
                 "result_dir": selected.name,
@@ -128,7 +129,14 @@ def main() -> None:
     with OUTPUT.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=("variant", "accuracy", "worst_tpr", "mean_tpr", "result_dir"),
+            fieldnames=(
+                "variant",
+                "accuracy",
+                *ATTACKS,
+                "worst_tpr",
+                "mean_tpr",
+                "result_dir",
+            ),
             lineterminator="\n",
         )
         writer.writeheader()
