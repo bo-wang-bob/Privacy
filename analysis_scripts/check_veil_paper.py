@@ -301,6 +301,8 @@ def check_result_tables(text: str) -> None:
         expected_count: int,
     ) -> None:
         block = table_block(label)
+        if r"FedMIA \tpr{} $\downarrow$" not in block:
+            raise AssertionError(f"{label} must name the FedMIA attack family.")
         if len(re.findall(r"\\multirow\{\d+\}\{\*\}\{", block)) != 3:
             raise AssertionError(f"{label} must merge its three dataset columns.")
         parsed = parse_grouped_table(block, allowed_methods)

@@ -313,8 +313,7 @@ rate is $10^{-3}$, and the prompt contains 16 context tokens.
 The backbone and execution policy are fixed across comparisons.  CLIP ViT-B/32
 is loaded from local storage, its encoders remain frozen, and formal runs require
 CUDA.  Reported means and sample standard deviations use three independent
-repetitions; the main matrix contains 54 runs, and the focused component study
-contains the full method plus three stage ablations.
+repetitions.
 
 \begin{table}[t]
 \centering
@@ -332,10 +331,11 @@ under the non-IID partition; the last column reports their arithmetic mean.}
 \label{tab:datasets}
 \end{table}
 
-Hyperparameters are selected once and then frozen across datasets.  We choose
-the lowest worst-attack leakage among configurations that maintain at least 0.60
-development accuracy.  The artifact records the full search and randomness
-controls.
+The evaluation separates configuration selection from transfer.  We select
+hyperparameters once on Flowers102 and freeze them before evaluating
+Caltech101 and DTD, so neither transfer dataset receives benchmark-specific
+retuning.  Among Flowers102 configurations, we choose the lowest worst-attack
+leakage that maintains at least 0.60 development accuracy.
 
 \subsection{Baselines}
 
@@ -388,8 +388,9 @@ and the remaining columns report attack TPR on the same trained model.
 \begin{tabular}{llrrrrrrr}
 \toprule
 & & \multicolumn{1}{c}{No attack} &
-\multicolumn{6}{c}{Attack \tpr{} $\downarrow$}\\
-\cmidrule(lr){3-3}\cmidrule(lr){4-9}
+\multicolumn{3}{c}{FedMIA \tpr{} $\downarrow$} &
+\multicolumn{3}{c}{Other \tpr{} $\downarrow$}\\
+\cmidrule(lr){3-3}\cmidrule(lr){4-6}\cmidrule(lr){7-9}
 Dataset & Defense & Acc. $\uparrow$ & Loss & Cos. & Joint & Nasr & RMIA & Quant.\\
 \midrule
 \multirow{4}{*}{Flowers102}
@@ -443,8 +444,9 @@ summary; exact values remain in the table.
 \begin{tabular}{llrrrrrrr}
 \toprule
 & & \multicolumn{1}{c}{No attack} &
-\multicolumn{6}{c}{Attack \tpr{} $\downarrow$}\\
-\cmidrule(lr){3-3}\cmidrule(lr){4-9}
+\multicolumn{3}{c}{FedMIA \tpr{} $\downarrow$} &
+\multicolumn{3}{c}{Other \tpr{} $\downarrow$}\\
+\cmidrule(lr){3-3}\cmidrule(lr){4-6}\cmidrule(lr){7-9}
 Dataset & Method & Acc. $\uparrow$ & Loss & Cos. & Joint & Nasr & RMIA & Quant.\\
 \midrule
 \multirow{3}{*}{Flowers102}
