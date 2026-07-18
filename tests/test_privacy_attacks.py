@@ -158,6 +158,52 @@ def test_fedmia_can_use_max_round_aggregation():
     assert torch.any(max_result.scores > mean_result.scores)
 
 
+def test_personalized_prompt_protocol_view_hides_local_parameters():
+    auditor = MembershipAuditor.__new__(MembershipAuditor)
+    auditor.audit_view = "protocol_plus_released_prompts"
+    auditor.federated_method = "fedotp"
+    auditor.initial_prompt_state = {
+        "prompt_learner.global_ctx": torch.zeros(2, 2),
+        "prompt_learner.local_ctx": torch.ones(2, 2),
+    }
+    updated = {
+        "prompt_learner.global_ctx": torch.full((2, 2), 3.0),
+        "prompt_learner.local_ctx": torch.full((2, 2), 9.0),
+    }
+    visible = auditor._observable_client_state(0, updated, released_states=None)
+    assert torch.equal(
+        visible["prompt_learner.global_ctx"], updated["prompt_learner.global_ctx"]
+    )
+    assert torch.equal(
+        visible["prompt_learner.local_ctx"],
+        auditor.initial_prompt_state["prompt_learner.local_ctx"],
+    )
+
+    auditor.federated_method = "fedpgp"
+    auditor.initial_prompt_state = {
+        "prompt_learner.global_ctx": torch.zeros(2, 2),
+        "prompt_learner.fedpgp_u": torch.ones(2, 1),
+        "prompt_learner.fedpgp_v": torch.ones(1, 2),
+    }
+    updated = {
+        "prompt_learner.global_ctx": torch.full((2, 2), 4.0),
+        "prompt_learner.fedpgp_u": torch.full((2, 1), 7.0),
+        "prompt_learner.fedpgp_v": torch.full((1, 2), 8.0),
+    }
+    visible = auditor._observable_client_state(0, updated, released_states=None)
+    assert torch.equal(
+        visible["prompt_learner.global_ctx"], updated["prompt_learner.global_ctx"]
+    )
+    assert torch.equal(
+        visible["prompt_learner.fedpgp_u"],
+        auditor.initial_prompt_state["prompt_learner.fedpgp_u"],
+    )
+    assert torch.equal(
+        visible["prompt_learner.fedpgp_v"],
+        auditor.initial_prompt_state["prompt_learner.fedpgp_v"],
+    )
+
+
 def test_fedmia_baselines_preserve_single_and_multi_round_definitions():
     membership = torch.tensor([1, 1, 0, 0])
     observations = [

@@ -6,9 +6,30 @@
 
 运行时用 `--aggregator` 选择：
 
-- `fedavg`：按客户端样本数加权的标准 FedAvg。
+- `fedavg`：保留历史提示词构造的标准 FedAvg；训练骨架与 PromptFL 相同。
+- `promptfl`：论文 PromptFL 基线。客户端只优化共享 CoOp soft prompt，服务器按客户端样本数执行 FedAvg。
+- `fedotp`：每个客户端同时优化全局/本地完整 prompt，以熵正则部分最优传输匹配图像 patch 与两类文本 prompt；只聚合全局 prompt。
+- `fedpgp`：全局 prompt 加客户端低秩个性化项，使用论文的任务损失与 prompt-wise 对比损失；只聚合全局 prompt。
 - `dpfpl`：适配 ICLR 2025 DP-FPL。每个客户端持久保留本地提示，服务器同步全局提示；本地提示使用低秩梯度投影/重构和局部高斯机制，全局上传使用裁剪与服务器高斯机制。
 - `fedask`：适配 NeurIPS 2025 FedASK。soft prompt 被参数化为冻结初始提示加 `B·A`；客户端固定 `A`，对完整 prompt 梯度做逐样本裁剪和扰动后更新 `B`，服务器执行两阶段随机草图、QR 与 SVD 重构 `A/B`。
+
+三个论文提示学习方法可直接使用统一配置运行：
+
+```bash
+python main.py --config configs/federated_prompt_paper.yaml --aggregator promptfl
+python main.py --config configs/federated_prompt_paper.yaml --aggregator fedotp
+python main.py --config configs/federated_prompt_paper.yaml --aggregator fedpgp
+```
+
+该配置关闭隐私攻击和额外防御，以单独验证论文训练目标。FedOTP/FedPGP 自动启用客户端个性化状态；PromptFL 使用共享全局状态。方法超参数分别位于配置文件的 `fedotp:`、`fedpgp:` 段中。
+
+三种方法的 FedMIA-Loss/FedMIA-Cosine 完整审计可一键运行：
+
+```bash
+./scripts/run_fedmia_prompt_methods.sh
+```
+
+启动器按任务顺序执行，每个任务只使用一张卡，并在候选 GPU 中自动选择空闲显存最多的一张。实验支持断点续跑，汇总结果位于 `results/fedmia_prompt_methods/summary_privacy_metrics.csv`，其中 TPR 以百分数报告，并同时给出 FPR=0.1%、1%、10% 三档结果与 AUC。
 
 方法细节和论文对应关系见 [docs/federated_methods.md](docs/federated_methods.md)。
 Flowers102 同场景公平比较和 VEIL（原 Local-GGEUR）优化结果见
@@ -37,7 +58,7 @@ python main.py --config configs/fedprompt_privacy.yaml \
   --aggregator dpfpl --attack none --defense hamp
 ```
 
-方法参数在配置文件的 `dpfpl:` 与 `fedask:` 段中设置。DP-FPL 自动使用个性化客户端状态；FedAvg 和 FedASK 使用共享全局状态。
+DP-FPL/FedASK 参数在配置文件的 `dpfpl:` 与 `fedask:` 段中设置。DP-FPL 自动使用个性化客户端状态；FedAvg、PromptFL 和 FedASK 使用共享全局状态。
 
 可以通过 `audit.audit_view` 明确攻击者可见性。默认的 `protocol_plus_released_prompts` 仅把真实上传消息用于更新攻击，并允许查询公开 prompt；也可选择 `released_prompt` 或用于强上界的 `full_whitebox`。方法摘要会报告保守的隐私预算和 FedASK 草图重构诊断。
 

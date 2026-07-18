@@ -5,7 +5,13 @@ import json
 from pathlib import Path
 
 import analysis_scripts.run_fedmia_complex_sweep as sweep
-from analysis_scripts.run_fedmia_complex_sweep import build_jobs, summarize
+from analysis_scripts.run_fedmia_complex_sweep import (
+    build_jobs,
+    filter_jobs_by_dataset,
+    filter_jobs_by_method,
+    summarize,
+)
+from main import validate_config
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +37,7 @@ def test_complex_fedmia_spec_expands_stable_seventy_eight_run_grid():
 
     assert len(jobs) == 78
     assert len({job.run_id for job in jobs}) == 78
+    assert jobs[0].run_id == "none_seed42_target0_793d9e9534"
     assert results_root == REPOSITORY_ROOT / "results" / "fedmia_complex_tpr1"
     assert {job.seed for job in jobs} == {42, 1337, 2027}
     assert {job.target_client_id for job in jobs} == {0}
@@ -46,6 +53,74 @@ def test_complex_fedmia_spec_expands_stable_seventy_eight_run_grid():
         assert job.config["audit"]["max_nonmember_samples"] == 2048
         assert "nasr_active" not in job.config["audit"]["attacks"]
         assert job.config["results_dir"] == str(job.run_root)
+
+
+def test_pathological_full_spec_expands_all_dataset_specific_schedules():
+    spec_path = REPOSITORY_ROOT / "configs" / "fedmia_pathological_full_sweep.yaml"
+    import yaml
+
+    with spec_path.open("r", encoding="utf-8") as file:
+        spec = yaml.safe_load(file)
+    jobs, results_root = build_jobs(spec, spec_path)
+
+    assert len(jobs) == 390
+    assert len({job.run_id for job in jobs}) == 390
+    assert results_root == REPOSITORY_ROOT / "results" / "fedmia_pathological_full"
+    assert {job.dataset for job in jobs} == {
+        "caltech101",
+        "oxfordpets",
+        "flowers",
+        "food101",
+        "cifar100",
+    }
+    assert all(job.config["partition_mode"] == "pathological" for job in jobs)
+    assert all(job.config["use_full_dataset"] is True for job in jobs)
+    assert all(job.config["fpl_shots"] is None for job in jobs)
+    assert all(job.config["local_epochs"] == 1 for job in jobs)
+    assert all(job.config["learning_rate"] == 0.0001 for job in jobs)
+    for job in jobs:
+        if job.dataset == "cifar100":
+            assert job.config["total_users"] == 50
+            assert job.config["sample_users"] == 10
+            assert job.config["num_global_iters"] == 400
+        else:
+            assert job.config["total_users"] == 10
+            assert job.config["sample_users"] == 10
+            assert job.config["num_global_iters"] == 100
+
+    food_jobs = filter_jobs_by_dataset(jobs, "food101")
+    assert len(food_jobs) == 78
+    assert {job.dataset for job in food_jobs} == {"food101"}
+
+
+def test_prompt_method_fedmia_spec_expands_three_methods_and_two_attacks():
+    spec_path = REPOSITORY_ROOT / "configs" / "fedmia_prompt_methods_sweep.yaml"
+    import yaml
+
+    with spec_path.open("r", encoding="utf-8") as file:
+        spec = yaml.safe_load(file)
+    jobs, results_root = build_jobs(spec, spec_path)
+
+    assert len(jobs) == 45
+    assert len({job.run_id for job in jobs}) == 45
+    assert results_root == REPOSITORY_ROOT / "results" / "fedmia_prompt_methods"
+    assert {job.method for job in jobs} == {"promptfl", "fedotp", "fedpgp"}
+    assert all(
+        job.config["audit"]["attacks"] == ["fedmia_loss", "fedmia_cosine"]
+        for job in jobs
+    )
+    assert all(job.config["defense"]["name"] == "none" for job in jobs)
+    assert all(job.method in job.run_id for job in jobs)
+    assert len(filter_jobs_by_method(jobs, "fedotp")) == 15
+    assert len(filter_jobs_by_dataset(jobs, "cifar100")) == 9
+    for job in jobs:
+        validate_config(job.config)
+        if job.dataset == "cifar100":
+            assert (job.config["total_users"], job.config["sample_users"]) == (50, 10)
+            assert job.config["num_global_iters"] == 400
+        else:
+            assert (job.config["total_users"], job.config["sample_users"]) == (10, 10)
+            assert job.config["num_global_iters"] == 100
 
 
 def test_sweep_summary_uses_tpr_at_one_percent_as_primary_table(tmp_path: Path):
@@ -100,4 +175,10 @@ def test_sweep_summary_uses_tpr_at_one_percent_as_primary_table(tmp_path: Path):
     assert abs(float(rows[0]["tpr_at_fpr_0.1_mean"]) - 0.35) < 1e-12
     assert abs(float(rows[0]["tpr_at_fpr_0.01_mean"]) - 0.15) < 1e-12
     assert (results_root / "summary_tpr_matrix.csv").is_file()
+    assert (results_root / "summary_privacy_metrics.csv").is_file()
+    with (results_root / "summary_privacy_metrics.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as file:
+        privacy_rows = list(csv.DictReader(file))
+    assert float(privacy_rows[0]["tpr_pct_at_fpr_1pct_mean"]) == 15.0
     assert (results_root / "privacy_utility_pareto.csv").is_file()

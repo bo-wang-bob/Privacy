@@ -22,6 +22,8 @@ FAIR_CONFIG_PATHS = (
     "local_epochs",
     "total_users",
     "sample_users",
+    "partition_mode",
+    "use_full_dataset",
     "dirichlet_alpha",
     "seed",
     "fpl_shots",
@@ -48,6 +50,8 @@ FAIR_CONFIG_PATHS = (
 )
 
 FAIR_CONFIG_DEFAULTS = {
+    "partition_mode": "auto",
+    "use_full_dataset": False,
     "audit.match_candidate_labels": False,
     "audit.fedmia_loss_aggregation": "mean",
     "audit.fedmia_cosine_aggregation": "mean",
@@ -93,9 +97,14 @@ def _method_name(config: dict[str, Any]) -> str:
     if aggregator == "fedavg" and defense in {"local_ggeur", "mirage", "veil"}:
         return "VEIL"
     if defense == "none":
-        return {"fedavg": "FedAvg", "dpfpl": "DP-FPL", "fedask": "FedASK"}.get(
-            aggregator, aggregator
-        )
+        return {
+            "promptfl": "PromptFL",
+            "fedotp": "FedOTP",
+            "fedpgp": "FedPGP",
+            "fedavg": "FedAvg",
+            "dpfpl": "DP-FPL",
+            "fedask": "FedASK",
+        }.get(aggregator, aggregator)
     return f"{aggregator}+{defense}"
 
 

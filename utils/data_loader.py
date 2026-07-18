@@ -47,6 +47,7 @@ def generate_dirichlet_split(
     root_dir: str = "./data",
     fpl: bool = True,
     fpl_shots: Optional[int] = None,
+    use_full_dataset: bool = False,
 ) -> Tuple[List[Subset], List[Subset], List[str]]:
     """
     Generate a Dirichlet (non-IID) split of the dataset.
@@ -76,6 +77,7 @@ def generate_dirichlet_split(
         root_dir,
         fpl=fpl,
         fpl_shots=fpl_shots,
+        use_full_dataset=use_full_dataset,
     )
     num_classes = len(class_names)
 
@@ -205,12 +207,147 @@ def dirichlet_partition_indices(
     return user_indices
 
 
+def pathological_class_assignment(
+    num_classes: int,
+    num_users: int,
+    seed: int,
+) -> List[List[int]]:
+    """Assign every class to exactly one client, balancing class counts.
+
+    Class identifiers are shuffled deterministically from ``seed`` and then
+    assigned round-robin.  Consequently, client class sets are pairwise
+    disjoint, their union contains every class, and class counts differ by at
+    most one.
+    """
+    if num_classes <= 0:
+        raise ValueError("num_classes must be positive.")
+    if num_users <= 0:
+        raise ValueError("num_users must be positive.")
+    if num_classes < num_users:
+        raise ValueError(
+            "Pathological label split requires at least one class per client: "
+            f"num_classes={num_classes}, num_users={num_users}."
+        )
+
+    class_ids = list(range(num_classes))
+    random.Random(int(seed)).shuffle(class_ids)
+    assignment: List[List[int]] = [[] for _ in range(num_users)]
+    for position, class_id in enumerate(class_ids):
+        assignment[position % num_users].append(class_id)
+    for classes in assignment:
+        classes.sort()
+    return assignment
+
+
+def pathological_partition_indices(
+    idx_by_class: List[List[int]],
+    class_assignment: List[List[int]],
+) -> List[List[int]]:
+    """Allocate all examples of a class to its sole assigned client."""
+    num_classes = len(idx_by_class)
+    owners: Dict[int, int] = {}
+    for user_id, class_ids in enumerate(class_assignment):
+        for class_id in class_ids:
+            if not 0 <= int(class_id) < num_classes:
+                raise ValueError(f"Invalid class id in assignment: {class_id}")
+            if int(class_id) in owners:
+                raise ValueError(f"Class {class_id} is assigned to multiple clients.")
+            owners[int(class_id)] = user_id
+    if set(owners) != set(range(num_classes)):
+        missing = sorted(set(range(num_classes)) - set(owners))
+        raise ValueError(f"Pathological assignment is missing classes: {missing}")
+
+    user_indices: List[List[int]] = [[] for _ in class_assignment]
+    for class_id, indices in enumerate(idx_by_class):
+        user_indices[owners[class_id]].extend(indices)
+    return user_indices
+
+
+def generate_pathological_split(
+    dataset_name: str,
+    num_users: int,
+    root_dir: str = "./data",
+    fpl: bool = True,
+    fpl_shots: Optional[int] = None,
+    use_full_dataset: bool = False,
+    seed: int = 42,
+) -> Tuple[List[Subset], List[Subset], List[str]]:
+    """Generate a label-exclusive pathological federated split.
+
+    The same deterministic class ownership is applied to the train and test
+    splits.  Every sample is assigned exactly once, every class belongs to one
+    client, and clients only train and evaluate on their owned classes.
+    """
+    if not fpl:
+        raise ValueError("This branch only supports FPL dataset loading.")
+    logger.info(
+        "Starting pathological label split for %s (num_users=%d, seed=%d)",
+        dataset_name,
+        num_users,
+        seed,
+    )
+    trainset, testset, class_names = _load_dataset(
+        dataset_name,
+        root_dir,
+        fpl=fpl,
+        fpl_shots=fpl_shots,
+        use_full_dataset=use_full_dataset,
+    )
+    num_classes = len(class_names)
+    assignment = pathological_class_assignment(num_classes, num_users, seed)
+    train_by_class = group_idx_by_class(trainset, num_classes)
+    test_by_class = group_idx_by_class(testset, num_classes)
+    train_user_indices = pathological_partition_indices(train_by_class, assignment)
+    test_user_indices = pathological_partition_indices(test_by_class, assignment)
+    # Avoid class-block ordering in each client subset. Besides giving the
+    # local loader a neutral base ordering, this keeps bounded privacy-audit
+    # candidate collection from taking every example from the first owned
+    # class. Separate deterministic streams preserve reproducibility.
+    for user_id, indices in enumerate(train_user_indices):
+        random.Random(int(seed) + 1009 * (user_id + 1)).shuffle(indices)
+    for user_id, indices in enumerate(test_user_indices):
+        random.Random(int(seed) + 2003 * (user_id + 1)).shuffle(indices)
+
+    empty_train_users = [
+        user_id for user_id, indices in enumerate(train_user_indices) if not indices
+    ]
+    if empty_train_users:
+        raise ValueError(
+            "Pathological split produced clients without training samples: "
+            f"{empty_train_users}."
+        )
+    if sum(map(len, train_user_indices)) != len(trainset):
+        raise AssertionError("Pathological training allocation dropped samples.")
+    if sum(map(len, test_user_indices)) != len(testset):
+        raise AssertionError("Pathological test allocation dropped samples.")
+
+    train_subsets = [Subset(trainset, indices) for indices in train_user_indices]
+    test_subsets = [Subset(testset, indices) for indices in test_user_indices]
+    logger.info(
+        "Pathological split completed: train=%d, test=%d, classes=%d, users=%d",
+        len(trainset),
+        len(testset),
+        num_classes,
+        num_users,
+    )
+    for user_id, class_ids in enumerate(assignment):
+        logger.info(
+            "Pathological user %d owns classes=%s train_samples=%d test_samples=%d",
+            user_id,
+            class_ids,
+            len(train_user_indices[user_id]),
+            len(test_user_indices[user_id]),
+        )
+    return train_subsets, test_subsets, class_names
+
+
 def generate_iid_split(
     dataset_name: str,
     num_users: int,
     root_dir: str = "./data",
     fpl: bool = True,
     fpl_shots: Optional[int] = None,
+    use_full_dataset: bool = False,
 ) -> Tuple[List[Subset], List[Subset], List[str]]:
     """
     Generate an IID split: for each class, distribute samples as evenly as possible
@@ -240,6 +377,7 @@ def generate_iid_split(
         root_dir,
         fpl=fpl,
         fpl_shots=fpl_shots,
+        use_full_dataset=use_full_dataset,
     )
     num_classes = len(class_names)
 
@@ -333,6 +471,7 @@ def _load_dataset(
     root_dir: str = "./data",
     fpl: bool = True,
     fpl_shots: Optional[int] = None,
+    use_full_dataset: bool = False,
 ):
     """
     Load dataset with optional transforms applied depending on ``fpl``.
@@ -395,6 +534,7 @@ def _load_dataset(
             dataset,
             root,
             fpl=fpl,
+            use_full_dataset=use_full_dataset,
         )
 
     elif dataset == "svhn":
@@ -431,6 +571,7 @@ def _load_dataset(
         trainset, testset, class_names = _load_food101(
             root,
             fpl=fpl,
+            use_full_dataset=use_full_dataset,
         )
     elif dataset in CALTECH256_DATASET_ALIASES:
         trainset, testset, class_names = _load_caltech256_object_categories(
@@ -499,6 +640,7 @@ def _load_standard_dataset(
     seed: int = 42,
     cifar100_train_per_class: int = 200,
     cifar100_test_per_class: int = 50,
+    use_full_dataset: bool = False,
 ):
     """Load PyTorch officially supported standard datasets (MNIST/FashionMNIST/CIFAR series)."""
     # Dataset class mapping
@@ -545,7 +687,7 @@ def _load_standard_dataset(
     else:
         raise ValueError(f"Unsupported dataset for class names: {dataset}")
 
-    if dataset == "cifar100":
+    if dataset == "cifar100" and not use_full_dataset:
         train_indices = _sample_indices_per_class(
             trainset,
             cifar100_train_per_class,
@@ -564,25 +706,37 @@ def _load_standard_dataset(
         )
         trainset = Subset(trainset, train_indices)
         testset = Subset(testset, test_indices)
+    elif dataset == "cifar100":
+        logger.info(
+            "Loaded full CIFAR100: classes=%d, train=%d, test=%d",
+            len(class_names),
+            len(trainset),
+            len(testset),
+        )
 
     return trainset, testset, class_names
 
 
 class Caltech101Subset(Dataset):
-    """Subset of Caltech101 dataset with PIL.Image samples"""
+    """Caltech101 subset with optional contiguous-label remapping."""
 
-    def __init__(self, dataset: Caltech101, indices: List[int], transform=None):
+    def __init__(
+        self,
+        dataset: Dataset,
+        indices: List[int],
+        transform=None,
+        label_mapping: Optional[Dict[int, int]] = None,
+    ):
         self.dataset = dataset
         self.indices = indices
         self.transform = transform
+        self.label_mapping = dict(label_mapping or {})
         # Build targets list for this subset
         self.targets = []
         for idx in indices:
             _, target = dataset[idx]
-            if isinstance(target, int):
-                self.targets.append(target)
-            else:
-                self.targets.append(int(target))
+            target = int(target)
+            self.targets.append(self.label_mapping.get(target, target))
 
     def __len__(self):
         return len(self.indices)
@@ -590,6 +744,7 @@ class Caltech101Subset(Dataset):
     def __getitem__(self, idx):
         original_idx = self.indices[idx]
         img, target = self.dataset[original_idx]
+        target = self.label_mapping.get(int(target), int(target))
         if self.transform:
             img = self.transform(img)
         return img, target
@@ -879,13 +1034,15 @@ def _load_food101(
     seed: int = 42,
     train_per_class: int = 200,
     test_per_class: int = 50,
+    use_full_dataset: bool = False,
 ):
     """Load Food-101 with the official train/test split.
 
     torchvision.datasets.Food101 expects root to be the parent directory of
     food-101, so a local dataset at data/food-101 is loaded with root="./data".
-    The full dataset is large, so this loader samples a deterministic subset:
-    up to 200 train images and 50 test images per class.
+    By default this loader retains the historical deterministic subset of up
+    to 200 train images and 50 test images per class.  ``use_full_dataset``
+    returns the complete official train and test splits.
     """
 
     train_transform = None
@@ -907,6 +1064,16 @@ def _load_food101(
         transform=test_transform,
     )
 
+    class_names = list(trainset.classes)
+    if use_full_dataset:
+        logger.info(
+            "Loaded full Food101: classes=%d, train=%d, test=%d",
+            len(class_names),
+            len(trainset),
+            len(testset),
+        )
+        return trainset, testset, class_names
+
     def sample_per_class(dataset, per_class: int) -> list[int]:
         rng = random.Random(seed)
         labels = getattr(dataset, "_labels")
@@ -924,7 +1091,6 @@ def _load_food101(
 
     train_indices = sample_per_class(trainset, train_per_class)
     test_indices = sample_per_class(testset, test_per_class)
-    class_names = list(trainset.classes)
     return Subset(trainset, train_indices), Subset(testset, test_indices), class_names
 
 
@@ -1364,9 +1530,35 @@ def _load_caltech101(
         testset: Test dataset with PIL.Image samples
         class_names: List of class names
     """
-    ds = Caltech101(root=root, download=False, target_type="category", transform=None)
-    class_names = list(ds.categories)
-    name2idx = {name: idx for idx, name in enumerate(class_names)}
+    raw_candidates = [
+        os.path.join(root, "caltech-101", "101_ObjectCategories"),
+        os.path.join(root, "101_ObjectCategories"),
+        os.path.join(root, "caltech101", "101_ObjectCategories"),
+    ]
+    raw_directory = next(
+        (candidate for candidate in raw_candidates if os.path.isdir(candidate)),
+        None,
+    )
+    if raw_directory is not None:
+        ds: Dataset = ImageFolder(raw_directory, transform=None)
+        source_class_names = list(ds.classes)  # type: ignore[attr-defined]
+        raw_targets = list(ds.targets)  # type: ignore[attr-defined]
+    else:
+        torchvision_dataset = Caltech101(
+            root=root,
+            download=False,
+            target_type="category",
+            transform=None,
+        )
+        ds = torchvision_dataset
+        source_class_names = list(torchvision_dataset.categories)
+        raw_targets = list(
+            torchvision_dataset.y
+            if hasattr(torchvision_dataset, "y")
+            else torchvision_dataset.targets  # type: ignore[attr-defined]
+        )
+    class_names = list(source_class_names)
+    name2idx = {name: idx for idx, name in enumerate(source_class_names)}
 
     def to_int_target(t):
         if isinstance(t, int):
@@ -1375,19 +1567,22 @@ def _load_caltech101(
             return name2idx[t]
         return int(t)
 
-    if hasattr(ds, "y"):
-        targets = [to_int_target(t) for t in list(ds.y)]
-    elif hasattr(ds, "targets"):
-        targets = [to_int_target(t) for t in list(ds.targets)]  # type: ignore
-    else:
-        targets = [to_int_target(ds[i][1]) for i in range(len(ds))]
+    targets = [to_int_target(target) for target in raw_targets]
 
     valid_indices = list(range(len(ds)))
+    label_mapping = {index: index for index in range(len(source_class_names))}
     if remove_background and "BACKGROUND_Google" in name2idx:
         bg_idx = name2idx["BACKGROUND_Google"]
         valid_indices = [i for i in valid_indices if targets[i] != bg_idx]
-        # Update class_names to remove background class
-        class_names = [name for name in class_names if name != "BACKGROUND_Google"]
+        kept_labels = [
+            old_label
+            for old_label, name in enumerate(source_class_names)
+            if name != "BACKGROUND_Google"
+        ]
+        label_mapping = {
+            old_label: new_label for new_label, old_label in enumerate(kept_labels)
+        }
+        class_names = [source_class_names[old_label] for old_label in kept_labels]
 
     class2indices = {}
     for i in valid_indices:
@@ -1420,8 +1615,18 @@ def _load_caltech101(
         test_transform = get_data_transform("caltech101", is_train=False)
 
     # Create subset datasets with PIL.Image format (if fpl then no transform)
-    trainset = Caltech101Subset(ds, train_idx, transform=train_transform)
-    testset = Caltech101Subset(ds, test_idx, transform=test_transform)
+    trainset = Caltech101Subset(
+        ds,
+        train_idx,
+        transform=train_transform,
+        label_mapping=label_mapping,
+    )
+    testset = Caltech101Subset(
+        ds,
+        test_idx,
+        transform=test_transform,
+        label_mapping=label_mapping,
+    )
 
     return trainset, testset, class_names
 

@@ -1,0 +1,91 @@
+name: fedmia_prompt_methods
+base_config: configs/federated_prompt_paper.yaml
+results_root: results/fedmia_prompt_methods
+
+# Jobs are sequential and each job uses exactly one GPU. Before every job the
+# launcher selects the candidate with the most free memory.
+gpus: [0, 1]
+minimum_free_memory_mb: 7000
+
+# Three independent repetitions for mean/std reporting.
+seeds: [42, 1337, 2027]
+target_client_ids: [0]
+
+methods:
+  - promptfl
+  - fedotp
+  - fedpgp
+
+# Full-data pathological partitions and the schedules requested for the
+# current benchmark. Oxford Flowers 102 is named "flowers" by the loader.
+datasets:
+  - name: caltech101
+    overrides:
+      dataset_name: caltech101
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: oxfordpets
+    overrides:
+      dataset_name: oxfordpets
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: flowers
+    overrides:
+      dataset_name: flowers
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: food101
+    overrides:
+      dataset_name: food101
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: cifar100
+    overrides:
+      dataset_name: cifar100
+      total_users: 50
+      sample_users: 10
+      num_global_iters: 400
+
+common:
+  data_root: /root/datasets
+  cache_dir: /root/DistributedFL/checkpoints/clip-vit-base-patch32
+  require_cuda: true
+  partition_mode: pathological
+  use_full_dataset: true
+  fpl_shots: null
+  local_epochs: 1
+  learning_rate: 0.0001
+  batch_size: 16
+  eval_batch_size: 64
+  eval_interval: 5
+  n_ctx: 16
+  class_specific_ctx: false
+  save_models: false
+  audit:
+    enabled: true
+    strict: true
+    # FedOTP/FedPGP expose only their communicated global prompt under this
+    # view; persistent local prompts/low-rank factors remain private.
+    audit_view: protocol_plus_released_prompts
+    attacks:
+      - fedmia_loss
+      - fedmia_cosine
+    target_client_id: 0
+    ensure_target_participation: true
+    audit_interval: 1
+    audit_batch_size: 64
+    max_member_samples: 128
+    max_nonmember_samples: 2048
+    match_candidate_labels: true
+    fedmia_loss_aggregation: mean
+    fedmia_cosine_aggregation: mean
+  defense:
+    name: none
+
+# Training methods are compared without an additional defense.
+defenses:
+  - name: none

@@ -15,11 +15,16 @@ class AttackResult:
 
     def to_summary(self) -> dict:
         metrics = membership_metrics(self.labels, self.scores)
+        member_count = int((self.labels == 1).sum())
+        nonmember_count = int((self.labels == 0).sum())
         return {
             "attack": self.name,
             "primary_metric": PRIMARY_METRIC,
             "primary_score": metrics[PRIMARY_METRIC],
             **metrics,
             "num_samples": int(self.labels.numel()),
+            "member_count": member_count,
+            "nonmember_count": nonmember_count,
+            "fpr_resolution": 1.0 / nonmember_count,
             "metadata": self.metadata,
         }

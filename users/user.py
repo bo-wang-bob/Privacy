@@ -118,6 +118,17 @@ class UserBase:
                     model, client_id=self.id, round_index=round_index
                 )
             return
+        if self.federated_method == "fedpgp":
+            self._train_fedpgp(
+                model,
+                code_poison=code_poison,
+                steps_override=1 if privacy_probe else None,
+            )
+            if privacy_probe and self.defense_controller is not None:
+                self.defense_controller.after_probe_training(
+                    model, client_id=self.id, round_index=round_index
+                )
+            return
         if self.defense_controller is not None:
             effective_round = round_index
             if privacy_probe and round_index == 0:
@@ -162,6 +173,37 @@ class UserBase:
                     loss = F.cross_entropy(model(images), labels)
                 loss.backward()
                 optimizer.step()
+
+    def _train_fedpgp(
+        self,
+        model: torch.nn.Module,
+        code_poison: bool = False,
+        steps_override: int | None = None,
+    ) -> None:
+        """Train global and low-rank local prompts with FedPGP's joint loss."""
+        if code_poison:
+            raise ValueError("FedPGP paper training does not define code poisoning.")
+        if not hasattr(model, "fedpgp_training_loss"):
+            raise TypeError("FedPGP requires a model with fedpgp_training_loss().")
+        model.to(self.device)
+        model.train()
+        trainable = [
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        ]
+        optimizer = torch.optim.SGD(trainable, lr=self.learning_rate)
+        maximum_steps = None if steps_override is None else int(steps_override)
+        completed = 0
+        for _ in range(self.local_epochs):
+            for images, labels in self.trainloader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                optimizer.zero_grad(set_to_none=True)
+                loss = model.fedpgp_training_loss(images, labels)
+                loss.backward()
+                optimizer.step()
+                completed += 1
+                if maximum_steps is not None and completed >= maximum_steps:
+                    return
 
     @staticmethod
     def _clip_tensor(gradient: torch.Tensor, max_norm: float) -> torch.Tensor:

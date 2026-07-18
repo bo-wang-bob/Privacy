@@ -1,0 +1,49 @@
+# Paper-aligned PromptFL/FedOTP/FedPGP training baseline. Override
+# `--aggregator` to select a method; PromptFL is the default.
+train_mode: centralized
+dataset_name: caltech101
+data_root: /root/datasets
+cache_dir: /root/DistributedFL/checkpoints/clip-vit-base-patch32
+require_cuda: true
+gpu: 0
+seed: 42
+
+partition_mode: pathological
+use_full_dataset: true
+fpl_shots: null
+total_users: 10
+sample_users: 10
+num_global_iters: 100
+local_epochs: 1
+learning_rate: 0.0001
+batch_size: 16
+eval_batch_size: 64
+eval_interval: 5
+
+n_ctx: 16
+class_specific_ctx: false
+aggregator: promptfl
+promptfl: {}
+fedotp:
+  epsilon: 0.01
+  transported_mass: 0.8
+  max_iterations: 100
+  threshold: 0.001
+fedpgp:
+  rank: 8
+  contrastive_weight: 0.5
+  temperature: 0.5
+
+model_load_path: null
+save_models: false
+results_dir: results/federated_prompt_paper
+
+# This file isolates the published training objectives. Privacy attacks and
+# defenses can be enabled in a separate like-for-like audit configuration.
+audit:
+  enabled: false
+  attacks: []
+  target_client_id: 0
+  ensure_target_participation: true
+defense:
+  name: none

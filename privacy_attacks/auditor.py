@@ -146,12 +146,13 @@ class MembershipAuditor:
         self.collate_fn = collate_fn
         self.seed = int(self.config.get("seed", 42))
         self.audit_interval = int(self.config.get("audit_interval", 1))
+        self.audit_batch_size = int(self.config.get("audit_batch_size", 64))
         self.calibration_fraction = float(self.config.get("calibration_fraction", 0.5))
         self.match_candidate_labels = bool(
             self.config.get("match_candidate_labels", False)
         )
-        if self.audit_interval <= 0:
-            raise ValueError("audit_interval must be positive.")
+        if self.audit_interval <= 0 or self.audit_batch_size <= 0:
+            raise ValueError("audit_interval and audit_batch_size must be positive.")
         self.observations: list[dict] = []
         self.results = []
         self.errors: dict[str, str] = {}
@@ -343,13 +344,35 @@ class MembershipAuditor:
     def should_observe(self, round_index: int) -> bool:
         return self.enabled and round_index % self.audit_interval == 0
 
+    def _candidate_outputs(
+        self, model: torch.nn.Module
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Evaluate large audit candidate pools without one oversized CLIP batch."""
+        logits_parts = []
+        representation_parts = []
+        loss_parts = []
+        for start in range(0, self.labels.numel(), self.audit_batch_size):
+            stop = start + self.audit_batch_size
+            logits, representation, losses = logits_and_representation(
+                model, self.images[start:stop], self.labels[start:stop]
+            )
+            logits_parts.append(logits)
+            representation_parts.append(representation)
+            loss_parts.append(losses)
+        return (
+            torch.cat(logits_parts),
+            torch.cat(representation_parts),
+            torch.cat(loss_parts),
+        )
+
     @staticmethod
     def _clone_prompt_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {name: tensor.detach().clone() for name, tensor in state.items()}
 
-    def _dpfpl_public_state(
+    def _global_prompt_public_state(
         self, source: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
+        """Retain private local parameters at initialization and expose globals."""
         state = self._clone_prompt_state(self.initial_prompt_state)
         for name, tensor in source.items():
             if name.endswith("global_ctx"):
@@ -359,8 +382,12 @@ class MembershipAuditor:
     def _observable_base_state(
         self, base_state: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        if self.audit_view != "full_whitebox" and self.federated_method == "dpfpl":
-            return self._dpfpl_public_state(base_state)
+        if self.audit_view != "full_whitebox" and self.federated_method in {
+            "dpfpl",
+            "fedotp",
+            "fedpgp",
+        }:
+            return self._global_prompt_public_state(base_state)
         return base_state
 
     def _observable_client_state(
@@ -373,17 +400,26 @@ class MembershipAuditor:
             return updated_state
         if (
             self.audit_view == "protocol_plus_released_prompts"
-            and self.federated_method == "fedavg"
+            and self.federated_method in {"fedavg", "promptfl"}
         ):
             # The full FedAvg model update is itself a protocol message.
             return updated_state
+        if (
+            self.audit_view == "protocol_plus_released_prompts"
+            and self.federated_method in {"fedotp", "fedpgp"}
+        ):
+            # The server sees each client's global prompt update, but FedOTP's
+            # local_ctx and FedPGP's low-rank U/V never leave that client.
+            return self._global_prompt_public_state(updated_state)
         if not released_states:
             raise ValueError("Released prompt state is required by this audit view.")
         released = released_states.get(user_id, released_states.get(0))
         if released is None:
             raise ValueError(f"No released prompt is available for client {user_id}.")
         if self.federated_method == "dpfpl":
-            return self._dpfpl_public_state(released)
+            return self._global_prompt_public_state(released)
+        if self.federated_method in {"fedotp", "fedpgp"}:
+            return self._global_prompt_public_state(released)
         return released
 
     def observe_round(
@@ -400,7 +436,11 @@ class MembershipAuditor:
             return
         names = trainable_names(self.model)
         observable_names = names
-        if self.audit_view != "full_whitebox" and self.federated_method == "dpfpl":
+        if self.audit_view != "full_whitebox" and self.federated_method in {
+            "dpfpl",
+            "fedotp",
+            "fedpgp",
+        }:
             observable_names = [name for name in names if name.endswith("global_ctx")]
         self.model.load_state_dict(
             self._observable_base_state(base_state), strict=False
@@ -434,11 +474,11 @@ class MembershipAuditor:
                 update = torch.cat(
                     [tensor.detach().flatten().cpu() for tensor in tensors.values()]
                 )
-                if message.get("kind") == "model_update":
-                    # FedAvg uploads parameter deltas (updated - base), while
-                    # gradient-similarity attacks use the descent gradient
-                    # (base - updated). Keep the stored protocol message exact,
-                    # and normalize its sign only for gradient measurements.
+                if message.get("kind") in {"model_update", "global_prompt_update"}:
+                    # FedAvg/PromptFL and personalized prompt methods upload
+                    # parameter deltas (updated - base), while gradient-similarity
+                    # attacks use the descent gradient (base - updated). Keep the
+                    # stored message exact and normalize only this measurement.
                     update = -update
             else:
                 update = flatten_state_delta(client_base, state, observable_names)
@@ -459,9 +499,7 @@ class MembershipAuditor:
             )
 
             self.model.load_state_dict(state, strict=False)
-            logits, representation, losses = logits_and_representation(
-                self.model, self.images, self.labels
-            )
+            logits, representation, losses = self._candidate_outputs(self.model)
             confidence.append(-losses)
             probabilities.append(torch.softmax(logits, dim=1))
             representations.append(representation)

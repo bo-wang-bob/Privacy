@@ -114,14 +114,14 @@ class ServerBase:
         if (
             self.defense.name in FEDMIA_BASELINE_DEFENSES
             and (
-                self.federated_method != "fedavg"
+                self.federated_method not in {"fedavg", "promptfl"}
                 or self.train_mode != "centralized"
             )
         ):
             raise ValueError(
                 "FedMIA baseline defenses require centralized FedAvg and are "
-                "standalone comparisons; stacking them with DP-FPL or FedASK "
-                "would change both mechanisms."
+                "standalone comparisons; stacking them with personalized or "
+                "private prompt methods would change both mechanisms."
             )
         if self.defense.name == "hamp":
             attach_hamp_output_transform(
@@ -326,10 +326,24 @@ class ServerBase:
             "configuration": self.method_config,
             "state_scope": (
                 "global_plus_persistent_per_client_local"
-                if self.federated_method == "dpfpl"
+                if self.federated_method in {"dpfpl", "fedotp", "fedpgp"}
                 else "shared_global"
             ),
         }
+        if self.federated_method == "promptfl":
+            method_summary["paper_alignment"] = (
+                "CoOp-style shared soft text prompt with sample-weighted FedAvg"
+            )
+        elif self.federated_method == "fedotp":
+            method_summary["paper_alignment"] = (
+                "global/local full-rank prompts with fixed-plan entropic "
+                "unbalanced optimal transport; only global_ctx is communicated"
+            )
+        elif self.federated_method == "fedpgp":
+            method_summary["paper_alignment"] = (
+                "aggregated global prompt plus persistent low-rank local "
+                "adaptation and CLIP-guided prompt-wise contrastive loss"
+            )
         if self.federated_method == "dpfpl":
             method_summary["privacy_mechanisms"] = {
                 "local": "RGP low-rank gradient clipping and Gaussian perturbation",

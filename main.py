@@ -15,7 +15,11 @@ from aggregator.aggregator_builder import build_aggregator
 from privacy_attacks.auditor import SUPPORTED_ATTACKS
 from privacy_defenses import FEDMIA_BASELINE_DEFENSES, SUPPORTED_DEFENSES
 from servers.serverbase import ServerBase
-from utils.data_loader import generate_dirichlet_split, generate_iid_split
+from utils.data_loader import (
+    generate_dirichlet_split,
+    generate_iid_split,
+    generate_pathological_split,
+)
 from utils.privacy_accounting import (
     calibrate_gaussian_noise,
     planned_private_probe_steps,
@@ -59,8 +63,18 @@ def validate_config(config: dict) -> None:
     if config["train_mode"] not in {"centralized", "local"}:
         raise ValueError("train_mode must be 'centralized' or 'local'.")
     method = config["aggregator"].lower()
-    if method not in {"fedavg", "dpfpl", "fedask"}:
-        raise ValueError("aggregator must be fedavg, dpfpl, or fedask.")
+    supported_methods = {
+        "promptfl",
+        "fedotp",
+        "fedpgp",
+        "fedavg",
+        "dpfpl",
+        "fedask",
+    }
+    if method not in supported_methods:
+        raise ValueError(
+            "aggregator must be promptfl, fedotp, fedpgp, fedavg, dpfpl, or fedask."
+        )
     method_config = config.get(method, {})
     if method in {"dpfpl", "fedask"} and int(method_config.get("rank", 4)) <= 0:
         raise ValueError(f"{method}.rank must be positive.")
@@ -89,6 +103,22 @@ def validate_config(config: dict) -> None:
         target = method_config.get("target_epsilon")
         if target is not None and float(target) <= 0:
             raise ValueError("fedask.target_epsilon must be positive when set.")
+    if method == "fedotp":
+        if float(method_config.get("epsilon", 0.01)) <= 0:
+            raise ValueError("fedotp.epsilon must be positive.")
+        if not 0 < float(method_config.get("transported_mass", 0.8)) <= 1:
+            raise ValueError("fedotp.transported_mass must be in (0, 1].")
+        if int(method_config.get("max_iterations", 100)) <= 0:
+            raise ValueError("fedotp.max_iterations must be positive.")
+        if float(method_config.get("threshold", 1e-3)) <= 0:
+            raise ValueError("fedotp.threshold must be positive.")
+    if method == "fedpgp":
+        if int(method_config.get("rank", 8)) <= 0:
+            raise ValueError("fedpgp.rank must be positive.")
+        if float(method_config.get("contrastive_weight", 0.5)) < 0:
+            raise ValueError("fedpgp.contrastive_weight must be non-negative.")
+        if float(method_config.get("temperature", 0.5)) <= 0:
+            raise ValueError("fedpgp.temperature must be positive.")
     if (
         method in {"dpfpl", "fedask"}
         and not 0 < float(method_config.get("delta", 1e-5)) < 1
@@ -98,6 +128,18 @@ def validate_config(config: dict) -> None:
         raise ValueError("total_users must be greater than one.")
     if not 1 <= config["sample_users"] <= config["total_users"]:
         raise ValueError("sample_users must be in [1, total_users].")
+    partition_mode = str(config.get("partition_mode", "auto")).lower()
+    if partition_mode not in {"auto", "dirichlet", "iid", "pathological"}:
+        raise ValueError(
+            "partition_mode must be auto, dirichlet, iid, or pathological."
+        )
+    fpl_shots = config.get("fpl_shots")
+    if fpl_shots is not None and int(fpl_shots) <= 0:
+        raise ValueError("fpl_shots must be positive when set.")
+    if bool(config.get("use_full_dataset", False)) and fpl_shots is not None:
+        raise ValueError(
+            "use_full_dataset=true requires fpl_shots=null so training is not capped."
+        )
     audit = config.get("audit", {})
     if not 0 <= int(audit.get("target_client_id", 0)) < config["total_users"]:
         raise ValueError("audit.target_client_id must identify an existing client.")
@@ -142,12 +184,18 @@ def validate_config(config: dict) -> None:
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
     if defense_name in FEDMIA_BASELINE_DEFENSES and (
-        method != "fedavg" or config["train_mode"] != "centralized"
+        method not in {"fedavg", "promptfl"}
+        or config["train_mode"] != "centralized"
     ):
         raise ValueError(
             "FedMIA baseline defenses require centralized FedAvg and must be "
-            "evaluated as standalone comparisons, not stacked with DP-FPL or "
-            "FedASK."
+            "evaluated as standalone comparisons, not stacked with personalized "
+            "or private prompt algorithms."
+        )
+    if method in {"fedotp", "fedpgp"} and defense_name != "none":
+        raise ValueError(
+            f"{method} paper training currently requires defense.name=none; "
+            "stacking a defense would change its published objective."
         )
     if defense_name == "mist" and config["sample_users"] < 2:
         raise ValueError("MIST requires at least two selected client submodels.")
@@ -323,12 +371,13 @@ def run(config: dict) -> list[dict]:
             local_steps,
             delta,
         )
-    if method in {"dpfpl", "fedask"}:
-        config[method] = method_config
+    config[method] = method_config
     effective_train_mode = (
         "local"
-        if method == "dpfpl"
-        else "centralized" if method == "fedask" else config["train_mode"]
+        if method in {"dpfpl", "fedotp", "fedpgp"}
+        else "centralized"
+        if method in {"fedask", "promptfl"}
+        else config["train_mode"]
     )
     config["effective_train_mode"] = effective_train_mode
 
@@ -367,26 +416,45 @@ def run(config: dict) -> list[dict]:
         bool(config.get("require_cuda", False)),
     )
 
-    if float(config["dirichlet_alpha"]) >= 10:
+    partition_mode = str(config.get("partition_mode", "auto")).lower()
+    split_arguments = {
+        "root_dir": config.get("data_root", "./data"),
+        "fpl": True,
+        "fpl_shots": config.get("fpl_shots"),
+        "use_full_dataset": bool(config.get("use_full_dataset", False)),
+    }
+    if partition_mode == "pathological":
+        train_sets, test_sets, class_names = generate_pathological_split(
+            config["dataset_name"],
+            num_users=config["total_users"],
+            seed=seed,
+            **split_arguments,
+        )
+    elif partition_mode == "iid" or (
+        partition_mode == "auto" and float(config["dirichlet_alpha"]) >= 10
+    ):
         train_sets, test_sets, class_names = generate_iid_split(
             config["dataset_name"],
             num_users=config["total_users"],
-            root_dir=config.get("data_root", "./data"),
-            fpl=True,
-            fpl_shots=config["fpl_shots"],
+            **split_arguments,
         )
     else:
         train_sets, test_sets, class_names = generate_dirichlet_split(
             config["dataset_name"],
             config["total_users"],
             config["dirichlet_alpha"],
-            root_dir=config.get("data_root", "./data"),
-            fpl=True,
-            fpl_shots=config["fpl_shots"],
+            **split_arguments,
         )
 
     processor, clip_model = _load_local_clip(config["cache_dir"], device)
-    parameterization = {"fedavg": "full", "dpfpl": "dpfpl", "fedask": "fedask"}[method]
+    parameterization = {
+        "fedavg": "full",
+        "promptfl": "promptfl",
+        "fedotp": "fedotp",
+        "fedpgp": "fedpgp",
+        "dpfpl": "dpfpl",
+        "fedask": "fedask",
+    }[method]
     model = CustomCLIP(
         clip_model=clip_model,
         processor=processor,
@@ -398,6 +466,7 @@ def run(config: dict) -> list[dict]:
         parameterization=parameterization,
         low_rank=int(method_config.get("rank", 4)),
         low_rank_scaling=float(method_config.get("scaling", 1.0)),
+        method_config=method_config,
     )
 
     def collate_fn(batch):
@@ -463,6 +532,18 @@ def default_config() -> dict:
         "total_users": 10,
         "sample_users": 10,
         "aggregator": "fedavg",
+        "promptfl": {},
+        "fedotp": {
+            "epsilon": 0.01,
+            "transported_mass": 0.8,
+            "max_iterations": 100,
+            "threshold": 0.001,
+        },
+        "fedpgp": {
+            "rank": 8,
+            "contrastive_weight": 0.5,
+            "temperature": 0.5,
+        },
         "dpfpl": {
             "rank": 4,
             "local_steps": 1,
@@ -487,6 +568,8 @@ def default_config() -> dict:
             "reproducible_dp_noise": False,
         },
         "dirichlet_alpha": 0.1,
+        "partition_mode": "auto",
+        "use_full_dataset": False,
         "gpu": 0,
         "require_cuda": False,
         "seed": 42,
@@ -634,8 +717,21 @@ def parse_args() -> dict:
     parser.add_argument("--local_epochs", type=int)
     parser.add_argument("--fpl_shots", type=int)
     parser.add_argument("--dirichlet_alpha", type=float)
+    parser.add_argument(
+        "--partition_mode",
+        choices=["auto", "dirichlet", "iid", "pathological"],
+    )
+    parser.add_argument(
+        "--use_full_dataset",
+        action="store_true",
+        default=None,
+        help="Use complete official train/test splits; requires fpl_shots=null.",
+    )
     parser.add_argument("--learning_rate", type=float)
-    parser.add_argument("--aggregator", choices=["fedavg", "dpfpl", "fedask"])
+    parser.add_argument(
+        "--aggregator",
+        choices=["promptfl", "fedotp", "fedpgp", "fedavg", "dpfpl", "fedask"],
+    )
     parser.add_argument("--target_client_id", type=int)
     parser.add_argument("--audit_attacks", help="Comma-separated attack names")
     parser.add_argument(
@@ -704,6 +800,8 @@ def parse_args() -> dict:
         "local_epochs",
         "fpl_shots",
         "dirichlet_alpha",
+        "partition_mode",
+        "use_full_dataset",
         "learning_rate",
         "aggregator",
     ):

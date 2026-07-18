@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run and summarize resumable multi-GPU FedMIA prompt experiments."""
+"""Run and summarize resumable multi-dataset FedMIA prompt experiments."""
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 class SweepJob:
     run_id: str
     config: dict[str, Any]
+    dataset: str
+    method: str
     seed: int
     target_client_id: int
     defense: str
@@ -92,6 +94,8 @@ def _stable_run_id(
     seed: int,
     target_client_id: int,
     config: dict[str, Any],
+    dataset_prefix: str | None = None,
+    method_prefix: str | None = None,
 ) -> str:
     canonical = copy.deepcopy(config)
     canonical.pop("gpu", None)
@@ -99,7 +103,11 @@ def _stable_run_id(
     digest = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:10]
-    return f"{defense}_seed{seed}_target{target_client_id}_{digest}"
+    prefixes = [
+        value for value in (dataset_prefix, method_prefix) if value is not None
+    ]
+    prefix = "" if not prefixes else f"{'_'.join(prefixes)}_"
+    return f"{prefix}{defense}_seed{seed}_target{target_client_id}_{digest}"
 
 
 def build_jobs(
@@ -116,11 +124,6 @@ def build_jobs(
     if not isinstance(common, dict):
         raise ValueError("sweep.common must be a mapping.")
     base_config = _deep_merge(base_config, common)
-    if data_root is not None:
-        base_config["data_root"] = str(_resolve_path(data_root))
-    if cache_dir is not None:
-        base_config["cache_dir"] = str(_resolve_path(cache_dir))
-
     sweep_name = str(spec.get("name", spec_path.stem))
     results_root = _resolve_path(spec.get("results_root", f"results/{sweep_name}"))
     seeds = [int(value) for value in spec.get("seeds", [42])]
@@ -129,46 +132,151 @@ def build_jobs(
     if not seeds or not targets or not isinstance(defenses, list) or not defenses:
         raise ValueError("The sweep needs seeds, target_client_ids, and defenses.")
 
+    dataset_entries = spec.get("datasets")
+    multi_dataset_spec = dataset_entries is not None
+    if dataset_entries is None:
+        dataset_entries = [
+            {"name": str(base_config.get("dataset_name", "dataset")), "overrides": {}}
+        ]
+    if not isinstance(dataset_entries, list) or not dataset_entries:
+        raise ValueError("sweep.datasets must be a non-empty list when provided.")
+
+    method_entries = spec.get("methods")
+    multi_method_spec = method_entries is not None
+    if method_entries is not None and (
+        not isinstance(method_entries, list) or not method_entries
+    ):
+        raise ValueError("sweep.methods must be a non-empty list when provided.")
+
     jobs: list[SweepJob] = []
     seen_ids: set[str] = set()
-    for entry in defenses:
-        if not isinstance(entry, dict) or "name" not in entry:
-            raise ValueError("Each defense entry must be a mapping with a name.")
-        defense = str(entry["name"]).lower()
-        fixed = entry.get("fixed", {})
-        if not isinstance(fixed, dict):
-            raise ValueError(f"Defense {defense} fixed parameters must be a mapping.")
-        for grid_parameters in _grid_rows(entry.get("grid")):
-            defense_parameters = {**fixed, **grid_parameters}
-            for seed, target_client_id in itertools.product(seeds, targets):
-                config = copy.deepcopy(base_config)
-                config["seed"] = seed
-                config.setdefault("audit", {})["target_client_id"] = target_client_id
-                config["defense"] = _deep_merge(
-                    config.get("defense", {}),
-                    {"name": defense, **defense_parameters},
+    for dataset_entry in dataset_entries:
+        if not isinstance(dataset_entry, dict) or "name" not in dataset_entry:
+            raise ValueError("Each dataset entry must be a mapping with a name.")
+        dataset_overrides = dataset_entry.get("overrides", {})
+        if not isinstance(dataset_overrides, dict):
+            raise ValueError("Dataset overrides must be a mapping.")
+        dataset_config = _deep_merge(base_config, dataset_overrides)
+        if "dataset_name" not in dataset_overrides:
+            dataset_config["dataset_name"] = str(dataset_entry["name"])
+        dataset = str(dataset_config["dataset_name"]).lower()
+        if data_root is not None:
+            dataset_config["data_root"] = str(_resolve_path(data_root))
+        if cache_dir is not None:
+            dataset_config["cache_dir"] = str(_resolve_path(cache_dir))
+
+        expanded_methods = method_entries or [
+            {"name": str(dataset_config.get("aggregator", "fedavg"))}
+        ]
+        for method_entry in expanded_methods:
+            if isinstance(method_entry, str):
+                method = method_entry.lower()
+                method_overrides: dict[str, Any] = {}
+            elif isinstance(method_entry, dict) and "name" in method_entry:
+                method = str(method_entry["name"]).lower()
+                method_overrides = method_entry.get("overrides", {})
+                if not isinstance(method_overrides, dict):
+                    raise ValueError("Method overrides must be a mapping.")
+            else:
+                raise ValueError(
+                    "Each method entry must be a name or a mapping with a name."
                 )
-                run_id = _stable_run_id(
-                    defense, seed, target_client_id, config
-                )
-                if run_id in seen_ids:
-                    raise ValueError(f"Duplicate sweep job generated: {run_id}")
-                seen_ids.add(run_id)
-                run_root = results_root / "runs" / run_id
-                config["results_dir"] = str(run_root)
-                jobs.append(
-                    SweepJob(
-                        run_id=run_id,
-                        config=config,
-                        seed=seed,
-                        target_client_id=target_client_id,
-                        defense=defense,
-                        defense_parameters=defense_parameters,
-                        run_root=run_root,
-                        config_path=results_root / "configs" / f"{run_id}.yaml",
+            method_config = _deep_merge(dataset_config, method_overrides)
+            method_config["aggregator"] = method
+
+            for entry in defenses:
+                if not isinstance(entry, dict) or "name" not in entry:
+                    raise ValueError("Each defense entry must be a mapping with a name.")
+                defense = str(entry["name"]).lower()
+                fixed = entry.get("fixed", {})
+                if not isinstance(fixed, dict):
+                    raise ValueError(
+                        f"Defense {defense} fixed parameters must be a mapping."
                     )
-                )
+                for grid_parameters in _grid_rows(entry.get("grid")):
+                    defense_parameters = {**fixed, **grid_parameters}
+                    for seed, target_client_id in itertools.product(seeds, targets):
+                        config = copy.deepcopy(method_config)
+                        config["seed"] = seed
+                        config.setdefault("audit", {})[
+                            "target_client_id"
+                        ] = target_client_id
+                        config["defense"] = _deep_merge(
+                            config.get("defense", {}),
+                            {"name": defense, **defense_parameters},
+                        )
+                        run_id = _stable_run_id(
+                            defense,
+                            seed,
+                            target_client_id,
+                            config,
+                            dataset_prefix=dataset if multi_dataset_spec else None,
+                            method_prefix=method if multi_method_spec else None,
+                        )
+                        if run_id in seen_ids:
+                            raise ValueError(f"Duplicate sweep job generated: {run_id}")
+                        seen_ids.add(run_id)
+                        run_root = results_root / "runs" / run_id
+                        config["results_dir"] = str(run_root)
+                        jobs.append(
+                            SweepJob(
+                                run_id=run_id,
+                                config=config,
+                                dataset=dataset,
+                                method=method,
+                                seed=seed,
+                                target_client_id=target_client_id,
+                                defense=defense,
+                                defense_parameters=defense_parameters,
+                                run_root=run_root,
+                                config_path=results_root
+                                / "configs"
+                                / f"{run_id}.yaml",
+                            )
+                        )
     return jobs, results_root
+
+
+def filter_jobs_by_dataset(
+    jobs: list[SweepJob], dataset_names: str | None
+) -> list[SweepJob]:
+    """Select complete dataset groups after expanding a sweep specification."""
+    if dataset_names is None:
+        return jobs
+    requested = {
+        value.strip().lower() for value in dataset_names.split(",") if value.strip()
+    }
+    if not requested:
+        raise ValueError("--datasets must contain at least one dataset name.")
+    available = {job.dataset for job in jobs}
+    unknown = requested - available
+    if unknown:
+        raise ValueError(
+            "Unknown dataset(s): "
+            f"{', '.join(sorted(unknown))}. Available: {', '.join(sorted(available))}."
+        )
+    return [job for job in jobs if job.dataset in requested]
+
+
+def filter_jobs_by_method(
+    jobs: list[SweepJob], method_names: str | None
+) -> list[SweepJob]:
+    """Select complete method groups after expanding a sweep specification."""
+    if method_names is None:
+        return jobs
+    requested = {
+        value.strip().lower() for value in method_names.split(",") if value.strip()
+    }
+    if not requested:
+        raise ValueError("--methods must contain at least one method name.")
+    available = {job.method for job in jobs}
+    unknown = requested - available
+    if unknown:
+        raise ValueError(
+            "Unknown method(s): "
+            f"{', '.join(sorted(unknown))}. Available: {', '.join(sorted(available))}."
+        )
+    return [job for job in jobs if job.method in requested]
 
 
 def _completed_result(job: SweepJob) -> Path | None:
@@ -362,6 +470,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
             detailed_rows.append(
                 {
                     "run_id": job.run_id,
+                    "dataset": job.dataset,
+                    "method": job.method,
                     "seed": job.seed,
                     "target_client_id": job.target_client_id,
                     "defense": job.defense,
@@ -373,7 +483,16 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
                     "tpr_at_fpr_0.1": float(attack["tpr_at_fpr_0.1"]),
                     "tpr_at_fpr_0.01": float(attack["tpr_at_fpr_0.01"]),
                     "tpr_at_fpr_0.001": float(attack["tpr_at_fpr_0.001"]),
+                    "tpr_pct_at_fpr_10pct": 100.0
+                    * float(attack["tpr_at_fpr_0.1"]),
+                    "tpr_pct_at_fpr_1pct": 100.0
+                    * float(attack["tpr_at_fpr_0.01"]),
+                    "tpr_pct_at_fpr_0_1pct": 100.0
+                    * float(attack["tpr_at_fpr_0.001"]),
                     "auc": float(attack["auc"]),
+                    "member_count": attack.get("member_count"),
+                    "nonmember_count": attack.get("nonmember_count"),
+                    "fpr_resolution": attack.get("fpr_resolution"),
                     "epsilon_upper_bound": epsilon_upper_bound,
                     "dp_delta": dp_delta,
                     "num_samples": int(attack["num_samples"]),
@@ -385,6 +504,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
     detailed_path = results_root / "summary_by_run.csv"
     detailed_fields = [
         "run_id",
+        "dataset",
+        "method",
         "seed",
         "target_client_id",
         "defense",
@@ -394,7 +515,13 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         "tpr_at_fpr_0.1",
         "tpr_at_fpr_0.01",
         "tpr_at_fpr_0.001",
+        "tpr_pct_at_fpr_10pct",
+        "tpr_pct_at_fpr_1pct",
+        "tpr_pct_at_fpr_0_1pct",
         "auc",
+        "member_count",
+        "nonmember_count",
+        "fpr_resolution",
         "epsilon_upper_bound",
         "dp_delta",
         "num_samples",
@@ -405,9 +532,11 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         writer.writeheader()
         writer.writerows(detailed_rows)
 
-    grouped: dict[tuple[int, str, str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str, int, str, str, str], list[dict[str, Any]]] = {}
     for row in detailed_rows:
         key = (
+            str(row["dataset"]),
+            str(row["method"]),
             int(row["target_client_id"]),
             row["defense"],
             row["defense_parameters"],
@@ -415,9 +544,14 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         )
         grouped.setdefault(key, []).append(row)
     aggregate_rows = []
-    for (target_client_id, defense, parameters, attack), rows in sorted(
-        grouped.items()
-    ):
+    for (
+        dataset,
+        method,
+        target_client_id,
+        defense,
+        parameters,
+        attack,
+    ), rows in sorted(grouped.items()):
         def mean(key: str) -> float:
             return statistics.fmean(float(row[key]) for row in rows)
 
@@ -430,9 +564,26 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
             for row in rows
             if row["epsilon_upper_bound"] is not None
         ]
+        member_values = [
+            int(row["member_count"])
+            for row in rows
+            if row["member_count"] is not None
+        ]
+        nonmember_values = [
+            int(row["nonmember_count"])
+            for row in rows
+            if row["nonmember_count"] is not None
+        ]
+        resolution_values = [
+            float(row["fpr_resolution"])
+            for row in rows
+            if row["fpr_resolution"] is not None
+        ]
 
         aggregate_rows.append(
             {
+                "dataset": dataset,
+                "method": method,
                 "target_client_id": target_client_id,
                 "defense": defense,
                 "defense_parameters": parameters,
@@ -446,8 +597,25 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
                 "tpr_at_fpr_0.01_std": sample_std("tpr_at_fpr_0.01"),
                 "tpr_at_fpr_0.001_mean": mean("tpr_at_fpr_0.001"),
                 "tpr_at_fpr_0.001_std": sample_std("tpr_at_fpr_0.001"),
+                "tpr_pct_at_fpr_10pct_mean": mean("tpr_pct_at_fpr_10pct"),
+                "tpr_pct_at_fpr_10pct_std": sample_std("tpr_pct_at_fpr_10pct"),
+                "tpr_pct_at_fpr_1pct_mean": mean("tpr_pct_at_fpr_1pct"),
+                "tpr_pct_at_fpr_1pct_std": sample_std("tpr_pct_at_fpr_1pct"),
+                "tpr_pct_at_fpr_0_1pct_mean": mean(
+                    "tpr_pct_at_fpr_0_1pct"
+                ),
+                "tpr_pct_at_fpr_0_1pct_std": sample_std(
+                    "tpr_pct_at_fpr_0_1pct"
+                ),
                 "auc_mean": mean("auc"),
                 "auc_std": sample_std("auc"),
+                "member_count_min": min(member_values) if member_values else None,
+                "nonmember_count_min": (
+                    min(nonmember_values) if nonmember_values else None
+                ),
+                "fpr_resolution_max": (
+                    max(resolution_values) if resolution_values else None
+                ),
                 "epsilon_upper_bound_mean": (
                     statistics.fmean(epsilon_values) if epsilon_values else None
                 ),
@@ -464,6 +632,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         )
     aggregate_path = results_root / "summary_aggregate.csv"
     aggregate_fields = [
+        "dataset",
+        "method",
         "target_client_id",
         "defense",
         "defense_parameters",
@@ -477,8 +647,17 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         "tpr_at_fpr_0.01_std",
         "tpr_at_fpr_0.001_mean",
         "tpr_at_fpr_0.001_std",
+        "tpr_pct_at_fpr_10pct_mean",
+        "tpr_pct_at_fpr_10pct_std",
+        "tpr_pct_at_fpr_1pct_mean",
+        "tpr_pct_at_fpr_1pct_std",
+        "tpr_pct_at_fpr_0_1pct_mean",
+        "tpr_pct_at_fpr_0_1pct_std",
         "auc_mean",
         "auc_std",
+        "member_count_min",
+        "nonmember_count_min",
+        "fpr_resolution_max",
         "epsilon_upper_bound_mean",
         "epsilon_upper_bound_std",
         "dp_delta",
@@ -490,6 +669,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
 
     tpr_matrix_path = results_root / "summary_tpr_matrix.csv"
     tpr_fields = [
+        "dataset",
+        "method",
         "target_client_id",
         "defense",
         "defense_parameters",
@@ -511,11 +692,46 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
             {field: row[field] for field in tpr_fields} for row in aggregate_rows
         )
 
+    privacy_metrics_path = results_root / "summary_privacy_metrics.csv"
+    privacy_metric_fields = [
+        "dataset",
+        "method",
+        "target_client_id",
+        "attack",
+        "runs",
+        "accuracy_mean",
+        "accuracy_std",
+        "tpr_pct_at_fpr_0_1pct_mean",
+        "tpr_pct_at_fpr_0_1pct_std",
+        "tpr_pct_at_fpr_1pct_mean",
+        "tpr_pct_at_fpr_1pct_std",
+        "tpr_pct_at_fpr_10pct_mean",
+        "tpr_pct_at_fpr_10pct_std",
+        "auc_mean",
+        "auc_std",
+        "member_count_min",
+        "nonmember_count_min",
+        "fpr_resolution_max",
+    ]
+    with privacy_metrics_path.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=privacy_metric_fields)
+        writer.writeheader()
+        writer.writerows(
+            {field: row[field] for field in privacy_metric_fields}
+            for row in aggregate_rows
+        )
+
     pareto_rows = []
-    by_attack: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    by_attack: dict[tuple[str, str, int, str], list[dict[str, Any]]] = {}
     for row in aggregate_rows:
         by_attack.setdefault(
-            (int(row["target_client_id"]), str(row["attack"])), []
+            (
+                str(row["dataset"]),
+                str(row["method"]),
+                int(row["target_client_id"]),
+                str(row["attack"]),
+            ),
+            [],
         ).append(row)
     for rows in by_attack.values():
         for candidate in rows:
@@ -639,8 +855,9 @@ def run_sweep(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Expand a FedMIA defense grid, run one experiment per GPU, resume "
-            "completed jobs, and aggregate TPR@1%FPR."
+            "Expand a multi-dataset FedMIA defense grid, run experiments "
+            "sequentially on the best candidate GPU, resume completed jobs, "
+            "and aggregate privacy metrics."
         )
     )
     parser.add_argument(
@@ -662,6 +879,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-root", help="Override the dataset root.")
     parser.add_argument("--cache-dir", help="Override the local CLIP cache.")
+    parser.add_argument(
+        "--datasets",
+        help=(
+            "Comma-separated dataset names to run after expansion, for example "
+            "caltech101,oxfordpets."
+        ),
+    )
+    parser.add_argument(
+        "--methods",
+        help=(
+            "Comma-separated federated methods to run after expansion, for "
+            "example promptfl,fedotp."
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -695,6 +926,8 @@ def main() -> int:
         data_root=args.data_root,
         cache_dir=args.cache_dir,
     )
+    jobs = filter_jobs_by_dataset(jobs, args.datasets)
+    jobs = filter_jobs_by_method(jobs, args.methods)
     if args.max_runs is not None:
         if args.max_runs <= 0:
             raise ValueError("--max-runs must be positive.")
@@ -704,6 +937,8 @@ def main() -> int:
         for job in jobs:
             print(
                 job.run_id,
+                f"dataset={job.dataset}",
+                f"method={job.method}",
                 f"seed={job.seed}",
                 f"target={job.target_client_id}",
                 f"defense={job.defense}",

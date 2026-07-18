@@ -1,0 +1,142 @@
+name: fedmia_pathological_full
+base_config: configs/fedmia_prompt_benchmark.yaml
+results_root: results/fedmia_pathological_full
+
+# Runs remain sequential and single-GPU. Before each job, the launcher picks
+# the candidate GPU with the most free memory.
+gpus: [0, 1]
+minimum_free_memory_mb: 7000
+
+seeds: [42, 1337, 2027]
+target_client_ids: [0]
+
+# Dataset-specific federation schedules. Oxford Flowers 102 is called
+# "flowers" by the repository loader.
+datasets:
+  - name: caltech101
+    overrides:
+      dataset_name: caltech101
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: oxfordpets
+    overrides:
+      dataset_name: oxfordpets
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: flowers
+    overrides:
+      dataset_name: flowers
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: food101
+    overrides:
+      dataset_name: food101
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: cifar100
+    overrides:
+      dataset_name: cifar100
+      total_users: 50
+      sample_users: 10
+      num_global_iters: 400
+
+common:
+  train_mode: centralized
+  data_root: /root/datasets
+  cache_dir: /root/DistributedFL/checkpoints/clip-vit-base-patch32
+  aggregator: fedavg
+  require_cuda: true
+  partition_mode: pathological
+  use_full_dataset: true
+  fpl_shots: null
+  local_epochs: 1
+  learning_rate: 0.0001
+  batch_size: 16
+  eval_batch_size: 64
+  n_ctx: 16
+  class_specific_ctx: false
+  eval_interval: 5
+  save_models: false
+  audit:
+    enabled: true
+    strict: true
+    audit_view: protocol_plus_released_prompts
+    target_client_id: 0
+    # For CIFAR100, this keeps client 0 among the 10 selected clients each
+    # round so its protocol trajectory is observable by the privacy auditor.
+    ensure_target_participation: true
+    attacks:
+      - blackbox_loss
+      - loss_series
+      - grad_cosine
+      - avg_cosine
+      - fedmia_loss
+      - fedmia_cosine
+      - nasr_passive
+      - rmia
+      - quantile_mia
+    max_member_samples: 128
+    max_nonmember_samples: 2048
+    audit_interval: 1
+    calibration_fraction: 0.5
+    match_candidate_labels: true
+    fedmia_baseline_single_round: last
+    fedmia_loss_aggregation: mean
+    fedmia_cosine_aggregation: mean
+
+# Same 26 defense settings as the existing complex sweep. Each setting is
+# repeated for every dataset and seed: 5 x 26 x 3 = 390 jobs.
+defenses:
+  - name: none
+
+  - name: perturb
+    fixed:
+      perturb_clip_norm: 1.0
+    grid:
+      perturb_noise_std: [0.01, 0.05, 0.1]
+
+  - name: sparse
+    grid:
+      sparse_ratio: [0.5, 0.9, 0.99]
+
+  - name: mixup
+    grid:
+      mixup_alpha: [0.1, 1.0, 10.0]
+
+  - name: sampling
+    grid:
+      sampling_ratio: [0.25, 0.5, 0.75]
+
+  - name: data_aug
+    fixed:
+      data_aug_flip_probability: 0.5
+      data_aug_color_jitter: 0.1
+    grid:
+      data_aug_strength: [0.05, 0.1, 0.2]
+
+  - name: data_aug_sampling
+    fixed:
+      data_aug_flip_probability: 0.5
+      data_aug_color_jitter: 0.1
+    grid:
+      sampling_ratio: [0.25, 0.5]
+      data_aug_strength: [0.05, 0.1]
+
+  - name: prompt_dp
+    fixed:
+      dp_max_grad_norm: 1.0
+      dp_delta: 0.00001
+      reproducible_dp_noise: true
+    grid:
+      dp_noise_multiplier: [0.5, 1.0, 2.0]
+
+  - name: hamp
+    fixed:
+      hamp_true_probability: 0.6
+      hamp_entropy_weight: 0.05
+    grid:
+      hamp_output_temperature: [2.0, 4.0, 8.0]

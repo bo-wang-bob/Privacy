@@ -56,3 +56,11 @@ class FedAvgAggregator(BaseAggregator):
             }
             return
         aggregate_fedavg_model_states(ctx, selected_ids)
+
+
+class PromptFLAggregator(FedAvgAggregator):
+    """Paper-named PromptFL entry point using standard prompt-only FedAvg."""
+
+    def __init__(self, device=torch.device("cpu"), **kwargs: object):
+        super().__init__(device=device, **kwargs)
+        self.name = "promptfl"

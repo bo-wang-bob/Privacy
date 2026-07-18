@@ -1,4 +1,32 @@
-# FedAvg 替代方法
+# 联邦提示训练方法
+
+## PromptFL (`aggregator: promptfl`)
+
+对应论文 *PromptFL: Let Federated Participants Cooperatively Learn Prompts Instead of Models*。每个客户端在冻结 CLIP 上只训练一组共享 CoOp context token，并最小化本地交叉熵；服务器按客户端训练样本数执行 FedAvg。
+
+历史 `fedavg` 入口已经具备相同的训练与聚合骨架，但它把学习 token 拼接在完整手工模板之前。严格的 `promptfl` 入口使用论文式 `[SOS] [learned context] [class] [EOS]` 构造，因此保留 `fedavg` 以兼容旧实验，论文对照应使用 `promptfl`。
+
+论文：[arXiv](https://arxiv.org/abs/2208.11625)。
+
+## FedOTP (`aggregator: fedotp`)
+
+对应 CVPR 2024 论文 *Global and Local Prompts Cooperation via Optimal Transport for Federated Learning*。
+
+- 每个客户端持久保留一个本地完整 prompt，并训练一个服务器同步的全局完整 prompt；
+- 图像 patch token 与全局/本地文本特征构成代价矩阵，用熵正则部分最优传输求固定运输计划，再由 Wasserstein 相似度计算分类损失；
+- 客户端只上传 `global_ctx`，服务器按样本数聚合；`local_ctx` 不通信且跨轮保留。
+
+主要参数为 `epsilon`、`transported_mass`、`max_iterations` 和 `threshold`。论文：[CVPR Open Access](https://openaccess.thecvf.com/content/CVPR2024/html/Li_Global_and_Local_Prompts_Cooperation_via_Optimal_Transport_for_Federated_CVPR_2024_paper.html)。官方代码：[FedOTP](https://github.com/HongxiaLee/FedOTP)。
+
+## FedPGP (`aggregator: fedpgp`)
+
+对应 ICML 2024 论文 *FedPGP: Federated Personalized Global Prompt for Vision-Language Models*。
+
+- 每个客户端使用服务器同步的 `global_ctx`，并持久保留低秩个性化项 `U·V`；
+- 分类使用 `global_ctx + U·V`；训练目标为交叉熵加 prompt-wise 对比损失，其中冻结的初始占位符 prompt 文本特征是正锚点，个性化 prompt 是负项；
+- 只聚合 `global_ctx`，低秩因子不上传。
+
+主要参数为 `rank`、`contrastive_weight` 和 `temperature`。论文：[PMLR](https://proceedings.mlr.press/v235/cui24c.html)。官方代码：[FedPGP](https://github.com/TianyuCuiOvO/FedPGP)。
 
 ## DP-FPL (`aggregator: dpfpl`)
 
