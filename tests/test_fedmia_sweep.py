@@ -108,7 +108,7 @@ def test_complex_fedmia_spec_expands_stable_seventy_eight_run_grid():
 
     assert len(jobs) == 78
     assert len({job.run_id for job in jobs}) == 78
-    assert jobs[0].run_id == "none_seed42_target0_793d9e9534"
+    assert jobs[0].run_id == "none_seed42_target0_4cfe584014"
     assert results_root == REPOSITORY_ROOT / "results" / "fedmia_complex_tpr1"
     assert {job.seed for job in jobs} == {42, 1337, 2027}
     assert {job.target_client_id for job in jobs} == {0}

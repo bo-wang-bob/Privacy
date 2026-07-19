@@ -46,8 +46,8 @@ datasets:
 
 common:
   train_mode: centralized
-  data_root: /root/datasets
-  cache_dir: /root/DistributedFL/checkpoints/clip-vit-base-patch32
+  data_root: ./data
+  cache_dir: ./checkpoints/clip-vit-base-patch32
   aggregator: fedavg
   require_cuda: true
   partition_mode: pathological

@@ -14,8 +14,8 @@ target_client_ids: [0]
 common:
   train_mode: centralized
   dataset_name: cifar100
-  data_root: /root/datasets
-  cache_dir: /root/DistributedFL/checkpoints/clip-vit-base-patch32
+  data_root: ./data
+  cache_dir: ./checkpoints/clip-vit-base-patch32
   aggregator: fedavg
   require_cuda: true
   num_global_iters: 20

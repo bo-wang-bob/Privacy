@@ -52,8 +52,8 @@ datasets:
       num_global_iters: 400
 
 common:
-  data_root: /root/datasets
-  cache_dir: /root/DistributedFL/checkpoints/clip-vit-base-patch32
+  data_root: ./data
+  cache_dir: ./checkpoints/clip-vit-base-patch32
   require_cuda: true
   partition_mode: pathological
   use_full_dataset: true

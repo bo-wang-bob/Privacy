@@ -2,8 +2,8 @@
 # `--aggregator` to select a method; PromptFL is the default.
 train_mode: centralized
 dataset_name: caltech101
-data_root: /root/datasets
-cache_dir: /root/DistributedFL/checkpoints/clip-vit-base-patch32
+data_root: ./data
+cache_dir: ./checkpoints/clip-vit-base-patch32
 require_cuda: true
 gpu: 0
 seed: 42
