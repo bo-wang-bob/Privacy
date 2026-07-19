@@ -31,6 +31,8 @@ python main.py --config configs/federated_prompt_paper.yaml --aggregator fedpgp
 
 启动器默认使用 `--jobs 1` 顺序执行；可通过 `--jobs N` 设置最大并发任务数。每个任务只使用一张卡，但同一张候选 GPU 可以同时运行多个任务；每次启动任务时都会选择满足显存门槛且空闲显存最多的卡。因此并发数可以超过候选 GPU 数，但 `--jobs` 和显存门槛应按实际显存容量设置。实验支持断点续跑，汇总结果位于 `results/fedmia_prompt_methods/summary_privacy_metrics.csv`，其中 TPR 以百分数报告，并同时给出 FPR=0.1%、1%、10% 三档结果与 AUC。
 
+该 sweep 在一次训练中对 10 个客户端执行 FedMIA 池化审计。每个客户端分别从本地训练集和同客户端测试集按类别一一配对成员与非成员，再合并攻击分数；因此 pathological 标签划分不会让攻击通过类别归属取巧。每个客户端最多贡献 128 对候选，合并后的 1280 个非成员可分辨 FPR=0.1% 档位。CIFAR100 有 50 个训练客户端，但同样固定审计前 10 个客户端以控制计算量。
+
 方法细节和论文对应关系见 [docs/federated_methods.md](docs/federated_methods.md)。
 Flowers102 同场景公平比较和 VEIL（原 Local-GGEUR）优化结果见
 [docs/flowers_fair_method_comparison.md](docs/flowers_fair_method_comparison.md)。

@@ -4,7 +4,7 @@ results_root: results/fedmia_prompt_methods
 
 # Each job uses exactly one GPU. The default is sequential; when jobs is raised,
 # multiple concurrent jobs may share a GPU that still meets the memory threshold.
-gpus: [0, 1]
+gpus: [0]
 minimum_free_memory_mb: 7000
 jobs: 1
 
@@ -50,6 +50,10 @@ datasets:
       total_users: 50
       sample_users: 10
       num_global_iters: 400
+      audit:
+        # Ten clients provide at least 1,000 paired non-members without making
+        # the 50-client CIFAR100 audit prohibitively expensive.
+        audit_client_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
 common:
   data_root: ./data
@@ -76,11 +80,16 @@ common:
       - fedmia_loss
       - fedmia_cosine
     target_client_id: 0
+    # For the 10-client datasets, pool exact per-class member/non-member pairs
+    # from every client in the same training run.
+    audit_client_ids: all
     ensure_target_participation: true
     audit_interval: 1
     audit_batch_size: 64
+    # Limits are applied per audited client. Exact pairing yields 128 members
+    # and 128 non-members per client, or 1,280 of each after pooling 10 clients.
     max_member_samples: 128
-    max_nonmember_samples: 2048
+    max_nonmember_samples: 128
     match_candidate_labels: true
     # Keep only the round signals required to reproduce Loss/Cosine attacks.
     # Use "full" only for one-off white-box debugging runs.

@@ -7,4 +7,6 @@ cd "$REPOSITORY_ROOT"
 exec python \
   analysis_scripts/run_fedmia_complex_sweep.py \
   --spec configs/fedmia_prompt_methods_sweep.yaml \
+  --gpus 0 \
+  --jobs 1 \
   "$@"

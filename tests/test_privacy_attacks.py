@@ -603,9 +603,20 @@ def _defended_server(
     defense: str,
     attack_enabled: bool = True,
     attack: str = "fedmia_loss",
+    audit_overrides=None,
 ):
     train_sets = [_dataset(index * 0.02) for index in range(4)]
     test_sets = [_dataset(0.4 + index * 0.02) for index in range(4)]
+    audit_config = {
+        "enabled": attack_enabled,
+        "strict": True,
+        "target_client_id": 0,
+        "ensure_target_participation": True,
+        "attacks": [attack] if attack_enabled else [],
+        "max_samples_per_group": 4,
+        "audit_interval": 1,
+    }
+    audit_config.update(audit_overrides or {})
     return ServerBase(
         train_mode="centralized",
         device=torch.device("cpu"),
@@ -624,15 +635,7 @@ def _defended_server(
         user_per_round=4,
         aggregator=build_aggregator("fedavg"),
         eval_interval=1,
-        audit_config={
-            "enabled": attack_enabled,
-            "strict": True,
-            "target_client_id": 0,
-            "ensure_target_participation": True,
-            "attacks": [attack] if attack_enabled else [],
-            "max_samples_per_group": 4,
-            "audit_interval": 1,
-        },
+        audit_config=audit_config,
         defense_config={
             "name": defense,
             "seed": 13,
@@ -667,6 +670,41 @@ def _defended_server(
             "local_ggeur_output_temperature": 3.0,
         },
     )
+
+
+def test_pooled_client_fedmia_uses_exact_per_class_pairs(tmp_path):
+    path = tmp_path / "pooled_clients"
+    summaries = _defended_server(
+        path,
+        "none",
+        audit_overrides={
+            "audit_client_ids": "all",
+            "match_candidate_labels": True,
+            "max_member_samples": 4,
+            "max_nonmember_samples": 8,
+        },
+    ).train()
+    assert len(summaries) == 1
+    assert summaries[0]["member_count"] == 16
+    assert summaries[0]["nonmember_count"] == 16
+    assert summaries[0]["metadata"]["scope"] == "pooled_clients"
+
+    payload = json.loads(
+        (path / "privacy_audit" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert payload["audit_scope"] == "pooled_clients"
+    assert payload["audit_client_ids"] == [0, 1, 2, 3]
+    assert payload["candidate_sampling"]["label_matching_mode"] == (
+        "exact_paired_per_client"
+    )
+    assert payload["candidate_sampling"]["label_histograms_matched"]
+    for client in payload["candidate_sampling"]["per_client"].values():
+        assert client["member_count"] == client["nonmember_count"] == 4
+
+    header = (path / "privacy_audit" / "predictions.csv").read_text(
+        encoding="utf-8"
+    ).splitlines()[0]
+    assert header == "attack,sample_index,audit_client_id,membership,score"
 
 
 def test_each_defense_runs_independently_with_one_attack():

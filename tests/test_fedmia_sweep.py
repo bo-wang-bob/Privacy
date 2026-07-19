@@ -176,6 +176,7 @@ def test_prompt_method_fedmia_spec_expands_three_methods_and_two_attacks():
     assert len({job.run_id for job in jobs}) == 45
     assert results_root == REPOSITORY_ROOT / "results" / "fedmia_prompt_methods"
     assert spec["jobs"] == 1
+    assert spec["gpus"] == [0]
     assert {job.method for job in jobs} == {"promptfl", "fedotp", "fedpgp"}
     assert all(
         job.config["audit"]["attacks"] == ["fedmia_loss", "fedmia_cosine"]
@@ -190,9 +191,11 @@ def test_prompt_method_fedmia_spec_expands_three_methods_and_two_attacks():
         if job.dataset == "cifar100":
             assert (job.config["total_users"], job.config["sample_users"]) == (50, 10)
             assert job.config["num_global_iters"] == 400
+            assert job.config["audit"]["audit_client_ids"] == list(range(10))
         else:
             assert (job.config["total_users"], job.config["sample_users"]) == (10, 10)
             assert job.config["num_global_iters"] == 100
+            assert job.config["audit"]["audit_client_ids"] == "all"
 
 
 def test_sweep_summary_uses_tpr_at_one_percent_as_primary_table(tmp_path: Path):

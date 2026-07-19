@@ -143,6 +143,24 @@ def validate_config(config: dict) -> None:
     audit = config.get("audit", {})
     if not 0 <= int(audit.get("target_client_id", 0)) < config["total_users"]:
         raise ValueError("audit.target_client_id must identify an existing client.")
+    audit_client_ids = audit.get("audit_client_ids")
+    if audit_client_ids is not None:
+        if isinstance(audit_client_ids, str):
+            if audit_client_ids.lower() != "all":
+                raise ValueError("audit.audit_client_ids must be 'all' or a list.")
+        elif isinstance(audit_client_ids, list):
+            normalized_ids = [int(value) for value in audit_client_ids]
+            if (
+                not normalized_ids
+                or len(set(normalized_ids)) != len(normalized_ids)
+                or min(normalized_ids) < 0
+                or max(normalized_ids) >= config["total_users"]
+            ):
+                raise ValueError(
+                    "audit.audit_client_ids must contain unique existing clients."
+                )
+        else:
+            raise ValueError("audit.audit_client_ids must be 'all' or a list.")
     if str(audit.get("audit_view", "protocol_plus_released_prompts")).lower() not in {
         "protocol_plus_released_prompts",
         "protocol_plus_queries",
@@ -156,6 +174,18 @@ def validate_config(config: dict) -> None:
         raise ValueError(f"Unknown membership attacks: {', '.join(unknown)}")
     if audit.get("enabled", True) and not attacks:
         raise ValueError("audit.enabled=true requires at least one membership attack.")
+    pooled_audit = audit_client_ids == "all" or (
+        isinstance(audit_client_ids, list) and len(audit_client_ids) > 1
+    )
+    if pooled_audit and attacks - {"fedmia_loss", "fedmia_cosine"}:
+        raise ValueError(
+            "Multi-client pooled auditing currently supports only FedMIA Loss "
+            "and FedMIA Cosine."
+        )
+    if pooled_audit and not bool(audit.get("match_candidate_labels", False)):
+        raise ValueError(
+            "Multi-client pooled auditing requires match_candidate_labels=true."
+        )
     if "nasr_active" in attacks and int(audit.get("active_max_samples", 16)) < 2:
         raise ValueError("audit.active_max_samples must be at least 2.")
     if "nasr_active" in attacks and int(audit.get("active_probe_cycles", 3)) <= 0:

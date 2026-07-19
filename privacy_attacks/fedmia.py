@@ -36,6 +36,7 @@ def run_fedmia(
     tail: str = "upper",
     calibration_fraction: float = 0.25,
     seed: int = 42,
+    candidate_indices: torch.Tensor | None = None,
 ) -> AttackResult:
     """FedMIA one-tailed null test using clients across rounds."""
     round_scores = []
@@ -48,6 +49,8 @@ def run_fedmia(
         target_position = client_ids.index(target_client_id)
         non_target = [index for index in range(len(client_ids)) if index != target_position]
         values = observation[measurement].to(torch.float64)
+        if candidate_indices is not None:
+            values = values[:, candidate_indices.detach().cpu().long()]
         target_value = values[target_position]
         null_values = values[non_target]
         null_mean, null_variance, removed = _filtered_null_statistics(null_values)
@@ -113,5 +116,6 @@ def run_fedmia(
             "tail_policy": tail,
             "selected_tail": selected_tail,
             "tail_calibration": calibration_metadata,
+            "target_client_id": int(target_client_id),
         },
     )

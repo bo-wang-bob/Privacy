@@ -497,6 +497,11 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
             "r", encoding="utf-8"
         ) as file:
             audit = json.load(file)
+        audit_scope = str(audit.get("audit_scope", "single_client"))
+        audit_client_ids = json.dumps(
+            audit.get("audit_client_ids", [job.target_client_id]),
+            separators=(",", ":"),
+        )
         for attack in audit.get("attacks", []):
             reportable = attack.get("reportable_metrics", attack)
 
@@ -514,6 +519,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
                     "method": job.method,
                     "seed": job.seed,
                     "target_client_id": job.target_client_id,
+                    "audit_scope": audit_scope,
+                    "audit_client_ids": audit_client_ids,
                     "defense": job.defense,
                     "defense_parameters": json.dumps(
                         job.defense_parameters, sort_keys=True
@@ -551,6 +558,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         "method",
         "seed",
         "target_client_id",
+        "audit_scope",
+        "audit_client_ids",
         "defense",
         "defense_parameters",
         "attack",
@@ -575,12 +584,16 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         writer.writeheader()
         writer.writerows(detailed_rows)
 
-    grouped: dict[tuple[str, str, int, str, str, str], list[dict[str, Any]]] = {}
+    grouped: dict[
+        tuple[str, str, int, str, str, str, str, str], list[dict[str, Any]]
+    ] = {}
     for row in detailed_rows:
         key = (
             str(row["dataset"]),
             str(row["method"]),
             int(row["target_client_id"]),
+            str(row["audit_scope"]),
+            str(row["audit_client_ids"]),
             row["defense"],
             row["defense_parameters"],
             row["attack"],
@@ -591,6 +604,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         dataset,
         method,
         target_client_id,
+        audit_scope,
+        audit_client_ids,
         defense,
         parameters,
         attack,
@@ -640,6 +655,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
                 "dataset": dataset,
                 "method": method,
                 "target_client_id": target_client_id,
+                "audit_scope": audit_scope,
+                "audit_client_ids": audit_client_ids,
                 "defense": defense,
                 "defense_parameters": parameters,
                 "attack": attack,
@@ -690,6 +707,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         "dataset",
         "method",
         "target_client_id",
+        "audit_scope",
+        "audit_client_ids",
         "defense",
         "defense_parameters",
         "attack",
@@ -727,6 +746,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         "dataset",
         "method",
         "target_client_id",
+        "audit_scope",
+        "audit_client_ids",
         "defense",
         "defense_parameters",
         "attack",
@@ -752,6 +773,8 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         "dataset",
         "method",
         "target_client_id",
+        "audit_scope",
+        "audit_client_ids",
         "attack",
         "runs",
         "accuracy_mean",

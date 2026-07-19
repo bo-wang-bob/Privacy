@@ -173,6 +173,7 @@ class ServerBase:
             config=self.audit_config,
             defense_config=self.defense_config,
             federated_method=self.federated_method,
+            num_classes=self.num_classes,
         )
         self.code_poison_enabled = "codepoison" in self.auditor.attacks
         self.private_probe_steps = planned_private_probe_steps(self.audit_config)

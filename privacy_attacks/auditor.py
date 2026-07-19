@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
 from privacy_attacks.code_poison import run_code_poison_attack
+from privacy_attacks.base import AttackResult
 from privacy_attacks.features import (
     flatten_state_delta,
     logits_and_representation,
@@ -71,6 +72,7 @@ class MembershipAuditor:
         config: dict | None = None,
         defense_config: dict | None = None,
         federated_method: str = "fedavg",
+        num_classes: int | None = None,
     ):
         self.config = config or {}
         self.defense_config = dict(defense_config or {"name": "none"})
@@ -145,6 +147,39 @@ class MembershipAuditor:
         )
         if not 0 <= target_client_id < len(users):
             raise ValueError("target_client_id is outside the client range.")
+        configured_client_ids = self.config.get("audit_client_ids")
+        if configured_client_ids is None:
+            self.audit_client_ids = [int(target_client_id)]
+        elif isinstance(configured_client_ids, str):
+            if configured_client_ids.lower() != "all":
+                raise ValueError("audit_client_ids must be 'all' or a list.")
+            self.audit_client_ids = list(range(len(users)))
+        elif isinstance(configured_client_ids, list):
+            self.audit_client_ids = [int(value) for value in configured_client_ids]
+        else:
+            raise ValueError("audit_client_ids must be 'all' or a list.")
+        if (
+            not self.audit_client_ids
+            or len(set(self.audit_client_ids)) != len(self.audit_client_ids)
+            or min(self.audit_client_ids) < 0
+            or max(self.audit_client_ids) >= len(users)
+        ):
+            raise ValueError("audit_client_ids must contain unique existing clients.")
+        self.pooled_client_audit = len(self.audit_client_ids) > 1
+        if self.pooled_client_audit and set(self.attacks) - {
+            "fedmia_loss",
+            "fedmia_cosine",
+        }:
+            raise ValueError(
+                "Multi-client pooled auditing supports only FedMIA Loss and Cosine."
+            )
+        self.num_classes = int(
+            num_classes
+            if num_classes is not None
+            else len(getattr(model, "classnames", ()))
+        )
+        if self.num_classes <= 0:
+            raise ValueError("Membership auditing requires a positive class count.")
         self.model = copy.deepcopy(model).to(device)
         self.initial_prompt_state = {
             name: parameter.detach().clone()
@@ -193,60 +228,143 @@ class MembershipAuditor:
                 raise ValueError(
                     "max_member_samples and max_nonmember_samples must be at least 2."
                 )
-            target = users[target_client_id]
-            member_images, member_labels = self._collect_many(
-                [target.train_data], max_members
-            )
-            candidate_support = set(member_labels.unique().tolist())
-            other_training_support = set()
-            class_count = max(
-                len(getattr(self.model, "classnames", ())),
-                int(member_labels.max().item()) + 1,
-            )
-            for user in users:
-                if user.id == target_client_id:
-                    continue
-                grouped = group_idx_by_class(user.train_data, class_count)
-                other_training_support.update(
-                    class_id
-                    for class_id, indices in enumerate(grouped)
-                    if indices
+            if self.pooled_client_audit:
+                if not self.match_candidate_labels:
+                    raise ValueError(
+                        "Multi-client pooled auditing requires exact label matching."
+                    )
+                image_parts = []
+                label_parts = []
+                membership_parts = []
+                client_parts = []
+                self.candidate_sampling_by_client = {}
+                per_client_overlap = {}
+                for client_id in self.audit_client_ids:
+                    target = users[client_id]
+                    (
+                        member_images,
+                        member_labels,
+                        nonmember_images,
+                        nonmember_labels,
+                        sampling,
+                    ) = self._collect_exact_paired_candidates(
+                        target.train_data,
+                        target.test_data,
+                        max_members,
+                        max_nonmembers,
+                        client_id,
+                    )
+                    images = torch.cat((member_images, nonmember_images))
+                    labels = torch.cat((member_labels, nonmember_labels))
+                    memberships = torch.cat(
+                        (
+                            torch.ones(member_labels.numel(), dtype=torch.long),
+                            torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+                        )
+                    )
+                    image_parts.append(images)
+                    label_parts.append(labels)
+                    membership_parts.append(memberships)
+                    client_parts.append(
+                        torch.full((labels.numel(),), client_id, dtype=torch.long)
+                    )
+                    self.candidate_sampling_by_client[str(client_id)] = sampling
+                    support = set(member_labels.unique().tolist())
+                    other_support = set()
+                    for user in users:
+                        if user.id == client_id:
+                            continue
+                        grouped = group_idx_by_class(
+                            user.train_data, self.num_classes
+                        )
+                        other_support.update(
+                            class_id
+                            for class_id, indices in enumerate(grouped)
+                            if indices
+                        )
+                    per_client_overlap[str(client_id)] = sorted(
+                        support & other_support
+                    )
+                self.images = torch.cat(image_parts).to(device)
+                self.labels = torch.cat(label_parts).to(device)
+                self.membership = torch.cat(membership_parts)
+                self.candidate_client_ids = torch.cat(client_parts)
+                self.candidate_label_support = sorted(
+                    self.labels.detach().cpu().unique().tolist()
                 )
-            self.null_client_candidate_label_overlap = sorted(
-                candidate_support & other_training_support
-            )
-            self.candidate_label_support = sorted(candidate_support)
-            unused_training_pool = self._unused_few_shot_training_pool(users)
-            nonmember_datasets = [target.test_data]
-            self.nonmember_source_priority = ["target_test"]
-            if unused_training_pool is not None:
-                nonmember_datasets.append(unused_training_pool)
-                self.nonmember_source_priority.append("unused_training_pool")
-            nonmember_datasets += [
-                user.test_data for user in users if user.id != target_client_id
-            ] + [
-                user.train_data for user in users if user.id != target_client_id
-            ]
-            self.nonmember_source_priority += [
-                "other_client_test",
-                "other_client_train",
-            ]
-            if self.match_candidate_labels:
-                nonmember_images, nonmember_labels = self._collect_label_matched(
-                    nonmember_datasets, member_labels, max_nonmembers
+                self.null_client_candidate_label_overlap_by_client = (
+                    per_client_overlap
                 )
+                self.null_client_candidate_label_overlap = sorted(
+                    {
+                        class_id
+                        for overlap in per_client_overlap.values()
+                        for class_id in overlap
+                    }
+                )
+                self.nonmember_source_priority = ["same_client_test"]
             else:
-                nonmember_images, nonmember_labels = self._collect_many(
-                    nonmember_datasets, max_nonmembers
+                target = users[target_client_id]
+                member_images, member_labels = self._collect_many(
+                    [target.train_data], max_members
                 )
-            self.images = torch.cat((member_images, nonmember_images)).to(device)
-            self.labels = torch.cat((member_labels, nonmember_labels)).to(device)
-            self.membership = torch.cat(
-                (
-                    torch.ones(member_labels.numel(), dtype=torch.long),
-                    torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+                candidate_support = set(member_labels.unique().tolist())
+                other_training_support = set()
+                class_count = max(
+                    self.num_classes,
+                    int(member_labels.max().item()) + 1,
                 )
-            )
+                for user in users:
+                    if user.id == target_client_id:
+                        continue
+                    grouped = group_idx_by_class(user.train_data, class_count)
+                    other_training_support.update(
+                        class_id
+                        for class_id, indices in enumerate(grouped)
+                        if indices
+                    )
+                self.null_client_candidate_label_overlap = sorted(
+                    candidate_support & other_training_support
+                )
+                self.null_client_candidate_label_overlap_by_client = {
+                    str(target_client_id): self.null_client_candidate_label_overlap
+                }
+                self.candidate_label_support = sorted(candidate_support)
+                unused_training_pool = self._unused_few_shot_training_pool(users)
+                nonmember_datasets = [target.test_data]
+                self.nonmember_source_priority = ["target_test"]
+                if unused_training_pool is not None:
+                    nonmember_datasets.append(unused_training_pool)
+                    self.nonmember_source_priority.append("unused_training_pool")
+                nonmember_datasets += [
+                    user.test_data for user in users if user.id != target_client_id
+                ] + [
+                    user.train_data for user in users if user.id != target_client_id
+                ]
+                self.nonmember_source_priority += [
+                    "other_client_test",
+                    "other_client_train",
+                ]
+                if self.match_candidate_labels:
+                    nonmember_images, nonmember_labels = self._collect_label_matched(
+                        nonmember_datasets, member_labels, max_nonmembers
+                    )
+                else:
+                    nonmember_images, nonmember_labels = self._collect_many(
+                        nonmember_datasets, max_nonmembers
+                    )
+                self.images = torch.cat((member_images, nonmember_images)).to(device)
+                self.labels = torch.cat((member_labels, nonmember_labels)).to(device)
+                self.membership = torch.cat(
+                    (
+                        torch.ones(member_labels.numel(), dtype=torch.long),
+                        torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+                    )
+                )
+                self.candidate_client_ids = torch.full(
+                    (self.labels.numel(),), target_client_id, dtype=torch.long
+                )
+                self.candidate_sampling_by_client = {}
 
     @staticmethod
     def _unused_few_shot_training_pool(users) -> Subset | None:
@@ -302,6 +420,129 @@ class MembershipAuditor:
         if limit - remaining < 2:
             raise ValueError("Each membership group needs at least two candidates.")
         return torch.cat(image_parts), torch.cat(label_parts)
+
+    def _collect_exact_paired_candidates(
+        self,
+        member_dataset,
+        nonmember_dataset,
+        member_limit: int,
+        nonmember_limit: int,
+        client_id: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict,
+    ]:
+        """Jointly sample equal per-class train/test candidates for one client."""
+        member_groups = group_idx_by_class(member_dataset, self.num_classes)
+        nonmember_groups = group_idx_by_class(nonmember_dataset, self.num_classes)
+        capacities = [
+            min(len(member_groups[class_id]), len(nonmember_groups[class_id]))
+            for class_id in range(self.num_classes)
+        ]
+        budget = min(member_limit, nonmember_limit, sum(capacities))
+        if budget < 2:
+            raise ValueError(
+                f"Client {client_id} has fewer than two same-label train/test pairs."
+            )
+
+        active_classes = [
+            class_id for class_id, capacity in enumerate(capacities) if capacity > 0
+        ]
+        order_generator = torch.Generator().manual_seed(
+            self.seed + 65537 * (client_id + 1)
+        )
+        order = [
+            active_classes[index]
+            for index in torch.randperm(
+                len(active_classes), generator=order_generator
+            ).tolist()
+        ]
+        quotas = [0] * self.num_classes
+        remaining = budget
+        while remaining:
+            allocated = False
+            for class_id in order:
+                if quotas[class_id] >= capacities[class_id]:
+                    continue
+                quotas[class_id] += 1
+                remaining -= 1
+                allocated = True
+                if remaining == 0:
+                    break
+            if not allocated:
+                raise AssertionError("Paired candidate allocation stalled.")
+
+        def select_indices(indices: list[int], count: int, salt: int) -> list[int]:
+            if count == 0:
+                return []
+            generator = torch.Generator().manual_seed(
+                self.seed + 104729 * (client_id + 1) + salt
+            )
+            permutation = torch.randperm(len(indices), generator=generator)[:count]
+            return [indices[position] for position in permutation.tolist()]
+
+        member_indices = []
+        nonmember_indices = []
+        for class_id, count in enumerate(quotas):
+            member_indices.extend(
+                select_indices(member_groups[class_id], count, 2 * class_id + 1)
+            )
+            nonmember_indices.extend(
+                select_indices(
+                    nonmember_groups[class_id], count, 2 * class_id + 2
+                )
+            )
+
+        def shuffle_indices(indices: list[int], salt: int) -> list[int]:
+            generator = torch.Generator().manual_seed(
+                self.seed + 999983 * (client_id + 1) + salt
+            )
+            permutation = torch.randperm(len(indices), generator=generator)
+            return [indices[position] for position in permutation.tolist()]
+
+        member_subset = Subset(member_dataset, shuffle_indices(member_indices, 11))
+        nonmember_subset = Subset(
+            nonmember_dataset, shuffle_indices(nonmember_indices, 17)
+        )
+        member_images, member_labels = self._collect_many(
+            [member_subset], budget
+        )
+        nonmember_images, nonmember_labels = self._collect_many(
+            [nonmember_subset], budget
+        )
+        member_histogram = torch.bincount(
+            member_labels, minlength=self.num_classes
+        )
+        nonmember_histogram = torch.bincount(
+            nonmember_labels, minlength=self.num_classes
+        )
+        if not torch.equal(member_histogram, nonmember_histogram):
+            raise AssertionError("Paired candidate label histograms drifted.")
+        if member_histogram.tolist() != quotas:
+            raise AssertionError("Paired candidate allocation did not match quotas.")
+        sampling = {
+            "client_id": int(client_id),
+            "member_count": int(budget),
+            "nonmember_count": int(budget),
+            "paired_label_histogram": quotas,
+            "pair_capacity_by_label": capacities,
+            "excluded_member_only_labels": [
+                class_id
+                for class_id in range(self.num_classes)
+                if member_groups[class_id] and not nonmember_groups[class_id]
+            ],
+            "sampling_seed": int(self.seed + 65537 * (client_id + 1)),
+        }
+        return (
+            member_images,
+            member_labels,
+            nonmember_images,
+            nonmember_labels,
+            sampling,
+        )
 
     def _collect_label_matched(
         self,
@@ -657,6 +898,64 @@ class MembershipAuditor:
         self.observations.append(observation)
         logger.info("Collected privacy signals for round %s", round_index)
 
+    def _run_fedmia_signal(
+        self,
+        measurement: str,
+        aggregation: str,
+        tail: str,
+    ) -> AttackResult:
+        if not self.pooled_client_audit:
+            return run_fedmia(
+                self.observations,
+                self.membership,
+                self.target_client_id,
+                measurement,
+                aggregation,
+                tail,
+                float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
+                self.seed,
+            )
+
+        client_results = []
+        global_indices = []
+        for client_id in self.audit_client_ids:
+            indices = torch.nonzero(
+                self.candidate_client_ids == client_id, as_tuple=False
+            ).flatten()
+            result = run_fedmia(
+                self.observations,
+                self.membership[indices],
+                client_id,
+                measurement,
+                aggregation,
+                tail,
+                float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
+                self.seed + 1009 * client_id,
+                candidate_indices=indices,
+            )
+            client_results.append(result)
+            global_indices.append(indices[result.sample_indices])
+        name = "fedmia_loss" if measurement == "confidence" else "fedmia_cosine"
+        return AttackResult(
+            name=name,
+            scores=torch.cat([result.scores for result in client_results]),
+            labels=torch.cat([result.labels for result in client_results]),
+            sample_indices=torch.cat(global_indices),
+            metadata={
+                "scope": "pooled_clients",
+                "audit_client_ids": self.audit_client_ids,
+                "measurement": measurement,
+                "round_aggregation": aggregation,
+                "tail_policy": tail,
+                "per_client": {
+                    str(client_id): result.metadata
+                    for client_id, result in zip(
+                        self.audit_client_ids, client_results
+                    )
+                },
+            },
+        )
+
     def _run(self, attack: str, final_model, final_state):
         if attack in {
             "blackbox_loss",
@@ -672,10 +971,7 @@ class MembershipAuditor:
                 self.config.get("fedmia_baseline_single_round", "last"),
             )
         if attack == "fedmia_loss":
-            return run_fedmia(
-                self.observations,
-                self.membership,
-                self.target_client_id,
+            return self._run_fedmia_signal(
                 "confidence",
                 str(self.config.get("fedmia_loss_aggregation", "mean")),
                 str(
@@ -683,14 +979,9 @@ class MembershipAuditor:
                         "fedmia_loss_tail", self.config.get("fedmia_tail", "upper")
                     )
                 ),
-                float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
-                self.seed,
             )
         if attack == "fedmia_cosine":
-            return run_fedmia(
-                self.observations,
-                self.membership,
-                self.target_client_id,
+            return self._run_fedmia_signal(
                 "cosine",
                 str(self.config.get("fedmia_cosine_aggregation", "mean")),
                 str(
@@ -698,8 +989,6 @@ class MembershipAuditor:
                         "fedmia_cosine_tail", self.config.get("fedmia_tail", "upper")
                     )
                 ),
-                float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
-                self.seed,
             )
         if attack == "nasr_passive":
             return run_passive_whitebox(
@@ -944,6 +1233,12 @@ class MembershipAuditor:
             json.dump(
                 {
                     "target_client_id": self.target_client_id,
+                    "audit_client_ids": self.audit_client_ids,
+                    "audit_scope": (
+                        "pooled_clients"
+                        if self.pooled_client_audit
+                        else "single_client"
+                    ),
                     "defense": self.defense_name,
                     "federated_method": self.federated_method,
                     "audit_view": self.audit_view,
@@ -985,6 +1280,9 @@ class MembershipAuditor:
                         "null_clients_share_candidate_training_labels": bool(
                             self.null_client_candidate_label_overlap
                         ),
+                        "null_client_candidate_label_overlap_by_client": (
+                            self.null_client_candidate_label_overlap_by_client
+                        ),
                     },
                     "candidate_sampling": {
                         "label_histograms_matched": (
@@ -992,7 +1290,9 @@ class MembershipAuditor:
                             and histograms_exactly_matched
                         ),
                         "label_matching_mode": (
-                            "exact_proportional"
+                            "exact_paired_per_client"
+                            if self.pooled_client_audit
+                            else "exact_proportional"
                             if self.match_candidate_labels
                             else "disabled"
                         ),
@@ -1010,6 +1310,7 @@ class MembershipAuditor:
                         "null_client_candidate_label_overlap": (
                             self.null_client_candidate_label_overlap
                         ),
+                        "per_client": self.candidate_sampling_by_client,
                     },
                     "audit_health": audit_health,
                     "attacks": summaries,
@@ -1025,18 +1326,35 @@ class MembershipAuditor:
             encoding="utf-8",
         ) as file:
             writer = csv.writer(file)
-            writer.writerow(("attack", "sample_index", "membership", "score"))
+            writer.writerow(
+                (
+                    "attack",
+                    "sample_index",
+                    "audit_client_id",
+                    "membership",
+                    "score",
+                )
+            )
             for result in self.results:
                 for index, label, score in zip(
                     result.sample_indices.tolist(),
                     result.labels.tolist(),
                     result.scores.tolist(),
                 ):
-                    writer.writerow((result.name, index, label, score))
+                    writer.writerow(
+                        (
+                            result.name,
+                            index,
+                            int(self.candidate_client_ids[index]),
+                            label,
+                            score,
+                        )
+                    )
         if self.signal_storage != "none":
             torch.save(
                 {
                     "candidate_labels": self.labels.detach().cpu(),
+                    "candidate_client_ids": self.candidate_client_ids,
                     "membership": self.membership,
                     "observations": self.observations,
                     "storage_mode": self.signal_storage,
