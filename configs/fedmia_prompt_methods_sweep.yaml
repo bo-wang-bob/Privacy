@@ -85,7 +85,8 @@ common:
     audit_client_ids: all
     ensure_target_participation: true
     audit_interval: 1
-    audit_batch_size: 64
+    # Keep CLIP audit inference within 24GB-class GPUs.
+    audit_batch_size: 16
     # Limits are applied per audited client. Exact pairing yields 128 members
     # and 128 non-members per client, or 1,280 of each after pooling 10 clients.
     max_member_samples: 128

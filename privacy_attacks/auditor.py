@@ -285,8 +285,10 @@ class MembershipAuditor:
                     per_client_overlap[str(client_id)] = sorted(
                         support & other_support
                     )
-                self.images = torch.cat(image_parts).to(device)
-                self.labels = torch.cat(label_parts).to(device)
+                # Pooled candidates can exceed a gigabyte at CLIP resolution.
+                # Keep them on CPU and transfer only the active audit batch.
+                self.images = torch.cat(image_parts)
+                self.labels = torch.cat(label_parts)
                 self.membership = torch.cat(membership_parts)
                 self.candidate_client_ids = torch.cat(client_parts)
                 self.candidate_label_support = sorted(
@@ -630,6 +632,7 @@ class MembershipAuditor:
     def should_observe(self, round_index: int) -> bool:
         return self.enabled and round_index % self.audit_interval == 0
 
+    @torch.no_grad()
     def _candidate_outputs(
         self,
         model: torch.nn.Module,
@@ -641,21 +644,49 @@ class MembershipAuditor:
         loss_parts = []
         for start in range(0, self.labels.numel(), self.audit_batch_size):
             stop = start + self.audit_batch_size
+            images = self.images[start:stop].to(self.device)
+            labels = self.labels[start:stop].to(self.device)
             if require_representation:
                 logits, representation, losses = logits_and_representation(
-                    model, self.images[start:stop], self.labels[start:stop]
+                    model, images, labels
                 )
                 representation_parts.append(representation)
             else:
-                logits = model(self.images[start:stop])
+                logits = model(images)
                 losses = F.cross_entropy(
-                    logits, self.labels[start:stop], reduction="none"
+                    logits, labels, reduction="none"
                 )
-            logits_parts.append(logits)
-            loss_parts.append(losses)
+            logits_parts.append(logits.detach().cpu())
+            loss_parts.append(losses.detach().cpu())
         return (
             torch.cat(logits_parts),
             torch.cat(representation_parts) if representation_parts else None,
+            torch.cat(loss_parts),
+        )
+
+    def _candidate_gradients(
+        self,
+        model: torch.nn.Module,
+        parameter_names: list[str],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute per-sample gradients while bounding resident GPU images."""
+        gradient_parts = []
+        signature_parts = []
+        loss_parts = []
+        for start in range(0, self.labels.numel(), self.audit_batch_size):
+            stop = start + self.audit_batch_size
+            gradients, signatures, losses = per_sample_prompt_gradients(
+                model,
+                self.images[start:stop].to(self.device),
+                self.labels[start:stop].to(self.device),
+                parameter_names,
+            )
+            gradient_parts.append(gradients)
+            signature_parts.append(signatures)
+            loss_parts.append(losses)
+        return (
+            torch.cat(gradient_parts),
+            torch.cat(signature_parts),
             torch.cat(loss_parts),
         )
 
@@ -759,8 +790,8 @@ class MembershipAuditor:
                 self._observable_base_state(base_state), strict=False
             )
             self.model.eval()
-            sample_gradients, signatures, _ = per_sample_prompt_gradients(
-                self.model, self.images, self.labels, observable_names
+            sample_gradients, signatures, _ = self._candidate_gradients(
+                self.model, observable_names
             )
 
         confidence = []

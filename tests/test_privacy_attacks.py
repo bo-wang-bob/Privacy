@@ -674,7 +674,7 @@ def _defended_server(
 
 def test_pooled_client_fedmia_uses_exact_per_class_pairs(tmp_path):
     path = tmp_path / "pooled_clients"
-    summaries = _defended_server(
+    server = _defended_server(
         path,
         "none",
         audit_overrides={
@@ -683,11 +683,17 @@ def test_pooled_client_fedmia_uses_exact_per_class_pairs(tmp_path):
             "max_member_samples": 4,
             "max_nonmember_samples": 8,
         },
-    ).train()
+    )
+    summaries = server.train()
     assert len(summaries) == 1
     assert summaries[0]["member_count"] == 16
     assert summaries[0]["nonmember_count"] == 16
     assert summaries[0]["metadata"]["scope"] == "pooled_clients"
+    assert server.auditor.images.device.type == "cpu"
+    assert all(
+        not observation["confidence"].requires_grad
+        for observation in server.auditor.observations
+    )
 
     payload = json.loads(
         (path / "privacy_audit" / "summary.json").read_text(encoding="utf-8")
