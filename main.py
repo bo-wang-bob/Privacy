@@ -167,6 +167,30 @@ def validate_config(config: dict) -> None:
         raise ValueError("audit.max_member_samples must be at least 2.")
     if int(audit.get("max_nonmember_samples", legacy_candidates)) < 2:
         raise ValueError("audit.max_nonmember_samples must be at least 2.")
+    if str(audit.get("signal_storage", "compact")).lower() not in {
+        "none",
+        "compact",
+        "full",
+    }:
+        raise ValueError("audit.signal_storage must be none, compact, or full.")
+    for key in ("fedmia_tail", "fedmia_loss_tail", "fedmia_cosine_tail"):
+        if key in audit and str(audit[key]).lower() not in {
+            "upper",
+            "lower",
+            "calibrated",
+        }:
+            raise ValueError(f"audit.{key} must be upper, lower, or calibrated.")
+    if not 0 < float(audit.get("fedmia_tail_calibration_fraction", 0.25)) < 1:
+        raise ValueError(
+            "audit.fedmia_tail_calibration_fraction must be between 0 and 1."
+        )
+    for key in (
+        "min_trainable_update_norm",
+        "max_stagnant_loss_range",
+        "uniform_loss_tolerance",
+    ):
+        if float(audit.get(key, 0.0)) < 0:
+            raise ValueError(f"audit.{key} must be non-negative.")
     if str(
         audit.get("audit_view", "protocol_plus_released_prompts")
     ).lower() == "released_prompt" and attacks & {
@@ -610,6 +634,14 @@ def default_config() -> dict:
             "audit_interval": 2,
             "calibration_fraction": 0.5,
             "match_candidate_labels": False,
+            "signal_storage": "compact",
+            "fedmia_tail": "upper",
+            "fedmia_tail_calibration_fraction": 0.25,
+            "training_health_check": True,
+            "fedmia_signal_health_check": False,
+            "min_trainable_update_norm": 1e-12,
+            "max_stagnant_loss_range": 1e-8,
+            "uniform_loss_tolerance": 1e-4,
             "active_max_samples": 16,
             "active_ascent_steps": 1,
             "active_ascent_lr": 0.01,

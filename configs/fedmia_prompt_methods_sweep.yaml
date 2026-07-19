@@ -2,10 +2,11 @@ name: fedmia_prompt_methods
 base_config: configs/federated_prompt_paper.yaml
 results_root: results/fedmia_prompt_methods
 
-# Jobs are sequential and each job uses exactly one GPU. Before every job the
-# launcher selects the candidate with the most free memory.
+# Each job uses exactly one GPU. The default is sequential; when jobs is raised,
+# the launcher assigns concurrent jobs to distinct eligible GPUs.
 gpus: [0, 1]
 minimum_free_memory_mb: 7000
+jobs: 1
 
 # Three independent repetitions for mean/std reporting.
 seeds: [42, 1337, 2027]
@@ -81,8 +82,16 @@ common:
     max_member_samples: 128
     max_nonmember_samples: 2048
     match_candidate_labels: true
+    # Keep only the round signals required to reproduce Loss/Cosine attacks.
+    # Use "full" only for one-off white-box debugging runs.
+    signal_storage: compact
+    # Paper-faithful one-tailed FedMIA: -loss and gradient cosine are both
+    # defined so that larger measurements indicate stronger membership evidence.
+    fedmia_tail: upper
     fedmia_loss_aggregation: mean
     fedmia_cosine_aggregation: mean
+    training_health_check: true
+    fedmia_signal_health_check: true
   defense:
     name: none
 

@@ -123,6 +123,24 @@ def test_fedotp_partial_transport_is_finite_and_moves_requested_mass():
     assert bool((plan.sum(dim=-1) <= 0.25 + 1e-5).all())
 
 
+def test_fedotp_production_epsilon_preserves_mass_and_nonzero_signal():
+    similarities = torch.tensor(
+        [[[0.25, 0.10], [0.05, 0.20], [-0.10, 0.15], [0.30, -0.05]]]
+    )
+    plan = entropic_partial_transport(
+        similarities,
+        epsilon=0.01,
+        transported_mass=0.8,
+        max_iterations=100,
+        threshold=1e-3,
+    )
+    assert torch.isfinite(plan).all()
+    assert torch.allclose(plan.sum(), torch.tensor(0.8), atol=1e-5)
+    scores = (plan * similarities).sum(dim=(1, 2))
+    assert torch.isfinite(scores).all()
+    assert float(scores.abs().max()) > 1e-6
+
+
 def test_all_paper_prompt_models_forward_without_data_or_checkpoints():
     images = torch.randn(2, 3, 8, 8)
     labels = torch.tensor([0, 1])
@@ -131,7 +149,7 @@ def test_all_paper_prompt_models_forward_without_data_or_checkpoints():
         (
             "fedotp",
             {
-                "epsilon": 0.1,
+                "epsilon": 0.01,
                 "transported_mass": 0.8,
                 "max_iterations": 20,
                 "threshold": 1e-4,
@@ -163,6 +181,13 @@ def test_all_paper_prompt_models_forward_without_data_or_checkpoints():
             for parameter in model.prompt_learner.parameters()
             if parameter.requires_grad
         )
+        trainable_gradients = [
+            parameter.grad
+            for parameter in model.prompt_learner.parameters()
+            if parameter.requires_grad
+        ]
+        assert all(torch.isfinite(gradient).all() for gradient in trainable_gradients)
+        assert any(float(gradient.norm()) > 1e-10 for gradient in trainable_gradients)
         assert all(
             parameter.grad is None for parameter in model.clip_model.parameters()
         )

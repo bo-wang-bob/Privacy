@@ -3,6 +3,22 @@ results/
 logs/
 checkpoints
 saved_models/
+analysis_reports/
+
+# Local model weights and experiment artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+
+# Local reference papers (compiled project PDFs under subdirectories may be tracked)
+paper/*.pdf
+
+# Python environments and tooling artifacts
+.venv/
+venv/
+env/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -10,8 +26,23 @@ __pycache__/
 .test_artifacts/
 .mypy_cache/
 .ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Editor and operating-system files
 .idea/
 .vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+*.bak
+
+# LaTeX build artifacts
 paper/**/*.aux
 paper/**/*.bbl
 paper/**/*.blg

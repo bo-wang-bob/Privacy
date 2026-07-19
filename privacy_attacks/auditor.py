@@ -117,6 +117,32 @@ class MembershipAuditor:
         unknown = sorted(set(self.attacks) - SUPPORTED_ATTACKS)
         if unknown:
             raise ValueError(f"Unsupported membership attacks: {', '.join(unknown)}")
+        self.signal_storage = str(
+            self.config.get("signal_storage", "compact")
+        ).lower()
+        if self.signal_storage not in {"none", "compact", "full"}:
+            raise ValueError("audit.signal_storage must be none, compact, or full.")
+        full_signals = self.signal_storage == "full"
+        requested_attacks = set(self.attacks)
+        self._needs_confidence = full_signals or bool(
+            requested_attacks
+            & {"blackbox_loss", "loss_series", "nasr_passive", "fedmia_loss"}
+        )
+        self._needs_cosine = full_signals or bool(
+            requested_attacks
+            & {"grad_cosine", "avg_cosine", "nasr_passive", "fedmia_cosine"}
+        )
+        self._needs_whitebox_features = full_signals or "nasr_passive" in requested_attacks
+        self._needs_probabilities = full_signals or bool(
+            requested_attacks & {"nasr_passive", "rmia", "quantile_mia"}
+        )
+        self._needs_representations = full_signals or bool(
+            requested_attacks
+            & {"nasr_passive", "transfer_representation", "quantile_mia"}
+        )
+        self._needs_client_states = full_signals or bool(
+            requested_attacks & {"pipra", "imia", "yoqo", "canary", "promptmia"}
+        )
         if not 0 <= target_client_id < len(users):
             raise ValueError("target_client_id is outside the client range.")
         self.model = copy.deepcopy(model).to(device)
@@ -171,6 +197,25 @@ class MembershipAuditor:
             member_images, member_labels = self._collect_many(
                 [target.train_data], max_members
             )
+            candidate_support = set(member_labels.unique().tolist())
+            other_training_support = set()
+            class_count = max(
+                len(getattr(self.model, "classnames", ())),
+                int(member_labels.max().item()) + 1,
+            )
+            for user in users:
+                if user.id == target_client_id:
+                    continue
+                grouped = group_idx_by_class(user.train_data, class_count)
+                other_training_support.update(
+                    class_id
+                    for class_id, indices in enumerate(grouped)
+                    if indices
+                )
+            self.null_client_candidate_label_overlap = sorted(
+                candidate_support & other_training_support
+            )
+            self.candidate_label_support = sorted(candidate_support)
             unused_training_pool = self._unused_few_shot_training_pool(users)
             nonmember_datasets = [target.test_data]
             self.nonmember_source_priority = ["target_test"]
@@ -267,10 +312,10 @@ class MembershipAuditor:
         """Collect non-members with the member-label distribution.
 
         Class identity can otherwise dominate a non-IID membership audit even
-        when a method has not memorized an individual. Matching labels keeps
-        the audit focused on within-class membership evidence. When the group
-        sizes differ, deterministic proportional apportionment replaces exact
-        histogram equality.
+        when a method has not memorized an individual.  The non-member
+        histogram is therefore an integer multiple of the member histogram;
+        if that is impossible under the available data, fail instead of
+        silently changing the requested label distribution.
         """
         target_labels = target_labels.detach().cpu().long().flatten()
         classes = len(getattr(self.model, "classnames", ()))
@@ -286,32 +331,32 @@ class MembershipAuditor:
             ],
             dtype=torch.long,
         )
-        requested = target_labels.numel() if limit is None else int(limit)
-        requested = min(
-            requested,
-            int(availability[member_counts > 0].sum().item()),
-        )
-        if requested < 2:
+        positive = member_counts > 0
+        if not bool(torch.all(availability[positive] >= member_counts[positive])):
+            missing = {
+                class_id: {
+                    "members": int(member_counts[class_id]),
+                    "available_nonmembers": int(availability[class_id]),
+                }
+                for class_id in torch.nonzero(positive, as_tuple=False).flatten().tolist()
+                if availability[class_id] < member_counts[class_id]
+            }
             raise ValueError(
-                "Cannot construct at least two label-matched non-members."
+                "Exact label-distribution matching is impossible; reduce member "
+                f"sampling or add non-member data for classes {missing}."
             )
-        if requested == target_labels.numel() and bool(
-            torch.all(availability >= member_counts)
-        ):
-            desired = member_counts.clone()
-        else:
-            desired = torch.zeros(classes, dtype=torch.long)
-            for _ in range(requested):
-                eligible = (member_counts > 0) & (desired < availability)
-                if not bool(eligible.any()):
-                    break
-                priorities = member_counts.to(torch.float64) / (
-                    desired.to(torch.float64) + 1.0
-                )
-                priorities[~eligible] = -1.0
-                desired[int(priorities.argmax().item())] += 1
-        if int(desired.sum().item()) < 2:
-            raise ValueError("Label-matched non-member allocation is too small.")
+        requested = target_labels.numel() if limit is None else int(limit)
+        maximum_by_limit = requested // target_labels.numel()
+        maximum_by_availability = min(
+            int(availability[class_id] // member_counts[class_id])
+            for class_id in torch.nonzero(positive, as_tuple=False).flatten().tolist()
+        )
+        multiplier = min(maximum_by_limit, maximum_by_availability)
+        if multiplier < 1:
+            raise ValueError(
+                "max_nonmember_samples is too small for exact label matching."
+            )
+        desired = member_counts * multiplier
 
         remaining = desired.tolist()
         selected = []
@@ -345,23 +390,31 @@ class MembershipAuditor:
         return self.enabled and round_index % self.audit_interval == 0
 
     def _candidate_outputs(
-        self, model: torch.nn.Module
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        model: torch.nn.Module,
+        require_representation: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Evaluate large audit candidate pools without one oversized CLIP batch."""
         logits_parts = []
         representation_parts = []
         loss_parts = []
         for start in range(0, self.labels.numel(), self.audit_batch_size):
             stop = start + self.audit_batch_size
-            logits, representation, losses = logits_and_representation(
-                model, self.images[start:stop], self.labels[start:stop]
-            )
+            if require_representation:
+                logits, representation, losses = logits_and_representation(
+                    model, self.images[start:stop], self.labels[start:stop]
+                )
+                representation_parts.append(representation)
+            else:
+                logits = model(self.images[start:stop])
+                losses = F.cross_entropy(
+                    logits, self.labels[start:stop], reduction="none"
+                )
             logits_parts.append(logits)
-            representation_parts.append(representation)
             loss_parts.append(losses)
         return (
             torch.cat(logits_parts),
-            torch.cat(representation_parts),
+            torch.cat(representation_parts) if representation_parts else None,
             torch.cat(loss_parts),
         )
 
@@ -372,11 +425,26 @@ class MembershipAuditor:
     def _global_prompt_public_state(
         self, source: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        """Retain private local parameters at initialization and expose globals."""
+        """Build an explicit global-only model from protocol-visible parameters.
+
+        Initial private parameters are not a protocol message and must not be
+        mixed with a later global prompt.  FedOTP duplicates the public global
+        prompt into its two OT slots; additive private adapters are neutralized.
+        """
         state = self._clone_prompt_state(self.initial_prompt_state)
+        global_context = None
         for name, tensor in source.items():
             if name.endswith("global_ctx"):
                 state[name] = tensor.detach().clone()
+                global_context = tensor.detach().clone()
+        if self.federated_method == "fedotp" and global_context is not None:
+            for name in state:
+                if name.endswith("local_ctx"):
+                    state[name] = global_context.clone()
+        elif self.federated_method in {"fedpgp", "dpfpl"}:
+            for name in state:
+                if name.endswith(("local_ctx", "fedpgp_u", "fedpgp_v")):
+                    state[name] = torch.zeros_like(state[name])
         return state
 
     def _observable_base_state(
@@ -442,13 +510,17 @@ class MembershipAuditor:
             "fedpgp",
         }:
             observable_names = [name for name in names if name.endswith("global_ctx")]
-        self.model.load_state_dict(
-            self._observable_base_state(base_state), strict=False
-        )
-        self.model.eval()
-        sample_gradients, signatures, _ = per_sample_prompt_gradients(
-            self.model, self.images, self.labels, observable_names
-        )
+        needs_gradients = self._needs_cosine or self._needs_whitebox_features
+        sample_gradients = None
+        signatures = None
+        if needs_gradients:
+            self.model.load_state_dict(
+                self._observable_base_state(base_state), strict=False
+            )
+            self.model.eval()
+            sample_gradients, signatures, _ = per_sample_prompt_gradients(
+                self.model, self.images, self.labels, observable_names
+            )
 
         confidence = []
         cosine = []
@@ -460,68 +532,115 @@ class MembershipAuditor:
             state = self._observable_client_state(
                 user_id, updated_states[user_id], released_states
             )
-            observable_states[user_id] = state
-            client_base = base_state if base_states is None else base_states[user_id]
-            if self.audit_view == "released_prompt":
-                update = torch.ones(1)
-            elif (
-                self.audit_view == "protocol_plus_released_prompts"
-                and protocol_messages is not None
-                and user_id in protocol_messages
-            ):
-                message = protocol_messages[user_id]
-                tensors = message.get("tensors", {})
-                update = torch.cat(
-                    [tensor.detach().flatten().cpu() for tensor in tensors.values()]
+            if self._needs_client_states:
+                observable_states[user_id] = state
+            if needs_gradients:
+                if sample_gradients is None:
+                    raise AssertionError("Gradient-dependent audit lost its gradients.")
+                client_base = (
+                    base_state if base_states is None else base_states[user_id]
                 )
-                if message.get("kind") in {"model_update", "global_prompt_update"}:
-                    # FedAvg/PromptFL and personalized prompt methods upload
-                    # parameter deltas (updated - base), while gradient-similarity
-                    # attacks use the descent gradient (base - updated). Keep the
-                    # stored message exact and normalize only this measurement.
-                    update = -update
-            else:
-                update = flatten_state_delta(client_base, state, observable_names)
-            compared_gradients = sample_gradients
-            if update.numel() != sample_gradients.shape[1]:
-                width = min(64, update.numel(), sample_gradients.shape[1])
-                update = F.adaptive_avg_pool1d(update.view(1, 1, -1), width).flatten()
-                compared_gradients = F.adaptive_avg_pool1d(
-                    sample_gradients.unsqueeze(1), width
-                ).squeeze(1)
-            update_norm = update.norm().clamp_min(1e-12)
-            sample_norm = compared_gradients.norm(dim=1).clamp_min(1e-12)
-            cosine.append((compared_gradients @ update) / (sample_norm * update_norm))
-            update_sq = update.square().sum()
-            gradient_difference.append(
-                update_sq
-                - (update.unsqueeze(0) - compared_gradients).square().sum(dim=1)
-            )
+                if self.audit_view == "released_prompt":
+                    update = torch.ones(1)
+                elif (
+                    self.audit_view == "protocol_plus_released_prompts"
+                    and protocol_messages is not None
+                    and user_id in protocol_messages
+                ):
+                    message = protocol_messages[user_id]
+                    tensors = message.get("tensors", {})
+                    update = torch.cat(
+                        [
+                            tensor.detach().flatten().cpu()
+                            for tensor in tensors.values()
+                        ]
+                    )
+                    if message.get("kind") in {
+                        "model_update",
+                        "global_prompt_update",
+                    }:
+                        # Uploaded deltas use the opposite sign from the descent
+                        # gradient used by gradient-similarity measurements.
+                        update = -update
+                else:
+                    update = flatten_state_delta(
+                        client_base, state, observable_names
+                    )
+                compared_gradients = sample_gradients
+                if update.numel() != sample_gradients.shape[1]:
+                    width = min(64, update.numel(), sample_gradients.shape[1])
+                    update = F.adaptive_avg_pool1d(
+                        update.view(1, 1, -1), width
+                    ).flatten()
+                    compared_gradients = F.adaptive_avg_pool1d(
+                        sample_gradients.unsqueeze(1), width
+                    ).squeeze(1)
+                update_norm = update.norm().clamp_min(1e-12)
+                sample_norm = compared_gradients.norm(dim=1).clamp_min(1e-12)
+                if self._needs_cosine:
+                    cosine.append(
+                        (compared_gradients @ update)
+                        / (sample_norm * update_norm)
+                    )
+                if self._needs_whitebox_features:
+                    update_sq = update.square().sum()
+                    gradient_difference.append(
+                        update_sq
+                        - (update.unsqueeze(0) - compared_gradients)
+                        .square()
+                        .sum(dim=1)
+                    )
 
-            self.model.load_state_dict(state, strict=False)
-            logits, representation, losses = self._candidate_outputs(self.model)
-            confidence.append(-losses)
-            probabilities.append(torch.softmax(logits, dim=1))
-            representations.append(representation)
+            needs_outputs = (
+                self._needs_confidence
+                or self._needs_probabilities
+                or self._needs_representations
+            )
+            if needs_outputs:
+                self.model.load_state_dict(state, strict=False)
+                logits, representation, losses = self._candidate_outputs(
+                    self.model,
+                    require_representation=self._needs_representations,
+                )
+                if self._needs_confidence:
+                    confidence.append(-losses)
+                if self._needs_probabilities:
+                    probabilities.append(torch.softmax(logits, dim=1))
+                if self._needs_representations:
+                    if representation is None:
+                        raise AssertionError(
+                            "Representation-dependent audit lost its features."
+                        )
+                    representations.append(representation)
 
         observation = {
             "round": int(round_index),
             "client_ids": torch.tensor(selected_ids, dtype=torch.long),
-            "confidence": torch.stack(confidence),
-            "cosine": torch.stack(cosine),
-            "gradient_difference": torch.stack(gradient_difference),
-            "gradient_signature": signatures,
-            "candidate_labels": self.labels.detach().cpu().clone(),
-            "probabilities": torch.stack(probabilities),
-            "representations": torch.stack(representations),
-            "client_states": {
+        }
+        if self._needs_confidence:
+            observation["confidence"] = torch.stack(confidence)
+        if self._needs_cosine:
+            observation["cosine"] = torch.stack(cosine)
+        if self._needs_whitebox_features:
+            if signatures is None:
+                raise AssertionError("White-box audit lost its gradient signatures.")
+            observation["gradient_difference"] = torch.stack(gradient_difference)
+            observation["gradient_signature"] = signatures
+            observation["candidate_labels"] = self.labels.detach().cpu().clone()
+        if self._needs_probabilities:
+            observation["probabilities"] = torch.stack(probabilities)
+        if self._needs_representations:
+            observation["representations"] = torch.stack(representations)
+        if self._needs_client_states:
+            observation["client_states"] = {
                 user_id: {
                     name: tensor.detach().cpu().clone()
                     for name, tensor in observable_states[user_id].items()
                 }
                 for user_id in selected_ids
-            },
-            "protocol_messages": {
+            }
+        if self.signal_storage == "full":
+            observation["protocol_messages"] = {
                 user_id: {
                     "kind": protocol_messages[user_id].get("kind", "unknown"),
                     "tensors": {
@@ -533,9 +652,8 @@ class MembershipAuditor:
                 }
                 for user_id in selected_ids
                 if protocol_messages is not None and user_id in protocol_messages
-            },
-            "audit_view": self.audit_view,
-        }
+            }
+            observation["audit_view"] = self.audit_view
         self.observations.append(observation)
         logger.info("Collected privacy signals for round %s", round_index)
 
@@ -560,6 +678,13 @@ class MembershipAuditor:
                 self.target_client_id,
                 "confidence",
                 str(self.config.get("fedmia_loss_aggregation", "mean")),
+                str(
+                    self.config.get(
+                        "fedmia_loss_tail", self.config.get("fedmia_tail", "upper")
+                    )
+                ),
+                float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
+                self.seed,
             )
         if attack == "fedmia_cosine":
             return run_fedmia(
@@ -568,6 +693,13 @@ class MembershipAuditor:
                 self.target_client_id,
                 "cosine",
                 str(self.config.get("fedmia_cosine_aggregation", "mean")),
+                str(
+                    self.config.get(
+                        "fedmia_cosine_tail", self.config.get("fedmia_tail", "upper")
+                    )
+                ),
+                float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
+                self.seed,
             )
         if attack == "nasr_passive":
             return run_passive_whitebox(
@@ -766,6 +898,26 @@ class MembershipAuditor:
                 logger.exception("Membership attack %s failed", attack)
                 self.errors[attack] = f"{type(error).__name__}: {error}"
         summaries = [result.to_summary() for result in self.results]
+        signal_health_enabled = bool(
+            self.config.get("fedmia_signal_health_check", False)
+        )
+        degenerate_fedmia = [
+            item["attack"]
+            for item in summaries
+            if item["attack"] in {"fedmia_loss", "fedmia_cosine"}
+            and item["score_degenerate"]
+        ]
+        if signal_health_enabled:
+            for attack in degenerate_fedmia:
+                self.errors[f"health:{attack}"] = (
+                    "Degenerate FedMIA scores: all evaluation candidates received "
+                    "the same score."
+                )
+        audit_health = {
+            "enabled": signal_health_enabled,
+            "passed": not degenerate_fedmia,
+            "degenerate_fedmia_attacks": degenerate_fedmia,
+        }
         candidate_labels = self.labels.detach().cpu().long()
         candidate_membership = self.membership.detach().cpu().long()
         histogram_width = int(candidate_labels.max().item()) + 1
@@ -775,7 +927,17 @@ class MembershipAuditor:
         nonmember_histogram = torch.bincount(
             candidate_labels[candidate_membership == 0], minlength=histogram_width
         ).tolist()
+        member_count = int((candidate_membership == 1).sum())
+        nonmember_count = int((candidate_membership == 0).sum())
         histograms_exactly_matched = member_histogram == nonmember_histogram
+        distributions_exactly_matched = all(
+            member * nonmember_count == nonmember * member_count
+            for member, nonmember in zip(member_histogram, nonmember_histogram)
+        )
+        label_tv_distance = 0.5 * sum(
+            abs(member / member_count - nonmember / nonmember_count)
+            for member, nonmember in zip(member_histogram, nonmember_histogram)
+        )
         with open(
             os.path.join(self.results_dir, "summary.json"), "w", encoding="utf-8"
         ) as file:
@@ -785,6 +947,17 @@ class MembershipAuditor:
                     "defense": self.defense_name,
                     "federated_method": self.federated_method,
                     "audit_view": self.audit_view,
+                    "signal_storage": {
+                        "mode": self.signal_storage,
+                        "signals_file_written": self.signal_storage != "none",
+                        "stored_observation_fields": sorted(
+                            {
+                                key
+                                for observation in self.observations
+                                for key in observation
+                            }
+                        ),
+                    },
                     "threat_model": {
                         "protocol_messages": self.audit_view
                         in {"protocol_plus_released_prompts", "full_whitebox"},
@@ -801,6 +974,16 @@ class MembershipAuditor:
                         ),
                         "candidate_label_distributions_matched": (
                             self.match_candidate_labels
+                            and distributions_exactly_matched
+                        ),
+                        "personalized_public_model_projection": (
+                            "global_only_neutral_private_parameters"
+                            if self.audit_view != "full_whitebox"
+                            and self.federated_method in {"fedotp", "fedpgp", "dpfpl"}
+                            else None
+                        ),
+                        "null_clients_share_candidate_training_labels": bool(
+                            self.null_client_candidate_label_overlap
                         ),
                     },
                     "candidate_sampling": {
@@ -809,16 +992,26 @@ class MembershipAuditor:
                             and histograms_exactly_matched
                         ),
                         "label_matching_mode": (
-                            "proportional"
+                            "exact_proportional"
                             if self.match_candidate_labels
                             else "disabled"
                         ),
-                        "member_count": int((candidate_membership == 1).sum()),
-                        "nonmember_count": int((candidate_membership == 0).sum()),
+                        "label_distributions_matched": (
+                            self.match_candidate_labels
+                            and distributions_exactly_matched
+                        ),
+                        "label_total_variation_distance": label_tv_distance,
+                        "member_count": member_count,
+                        "nonmember_count": nonmember_count,
                         "nonmember_source_priority": self.nonmember_source_priority,
                         "member_label_histogram": member_histogram,
                         "nonmember_label_histogram": nonmember_histogram,
+                        "candidate_label_support": self.candidate_label_support,
+                        "null_client_candidate_label_overlap": (
+                            self.null_client_candidate_label_overlap
+                        ),
                     },
+                    "audit_health": audit_health,
                     "attacks": summaries,
                     "errors": self.errors,
                 },
@@ -840,14 +1033,16 @@ class MembershipAuditor:
                     result.scores.tolist(),
                 ):
                     writer.writerow((result.name, index, label, score))
-        torch.save(
-            {
-                "candidate_labels": self.labels.detach().cpu(),
-                "membership": self.membership,
-                "observations": self.observations,
-            },
-            os.path.join(self.results_dir, "signals.pt"),
-        )
+        if self.signal_storage != "none":
+            torch.save(
+                {
+                    "candidate_labels": self.labels.detach().cpu(),
+                    "membership": self.membership,
+                    "observations": self.observations,
+                    "storage_mode": self.signal_storage,
+                },
+                os.path.join(self.results_dir, "signals.pt"),
+            )
         if self.errors and bool(self.config.get("strict", True)):
             failed = ", ".join(sorted(self.errors))
             raise RuntimeError(

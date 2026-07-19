@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 from typing import Tuple, List, Union, Optional, cast
@@ -82,31 +84,43 @@ def entropic_partial_transport(
     batch, patches, prompts = similarities.shape
     if patches <= 0 or prompts <= 0:
         raise ValueError("FedOTP requires at least one patch and one prompt.")
-    source = similarities.new_full((batch, patches), 1.0 / patches)
-    target = similarities.new_full(
-        (batch, prompts), transported_mass / prompts
+    # The paper configuration uses epsilon=0.01.  Forming the Gibbs kernel in
+    # float32 makes most CLIP-scale similarities underflow to zero, while an
+    # absolute denominator clamp changes the Sinkhorn equations.  Keep the
+    # complete scaling iteration in log space and float64; the returned plan is
+    # cast back only after its marginals have been formed.
+    working = similarities.to(torch.float64)
+    log_kernel = -(1.0 - working) / float(epsilon)
+    log_source = working.new_full((batch, patches), -math.log(patches))
+    log_target = working.new_full(
+        (batch, prompts), math.log(transported_mass / prompts)
     )
-    kernel = torch.exp(-(1.0 - similarities) / epsilon).clamp_min(
-        torch.finfo(similarities.dtype).tiny
-    )
-    kernel_source = kernel / source.unsqueeze(-1)
-    kernel_target = kernel.transpose(1, 2) / target.unsqueeze(-1)
-    left = torch.ones_like(source)
-    right = torch.ones_like(target)
+    log_left = torch.zeros_like(log_source)
+    log_right = torch.zeros_like(log_target)
     for _ in range(max_iterations):
-        previous = right
-        left = torch.minimum(
-            1.0 / torch.bmm(kernel_source, right.unsqueeze(-1)).squeeze(-1).clamp_min(1e-12),
-            torch.ones_like(left),
+        previous = log_right
+        log_left = torch.minimum(
+            log_source
+            - torch.logsumexp(log_kernel + log_right.unsqueeze(-2), dim=-1),
+            torch.zeros_like(log_left),
         )
-        right = 1.0 / torch.bmm(
-            kernel_target, left.unsqueeze(-1)
-        ).squeeze(-1).clamp_min(1e-12)
-        if float((right - previous).abs().mean()) < threshold:
+        log_right = log_target - torch.logsumexp(
+            log_kernel + log_left.unsqueeze(-1), dim=-2
+        )
+        if float((log_right - previous).abs().mean()) < threshold:
             break
-    plan = left.unsqueeze(-1) * kernel * right.unsqueeze(-2)
+    plan = torch.exp(
+        log_left.unsqueeze(-1) + log_kernel + log_right.unsqueeze(-2)
+    ).to(similarities.dtype)
     if not bool(torch.isfinite(plan).all()):
         raise FloatingPointError("FedOTP transport plan contains non-finite values.")
+    expected_mass = similarities.new_full((batch,), transported_mass)
+    actual_mass = plan.sum(dim=(1, 2))
+    tolerance = max(1e-5, 10.0 * torch.finfo(similarities.dtype).eps)
+    if not torch.allclose(actual_mass, expected_mass, atol=tolerance, rtol=1e-4):
+        raise FloatingPointError(
+            "FedOTP transport plan did not preserve the requested mass."
+        )
     return plan
 
 

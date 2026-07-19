@@ -6,6 +6,7 @@ import os
 import random
 import json
 import math
+import statistics
 
 import torch
 
@@ -66,6 +67,7 @@ class ServerBase:
         self.train_mode = train_mode
         self.device = device
         self.dataset_name = dataset_name
+        self.num_classes = len(class_names)
         self.model = model
         self.total_users_num = total_users
         self.num_glob_iters = num_glob_iters
@@ -86,6 +88,7 @@ class ServerBase:
         self.metrics_path = os.path.join(results_dir, "training_metrics.csv")
         with open(self.metrics_path, "w", newline="", encoding="utf-8") as file:
             csv.writer(file).writerow(("round", "loss", "accuracy", "samples"))
+        self.training_metrics: list[dict[str, float | int]] = []
 
         self.ctx = Context(
             users_num=total_users,
@@ -217,15 +220,103 @@ class ServerBase:
             total_loss += loss
             total_correct += correct
             total_samples += samples
+        metrics = {
+            "round": int(round_index),
+            "loss": total_loss / max(total_samples, 1),
+            "accuracy": total_correct / max(total_samples, 1),
+            "samples": int(total_samples),
+        }
+        self.training_metrics.append(metrics)
         with open(self.metrics_path, "a", newline="", encoding="utf-8") as file:
             csv.writer(file).writerow(
                 (
-                    round_index,
-                    total_loss / max(total_samples, 1),
-                    total_correct / max(total_samples, 1),
-                    total_samples,
+                    metrics["round"],
+                    metrics["loss"],
+                    metrics["accuracy"],
+                    metrics["samples"],
                 )
             )
+
+    def _validate_training_health(
+        self,
+        initial_state: dict[str, torch.Tensor],
+        final_state: dict[str, torch.Tensor],
+    ) -> dict:
+        """Persist and enforce inexpensive training-degeneracy checks."""
+        enabled = bool(self.audit_config.get("training_health_check", True))
+        minimum_update = float(
+            self.audit_config.get("min_trainable_update_norm", 1e-12)
+        )
+        stagnant_tolerance = float(
+            self.audit_config.get("max_stagnant_loss_range", 1e-8)
+        )
+        uniform_tolerance = float(
+            self.audit_config.get("uniform_loss_tolerance", 1e-4)
+        )
+        if minimum_update < 0 or stagnant_tolerance < 0 or uniform_tolerance < 0:
+            raise ValueError("Training health tolerances must be non-negative.")
+
+        squared_delta = 0.0
+        finite_state = True
+        compared = 0
+        for name, initial in initial_state.items():
+            if name not in final_state:
+                continue
+            final = final_state[name]
+            finite_state = finite_state and bool(torch.isfinite(final).all())
+            difference = (
+                final.detach().to(torch.float64).cpu()
+                - initial.to(torch.float64).cpu()
+            )
+            squared_delta += float(
+                difference.square().sum()
+            )
+            compared += final.numel()
+        update_norm = math.sqrt(squared_delta)
+        losses = [float(item["loss"]) for item in self.training_metrics]
+        finite_metrics = bool(losses) and all(
+            math.isfinite(value) for value in losses
+        )
+        loss_range = max(losses) - min(losses) if losses else None
+        uniform_loss = math.log(max(self.num_classes, 1))
+        uniform_stagnation = bool(
+            len(losses) >= 2
+            and loss_range is not None
+            and loss_range <= stagnant_tolerance
+            and abs(statistics.fmean(losses) - uniform_loss) <= uniform_tolerance
+        )
+        reasons = []
+        if not finite_state or not finite_metrics:
+            reasons.append("non_finite_state_or_metrics")
+        if compared == 0 or update_norm <= minimum_update:
+            reasons.append("trainable_parameters_did_not_move")
+        if uniform_stagnation:
+            reasons.append("loss_stagnated_at_uniform_classifier_baseline")
+        health = {
+            "enabled": enabled,
+            "passed": not reasons,
+            "reasons": reasons,
+            "trainable_update_norm": update_norm,
+            "minimum_trainable_update_norm": minimum_update,
+            "finite_state": finite_state,
+            "finite_metrics": finite_metrics,
+            "evaluation_count": len(losses),
+            "initial_loss": losses[0] if losses else None,
+            "final_loss": losses[-1] if losses else None,
+            "loss_range": loss_range,
+            "uniform_classifier_loss": uniform_loss,
+        }
+        with open(
+            os.path.join(self.results_dir, "training_health.json"),
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(health, file, indent=2, allow_nan=False)
+        if enabled and reasons:
+            raise RuntimeError(
+                "Training health check failed: " + ", ".join(reasons)
+            )
+        return health
 
     def _save_round(self, round_index: int) -> None:
         if not self.save_models_enabled:
@@ -253,6 +344,9 @@ class ServerBase:
             self.ctx.set_base_model_state(
                 user.id, self._clone_state(user.get_parameters())
             )
+        initial_target_state = self._clone_state(
+            self.ctx.get_base_model_state(self.target_client_id), cpu=True
+        )
 
         for round_index in range(self.num_glob_iters):
             if round_index > 0:
@@ -314,6 +408,9 @@ class ServerBase:
             final_state = self.ctx.new_model_state[0]
         else:
             final_state = self.ctx.new_model_state[self.target_client_id]
+        training_health = self._validate_training_health(
+            initial_target_state, final_state
+        )
         self.model.load_state_dict(final_state, strict=False)
         torch.save(
             self._clone_state(final_state, cpu=True),
@@ -324,6 +421,7 @@ class ServerBase:
         method_summary = {
             "federated_method": self.federated_method,
             "configuration": self.method_config,
+            "training_health": training_health,
             "state_scope": (
                 "global_plus_persistent_per_client_local"
                 if self.federated_method in {"dpfpl", "fedotp", "fedpgp"}

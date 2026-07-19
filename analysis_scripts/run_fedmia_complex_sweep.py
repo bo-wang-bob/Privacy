@@ -291,6 +291,16 @@ def _completed_result(job: SweepJob) -> Path | None:
         result_dir = summary.parents[1]
         if not (result_dir / "training_metrics.csv").is_file():
             continue
+        if bool(job.config.get("audit", {}).get("training_health_check", False)):
+            health_path = result_dir / "training_health.json"
+            if not health_path.is_file():
+                continue
+            try:
+                with health_path.open("r", encoding="utf-8") as file:
+                    if not bool(json.load(file).get("passed", False)):
+                        continue
+            except (OSError, json.JSONDecodeError):
+                continue
         try:
             with summary.open("r", encoding="utf-8") as file:
                 audit = json.load(file)
@@ -409,6 +419,31 @@ def _wait_for_best_gpu(
         time.sleep(poll_seconds)
 
 
+def _best_available_gpu(
+    candidate_gpus: list[int],
+    busy_gpus: set[int],
+    minimum_free_memory_mb: int,
+) -> GPUStatus | None:
+    """Return the best eligible GPU that is not already running a sweep job."""
+    available = [gpu for gpu in candidate_gpus if gpu not in busy_gpus]
+    if not available:
+        return None
+    eligible = [
+        status
+        for status in _query_gpu_status(available)
+        if status.free_memory_mb >= minimum_free_memory_mb
+    ]
+    if not eligible:
+        return None
+    return max(
+        eligible,
+        key=lambda status: (
+            status.free_memory_mb,
+            -status.utilization_percent,
+        ),
+    )
+
+
 def _launch(job: SweepJob, gpu: int, logs_root: Path) -> ActiveRun:
     _write_job_config(job)
     logs_root.mkdir(parents=True, exist_ok=True)
@@ -467,6 +502,15 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         ) as file:
             audit = json.load(file)
         for attack in audit.get("attacks", []):
+            reportable = attack.get("reportable_metrics", attack)
+
+            def optional_metric(key: str) -> float | None:
+                value = reportable.get(key)
+                return None if value is None else float(value)
+
+            tpr10 = optional_metric("tpr_at_fpr_0.1")
+            tpr1 = optional_metric("tpr_at_fpr_0.01")
+            tpr0_1 = optional_metric("tpr_at_fpr_0.001")
             detailed_rows.append(
                 {
                     "run_id": job.run_id,
@@ -480,15 +524,18 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
                     ),
                     "attack": attack["attack"],
                     "final_accuracy": final_accuracy,
-                    "tpr_at_fpr_0.1": float(attack["tpr_at_fpr_0.1"]),
-                    "tpr_at_fpr_0.01": float(attack["tpr_at_fpr_0.01"]),
-                    "tpr_at_fpr_0.001": float(attack["tpr_at_fpr_0.001"]),
-                    "tpr_pct_at_fpr_10pct": 100.0
-                    * float(attack["tpr_at_fpr_0.1"]),
-                    "tpr_pct_at_fpr_1pct": 100.0
-                    * float(attack["tpr_at_fpr_0.01"]),
-                    "tpr_pct_at_fpr_0_1pct": 100.0
-                    * float(attack["tpr_at_fpr_0.001"]),
+                    "tpr_at_fpr_0.1": tpr10,
+                    "tpr_at_fpr_0.01": tpr1,
+                    "tpr_at_fpr_0.001": tpr0_1,
+                    "tpr_pct_at_fpr_10pct": (
+                        None if tpr10 is None else 100.0 * tpr10
+                    ),
+                    "tpr_pct_at_fpr_1pct": (
+                        None if tpr1 is None else 100.0 * tpr1
+                    ),
+                    "tpr_pct_at_fpr_0_1pct": (
+                        None if tpr0_1 is None else 100.0 * tpr0_1
+                    ),
                     "auc": float(attack["auc"]),
                     "member_count": attack.get("member_count"),
                     "nonmember_count": attack.get("nonmember_count"),
@@ -552,12 +599,24 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         parameters,
         attack,
     ), rows in sorted(grouped.items()):
-        def mean(key: str) -> float:
-            return statistics.fmean(float(row[key]) for row in rows)
+        def values(key: str) -> list[float]:
+            return [
+                float(row[key])
+                for row in rows
+                if row.get(key) is not None and row.get(key) != ""
+            ]
 
-        def sample_std(key: str) -> float:
-            values = [float(row[key]) for row in rows]
-            return statistics.stdev(values) if len(values) > 1 else 0.0
+        def mean(key: str) -> float | None:
+            selected = values(key)
+            return statistics.fmean(selected) if selected else None
+
+        def sample_std(key: str) -> float | None:
+            selected = values(key)
+            return (
+                statistics.stdev(selected)
+                if len(selected) > 1
+                else 0.0 if selected else None
+            )
 
         epsilon_values = [
             float(row["epsilon_upper_bound"])
@@ -734,7 +793,10 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
             [],
         ).append(row)
     for rows in by_attack.values():
-        for candidate in rows:
+        comparable = [
+            row for row in rows if row["tpr_at_fpr_0.01_mean"] is not None
+        ]
+        for candidate in comparable:
             dominated = any(
                 other is not candidate
                 and float(other["accuracy_mean"])
@@ -747,7 +809,7 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
                     or float(other["tpr_at_fpr_0.01_mean"])
                     < float(candidate["tpr_at_fpr_0.01_mean"])
                 )
-                for other in rows
+                for other in comparable
             )
             if not dominated:
                 pareto_rows.append(candidate)
@@ -765,7 +827,11 @@ def run_sweep(
     gpus: list[int],
     force: bool,
     minimum_free_memory_mb: int,
+    max_parallel_jobs: int = 1,
 ) -> int:
+    if max_parallel_jobs <= 0:
+        raise ValueError("jobs must be positive.")
+    effective_parallel_jobs = min(max_parallel_jobs, len(gpus))
     state_path = results_root / "sweep_state.json"
     state = _load_state(state_path)
     pending = []
@@ -782,66 +848,96 @@ def run_sweep(
     print(
         f"Sweep jobs={len(jobs)}, pending={len(pending)}, "
         f"already_complete={len(jobs) - len(pending)}, candidate_gpus={gpus}, "
-        f"execution=sequential, minimum_free_memory_mb={minimum_free_memory_mb}",
+        f"requested_parallel_jobs={max_parallel_jobs}, "
+        f"effective_parallel_jobs={effective_parallel_jobs}, "
+        f"minimum_free_memory_mb={minimum_free_memory_mb}",
         flush=True,
     )
 
     failures = 0
     completed_count = len(jobs) - len(pending)
-    while pending:
-        job = pending.pop(0)
-        status = _wait_for_best_gpu(gpus, minimum_free_memory_mb)
-        run = _launch(job, status.index, results_root / "launcher_logs")
-        state["runs"][job.run_id] = {
-            "status": "running",
-            "gpu": status.index,
-            "gpu_free_memory_mb_at_start": status.free_memory_mb,
-            "gpu_utilization_at_start": status.utilization_percent,
-            "started_at": time.time(),
-        }
-        _save_state(state_path, state)
+    active: dict[int, ActiveRun] = {}
+    try:
+        while pending or active:
+            while pending and len(active) < effective_parallel_jobs:
+                status = _best_available_gpu(
+                    gpus, set(active), minimum_free_memory_mb
+                )
+                if status is None:
+                    if active:
+                        break
+                    available = [gpu for gpu in gpus if gpu not in active]
+                    status = _wait_for_best_gpu(
+                        available, minimum_free_memory_mb
+                    )
+                job = pending.pop(0)
+                run = _launch(job, status.index, results_root / "launcher_logs")
+                active[status.index] = run
+                state["runs"][job.run_id] = {
+                    "status": "running",
+                    "gpu": status.index,
+                    "gpu_free_memory_mb_at_start": status.free_memory_mb,
+                    "gpu_utilization_at_start": status.utilization_percent,
+                    "started_at": time.time(),
+                }
+                _save_state(state_path, state)
+                print(
+                    f"[{completed_count}/{len(jobs)}] started {job.run_id} on "
+                    f"gpu:{status.index} (free={status.free_memory_mb}MiB, "
+                    f"util={status.utilization_percent}%, "
+                    f"active={len(active)}/{effective_parallel_jobs})",
+                    flush=True,
+                )
+
+            finished_gpus = [
+                gpu for gpu, run in active.items() if run.process.poll() is not None
+            ]
+            if not finished_gpus:
+                time.sleep(2)
+                continue
+            for gpu in finished_gpus:
+                run = active.pop(gpu)
+                return_code = int(run.process.returncode)
+                run.log_file.close()
+                result_dir = _completed_result(run.job)
+                succeeded = return_code == 0 and result_dir is not None
+                state["runs"][run.job.run_id] = {
+                    "status": "succeeded" if succeeded else "failed",
+                    "gpu": gpu,
+                    "return_code": return_code,
+                    "finished_at": time.time(),
+                    "result_dir": None if result_dir is None else str(result_dir),
+                }
+                _save_state(state_path, state)
+                completed_count += 1
+                if not succeeded:
+                    failures += 1
+                print(
+                    f"[{completed_count}/{len(jobs)}] "
+                    f"{'finished' if succeeded else 'FAILED'} {run.job.run_id} "
+                    f"on gpu:{gpu} (active={len(active)}/{effective_parallel_jobs})",
+                    flush=True,
+                )
+    except KeyboardInterrupt:
         print(
-            f"[{completed_count}/{len(jobs)}] started {job.run_id} on "
-            f"gpu:{status.index} (free={status.free_memory_mb}MiB, "
-            f"util={status.utilization_percent}%)",
+            f"Interrupt received; terminating {len(active)} active experiment(s)...",
             flush=True,
         )
-        try:
-            return_code = run.process.wait()
-        except KeyboardInterrupt:
-            print("Interrupt received; terminating active experiment...", flush=True)
+        for gpu, run in active.items():
             run.process.terminate()
+        for gpu, run in active.items():
             try:
                 run.process.wait(timeout=20)
             except subprocess.TimeoutExpired:
                 run.process.kill()
             run.log_file.close()
-            state["runs"][job.run_id] = {
+            state["runs"][run.job.run_id] = {
                 "status": "interrupted",
-                "gpu": status.index,
+                "gpu": gpu,
                 "finished_at": time.time(),
             }
-            _save_state(state_path, state)
-            return 130
-        run.log_file.close()
-        result_dir = _completed_result(job)
-        succeeded = return_code == 0 and result_dir is not None
-        state["runs"][job.run_id] = {
-            "status": "succeeded" if succeeded else "failed",
-            "gpu": status.index,
-            "return_code": return_code,
-            "finished_at": time.time(),
-            "result_dir": None if result_dir is None else str(result_dir),
-        }
         _save_state(state_path, state)
-        completed_count += 1
-        if not succeeded:
-            failures += 1
-        print(
-            f"[{completed_count}/{len(jobs)}] "
-            f"{'finished' if succeeded else 'FAILED'} {job.run_id}",
-            flush=True,
-        )
+        return 130
 
     complete_runs, attack_rows = summarize(jobs, results_root)
     print(
@@ -856,7 +952,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Expand a multi-dataset FedMIA defense grid, run experiments "
-            "sequentially on the best candidate GPU, resume completed jobs, "
+            "on automatically selected single GPUs, resume completed jobs, "
             "and aggregate privacy metrics."
         )
     )
@@ -868,8 +964,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gpus",
         help=(
-            "Comma-separated candidate GPU indices. Each sequential job "
-            "automatically uses the least busy candidate with most free memory."
+            "Comma-separated candidate GPU indices. Each job automatically "
+            "uses an eligible candidate with the most free memory."
+        ),
+    )
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        help=(
+            "Maximum concurrent tasks. Defaults to 1; concurrency cannot exceed "
+            "the number of candidate GPUs, and each GPU runs at most one task."
         ),
     )
     parser.add_argument(
@@ -959,12 +1063,18 @@ def main() -> int:
     )
     if minimum_free_memory_mb < 0:
         raise ValueError("minimum free GPU memory must be non-negative.")
+    max_parallel_jobs = (
+        int(args.jobs) if args.jobs is not None else int(spec.get("jobs", 1))
+    )
+    if max_parallel_jobs <= 0:
+        raise ValueError("--jobs must be positive.")
     return run_sweep(
         jobs,
         results_root,
         _parse_gpus(gpu_text),
         args.force,
         minimum_free_memory_mb,
+        max_parallel_jobs,
     )
 
 

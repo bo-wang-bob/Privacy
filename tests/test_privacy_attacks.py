@@ -4,6 +4,7 @@ import itertools
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,6 +15,7 @@ from aggregator.fedavg_aggregator import aggregate_fedavg_model_states
 from main import default_config, validate_config
 from privacy_attacks.code_poison import generate_membership_encoding_samples
 from privacy_attacks.auditor import MembershipAuditor
+from privacy_attacks.base import AttackResult
 from privacy_attacks.fedmia import run_fedmia
 from privacy_attacks.fedmia_baselines import run_fedmia_baseline
 from privacy_attacks.metrics import fit_shrinkage_attack, membership_metrics
@@ -90,6 +92,39 @@ def test_membership_metrics_and_secret_samples_are_deterministic():
     assert not torch.equal(first[0], first[1])
 
 
+def test_attack_summary_marks_unresolvable_low_fpr_as_not_reportable():
+    labels = torch.tensor([1, 1, 0, 0])
+    result = AttackResult(
+        name="fedmia_loss",
+        scores=torch.tensor([0.9, 0.8, 0.2, 0.1]),
+        labels=labels,
+        sample_indices=torch.arange(4),
+    )
+    summary = result.to_summary()
+    assert summary["tpr_at_fpr_0.001"] == 1.0
+    assert summary["reportable_metrics"]["tpr_at_fpr_0.001"] is None
+    assert not summary["metric_availability"]["tpr_at_fpr_0.001"]["resolvable"]
+
+
+def test_training_health_rejects_uniform_zero_update_run(tmp_path):
+    server = ServerBase.__new__(ServerBase)
+    server.audit_config = {"training_health_check": True}
+    server.num_classes = 3
+    server.results_dir = str(tmp_path)
+    uniform_loss = float(torch.log(torch.tensor(3.0)))
+    server.training_metrics = [
+        {"round": 0, "loss": uniform_loss, "accuracy": 0.3, "samples": 10},
+        {"round": 1, "loss": uniform_loss, "accuracy": 0.3, "samples": 10},
+    ]
+    state = {"prompt": torch.zeros(2, 2)}
+    with pytest.raises(RuntimeError, match="Training health check failed"):
+        server._validate_training_health(state, state)
+    health = json.loads((tmp_path / "training_health.json").read_text())
+    assert not health["passed"]
+    assert "trainable_parameters_did_not_move" in health["reasons"]
+    assert "loss_stagnated_at_uniform_classifier_baseline" in health["reasons"]
+
+
 def test_cofedmid_class_partition_balances_overlap_and_coverage():
     controller = DefenseController(
         {"name": "cofedmid", "seed": 42},
@@ -158,6 +193,32 @@ def test_fedmia_can_use_max_round_aggregation():
     assert torch.any(max_result.scores > mean_result.scores)
 
 
+def test_fedmia_calibrates_tail_on_a_disjoint_stratified_split():
+    membership = torch.tensor([1] * 10 + [0] * 10)
+    target_values = torch.tensor([-2.0] * 10 + [2.0] * 10)
+    observations = [
+        {
+            "round": 0,
+            "client_ids": torch.tensor([0, 1, 2]),
+            "confidence": torch.stack(
+                (target_values, torch.zeros(20), torch.zeros(20))
+            ),
+        }
+    ]
+    result = run_fedmia(
+        observations,
+        membership,
+        0,
+        "confidence",
+        tail="calibrated",
+        calibration_fraction=0.3,
+        seed=7,
+    )
+    assert result.metadata["selected_tail"] == "lower"
+    assert result.metadata["tail_calibration"]["samples"] == 6
+    assert membership_metrics(result.labels, result.scores)["auc"] == 1.0
+
+
 def test_personalized_prompt_protocol_view_hides_local_parameters():
     auditor = MembershipAuditor.__new__(MembershipAuditor)
     auditor.audit_view = "protocol_plus_released_prompts"
@@ -176,7 +237,7 @@ def test_personalized_prompt_protocol_view_hides_local_parameters():
     )
     assert torch.equal(
         visible["prompt_learner.local_ctx"],
-        auditor.initial_prompt_state["prompt_learner.local_ctx"],
+        updated["prompt_learner.global_ctx"],
     )
 
     auditor.federated_method = "fedpgp"
@@ -196,11 +257,11 @@ def test_personalized_prompt_protocol_view_hides_local_parameters():
     )
     assert torch.equal(
         visible["prompt_learner.fedpgp_u"],
-        auditor.initial_prompt_state["prompt_learner.fedpgp_u"],
+        torch.zeros_like(updated["prompt_learner.fedpgp_u"]),
     )
     assert torch.equal(
         visible["prompt_learner.fedpgp_v"],
-        auditor.initial_prompt_state["prompt_learner.fedpgp_v"],
+        torch.zeros_like(updated["prompt_learner.fedpgp_v"]),
     )
 
 
@@ -649,6 +710,32 @@ def test_each_defense_runs_independently_with_one_attack():
         assert (path / "privacy_audit" / "summary.json").exists()
 
 
+def test_compact_fedmia_signal_storage_omits_unused_large_tensors(tmp_path):
+    path = tmp_path / "compact_signals"
+    summaries = _defended_server(path, "none", attack="fedmia_loss").train()
+    assert [item["attack"] for item in summaries] == ["fedmia_loss"]
+    payload = torch.load(
+        path / "privacy_audit" / "signals.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert payload["storage_mode"] == "compact"
+    assert payload["observations"]
+    assert set(payload["observations"][0]) == {
+        "round",
+        "client_ids",
+        "confidence",
+    }
+    summary = json.loads(
+        (path / "privacy_audit" / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["signal_storage"]["stored_observation_fields"] == [
+        "client_ids",
+        "confidence",
+        "round",
+    ]
+
+
 def test_local_ggeur_mean_noise_is_local_deterministic_and_preserves_covariance():
     features = torch.tensor(
         [[1.0, 0.0], [0.8, 0.2], [0.0, 1.0], [0.2, 0.8]]
@@ -717,6 +804,20 @@ def test_membership_candidates_support_larger_proportionally_matched_nonmembers(
     )
     assert labels.numel() == 9
     assert torch.equal(torch.bincount(labels, minlength=2), torch.tensor([6, 3]))
+
+
+def test_exact_label_matching_rejects_unavailable_member_class():
+    auditor = MembershipAuditor.__new__(MembershipAuditor)
+    auditor.model = SimpleNamespace(classnames=["zero", "one"])
+    auditor.seed = 29
+    auditor.collate_fn = None
+    member_labels = torch.tensor([0, 0, 1, 1])
+    dataset = TensorDataset(
+        torch.arange(3, dtype=torch.float32).view(3, 1),
+        torch.tensor([0, 0, 1]),
+    )
+    with pytest.raises(ValueError, match="Exact label-distribution matching"):
+        auditor._collect_label_matched([dataset], member_labels, limit=8)
 
 
 def test_auditor_recovers_training_examples_excluded_by_few_shot_selection():
@@ -798,6 +899,7 @@ def test_dpfpl_and_fedask_run_as_fedavg_replacements():
                 "attacks": ["fedmia_loss"],
                 "max_samples_per_group": 4,
                 "audit_interval": 1,
+                "signal_storage": "full",
             },
             defense_config={"name": "hamp", "hamp_output_temperature": 2.0},
             method_config=method_config,
