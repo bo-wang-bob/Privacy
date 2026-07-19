@@ -27,7 +27,7 @@ def test_sequential_launcher_selects_gpu_with_most_free_memory(monkeypatch):
     assert selected.index == 1
 
 
-def test_parallel_gpu_selection_excludes_busy_devices(monkeypatch):
+def test_parallel_gpu_selection_keeps_all_eligible_devices(monkeypatch):
     statuses = {
         0: sweep.GPUStatus(index=0, free_memory_mb=9000, utilization_percent=5),
         1: sweep.GPUStatus(index=1, free_memory_mb=15000, utilization_percent=30),
@@ -37,19 +37,11 @@ def test_parallel_gpu_selection_excludes_busy_devices(monkeypatch):
         "_query_gpu_status",
         lambda candidates: [statuses[gpu] for gpu in candidates],
     )
-    selected = sweep._best_available_gpu(
-        [0, 1], busy_gpus={1}, minimum_free_memory_mb=7000
-    )
-    assert selected is not None and selected.index == 0
-    assert (
-        sweep._best_available_gpu(
-            [0, 1], busy_gpus={0, 1}, minimum_free_memory_mb=7000
-        )
-        is None
-    )
+    selected = sweep._best_available_gpu([0, 1], minimum_free_memory_mb=7000)
+    assert selected is not None and selected.index == 1
 
 
-def test_parallel_scheduler_starts_at_most_one_job_per_gpu(tmp_path, monkeypatch):
+def test_parallel_scheduler_allows_multiple_jobs_on_one_gpu(tmp_path, monkeypatch):
     spec_path = REPOSITORY_ROOT / "configs" / "fedmia_prompt_methods_sweep.yaml"
     import yaml
 
@@ -86,8 +78,8 @@ def test_parallel_scheduler_starts_at_most_one_job_per_gpu(tmp_path, monkeypatch
     monkeypatch.setattr(
         sweep,
         "_best_available_gpu",
-        lambda candidates, busy, _minimum: sweep.GPUStatus(
-            index=next(gpu for gpu in candidates if gpu not in busy),
+        lambda candidates, _minimum: sweep.GPUStatus(
+            index=candidates[0],
             free_memory_mb=10000,
             utilization_percent=0,
         ),
@@ -97,14 +89,13 @@ def test_parallel_scheduler_starts_at_most_one_job_per_gpu(tmp_path, monkeypatch
     result = sweep.run_sweep(
         jobs,
         tmp_path,
-        gpus=[0, 1],
+        gpus=[0],
         force=False,
         minimum_free_memory_mb=7000,
-        max_parallel_jobs=2,
+        max_parallel_jobs=3,
     )
     assert result == 0
-    assert set(launch_gpus[:2]) == {0, 1}
-    assert len(launch_gpus) == 3
+    assert launch_gpus == [0, 0, 0]
 
 
 def test_complex_fedmia_spec_expands_stable_seventy_eight_run_grid():

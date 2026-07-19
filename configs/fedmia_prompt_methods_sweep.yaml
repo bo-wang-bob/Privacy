@@ -3,7 +3,7 @@ base_config: configs/federated_prompt_paper.yaml
 results_root: results/fedmia_prompt_methods
 
 # Each job uses exactly one GPU. The default is sequential; when jobs is raised,
-# the launcher assigns concurrent jobs to distinct eligible GPUs.
+# multiple concurrent jobs may share a GPU that still meets the memory threshold.
 gpus: [0, 1]
 minimum_free_memory_mb: 7000
 jobs: 1

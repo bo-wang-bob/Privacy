@@ -421,16 +421,12 @@ def _wait_for_best_gpu(
 
 def _best_available_gpu(
     candidate_gpus: list[int],
-    busy_gpus: set[int],
     minimum_free_memory_mb: int,
 ) -> GPUStatus | None:
-    """Return the best eligible GPU that is not already running a sweep job."""
-    available = [gpu for gpu in candidate_gpus if gpu not in busy_gpus]
-    if not available:
-        return None
+    """Return the best eligible GPU, including GPUs running sweep jobs."""
     eligible = [
         status
-        for status in _query_gpu_status(available)
+        for status in _query_gpu_status(candidate_gpus)
         if status.free_memory_mb >= minimum_free_memory_mb
     ]
     if not eligible:
@@ -831,7 +827,7 @@ def run_sweep(
 ) -> int:
     if max_parallel_jobs <= 0:
         raise ValueError("jobs must be positive.")
-    effective_parallel_jobs = min(max_parallel_jobs, len(gpus))
+    effective_parallel_jobs = max_parallel_jobs
     state_path = results_root / "sweep_state.json"
     state = _load_state(state_path)
     pending = []
@@ -856,23 +852,18 @@ def run_sweep(
 
     failures = 0
     completed_count = len(jobs) - len(pending)
-    active: dict[int, ActiveRun] = {}
+    active: dict[str, ActiveRun] = {}
     try:
         while pending or active:
             while pending and len(active) < effective_parallel_jobs:
-                status = _best_available_gpu(
-                    gpus, set(active), minimum_free_memory_mb
-                )
+                status = _best_available_gpu(gpus, minimum_free_memory_mb)
                 if status is None:
                     if active:
                         break
-                    available = [gpu for gpu in gpus if gpu not in active]
-                    status = _wait_for_best_gpu(
-                        available, minimum_free_memory_mb
-                    )
+                    status = _wait_for_best_gpu(gpus, minimum_free_memory_mb)
                 job = pending.pop(0)
                 run = _launch(job, status.index, results_root / "launcher_logs")
-                active[status.index] = run
+                active[job.run_id] = run
                 state["runs"][job.run_id] = {
                     "status": "running",
                     "gpu": status.index,
@@ -889,14 +880,17 @@ def run_sweep(
                     flush=True,
                 )
 
-            finished_gpus = [
-                gpu for gpu, run in active.items() if run.process.poll() is not None
+            finished_run_ids = [
+                run_id
+                for run_id, run in active.items()
+                if run.process.poll() is not None
             ]
-            if not finished_gpus:
+            if not finished_run_ids:
                 time.sleep(2)
                 continue
-            for gpu in finished_gpus:
-                run = active.pop(gpu)
+            for run_id in finished_run_ids:
+                run = active.pop(run_id)
+                gpu = run.gpu
                 return_code = int(run.process.returncode)
                 run.log_file.close()
                 result_dir = _completed_result(run.job)
@@ -923,9 +917,9 @@ def run_sweep(
             f"Interrupt received; terminating {len(active)} active experiment(s)...",
             flush=True,
         )
-        for gpu, run in active.items():
+        for run in active.values():
             run.process.terminate()
-        for gpu, run in active.items():
+        for run in active.values():
             try:
                 run.process.wait(timeout=20)
             except subprocess.TimeoutExpired:
@@ -933,7 +927,7 @@ def run_sweep(
             run.log_file.close()
             state["runs"][run.job.run_id] = {
                 "status": "interrupted",
-                "gpu": gpu,
+                "gpu": run.gpu,
                 "finished_at": time.time(),
             }
         _save_state(state_path, state)
@@ -972,8 +966,8 @@ def parse_args() -> argparse.Namespace:
         "--jobs",
         type=int,
         help=(
-            "Maximum concurrent tasks. Defaults to 1; concurrency cannot exceed "
-            "the number of candidate GPUs, and each GPU runs at most one task."
+            "Maximum concurrent tasks. Defaults to 1; multiple tasks may share "
+            "a candidate GPU when it still meets the free-memory threshold."
         ),
     )
     parser.add_argument(
