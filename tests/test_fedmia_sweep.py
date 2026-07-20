@@ -226,6 +226,56 @@ def test_prompt_method_fewshot_spec_caps_system_pool_and_uses_dirichlet():
         validate_config(job.config)
 
 
+def test_fewshot_job_hyperparameters_report_effective_configuration():
+    spec_path = (
+        REPOSITORY_ROOT
+        / "configs"
+        / "fedmia_prompt_methods_fewshot_sweep.yaml"
+    )
+    import yaml
+
+    with spec_path.open("r", encoding="utf-8") as file:
+        spec = yaml.safe_load(file)
+    jobs, _ = build_jobs(spec, spec_path)
+    job = next(
+        item
+        for item in jobs
+        if item.dataset == "cifar100" and item.method == "fedotp"
+    )
+
+    parameters = sweep._job_hyperparameters(job)
+    assert parameters["data"] == {
+        "partition_mode": "dirichlet",
+        "fpl_shots": 16,
+        "dirichlet_alpha": 0.1,
+        "use_full_dataset": False,
+    }
+    assert parameters["federated"] == {
+        "total_users": 10,
+        "sample_users": 10,
+        "num_global_iters": 50,
+        "local_epochs": 2,
+    }
+    assert parameters["optimization"]["learning_rate"] == 0.001
+    assert parameters["method_parameters"] == job.config["fedotp"]
+    assert parameters["privacy_audit"]["attacks"] == [
+        "fedmia_loss",
+        "fedmia_cosine",
+    ]
+    block = sweep._job_hyperparameters_block(job)
+    assert block.startswith("=" * 88)
+    assert f"HYPERPARAMETERS | {job.run_id}" in block
+    assert "  data.partition_mode" in block
+    assert " : dirichlet" in block
+    assert (
+        "privacy_audit.attacks"
+        in block
+        and "fedmia_loss, fedmia_cosine" in block
+    )
+    assert "{" not in block and '"' not in block and "[" not in block
+    assert block.endswith("=" * 88)
+
+
 def test_sweep_cli_fewshot_values_override_full_dataset_yaml():
     spec_path = REPOSITORY_ROOT / "configs" / "fedmia_prompt_methods_sweep.yaml"
     import yaml

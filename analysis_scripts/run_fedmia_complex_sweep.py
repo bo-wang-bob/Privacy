@@ -110,6 +110,94 @@ def _stable_run_id(
     return f"{prefix}{defense}_seed{seed}_target{target_client_id}_{digest}"
 
 
+def _job_hyperparameters(job: SweepJob) -> dict[str, Any]:
+    """Return the effective, user-facing hyperparameters for one run."""
+    config = job.config
+    audit = config.get("audit", {})
+    method_parameters = config.get(job.method, {})
+    return {
+        "dataset": job.dataset,
+        "method": job.method,
+        "seed": job.seed,
+        "data": {
+            "partition_mode": config.get("partition_mode"),
+            "fpl_shots": config.get("fpl_shots"),
+            "dirichlet_alpha": config.get("dirichlet_alpha"),
+            "use_full_dataset": config.get("use_full_dataset"),
+        },
+        "federated": {
+            "total_users": config.get("total_users"),
+            "sample_users": config.get("sample_users"),
+            "num_global_iters": config.get("num_global_iters"),
+            "local_epochs": config.get("local_epochs"),
+        },
+        "optimization": {
+            "learning_rate": config.get("learning_rate"),
+            "batch_size": config.get("batch_size"),
+            "eval_batch_size": config.get("eval_batch_size"),
+            "eval_interval": config.get("eval_interval"),
+        },
+        "prompt": {
+            "n_ctx": config.get("n_ctx"),
+            "class_specific_ctx": config.get("class_specific_ctx"),
+        },
+        "method_parameters": method_parameters,
+        "privacy_audit": {
+            "attacks": audit.get("attacks", []),
+            "audit_client_ids": audit.get("audit_client_ids"),
+            "audit_interval": audit.get("audit_interval"),
+            "max_member_samples": audit.get("max_member_samples"),
+            "max_nonmember_samples": audit.get("max_nonmember_samples"),
+            "fedmia_tail": audit.get("fedmia_tail"),
+            "fedmia_loss_aggregation": audit.get("fedmia_loss_aggregation"),
+            "fedmia_cosine_aggregation": audit.get(
+                "fedmia_cosine_aggregation"
+            ),
+        },
+        "defense": config.get("defense", {"name": job.defense}),
+    }
+
+
+def _flatten_hyperparameters(
+    value: dict[str, Any], prefix: str = ""
+) -> list[tuple[str, Any]]:
+    flattened = []
+    for key, item in value.items():
+        dotted_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(item, dict):
+            flattened.extend(_flatten_hyperparameters(item, dotted_key))
+        else:
+            flattened.append((dotted_key, item))
+    return flattened
+
+
+def _display_hyperparameter(value: Any) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, tuple)):
+        return ", ".join(_display_hyperparameter(item) for item in value)
+    return str(value)
+
+
+def _job_hyperparameters_block(job: SweepJob) -> str:
+    divider = "=" * 88
+    flattened = _flatten_hyperparameters(_job_hyperparameters(job))
+    key_width = max(len(key) for key, _value in flattened)
+    parameter_lines = "\n".join(
+        f"  {key:<{key_width}} : {_display_hyperparameter(value)}"
+        for key, value in flattened
+    )
+    return (
+        f"{divider}\n"
+        f"HYPERPARAMETERS | {job.run_id}\n"
+        f"{divider}\n"
+        f"{parameter_lines}\n"
+        f"{divider}"
+    )
+
+
 def build_jobs(
     spec: dict[str, Any],
     spec_path: Path,
@@ -475,6 +563,7 @@ def _launch(job: SweepJob, gpu: int, logs_root: Path) -> ActiveRun:
         str(gpu),
     ]
     log_file.write("COMMAND " + " ".join(command) + "\n")
+    log_file.write(_job_hyperparameters_block(job) + "\n")
     log_file.flush()
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
@@ -906,6 +995,7 @@ def run_sweep(
                         break
                     status = _wait_for_best_gpu(gpus, minimum_free_memory_mb)
                 job = pending.pop(0)
+                print(_job_hyperparameters_block(job), flush=True)
                 run = _launch(job, status.index, results_root / "launcher_logs")
                 active[job.run_id] = run
                 state["runs"][job.run_id] = {
@@ -1112,19 +1202,7 @@ def main() -> int:
     if args.dry_run:
         print(f"Expanded {len(jobs)} jobs; results_root={results_root}")
         for job in jobs:
-            print(
-                job.run_id,
-                f"dataset={job.dataset}",
-                f"method={job.method}",
-                f"seed={job.seed}",
-                f"target={job.target_client_id}",
-                f"defense={job.defense}",
-                f"rounds={job.config.get('num_global_iters')}",
-                f"shots={job.config.get('fpl_shots')}",
-                f"partition={job.config.get('partition_mode')}",
-                f"alpha={job.config.get('dirichlet_alpha')}",
-                json.dumps(job.defense_parameters, sort_keys=True),
-            )
+            print(_job_hyperparameters_block(job))
         return 0
     if args.summarize_only:
         complete_runs, attack_rows = summarize(jobs, results_root)

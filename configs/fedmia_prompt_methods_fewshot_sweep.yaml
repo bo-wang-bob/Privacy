@@ -58,7 +58,7 @@ common:
   fpl_shots: 16
   dirichlet_alpha: 0.1
   local_epochs: 2
-  learning_rate: 0.0001
+  learning_rate: 0.001
   batch_size: 16
   eval_batch_size: 64
   eval_interval: 5
