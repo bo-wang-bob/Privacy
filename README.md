@@ -1,138 +1,197 @@
-# 联邦提示学习隐私攻击与防御基准
+# Federated CLIP Soft-Prompt Membership Privacy Benchmark
 
-本仓库保留冻结 CLIP 骨干上的联邦 soft-prompt 学习，并提供统一的成员推理攻击、独立防御和联邦训练方法接口。后门触发器、恶意客户端逻辑与 SEISMOGRAPH 防御均不在本仓库中。
+本仓库用于研究联邦 CLIP soft-prompt tuning 中的成员隐私风险。系统冻结
+CLIP 骨干，只训练可学习提示参数，并在统一训练流程中提供联邦方法、数据划分、
+成员推理攻击、隐私防御和实验结果汇总。
 
-## 联邦训练方法
+仓库聚焦成员隐私审计，不包含后门触发器、恶意客户端投毒、ASR 指标或
+SEISMOGRAPH 防御。
 
-运行时用 `--aggregator` 选择：
+## 核心能力
 
-- `fedavg`：保留历史提示词构造的标准 FedAvg；训练骨架与 PromptFL 相同。
-- `promptfl`：论文 PromptFL 基线。客户端只优化共享 CoOp soft prompt，服务器按客户端样本数执行 FedAvg。
-- `fedotp`：每个客户端同时优化全局/本地完整 prompt，以熵正则部分最优传输匹配图像 patch 与两类文本 prompt；只聚合全局 prompt。
-- `fedpgp`：全局 prompt 加客户端低秩个性化项，使用论文的任务损失与 prompt-wise 对比损失；只聚合全局 prompt。
-- `dpfpl`：适配 ICLR 2025 DP-FPL。每个客户端持久保留本地提示，服务器同步全局提示；本地提示使用低秩梯度投影/重构和局部高斯机制，全局上传使用裁剪与服务器高斯机制。
-- `fedask`：适配 NeurIPS 2025 FedASK。soft prompt 被参数化为冻结初始提示加 `B·A`；客户端固定 `A`，对完整 prompt 梯度做逐样本裁剪和扰动后更新 `B`，服务器执行两阶段随机草图、QR 与 SVD 重构 `A/B`。
+| 模块 | 支持内容 |
+| --- | --- |
+| 联邦训练 | FedAvg、PromptFL、FedOTP、FedPGP、DP-FPL、FedASK |
+| 数据划分 | IID、Dirichlet non-IID、pathological label split、全量和 few-shot 训练 |
+| 隐私审计 | 单客户端攻击和多客户端池化攻击；统一输出 AUC 与低 FPR 下的 TPR |
+| 隐私防御 | 更新扰动、稀疏化、Mixup、采样、数据增强、CoFedMID、Prompt-DP、MIST、SOFT、HAMP、VEIL |
+| 实验管理 | YAML 配置、命令行覆盖、批量 sweep、断点识别和 CSV 汇总 |
 
-三个论文提示学习方法可直接使用统一配置运行：
+所有训练和聚合操作只处理 `requires_grad=True` 的参数。客户端状态和跨轮次
+审计信号使用 detached tensor 副本，避免共享可变状态。
 
-```bash
-python main.py --config configs/federated_prompt_paper.yaml --aggregator promptfl
-python main.py --config configs/federated_prompt_paper.yaml --aggregator fedotp
-python main.py --config configs/federated_prompt_paper.yaml --aggregator fedpgp
+## 仓库结构
+
+```text
+.
+├── main.py                 # 训练与审计入口
+├── aggregator/             # 联邦聚合与个性化方法
+├── trainmodel/             # CLIP soft-prompt 模型
+├── users/                  # 客户端本地训练逻辑
+├── servers/                # 联邦训练循环
+├── privacy_attacks/        # 成员推理攻击与统一审计器
+├── privacy_defenses/       # 独立隐私防御
+├── utils/                  # 数据划分和隐私会计
+├── configs/                # 单次实验与 sweep 配置
+├── scripts/                # 实验启动脚本
+├── analysis_scripts/       # 结果汇总、重放和绘图工具
+├── docs/                   # 方法与实现说明
+└── tests/                  # 不依赖数据集或 CLIP 权重的轻量测试
 ```
 
-该配置关闭隐私攻击和额外防御，以单独验证论文训练目标。FedOTP/FedPGP 自动启用客户端个性化状态；PromptFL 使用共享全局状态。方法超参数分别位于配置文件的 `fedotp:`、`fedpgp:` 段中。
+## 环境准备
 
-三种方法的 FedMIA-Loss/FedMIA-Cosine 完整审计可一键运行：
+推荐使用 Python 3.10 或更高版本：
 
 ```bash
-./scripts/run_fedmia_prompt_methods.sh
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 ```
 
-新增的 few-shot 设置先从整个联邦系统的训练集为每个类别抽取 16 张
-图片，再以 Dirichlet α=0.1 将这个共享样本池划分给客户端；测试集不做
-few-shot 截断。默认配置和一键命令分别为
-`configs/fedmia_prompt_methods_fewshot_sweep.yaml` 与：
+GPU 实验需要与当前 CUDA 环境匹配的 PyTorch。
+
+### CLIP 权重
+
+程序仅以 `local_files_only=True` 加载 `openai/clip-vit-base-patch32`，不会在
+运行时下载权重。请提前准备本地 Transformers 缓存，并在配置中设置：
+
+```yaml
+cache_dir: ./checkpoints/clip-vit-base-patch32
+```
+
+### 数据集
+
+数据加载器使用本地数据，`download=False`。请将数据放在 `data_root` 下，
+并在 YAML 中设置数据集名称和路径：
+
+```yaml
+dataset_name: cifar100
+data_root: ./data
+```
+
+当前加载器支持 MNIST、FashionMNIST、CIFAR-10、CIFAR-100、SVHN、
+Tiny ImageNet、Caltech101、Oxford-IIIT Pets、Flowers102、Food101、
+Caltech256、FGVC-Aircraft 和 DTD。不同数据集的目录约定见
+[`utils/data_loader.py`](utils/data_loader.py)。
+
+## 快速开始
+
+### 仅运行联邦提示学习
+
+以下命令使用 PromptFL 训练，不启用攻击或防御：
+
+```bash
+python main.py \
+  --config configs/federated_prompt_paper.yaml \
+  --aggregator promptfl
+```
+
+将 `promptfl` 替换为 `fedavg`、`fedotp`、`fedpgp`、`dpfpl` 或 `fedask`
+即可选择其他联邦方法。各方法专用参数位于配置文件的同名段中。
+
+### 运行单个攻击与防御
+
+```bash
+python main.py \
+  --config configs/fedprompt_privacy.yaml \
+  --aggregator promptfl \
+  --attack fedmia_loss \
+  --defense none
+```
+
+`--attack none` 可关闭攻击，`--defense none` 可关闭防御。也可以通过
+`--audit_attacks` 传入逗号分隔的多个攻击名称。
+
+### 运行 Few-shot 多客户端审计
 
 ```bash
 ./scripts/run_fedmia_prompt_methods_fewshot.sh
 ```
 
-该脚本默认只展开 PromptFL 的 5 个数据集、3 个随机种子，共 15 个任务。
-如需运行其他架构，可显式覆盖方法过滤条件：
+该脚本默认运行 PromptFL。可覆盖方法、few-shot 数量、Dirichlet 系数和轮数：
 
 ```bash
 ./scripts/run_fedmia_prompt_methods_fewshot.sh \
-  --methods promptfl,fedotp,fedpgp
+  --methods promptfl,fedotp,fedpgp \
+  --fpl-shots 8 \
+  --dirichlet-alpha 0.5 \
+  --rounds 75
 ```
 
-可直接从脚本覆盖每类图片数和异构程度，例如：
+## 多客户端成员隐私审计
 
-```bash
-./scripts/run_fedmia_prompt_methods_fewshot.sh \
-  --fpl-shots 8 --dirichlet-alpha 0.5 --rounds 75
+设置 `audit.audit_client_ids: all` 或提供多个客户端 ID 时，审计器会先在每个
+客户端上独立执行攻击，再汇总所有预测。成员和非成员候选在客户端内按类别
+精确配对，避免客户端身份或类别分布直接泄露成员标签。
+
+当前支持池化执行的攻击为：
+
+- `loss_series`
+- `grad_cosine`
+- `avg_cosine`
+- `fedmia_loss`
+- `fedmia_cosine`
+- `nasr_passive`
+- `transfer_representation`
+- `rmia`
+- `quantile_mia`
+
+非 FedMIA 分数使用客户端内、无成员标签的经验 CDF 秩校准后再合并；FedMIA
+保留自身的零假设 CDF。汇总文件同时包含总体指标、客户端宏平均指标和逐客户
+端指标。多客户端审计需要：
+
+```yaml
+audit:
+  enabled: true
+  audit_client_ids: all
+  match_candidate_labels: true
 ```
 
-`--shots` 是 `--fpl-shots` 的简写。两个参数也可用于原有 sweep
-启动器；命令行值优先于 YAML，并自动启用 Dirichlet 划分和关闭
-full-data 模式。通信轮数默认是 50；可用 `--rounds N` 覆盖，
-`--num-global-iters N` 是它的等价写法。
+完整攻击定义和威胁模型见 [`docs/attack_mapping.md`](docs/attack_mapping.md)。
 
-few-shot 隐私审计会继续执行逐客户端、逐类别的成员/非成员精确配对，并在
-同一次训练中运行 `loss_series`、`grad_cosine`、`avg_cosine`、两种 FedMIA、
-`nasr_passive`、`transfer_representation`、`rmia` 和 `quantile_mia`。FedMIA
-使用自身的零假设 CDF；其余攻击先做客户端内、无成员标签的经验 CDF 秩
-校准，再合并不同客户端的分数。`summary.json` 同时保留总体、客户端宏平均
-和逐客户端指标。若极端 Dirichlet 划分使个别客户端不足两对候选，或该
-客户端没有参与任何可用通信轮次，池化审计会跳过该客户端并记录原因；
-攻击指标只根据实际审计到的客户端和样本计算。样本量不足以解析某档 FPR
-时，该指标保持不可报告，而不会输出伪精确结果。
+## 配置说明
 
-few-shot sweep 对所有数据集统一使用 10 个客户端、每轮 10 个客户端全部
-参与、默认 50 个通信轮，并在每个客户端执行 2 个本地 epochs。
+实验主要通过 YAML 管理，常用字段包括：
 
-启动器默认使用 `--jobs 1` 顺序执行；可通过 `--jobs N` 设置最大并发任务数。每个任务只使用一张卡，但同一张候选 GPU 可以同时运行多个任务；每次启动任务时都会选择满足显存门槛且空闲显存最多的卡。因此并发数可以超过候选 GPU 数，但 `--jobs` 和显存门槛应按实际显存容量设置。实验支持断点续跑，汇总结果位于 `results/fedmia_prompt_methods/summary_privacy_metrics.csv`，其中 TPR 以百分数报告，并同时给出 FPR=0.1%、1%、10% 三档结果与 AUC。
+- `aggregator`：联邦训练方法；
+- `total_users`、`sample_users`：客户端总数和每轮参与数；
+- `partition_mode`：`iid`、`dirichlet`、`pathological` 或 `auto`；
+- `fpl_shots`、`use_full_dataset`：few-shot 或全量训练；
+- `audit`：攻击列表、审计客户端、候选数量和攻击参数；
+- `defense`：独立防御名称和参数；
+- `results_dir`：运行输出根目录。
 
-该 sweep 在一次训练中对 10 个客户端执行多攻击池化审计。每个客户端分别从本地训练集和同客户端测试集按类别一一配对成员与非成员，再合并攻击分数；因此 pathological 标签划分不会让攻击通过类别归属取巧。每个客户端最多贡献 128 对候选，合并后的 1280 个非成员可分辨 FPR=0.1% 档位。CIFAR100 有 50 个训练客户端，但同样固定审计前 10 个客户端以控制计算量。
+命令行参数会覆盖 YAML 中对应字段。可用配置位于 [`configs/`](configs/)，
+联邦方法与防御的实现说明分别见
+[`docs/federated_methods.md`](docs/federated_methods.md) 和
+[`docs/defenses.md`](docs/defenses.md)。
 
-方法细节和论文对应关系见 [docs/federated_methods.md](docs/federated_methods.md)。
-Flowers102 同场景公平比较和 VEIL（原 Local-GGEUR）优化结果见
-[docs/flowers_fair_method_comparison.md](docs/flowers_fair_method_comparison.md)。
-AAAI 2027 论文源码位于 [paper/aaai2027/veil.tex](paper/aaai2027/veil.tex)。
+## 输出文件
 
-## 攻击与防御
+每次运行会在 `results_dir` 下创建独立目录，主要包含：
 
-成员推理攻击包括 Nasr 被动/主动攻击、FedMIA、表示迁移、CodePoison、PIPRA、RMIA、IMIA、Quantile-MIA、YOQO、Canary 和 PromptMIA。映射说明见 [docs/attack_mapping.md](docs/attack_mapping.md)。
+- `run_config.yaml`：合并命令行覆盖后的实际配置；
+- `run.log`：训练、评估与审计日志；
+- `training_metrics.csv`：各评估轮次的损失与准确率；
+- `training_health.json`：训练状态健康检查；
+- `final_prompt.pt`：最终可训练提示参数；
+- `federated_method_summary.json`：联邦方法配置与诊断；
+- `defense_summary.json`：防御配置、统计与隐私会计；
+- `privacy_audit/summary.json`：攻击指标和逐客户端元数据；
+- `privacy_audit/predictions.csv`：逐候选成员分数；
+- `privacy_audit/signals.pt`：可选的跨轮次审计信号。
 
-可独立选择 `cofedmid`、`prompt_dp`、`mist`、`soft`、`hamp`、`veil`
-六种防御；`local_ggeur`、`mirage` 仅保留为 VEIL 的历史兼容名。详见
-[docs/defenses.md](docs/defenses.md)。一次运行可指定：
-
-```bash
-# 一个方法 + 一个攻击 + 一个防御
-python main.py --config configs/fedprompt_privacy.yaml \
-  --aggregator dpfpl --attack fedmia_loss --defense prompt_dp
-
-# FedASK + 仅攻击
-python main.py --config configs/fedprompt_privacy.yaml \
-  --aggregator fedask --attack pipra --defense none
-
-# DP-FPL + 仅防御
-python main.py --config configs/fedprompt_privacy.yaml \
-  --aggregator dpfpl --attack none --defense hamp
-```
-
-DP-FPL/FedASK 参数在配置文件的 `dpfpl:` 与 `fedask:` 段中设置。DP-FPL 自动使用个性化客户端状态；FedAvg、PromptFL 和 FedASK 使用共享全局状态。
-
-可以通过 `audit.audit_view` 明确攻击者可见性。默认的 `protocol_plus_released_prompts` 仅把真实上传消息用于更新攻击，并允许查询公开 prompt；也可选择 `released_prompt` 或用于强上界的 `full_whitebox`。方法摘要会报告保守的隐私预算和 FedASK 草图重构诊断。
-
-## 环境
-
-推荐 Python 3.10+：
-
-```bash
-pip install -r requirements.txt
-```
-
-CLIP 始终通过 `local_files_only=True` 加载。请提前把 `openai/clip-vit-base-patch32` 放入 `cache_dir` 指定的本地缓存；程序不会下载模型权重。
-
-## 输出
-
-每次运行会生成：
-
-- `run_config.yaml`：实际运行配置；
-- `training_metrics.csv`：任务损失与准确率；
-- `final_prompt.pt`：最终可训练提示状态；
-- `federated_method_summary.json`：联邦方法、隐私参数及重构/裁剪诊断；
-- `defense_summary.json`：所选防御及统计；
-- `privacy_audit/`：攻击分数、指标和审计信号（启用攻击时）。
+`signal_storage` 可设置为 `none`、`compact` 或 `full`，用于控制审计信号的
+保存范围。
 
 ## 测试
 
-轻量测试不需要数据集或 CLIP 权重：
+轻量测试不需要数据集、GPU 或 CLIP 检查点：
 
 ```bash
 python -m pytest -q
 ```
 
-本仓库报告的是论文方法在联邦 CLIP soft-prompt 场景中的适配结果。模型、数据划分与威胁模型和原论文实验可能不同，不能把这里的数值直接视为论文复现数值。
+测试覆盖联邦聚合、few-shot 数据划分、攻击与防御接口、审计池化、信号压缩
+和 sweep 配置。

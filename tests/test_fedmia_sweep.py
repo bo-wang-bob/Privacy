@@ -268,7 +268,7 @@ def test_fewshot_job_hyperparameters_report_effective_configuration():
         "num_global_iters": 50,
         "local_epochs": 2,
     }
-    assert parameters["optimization"]["learning_rate"] == 0.001
+    assert parameters["optimization"]["learning_rate"] == 0.005
     assert parameters["method_parameters"] == job.config["fedotp"]
     assert parameters["privacy_audit"]["attacks"] == FIRST_BATCH_ATTACKS
     block = sweep._job_hyperparameters_block(job)
