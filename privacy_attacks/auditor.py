@@ -57,6 +57,34 @@ SUPPORTED_ATTACKS = {
     "promptmia",
 }
 
+# These attacks can be evaluated client by client from one shared observation
+# trajectory, then combined without treating client identity as membership
+# evidence. Active/query attacks remain single-client because their probes must
+# be scheduled and accounted for separately for every target user.
+POOLED_CLIENT_ATTACKS = {
+    "loss_series",
+    "grad_cosine",
+    "avg_cosine",
+    "nasr_passive",
+    "fedmia_loss",
+    "fedmia_cosine",
+    "transfer_representation",
+    "rmia",
+    "quantile_mia",
+}
+
+_CLIENT_CANDIDATE_FIELDS = {
+    "confidence",
+    "cosine",
+    "gradient_difference",
+    "probabilities",
+    "representations",
+}
+_CANDIDATE_FIELDS = {
+    "gradient_signature",
+    "candidate_labels",
+}
+
 
 class MembershipAuditor:
     """Collect once, then run all configured prompt-tuning membership attacks."""
@@ -166,12 +194,10 @@ class MembershipAuditor:
         ):
             raise ValueError("audit_client_ids must contain unique existing clients.")
         self.pooled_client_audit = len(self.audit_client_ids) > 1
-        if self.pooled_client_audit and set(self.attacks) - {
-            "fedmia_loss",
-            "fedmia_cosine",
-        }:
+        if self.pooled_client_audit and set(self.attacks) - POOLED_CLIENT_ATTACKS:
             raise ValueError(
-                "Multi-client pooled auditing supports only FedMIA Loss and Cosine."
+                "Multi-client pooled auditing supports only: "
+                + ", ".join(sorted(POOLED_CLIENT_ATTACKS))
             )
         self.num_classes = int(
             num_classes
@@ -1020,6 +1046,10 @@ class MembershipAuditor:
                 "audited client must participate in a round with another client."
             )
         name = "fedmia_loss" if measurement == "confidence" else "fedmia_cosine"
+        per_client_metrics = {
+            str(client_id): self._pooled_client_metadata(result)
+            for client_id, result in zip(evaluated_client_ids, client_results)
+        }
         return AttackResult(
             name=name,
             scores=torch.cat([result.scores for result in client_results]),
@@ -1035,6 +1065,208 @@ class MembershipAuditor:
                 "measurement": measurement,
                 "round_aggregation": aggregation,
                 "tail_policy": tail,
+                "score_pooling": "native_fedmia_null_cdf",
+                "macro_metrics": self._macro_client_metrics(per_client_metrics),
+                "per_client_metrics": per_client_metrics,
+                "per_client": {
+                    str(client_id): result.metadata
+                    for client_id, result in zip(
+                        evaluated_client_ids, client_results
+                    )
+                },
+            },
+        )
+
+    @staticmethod
+    def _slice_candidate_observations(
+        observations: list[dict], candidate_indices: torch.Tensor
+    ) -> list[dict]:
+        """Select one client's candidates without mutating stored round signals."""
+        candidate_indices = candidate_indices.detach().cpu().long()
+        selected = []
+        for observation in observations:
+            sliced = {}
+            for key, value in observation.items():
+                if key in _CLIENT_CANDIDATE_FIELDS:
+                    sliced[key] = value.index_select(1, candidate_indices)
+                elif key in _CANDIDATE_FIELDS:
+                    sliced[key] = value.index_select(0, candidate_indices)
+                else:
+                    sliced[key] = value
+            selected.append(sliced)
+        return selected
+
+    @staticmethod
+    def _client_rank_scores(scores: torch.Tensor) -> torch.Tensor:
+        """Map scores to a label-free within-client empirical CDF."""
+        values = scores.detach().to(device="cpu", dtype=torch.float64).flatten()
+        _, inverse, counts = torch.unique(
+            values,
+            sorted=True,
+            return_inverse=True,
+            return_counts=True,
+        )
+        upper = counts.cumsum(dim=0).to(torch.float64)
+        lower = upper - counts
+        average_rank = lower + (counts.to(torch.float64) + 1.0) / 2.0
+        return (average_rank[inverse] / values.numel()).to(torch.float32)
+
+    @staticmethod
+    def _pooled_client_metadata(result: AttackResult) -> dict:
+        summary = result.to_summary()
+        return {
+            "auc": summary["auc"],
+            "reportable_metrics": summary["reportable_metrics"],
+            "member_count": summary["member_count"],
+            "nonmember_count": summary["nonmember_count"],
+            "num_samples": summary["num_samples"],
+            "attack_metadata": result.metadata,
+        }
+
+    @staticmethod
+    def _macro_client_metrics(per_client: dict[str, dict]) -> dict:
+        metric_keys = (
+            "auc",
+            "tpr_at_fpr_0.1",
+            "tpr_at_fpr_0.01",
+            "tpr_at_fpr_0.001",
+        )
+        macro = {}
+        for key in metric_keys:
+            values = []
+            for client in per_client.values():
+                value = (
+                    client["auc"]
+                    if key == "auc"
+                    else client["reportable_metrics"].get(key)
+                )
+                if value is not None:
+                    values.append(float(value))
+            if not values:
+                macro[key] = {"mean": None, "std": None, "clients": 0}
+                continue
+            tensor = torch.tensor(values, dtype=torch.float64)
+            macro[key] = {
+                "mean": float(tensor.mean()),
+                "std": float(tensor.std(unbiased=False)),
+                "clients": len(values),
+            }
+        return macro
+
+    def _run_pooled_client_once(
+        self,
+        attack: str,
+        client_id: int,
+        indices: torch.Tensor,
+    ) -> AttackResult:
+        observations = self._slice_candidate_observations(
+            self.observations, indices
+        )
+        membership = self.membership[indices]
+        labels = self.labels[indices]
+        seed = self.seed + 1009 * client_id
+        if attack in {"loss_series", "grad_cosine", "avg_cosine"}:
+            return run_fedmia_baseline(
+                observations,
+                membership,
+                client_id,
+                attack,
+                self.config.get("fedmia_baseline_single_round", "last"),
+            )
+        if attack == "nasr_passive":
+            return run_passive_whitebox(
+                observations,
+                membership,
+                client_id,
+                self.calibration_fraction,
+                seed,
+            )
+        if attack == "transfer_representation":
+            return run_transfer_representation_attack(
+                observations,
+                membership,
+                client_id,
+                self.calibration_fraction,
+                seed,
+            )
+        if attack == "rmia":
+            return run_rmia(
+                observations,
+                membership,
+                labels,
+                client_id,
+                float(self.config.get("auxiliary_fraction", 0.5)),
+                seed,
+                offline_a=float(self.config.get("rmia_offline_a", 0.3)),
+                gamma=float(self.config.get("rmia_gamma", 1.0)),
+            )
+        if attack == "quantile_mia":
+            return run_quantile_mia(
+                observations,
+                membership,
+                labels,
+                client_id,
+                float(self.config.get("auxiliary_fraction", 0.5)),
+                seed,
+                quantile=float(self.config.get("qmia_quantile", 0.9)),
+                epochs=int(self.config.get("qmia_epochs", 200)),
+                learning_rate=float(self.config.get("qmia_learning_rate", 0.01)),
+            )
+        raise AssertionError(f"Unhandled pooled membership attack {attack}")
+
+    def _run_pooled_client_attack(self, attack: str) -> AttackResult:
+        client_results = []
+        evaluated_client_ids = []
+        global_indices = []
+        skipped_clients = dict(self.skipped_audit_clients)
+        for client_id in self.audit_client_ids:
+            indices = torch.nonzero(
+                self.candidate_client_ids == client_id, as_tuple=False
+            ).flatten()
+            try:
+                result = self._run_pooled_client_once(
+                    attack, client_id, indices
+                )
+            except Exception as error:
+                if not self.allow_partial_client_audit:
+                    raise
+                skipped_clients[str(client_id)] = f"{type(error).__name__}: {error}"
+                logger.warning(
+                    "Skipping client %d in pooled %s attack: %s",
+                    client_id,
+                    attack,
+                    error,
+                )
+                continue
+            client_results.append(result)
+            evaluated_client_ids.append(client_id)
+            global_indices.append(indices[result.sample_indices])
+        if not client_results:
+            raise ValueError(f"Pooled {attack} could not evaluate any client.")
+
+        per_client_metrics = {
+            str(client_id): self._pooled_client_metadata(result)
+            for client_id, result in zip(evaluated_client_ids, client_results)
+        }
+        return AttackResult(
+            name=attack,
+            scores=torch.cat(
+                [self._client_rank_scores(result.scores) for result in client_results]
+            ),
+            labels=torch.cat([result.labels for result in client_results]),
+            sample_indices=torch.cat(global_indices),
+            metadata={
+                "scope": "pooled_clients",
+                "requested_audit_client_ids": self.requested_audit_client_ids,
+                "audit_client_ids": evaluated_client_ids,
+                "skipped_audit_clients": skipped_clients,
+                "few_shot": self.few_shot,
+                "fpl_shots": self.fpl_shots,
+                "score_pooling": (
+                    "per_client_empirical_cdf_without_membership_labels"
+                ),
+                "macro_metrics": self._macro_client_metrics(per_client_metrics),
+                "per_client_metrics": per_client_metrics,
                 "per_client": {
                     str(client_id): result.metadata
                     for client_id, result in zip(
@@ -1045,6 +1277,30 @@ class MembershipAuditor:
         )
 
     def _run(self, attack: str, final_model, final_state):
+        if self.pooled_client_audit and attack in POOLED_CLIENT_ATTACKS:
+            if attack == "fedmia_loss":
+                return self._run_fedmia_signal(
+                    "confidence",
+                    str(self.config.get("fedmia_loss_aggregation", "mean")),
+                    str(
+                        self.config.get(
+                            "fedmia_loss_tail",
+                            self.config.get("fedmia_tail", "upper"),
+                        )
+                    ),
+                )
+            if attack == "fedmia_cosine":
+                return self._run_fedmia_signal(
+                    "cosine",
+                    str(self.config.get("fedmia_cosine_aggregation", "mean")),
+                    str(
+                        self.config.get(
+                            "fedmia_cosine_tail",
+                            self.config.get("fedmia_tail", "upper"),
+                        )
+                    ),
+                )
+            return self._run_pooled_client_attack(attack)
         if attack in {
             "blackbox_loss",
             "loss_series",

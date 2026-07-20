@@ -12,7 +12,7 @@ import torch
 import yaml
 
 from aggregator.aggregator_builder import build_aggregator
-from privacy_attacks.auditor import SUPPORTED_ATTACKS
+from privacy_attacks.auditor import POOLED_CLIENT_ATTACKS, SUPPORTED_ATTACKS
 from privacy_defenses import FEDMIA_BASELINE_DEFENSES, SUPPORTED_DEFENSES
 from servers.serverbase import ServerBase
 from utils.data_loader import (
@@ -26,6 +26,46 @@ from utils.privacy_accounting import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _format_privacy_audit_summary(summaries: list[dict]) -> str:
+    """Format the final audit log without dumping full result metadata."""
+    if not summaries:
+        return "Privacy audit completed: no attack results."
+
+    lines = ["Privacy audit completed:"]
+    for summary in summaries:
+        reportable = summary.get("reportable_metrics", {})
+        auc = reportable.get("auc", summary.get("auc"))
+        primary_metric = summary.get("primary_metric", "tpr_at_fpr_0.01")
+        primary_score = summary.get("primary_score")
+        if primary_score is None:
+            primary_score = reportable.get(primary_metric)
+
+        auc_text = "n/a" if auc is None else f"{float(auc):.4f}"
+        primary_text = (
+            "n/a"
+            if primary_score is None
+            else f"{100.0 * float(primary_score):.2f}%"
+        )
+        primary_label = {
+            "tpr_at_fpr_0.1": "TPR@10%FPR",
+            "tpr_at_fpr_0.01": "TPR@1%FPR",
+            "tpr_at_fpr_0.001": "TPR@0.1%FPR",
+        }.get(primary_metric, primary_metric)
+        lines.append(
+            "  %s | AUC=%s | %s=%s | samples=%s (members=%s, non-members=%s)"
+            % (
+                summary.get("attack", "unknown"),
+                auc_text,
+                primary_label,
+                primary_text,
+                summary.get("num_samples", "n/a"),
+                summary.get("member_count", "n/a"),
+                summary.get("nonmember_count", "n/a"),
+            )
+        )
+    return "\n".join(lines)
 
 
 def _result_run_id(
@@ -179,10 +219,10 @@ def validate_config(config: dict) -> None:
     pooled_audit = audit_client_ids == "all" or (
         isinstance(audit_client_ids, list) and len(audit_client_ids) > 1
     )
-    if pooled_audit and attacks - {"fedmia_loss", "fedmia_cosine"}:
+    if pooled_audit and attacks - POOLED_CLIENT_ATTACKS:
         raise ValueError(
-            "Multi-client pooled auditing currently supports only FedMIA Loss "
-            "and FedMIA Cosine."
+            "Multi-client pooled auditing currently supports only: "
+            + ", ".join(sorted(POOLED_CLIENT_ATTACKS))
         )
     if pooled_audit and not bool(audit.get("match_candidate_labels", False)):
         raise ValueError(
@@ -577,7 +617,7 @@ def run(config: dict) -> list[dict]:
         method_config=method_config,
     )
     summaries = server.train()
-    logger.info("Privacy audit completed: %s", summaries)
+    logger.info("%s", _format_privacy_audit_summary(summaries))
     return summaries
 
 

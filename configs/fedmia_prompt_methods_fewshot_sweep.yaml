@@ -70,8 +70,15 @@ common:
     strict: true
     audit_view: protocol_plus_released_prompts
     attacks:
+      - loss_series
+      - grad_cosine
+      - avg_cosine
       - fedmia_loss
       - fedmia_cosine
+      - nasr_passive
+      - transfer_representation
+      - rmia
+      - quantile_mia
     target_client_id: 0
     audit_client_ids: all
     # A very heterogeneous few-shot split can leave a client without two
@@ -87,6 +94,10 @@ common:
     fedmia_tail: upper
     fedmia_loss_aggregation: mean
     fedmia_cosine_aggregation: mean
+    calibration_fraction: 0.5
+    auxiliary_fraction: 0.5
+    qmia_epochs: 200
+    qmia_learning_rate: 0.01
     training_health_check: true
     fedmia_signal_health_check: true
   defense:

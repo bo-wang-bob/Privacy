@@ -1,5 +1,6 @@
-import json
 import copy
+import csv
+import json
 import itertools
 from types import SimpleNamespace
 from pathlib import Path
@@ -711,6 +712,68 @@ def test_pooled_client_fedmia_uses_exact_per_class_pairs(tmp_path):
         encoding="utf-8"
     ).splitlines()[0]
     assert header == "attack,sample_index,audit_client_id,membership,score"
+
+
+def test_pooled_client_first_batch_runs_from_one_training(tmp_path):
+    attacks = [
+        "loss_series",
+        "grad_cosine",
+        "avg_cosine",
+        "fedmia_loss",
+        "fedmia_cosine",
+        "nasr_passive",
+        "transfer_representation",
+        "rmia",
+        "quantile_mia",
+    ]
+    path = tmp_path / "pooled-first-batch"
+    server = _defended_server(
+        path,
+        defense="none",
+        audit_overrides={
+            "attacks": attacks,
+            "audit_client_ids": "all",
+            "match_candidate_labels": True,
+            "max_member_samples": 4,
+            "max_nonmember_samples": 4,
+            "calibration_fraction": 0.5,
+            "auxiliary_fraction": 0.5,
+            "qmia_epochs": 2,
+        },
+    )
+
+    summaries = server.train()
+
+    assert [summary["attack"] for summary in summaries] == attacks
+    for summary in summaries:
+        metadata = summary["metadata"]
+        assert metadata["scope"] == "pooled_clients"
+        assert metadata["audit_client_ids"] == [0, 1, 2, 3]
+        assert metadata["macro_metrics"]["auc"]["clients"] == 4
+        assert set(metadata["per_client_metrics"]) == {"0", "1", "2", "3"}
+        if summary["attack"].startswith("fedmia_"):
+            assert metadata["score_pooling"] == "native_fedmia_null_cdf"
+        else:
+            assert metadata["score_pooling"] == (
+                "per_client_empirical_cdf_without_membership_labels"
+            )
+
+    with (path / "privacy_audit" / "predictions.csv").open(
+        newline="", encoding="utf-8"
+    ) as file:
+        rows = list(csv.DictReader(file))
+    assert {row["attack"] for row in rows} == set(attacks)
+    assert {int(row["audit_client_id"]) for row in rows} == {0, 1, 2, 3}
+
+
+def test_pooled_client_audit_still_rejects_blackbox_loss():
+    config = default_config()
+    config["audit"]["audit_client_ids"] = "all"
+    config["audit"]["match_candidate_labels"] = True
+    config["audit"]["attacks"] = ["blackbox_loss"]
+
+    with pytest.raises(ValueError, match="Multi-client pooled auditing"):
+        validate_config(config)
 
 
 def test_pooled_fewshot_audit_skips_clients_without_paired_candidates(tmp_path):

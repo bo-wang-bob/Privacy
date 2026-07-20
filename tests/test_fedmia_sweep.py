@@ -15,6 +15,17 @@ from main import validate_config
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+FIRST_BATCH_ATTACKS = [
+    "loss_series",
+    "grad_cosine",
+    "avg_cosine",
+    "fedmia_loss",
+    "fedmia_cosine",
+    "nasr_passive",
+    "transfer_representation",
+    "rmia",
+    "quantile_mia",
+]
 
 
 def test_sequential_launcher_selects_gpu_with_most_free_memory(monkeypatch):
@@ -220,6 +231,7 @@ def test_prompt_method_fewshot_spec_caps_system_pool_and_uses_dirichlet():
     assert all(job.config["dirichlet_alpha"] == 0.1 for job in jobs)
     for job in jobs:
         assert job.config["audit"]["audit_client_ids"] == "all"
+        assert job.config["audit"]["attacks"] == FIRST_BATCH_ATTACKS
         assert (job.config["total_users"], job.config["sample_users"]) == (10, 10)
         assert job.config["num_global_iters"] == 50
         assert job.config["local_epochs"] == 2
@@ -258,19 +270,15 @@ def test_fewshot_job_hyperparameters_report_effective_configuration():
     }
     assert parameters["optimization"]["learning_rate"] == 0.001
     assert parameters["method_parameters"] == job.config["fedotp"]
-    assert parameters["privacy_audit"]["attacks"] == [
-        "fedmia_loss",
-        "fedmia_cosine",
-    ]
+    assert parameters["privacy_audit"]["attacks"] == FIRST_BATCH_ATTACKS
     block = sweep._job_hyperparameters_block(job)
     assert block.startswith("=" * 88)
     assert f"HYPERPARAMETERS | {job.run_id}" in block
     assert "  data.partition_mode" in block
     assert " : dirichlet" in block
     assert (
-        "privacy_audit.attacks"
-        in block
-        and "fedmia_loss, fedmia_cosine" in block
+        "privacy_audit.attacks" in block
+        and ", ".join(FIRST_BATCH_ATTACKS) in block
     )
     assert "{" not in block and '"' not in block and "[" not in block
     assert block.endswith("=" * 88)
