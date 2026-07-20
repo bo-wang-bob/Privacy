@@ -9,4 +9,5 @@ exec python \
   --spec configs/fedmia_prompt_methods_fewshot_sweep.yaml \
   --gpus 0 \
   --jobs 1 \
+  --methods promptfl \
   "$@"

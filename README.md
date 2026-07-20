@@ -38,6 +38,14 @@ few-shot 截断。默认配置和一键命令分别为
 ./scripts/run_fedmia_prompt_methods_fewshot.sh
 ```
 
+该脚本默认只展开 PromptFL 的 5 个数据集、3 个随机种子，共 15 个任务。
+如需运行其他架构，可显式覆盖方法过滤条件：
+
+```bash
+./scripts/run_fedmia_prompt_methods_fewshot.sh \
+  --methods promptfl,fedotp,fedpgp
+```
+
 可直接从脚本覆盖每类图片数和异构程度，例如：
 
 ```bash
