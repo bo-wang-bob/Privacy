@@ -5,7 +5,6 @@ import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from torchvision.datasets import ImageFolder
-from tqdm import trange
 import scipy.io as sio
 from PIL import Image
 from typing import Tuple, List, Dict, Any, Optional
@@ -161,7 +160,10 @@ def generate_dirichlet_split(
 
 
 def dirichlet_partition_indices(
-    idx_by_class: List[List[int]], num_users: int, alpha: float
+    idx_by_class: List[List[int]],
+    num_users: int,
+    alpha: float,
+    max_attempts: int = 100,
 ) -> List[List[int]]:
     """
     Allocate data indices to different users based on Dirichlet distribution.
@@ -174,37 +176,62 @@ def dirichlet_partition_indices(
     Returns:
         List of index lists for each user
     """
-    user_indices: List[List[int]] = [[] for _ in range(num_users)]
-
-    for cls_idx in trange(len(idx_by_class), desc="Dirichlet data allocation"):
-        cls_indices = idx_by_class[cls_idx]
-        cls_size = len(cls_indices)
-        if cls_size == 0:
-            continue
-
-        # Shuffle indices within class
-        shuffled_indices = cls_indices.copy()
-        random.shuffle(shuffled_indices)
-
-        # Generate Dirichlet distribution proportions
-        proportions = np.random.dirichlet([alpha] * num_users)
-        # Allocate samples based on proportions
-        sample_counts = np.random.multinomial(cls_size, proportions)
-
-        # Distribute indices to users
-        start_idx = 0
-        for user_id in range(num_users):
-            end_idx = start_idx + sample_counts[user_id]
-            if end_idx > start_idx:
-                user_indices[user_id].extend(shuffled_indices[start_idx:end_idx])
-            start_idx = end_idx
-
-        assert start_idx == cls_size, (
-            f"Class {cls_idx} allocation incomplete: "
-            f"should have {cls_size} samples, actually allocated {start_idx}"
+    if num_users <= 0:
+        raise ValueError("num_users must be positive.")
+    if alpha <= 0:
+        raise ValueError("Dirichlet alpha must be positive.")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive.")
+    total_samples = sum(len(indices) for indices in idx_by_class)
+    if total_samples < num_users:
+        raise ValueError(
+            "Dirichlet partition needs at least one training sample per client: "
+            f"samples={total_samples}, num_users={num_users}."
         )
 
-    return user_indices
+    # Small alpha values and many clients can occasionally produce an empty
+    # client. A shuffled DataLoader cannot train on such a subset, so redraw
+    # the complete Dirichlet allocation while preserving the requested model.
+    for attempt in range(1, max_attempts + 1):
+        user_indices: List[List[int]] = [[] for _ in range(num_users)]
+        for cls_idx, cls_indices in enumerate(idx_by_class):
+            cls_size = len(cls_indices)
+            if cls_size == 0:
+                continue
+
+            shuffled_indices = cls_indices.copy()
+            random.shuffle(shuffled_indices)
+            proportions = np.random.dirichlet([alpha] * num_users)
+            sample_counts = np.random.multinomial(cls_size, proportions)
+
+            start_idx = 0
+            for user_id in range(num_users):
+                end_idx = start_idx + sample_counts[user_id]
+                if end_idx > start_idx:
+                    user_indices[user_id].extend(
+                        shuffled_indices[start_idx:end_idx]
+                    )
+                start_idx = end_idx
+
+            assert start_idx == cls_size, (
+                f"Class {cls_idx} allocation incomplete: "
+                f"should have {cls_size} samples, actually allocated {start_idx}"
+            )
+
+        if all(user_indices):
+            if attempt > 1:
+                logger.info(
+                    "Accepted non-empty Dirichlet allocation after %d attempts.",
+                    attempt,
+                )
+            return user_indices
+
+    raise ValueError(
+        "Dirichlet partition repeatedly produced empty clients after "
+        f"{max_attempts} attempts (samples={total_samples}, users={num_users}, "
+        f"alpha={alpha}). Increase fpl_shots or dirichlet_alpha, or reduce "
+        "total_users."
+    )
 
 
 def pathological_class_assignment(

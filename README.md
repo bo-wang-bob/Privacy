@@ -29,6 +29,35 @@ python main.py --config configs/federated_prompt_paper.yaml --aggregator fedpgp
 ./scripts/run_fedmia_prompt_methods.sh
 ```
 
+新增的 few-shot 设置先从整个联邦系统的训练集为每个类别抽取 16 张
+图片，再以 Dirichlet α=0.1 将这个共享样本池划分给客户端；测试集不做
+few-shot 截断。默认配置和一键命令分别为
+`configs/fedmia_prompt_methods_fewshot_sweep.yaml` 与：
+
+```bash
+./scripts/run_fedmia_prompt_methods_fewshot.sh
+```
+
+可直接从脚本覆盖每类图片数和异构程度，例如：
+
+```bash
+./scripts/run_fedmia_prompt_methods_fewshot.sh \
+  --fpl-shots 8 --dirichlet-alpha 0.5
+```
+
+`--shots` 是 `--fpl-shots` 的简写。两个参数也可用于原有 sweep
+启动器；命令行值优先于 YAML，并自动启用 Dirichlet 划分和关闭
+full-data 模式。
+
+few-shot 隐私审计会继续执行逐客户端、逐类别的成员/非成员精确配对。
+若极端 Dirichlet 划分使个别客户端不足两对候选，或该客户端没有参与
+任何可用通信轮次，池化 FedMIA 会跳过该客户端并在 `summary.json` 中记录
+原因；攻击指标只根据实际审计到的客户端和样本计算。样本量不足以解析
+某档 FPR 时，该指标保持不可报告，而不会输出伪精确结果。
+
+few-shot sweep 对所有数据集统一使用 10 个客户端、每轮 10 个客户端全部
+参与、25 个通信轮，并在每个客户端执行 2 个本地 epochs。
+
 启动器默认使用 `--jobs 1` 顺序执行；可通过 `--jobs N` 设置最大并发任务数。每个任务只使用一张卡，但同一张候选 GPU 可以同时运行多个任务；每次启动任务时都会选择满足显存门槛且空闲显存最多的卡。因此并发数可以超过候选 GPU 数，但 `--jobs` 和显存门槛应按实际显存容量设置。实验支持断点续跑，汇总结果位于 `results/fedmia_prompt_methods/summary_privacy_metrics.csv`，其中 TPR 以百分数报告，并同时给出 FPR=0.1%、1%、10% 三档结果与 AUC。
 
 该 sweep 在一次训练中对 10 个客户端执行 FedMIA 池化审计。每个客户端分别从本地训练集和同客户端测试集按类别一一配对成员与非成员，再合并攻击分数；因此 pathological 标签划分不会让攻击通过类别归属取巧。每个客户端最多贡献 128 对候选，合并后的 1280 个非成员可分辨 FPR=0.1% 档位。CIFAR100 有 50 个训练客户端，但同样固定审计前 10 个客户端以控制计算量。

@@ -206,6 +206,13 @@ class MembershipAuditor:
         self.results_dir = os.path.join(results_dir, "privacy_audit")
         self.collate_fn = collate_fn
         self.seed = int(self.config.get("seed", 42))
+        self.few_shot = bool(self.config.get("few_shot", False))
+        self.fpl_shots = self.config.get("fpl_shots")
+        self.allow_partial_client_audit = bool(
+            self.config.get("allow_partial_client_audit", self.few_shot)
+        )
+        self.requested_audit_client_ids = list(self.audit_client_ids)
+        self.skipped_audit_clients: dict[str, str] = {}
         self.audit_interval = int(self.config.get("audit_interval", 1))
         self.audit_batch_size = int(self.config.get("audit_batch_size", 64))
         self.calibration_fraction = float(self.config.get("calibration_fraction", 0.5))
@@ -239,21 +246,34 @@ class MembershipAuditor:
                 client_parts = []
                 self.candidate_sampling_by_client = {}
                 per_client_overlap = {}
+                eligible_client_ids = []
                 for client_id in self.audit_client_ids:
                     target = users[client_id]
-                    (
-                        member_images,
-                        member_labels,
-                        nonmember_images,
-                        nonmember_labels,
-                        sampling,
-                    ) = self._collect_exact_paired_candidates(
-                        target.train_data,
-                        target.test_data,
-                        max_members,
-                        max_nonmembers,
-                        client_id,
-                    )
+                    try:
+                        (
+                            member_images,
+                            member_labels,
+                            nonmember_images,
+                            nonmember_labels,
+                            sampling,
+                        ) = self._collect_exact_paired_candidates(
+                            target.train_data,
+                            target.test_data,
+                            max_members,
+                            max_nonmembers,
+                            client_id,
+                        )
+                    except ValueError as error:
+                        if not self.allow_partial_client_audit:
+                            raise
+                        self.skipped_audit_clients[str(client_id)] = str(error)
+                        logger.warning(
+                            "Skipping client %d in few-shot privacy audit: %s",
+                            client_id,
+                            error,
+                        )
+                        continue
+                    eligible_client_ids.append(client_id)
                     images = torch.cat((member_images, nonmember_images))
                     labels = torch.cat((member_labels, nonmember_labels))
                     memberships = torch.cat(
@@ -285,6 +305,14 @@ class MembershipAuditor:
                     per_client_overlap[str(client_id)] = sorted(
                         support & other_support
                     )
+                if not eligible_client_ids:
+                    raise ValueError(
+                        "Few-shot privacy audit found no client with at least two "
+                        "same-label member/non-member pairs. Increase fpl_shots or "
+                        "dirichlet_alpha, reduce total_users, or provide a larger "
+                        "non-member test split."
+                    )
+                self.audit_client_ids = eligible_client_ids
                 # Pooled candidates can exceed a gigabyte at CLIP resolution.
                 # Keep them on CPU and transfer only the active audit batch.
                 self.images = torch.cat(image_parts)
@@ -948,11 +976,30 @@ class MembershipAuditor:
             )
 
         client_results = []
+        evaluated_client_ids = []
+        skipped_clients = dict(self.skipped_audit_clients)
         global_indices = []
         for client_id in self.audit_client_ids:
             indices = torch.nonzero(
                 self.candidate_client_ids == client_id, as_tuple=False
             ).flatten()
+            has_usable_round = any(
+                client_id in observation["client_ids"].tolist()
+                and observation["client_ids"].numel() >= 2
+                for observation in self.observations
+            )
+            if not has_usable_round and self.allow_partial_client_audit:
+                error = (
+                    "FedMIA needs a round containing the target and another client."
+                )
+                skipped_clients[str(client_id)] = error
+                logger.warning(
+                    "Skipping client %d in pooled %s attack: %s",
+                    client_id,
+                    measurement,
+                    error,
+                )
+                continue
             result = run_fedmia(
                 self.observations,
                 self.membership[indices],
@@ -965,7 +1012,13 @@ class MembershipAuditor:
                 candidate_indices=indices,
             )
             client_results.append(result)
+            evaluated_client_ids.append(client_id)
             global_indices.append(indices[result.sample_indices])
+        if not client_results:
+            raise ValueError(
+                "FedMIA could not evaluate any few-shot client. At least one "
+                "audited client must participate in a round with another client."
+            )
         name = "fedmia_loss" if measurement == "confidence" else "fedmia_cosine"
         return AttackResult(
             name=name,
@@ -974,14 +1027,18 @@ class MembershipAuditor:
             sample_indices=torch.cat(global_indices),
             metadata={
                 "scope": "pooled_clients",
-                "audit_client_ids": self.audit_client_ids,
+                "requested_audit_client_ids": self.requested_audit_client_ids,
+                "audit_client_ids": evaluated_client_ids,
+                "skipped_audit_clients": skipped_clients,
+                "few_shot": self.few_shot,
+                "fpl_shots": self.fpl_shots,
                 "measurement": measurement,
                 "round_aggregation": aggregation,
                 "tail_policy": tail,
                 "per_client": {
                     str(client_id): result.metadata
                     for client_id, result in zip(
-                        self.audit_client_ids, client_results
+                        evaluated_client_ids, client_results
                     )
                 },
             },
@@ -1264,6 +1321,7 @@ class MembershipAuditor:
             json.dump(
                 {
                     "target_client_id": self.target_client_id,
+                    "requested_audit_client_ids": self.requested_audit_client_ids,
                     "audit_client_ids": self.audit_client_ids,
                     "audit_scope": (
                         "pooled_clients"
@@ -1283,6 +1341,14 @@ class MembershipAuditor:
                                 for key in observation
                             }
                         ),
+                    },
+                    "few_shot": {
+                        "enabled": self.few_shot,
+                        "fpl_shots": self.fpl_shots,
+                        "allow_partial_client_audit": (
+                            self.allow_partial_client_audit
+                        ),
+                        "skipped_audit_clients": self.skipped_audit_clients,
                     },
                     "threat_model": {
                         "protocol_messages": self.audit_view

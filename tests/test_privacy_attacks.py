@@ -713,6 +713,81 @@ def test_pooled_client_fedmia_uses_exact_per_class_pairs(tmp_path):
     assert header == "attack,sample_index,audit_client_id,membership,score"
 
 
+def test_pooled_fewshot_audit_skips_clients_without_paired_candidates(tmp_path):
+    def candidates(labels, offset):
+        labels = torch.as_tensor(labels, dtype=torch.long)
+        images = torch.arange(
+            labels.numel() * 3 * 4 * 4, dtype=torch.float32
+        ).reshape(labels.numel(), 3, 4, 4)
+        return TensorDataset(images + offset, labels)
+
+    users = [
+        SimpleNamespace(
+            id=0,
+            train_data=candidates([0, 0], 0),
+            test_data=candidates([1, 1], 10),
+        ),
+        SimpleNamespace(
+            id=1,
+            train_data=candidates([0, 1, 0, 1], 20),
+            test_data=candidates([0, 1, 0, 1], 30),
+        ),
+        SimpleNamespace(
+            id=2,
+            train_data=candidates([0, 1, 0, 1], 40),
+            test_data=candidates([0, 1, 0, 1], 50),
+        ),
+    ]
+    auditor = MembershipAuditor(
+        model=ToyPromptModel(),
+        users=users,
+        target_client_id=0,
+        device=torch.device("cpu"),
+        results_dir=str(tmp_path),
+        config={
+            "enabled": True,
+            "attacks": ["fedmia_loss"],
+            "audit_client_ids": "all",
+            "match_candidate_labels": True,
+            "max_member_samples": 4,
+            "max_nonmember_samples": 4,
+            "few_shot": True,
+            "fpl_shots": 2,
+            "allow_partial_client_audit": True,
+            "signal_storage": "none",
+        },
+        num_classes=2,
+    )
+
+    assert auditor.requested_audit_client_ids == [0, 1, 2]
+    assert auditor.audit_client_ids == [1, 2]
+    assert "fewer than two" in auditor.skipped_audit_clients["0"]
+    assert int((auditor.membership == 1).sum()) == 8
+    assert int((auditor.membership == 0).sum()) == 8
+
+    # Client 2 has valid candidates but no observed round. Few-shot pooled
+    # FedMIA still evaluates client 1 and reports client 2 as unavailable.
+    width = auditor.membership.numel()
+    auditor.observations = [
+        {
+            "round": 0,
+            "client_ids": torch.tensor([1, 0]),
+            "confidence": torch.stack(
+                (
+                    torch.linspace(-1.0, 1.0, width),
+                    torch.linspace(1.0, -1.0, width),
+                )
+            ),
+        }
+    ]
+    result = auditor._run_fedmia_signal("confidence", "mean", "upper")
+    assert result.metadata["audit_client_ids"] == [1]
+    assert result.metadata["requested_audit_client_ids"] == [0, 1, 2]
+    assert "2" in result.metadata["skipped_audit_clients"]
+    assert int((result.labels == 1).sum()) == 4
+    assert int((result.labels == 0).sum()) == 4
+
+
 def test_each_defense_runs_independently_with_one_attack():
     root = Path(".test_artifacts") / "defenses"
     for defense in (

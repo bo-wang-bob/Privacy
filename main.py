@@ -140,6 +140,8 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "use_full_dataset=true requires fpl_shots=null so training is not capped."
         )
+    if float(config.get("dirichlet_alpha", 0.1)) <= 0:
+        raise ValueError("dirichlet_alpha must be positive.")
     audit = config.get("audit", {})
     if not 0 <= int(audit.get("target_client_id", 0)) < config["total_users"]:
         raise ValueError("audit.target_client_id must identify an existing client.")
@@ -530,6 +532,12 @@ def run(config: dict) -> list[dict]:
 
     audit_config = dict(config.get("audit", {}))
     audit_config.setdefault("seed", seed)
+    audit_config.setdefault(
+        "few_shot",
+        config.get("fpl_shots") is not None
+        and not bool(config.get("use_full_dataset", False)),
+    )
+    audit_config.setdefault("fpl_shots", config.get("fpl_shots"))
     server = ServerBase(
         train_mode=effective_train_mode,
         device=device,
@@ -777,8 +785,10 @@ def parse_args() -> dict:
     parser.add_argument("--total_users", type=int)
     parser.add_argument("--sample_users", type=int)
     parser.add_argument("--local_epochs", type=int)
-    parser.add_argument("--fpl_shots", type=int)
-    parser.add_argument("--dirichlet_alpha", type=float)
+    parser.add_argument("--fpl_shots", "--fpl-shots", "--shots", type=int)
+    parser.add_argument(
+        "--dirichlet_alpha", "--dirichlet-alpha", type=float
+    )
     parser.add_argument(
         "--partition_mode",
         choices=["auto", "dirichlet", "iid", "pathological"],
@@ -870,6 +880,15 @@ def parse_args() -> dict:
         value = getattr(args, key)
         if value is not None:
             config[key] = value
+    # A direct few-shot/alpha override denotes the Dirichlet experiment
+    # family unless the caller explicitly selected another partition mode.
+    if args.fpl_shots is not None and args.use_full_dataset is None:
+        config["use_full_dataset"] = False
+    if (
+        args.partition_mode is None
+        and (args.fpl_shots is not None or args.dirichlet_alpha is not None)
+    ):
+        config["partition_mode"] = "dirichlet"
     if args.target_client_id is not None:
         config["audit"]["target_client_id"] = args.target_client_id
     if args.audit_attacks:

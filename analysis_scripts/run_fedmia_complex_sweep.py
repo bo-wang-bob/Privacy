@@ -115,7 +115,13 @@ def build_jobs(
     spec_path: Path,
     data_root: str | None = None,
     cache_dir: str | None = None,
+    fpl_shots: int | None = None,
+    dirichlet_alpha: float | None = None,
 ) -> tuple[list[SweepJob], Path]:
+    if fpl_shots is not None and fpl_shots <= 0:
+        raise ValueError("--fpl-shots must be positive.")
+    if dirichlet_alpha is not None and dirichlet_alpha <= 0:
+        raise ValueError("--dirichlet-alpha must be positive.")
     base_config_path = _resolve_path(
         spec.get("base_config", "configs/fedmia_prompt_benchmark.yaml")
     )
@@ -164,6 +170,16 @@ def build_jobs(
             dataset_config["data_root"] = str(_resolve_path(data_root))
         if cache_dir is not None:
             dataset_config["cache_dir"] = str(_resolve_path(cache_dir))
+        # Command-line few-shot options intentionally win over base, common,
+        # and per-dataset YAML values. Supplying either option selects the
+        # Dirichlet experiment family; a shot cap also disables full-data mode.
+        if fpl_shots is not None:
+            dataset_config["fpl_shots"] = int(fpl_shots)
+            dataset_config["use_full_dataset"] = False
+            dataset_config["partition_mode"] = "dirichlet"
+        if dirichlet_alpha is not None:
+            dataset_config["dirichlet_alpha"] = float(dirichlet_alpha)
+            dataset_config["partition_mode"] = "dirichlet"
 
         expanded_methods = method_entries or [
             {"name": str(dataset_config.get("aggregator", "fedavg"))}
@@ -1001,6 +1017,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", help="Override the dataset root.")
     parser.add_argument("--cache-dir", help="Override the local CLIP cache.")
     parser.add_argument(
+        "--fpl-shots",
+        "--fpl_shots",
+        "--shots",
+        dest="fpl_shots",
+        type=int,
+        help=(
+            "Override the system-wide training cap per class. This disables "
+            "full-data mode and selects Dirichlet partitioning."
+        ),
+    )
+    parser.add_argument(
+        "--dirichlet-alpha",
+        "--dirichlet_alpha",
+        dest="dirichlet_alpha",
+        type=float,
+        help=(
+            "Override the Dirichlet concentration parameter and select "
+            "Dirichlet partitioning."
+        ),
+    )
+    parser.add_argument(
         "--datasets",
         help=(
             "Comma-separated dataset names to run after expansion, for example "
@@ -1046,6 +1083,8 @@ def main() -> int:
         spec_path,
         data_root=args.data_root,
         cache_dir=args.cache_dir,
+        fpl_shots=args.fpl_shots,
+        dirichlet_alpha=args.dirichlet_alpha,
     )
     jobs = filter_jobs_by_dataset(jobs, args.datasets)
     jobs = filter_jobs_by_method(jobs, args.methods)
@@ -1063,6 +1102,9 @@ def main() -> int:
                 f"seed={job.seed}",
                 f"target={job.target_client_id}",
                 f"defense={job.defense}",
+                f"shots={job.config.get('fpl_shots')}",
+                f"partition={job.config.get('partition_mode')}",
+                f"alpha={job.config.get('dirichlet_alpha')}",
                 json.dumps(job.defense_parameters, sort_keys=True),
             )
         return 0
