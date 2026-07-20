@@ -115,9 +115,12 @@ def build_jobs(
     spec_path: Path,
     data_root: str | None = None,
     cache_dir: str | None = None,
+    num_global_iters: int | None = None,
     fpl_shots: int | None = None,
     dirichlet_alpha: float | None = None,
 ) -> tuple[list[SweepJob], Path]:
+    if num_global_iters is not None and num_global_iters <= 0:
+        raise ValueError("--num-global-iters/--rounds must be positive.")
     if fpl_shots is not None and fpl_shots <= 0:
         raise ValueError("--fpl-shots must be positive.")
     if dirichlet_alpha is not None and dirichlet_alpha <= 0:
@@ -170,6 +173,8 @@ def build_jobs(
             dataset_config["data_root"] = str(_resolve_path(data_root))
         if cache_dir is not None:
             dataset_config["cache_dir"] = str(_resolve_path(cache_dir))
+        if num_global_iters is not None:
+            dataset_config["num_global_iters"] = int(num_global_iters)
         # Command-line few-shot options intentionally win over base, common,
         # and per-dataset YAML values. Supplying either option selects the
         # Dirichlet experiment family; a shot cap also disables full-data mode.
@@ -1017,6 +1022,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", help="Override the dataset root.")
     parser.add_argument("--cache-dir", help="Override the local CLIP cache.")
     parser.add_argument(
+        "--num-global-iters",
+        "--num_global_iters",
+        "--rounds",
+        dest="num_global_iters",
+        type=int,
+        help=(
+            "Override the number of federated communication rounds. When "
+            "omitted, the sweep YAML value is used (50 for the few-shot spec)."
+        ),
+    )
+    parser.add_argument(
         "--fpl-shots",
         "--fpl_shots",
         "--shots",
@@ -1083,6 +1099,7 @@ def main() -> int:
         spec_path,
         data_root=args.data_root,
         cache_dir=args.cache_dir,
+        num_global_iters=args.num_global_iters,
         fpl_shots=args.fpl_shots,
         dirichlet_alpha=args.dirichlet_alpha,
     )
@@ -1102,6 +1119,7 @@ def main() -> int:
                 f"seed={job.seed}",
                 f"target={job.target_client_id}",
                 f"defense={job.defense}",
+                f"rounds={job.config.get('num_global_iters')}",
                 f"shots={job.config.get('fpl_shots')}",
                 f"partition={job.config.get('partition_mode')}",
                 f"alpha={job.config.get('dirichlet_alpha')}",

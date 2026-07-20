@@ -23,31 +23,31 @@ datasets:
       dataset_name: caltech101
       total_users: 10
       sample_users: 10
-      num_global_iters: 25
+      num_global_iters: 50
   - name: oxfordpets
     overrides:
       dataset_name: oxfordpets
       total_users: 10
       sample_users: 10
-      num_global_iters: 25
+      num_global_iters: 50
   - name: flowers
     overrides:
       dataset_name: flowers
       total_users: 10
       sample_users: 10
-      num_global_iters: 25
+      num_global_iters: 50
   - name: food101
     overrides:
       dataset_name: food101
       total_users: 10
       sample_users: 10
-      num_global_iters: 25
+      num_global_iters: 50
   - name: cifar100
     overrides:
       dataset_name: cifar100
       total_users: 10
       sample_users: 10
-      num_global_iters: 25
+      num_global_iters: 50
 
 common:
   data_root: ./data

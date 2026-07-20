@@ -221,7 +221,7 @@ def test_prompt_method_fewshot_spec_caps_system_pool_and_uses_dirichlet():
     for job in jobs:
         assert job.config["audit"]["audit_client_ids"] == "all"
         assert (job.config["total_users"], job.config["sample_users"]) == (10, 10)
-        assert job.config["num_global_iters"] == 25
+        assert job.config["num_global_iters"] == 50
         assert job.config["local_epochs"] == 2
         validate_config(job.config)
 
@@ -243,6 +243,30 @@ def test_sweep_cli_fewshot_values_override_full_dataset_yaml():
     assert all(job.config["use_full_dataset"] is False for job in jobs)
     assert all(job.config["fpl_shots"] == 8 for job in jobs)
     assert all(job.config["dirichlet_alpha"] == 0.5 for job in jobs)
+
+
+def test_sweep_cli_rounds_override_fewshot_default():
+    spec_path = (
+        REPOSITORY_ROOT
+        / "configs"
+        / "fedmia_prompt_methods_fewshot_sweep.yaml"
+    )
+    import pytest
+    import yaml
+
+    with spec_path.open("r", encoding="utf-8") as file:
+        spec = yaml.safe_load(file)
+
+    default_jobs, _ = build_jobs(spec, spec_path)
+    overridden_jobs, _ = build_jobs(spec, spec_path, num_global_iters=37)
+
+    assert all(job.config["num_global_iters"] == 50 for job in default_jobs)
+    assert all(job.config["num_global_iters"] == 37 for job in overridden_jobs)
+    assert {job.run_id for job in default_jobs}.isdisjoint(
+        job.run_id for job in overridden_jobs
+    )
+    with pytest.raises(ValueError, match="must be positive"):
+        build_jobs(spec, spec_path, num_global_iters=0)
 
 
 def test_sweep_summary_uses_tpr_at_one_percent_as_primary_table(tmp_path: Path):

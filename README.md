@@ -42,12 +42,13 @@ few-shot 截断。默认配置和一键命令分别为
 
 ```bash
 ./scripts/run_fedmia_prompt_methods_fewshot.sh \
-  --fpl-shots 8 --dirichlet-alpha 0.5
+  --fpl-shots 8 --dirichlet-alpha 0.5 --rounds 75
 ```
 
 `--shots` 是 `--fpl-shots` 的简写。两个参数也可用于原有 sweep
 启动器；命令行值优先于 YAML，并自动启用 Dirichlet 划分和关闭
-full-data 模式。
+full-data 模式。通信轮数默认是 50；可用 `--rounds N` 覆盖，
+`--num-global-iters N` 是它的等价写法。
 
 few-shot 隐私审计会继续执行逐客户端、逐类别的成员/非成员精确配对。
 若极端 Dirichlet 划分使个别客户端不足两对候选，或该客户端没有参与
@@ -56,7 +57,7 @@ few-shot 隐私审计会继续执行逐客户端、逐类别的成员/非成员�
 某档 FPR 时，该指标保持不可报告，而不会输出伪精确结果。
 
 few-shot sweep 对所有数据集统一使用 10 个客户端、每轮 10 个客户端全部
-参与、25 个通信轮，并在每个客户端执行 2 个本地 epochs。
+参与、默认 50 个通信轮，并在每个客户端执行 2 个本地 epochs。
 
 启动器默认使用 `--jobs 1` 顺序执行；可通过 `--jobs N` 设置最大并发任务数。每个任务只使用一张卡，但同一张候选 GPU 可以同时运行多个任务；每次启动任务时都会选择满足显存门槛且空闲显存最多的卡。因此并发数可以超过候选 GPU 数，但 `--jobs` 和显存门槛应按实际显存容量设置。实验支持断点续跑，汇总结果位于 `results/fedmia_prompt_methods/summary_privacy_metrics.csv`，其中 TPR 以百分数报告，并同时给出 FPR=0.1%、1%、10% 三档结果与 AUC。
 
