@@ -234,7 +234,7 @@ def test_prompt_method_fewshot_spec_caps_system_pool_and_uses_dirichlet():
         assert job.config["audit"]["attacks"] == FIRST_BATCH_ATTACKS
         assert (job.config["total_users"], job.config["sample_users"]) == (10, 10)
         assert job.config["num_global_iters"] == 50
-        assert job.config["local_epochs"] == 2
+        assert job.config["local_epochs"] == 5
         validate_config(job.config)
 
 
@@ -266,7 +266,7 @@ def test_fewshot_job_hyperparameters_report_effective_configuration():
         "total_users": 10,
         "sample_users": 10,
         "num_global_iters": 50,
-        "local_epochs": 2,
+        "local_epochs": 5,
     }
     assert parameters["optimization"]["learning_rate"] == 0.005
     assert parameters["method_parameters"] == job.config["fedotp"]

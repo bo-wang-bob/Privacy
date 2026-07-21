@@ -57,7 +57,7 @@ common:
   use_full_dataset: false
   fpl_shots: 16
   dirichlet_alpha: 0.1
-  local_epochs: 2
+  local_epochs: 5
   learning_rate: 0.005
   batch_size: 16
   eval_batch_size: 64
