@@ -17,6 +17,13 @@
 
 `grad_cosine` 与 `avg_cosine` 依赖客户端更新，因此不能用于仅发布最终 prompt 的 `released_prompt` 审计视图。`blackbox_loss` 与 `loss_series` 可以在该视图中退化为最终发布状态上的查询。
 
+Prompt 方法 sweep 还包含两个仓库扩展：`fedmia_text`（FedMIA-III）将候选
+prompt 梯度通过虚拟下降步映射为文本矩阵变化；`fedmia_text_gradient`
+（FedMIA-IV）则直接使用 `logits = scale * T x` 的解析交叉熵下降方向
+`-scale * (softmax(logits) - one_hot(y)) x^T`。二者都与客户端真实文本矩阵
+变化计算 Frobenius 余弦，再使用同一套跨客户端 null CDF。FedMIA-IV 不使用
+JVP；FedOTP 的 UOT logit 不满足 `T x` 假设，所以对应任务只运行到 FedMIA-III。
+
 ## 防御定义与兼容性
 
 | 运行名 | prompt 适配 | 主要参数 |
@@ -76,8 +83,8 @@ python main.py --config configs/fedmia_prompt_benchmark.yaml --defense data_aug_
 - `summary_aggregate.csv`：跨 seed 的均值和样本标准差，以 TPR@1%FPR 为主要隐私指标；
 - `summary_tpr_matrix.csv`：TPR@10%FPR、TPR@1%FPR 和 TPR@0.1%FPR 的比较矩阵；
 - `privacy_utility_pareto.csv`：逐攻击的隐私—准确率非支配配置；
-- `launcher_logs/`：每个独立实验的完整控制台日志；
-- `configs/`：实际传给 `main.py` 的展开后 YAML，便于精确复现。
+- `runs/<run_id>/run.log`：每个独立实验的完整控制台日志；
+- `runs/<run_id>/run_config.yaml`：实际传给 `main.py` 的展开后 YAML。
 
 ## 当前验证状态
 

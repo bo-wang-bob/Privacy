@@ -138,6 +138,8 @@ python main.py \
 - `promptres`
 - `fedmia_loss`
 - `fedmia_cosine`
+- `fedmia_text`
+- `fedmia_text_gradient`
 - `nasr_passive`
 - `transfer_representation`
 - `rmia`
@@ -158,6 +160,35 @@ audit:
 ```bash
 python analysis_scripts/verify_promptres_toy.py
 ```
+
+`fedmia_text`（本仓库扩展，简称 FedMIA-III）把攻击空间从提示参数扩展到 CLIP 文本特征
+矩阵。每轮先计算各客户端训练前后的归一化文本特征矩阵变化，再沿候选样本
+的提示梯度执行一个小幅虚拟下降步，并比较两者的 Frobenius 余弦相似度。
+其他客户端的同类分数继续作为 FedMIA 的逐轮零假设：
+
+```yaml
+audit:
+  attacks: [fedmia_loss, fedmia_cosine, fedmia_text, fedmia_text_gradient]
+  fedmia_text_probe_norm: 0.001
+  fedmia_text_candidate_batch_size: 8
+  fedmia_text_aggregation: mean
+  fedmia_text_tail: upper
+  fedmia_text_gradient_aggregation: mean
+  fedmia_text_gradient_tail: upper
+  fedmia_text_gradient_project_tangent: false
+```
+
+FedMIA-III 只保存每个客户端与候选样本的最终相似度，不保存完整候选文本
+特征矩阵。它需要协议能够重建逐客户端提示；`released_prompt` 视图不支持，
+FedASK 在非 `full_whitebox` 视图下也不支持。
+
+`fedmia_text_gradient`（FedMIA-IV）在假设分类 logit 为
+`scale * image_features @ text_features.T` 时，直接计算候选样本交叉熵对文本
+矩阵的负梯度 `-scale * (softmax(logits) - one_hot(label)) x.T`，并与客户端
+实际文本矩阵变化计算 Frobenius 余弦。它不使用 JVP，也不重新编码候选 prompt；
+可选的 `fedmia_text_gradient_project_tangent=true` 会将每一类梯度投影到归一化
+文本特征的切空间。FedOTP 使用最优传输 logit，不满足这一假设，因此不支持
+FedMIA-IV。
 
 非 FedMIA 分数使用客户端内、无成员标签的经验 CDF 秩校准后再合并；FedMIA
 保留自身的零假设 CDF。汇总文件同时包含总体指标、客户端宏平均指标和逐客户
@@ -215,9 +246,12 @@ audit:
 `signal_storage` 可设置为 `none`、`compact` 或 `full`，用于控制审计信号的
 保存范围。
 
-通过 sweep 脚本启动时，标准输出和错误统一保存在结果根目录下的
-`launcher_logs/<run_id>.log`，不再在单次运行目录中重复生成内容相同的
-`run.log`。进度日志按 `eval_interval` 输出；逐轮详情仅在 DEBUG 级别记录。
+通过 sweep 脚本启动时，每个任务只使用 `runs/<run_id>/` 一个目录。展开后的
+实际配置保存为其中的 `run_config.yaml`，标准输出和错误保存为其中的
+`run.log`，训练指标与审计结果也直接写入同一目录，不再创建独立的
+`configs/`、`launcher_logs/` 或时间戳子目录。完整超参数只保留在
+`run_config.yaml`，不在日志中重复打印。进度日志按 `eval_interval` 输出；
+逐轮详情仅在 DEBUG 级别记录。
 
 ## 测试
 

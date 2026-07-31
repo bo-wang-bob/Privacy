@@ -151,6 +151,13 @@ def _job_hyperparameters(job: SweepJob) -> dict[str, Any]:
             "nonmember_to_member_ratio": audit.get(
                 "nonmember_to_member_ratio"
             ),
+            "fedmia_text_probe_norm": audit.get("fedmia_text_probe_norm"),
+            "fedmia_text_candidate_batch_size": audit.get(
+                "fedmia_text_candidate_batch_size"
+            ),
+            "fedmia_text_gradient_project_tangent": audit.get(
+                "fedmia_text_gradient_project_tangent", False
+            ),
             "max_member_samples": audit.get("max_member_samples"),
             "max_nonmember_samples": audit.get("max_nonmember_samples"),
             "fedmia_tail": audit.get("fedmia_tail"),
@@ -332,6 +339,10 @@ def build_jobs(
                         seen_ids.add(run_id)
                         run_root = results_root / "runs" / run_id
                         config["results_dir"] = str(run_root)
+                        # A sweep job already has a stable, unique run directory.
+                        # Tell main.py to write directly into it instead of adding
+                        # another timestamped directory beneath it.
+                        config["results_dir_is_run_dir"] = True
                         jobs.append(
                             SweepJob(
                                 run_id=run_id,
@@ -343,9 +354,7 @@ def build_jobs(
                                 defense=defense,
                                 defense_parameters=defense_parameters,
                                 run_root=run_root,
-                                config_path=results_root
-                                / "configs"
-                                / f"{run_id}.yaml",
+                                config_path=run_root / "run_config.yaml",
                             )
                         )
     return jobs, results_root
@@ -396,8 +405,13 @@ def filter_jobs_by_method(
 def _completed_result(job: SweepJob) -> Path | None:
     if not job.run_root.exists():
         return None
+    # New sweeps write directly into run_root. Keep recognizing the previous
+    # timestamped layout so existing completed experiments remain resumable.
     summaries = sorted(
-        job.run_root.glob("*/privacy_audit/summary.json"),
+        [
+            *job.run_root.glob("privacy_audit/summary.json"),
+            *job.run_root.glob("*/privacy_audit/summary.json"),
+        ],
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -554,10 +568,14 @@ def _best_available_gpu(
     )
 
 
-def _launch(job: SweepJob, gpu: int, logs_root: Path) -> ActiveRun:
+def _launch(job: SweepJob, gpu: int) -> ActiveRun:
     _write_job_config(job)
-    logs_root.mkdir(parents=True, exist_ok=True)
-    log_path = logs_root / f"{job.run_id}.log"
+    # An incomplete or explicitly forced retry must not inherit a prior
+    # completion summary from the same stable run directory.
+    stale_summary = job.run_root / "privacy_audit" / "summary.json"
+    if stale_summary.is_file():
+        stale_summary.unlink()
+    log_path = job.run_root / "run.log"
     log_file = log_path.open("w", encoding="utf-8")
     command = [
         sys.executable,
@@ -568,7 +586,6 @@ def _launch(job: SweepJob, gpu: int, logs_root: Path) -> ActiveRun:
         str(gpu),
     ]
     log_file.write("COMMAND " + " ".join(command) + "\n")
-    log_file.write(_job_hyperparameters_block(job) + "\n")
     log_file.flush()
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
@@ -1004,7 +1021,7 @@ def run_sweep(
                     status = _wait_for_best_gpu(gpus, minimum_free_memory_mb)
                 job = pending.pop(0)
                 print(_job_hyperparameters_block(job), flush=True)
-                run = _launch(job, status.index, results_root / "launcher_logs")
+                run = _launch(job, status.index)
                 active[job.run_id] = run
                 state["runs"][job.run_id] = {
                     "status": "running",

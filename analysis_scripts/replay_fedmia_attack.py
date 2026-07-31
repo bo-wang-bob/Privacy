@@ -9,8 +9,8 @@ Example
 -------
 MPLCONFIGDIR=/tmp/matplotlib-fedmia-replay \
 python analysis_scripts/replay_fedmia_attack.py \
-  results/fedmia_prompt_methods_fewshot/launcher_logs/\
-cifar100_promptfl_none_seed42_target0_b9cda3ae45.log
+  results/fedmia_prompt_methods_fewshot/runs/\
+cifar100_promptfl_none_seed42_target0_b9cda3ae45/run.log
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "launcher_log",
         type=Path,
-        help="Path to one launcher_logs/<job-id>.log file.",
+        help="Path to one runs/<job-id>/run.log file.",
     )
     parser.add_argument(
         "--output-dir",
@@ -116,14 +116,26 @@ def _launcher_config_path(launcher_log: Path) -> Path | None:
 
 
 def resolve_run_dir(launcher_log: Path) -> tuple[Path, Path]:
-    """Resolve the generated config and timestamped result directory."""
+    """Resolve the generated config and result directory."""
     launcher_log = launcher_log.resolve()
     if not launcher_log.is_file():
         raise FileNotFoundError(f"Launcher log does not exist: {launcher_log}")
 
-    sweep_root = launcher_log.parent.parent
+    flat_layout = (
+        launcher_log.name == "run.log"
+        and launcher_log.parent.parent.name == "runs"
+    )
+    if flat_layout:
+        run_dir = launcher_log.parent
+        sweep_root = run_dir.parent.parent
+        job_id = run_dir.name
+    else:
+        # Backward compatibility with launcher_logs/<job-id>.log and a
+        # timestamped result directory below runs/<job-id>/.
+        run_dir = None
+        sweep_root = launcher_log.parent.parent
+        job_id = launcher_log.stem
     state_path = sweep_root / "sweep_state.json"
-    job_id = launcher_log.stem
     if state_path.is_file():
         state = json.loads(state_path.read_text(encoding="utf-8"))
         run_state = state.get("runs", {}).get(job_id, {})
@@ -131,7 +143,11 @@ def resolve_run_dir(launcher_log: Path) -> tuple[Path, Path]:
         if result_dir:
             config_path = _launcher_config_path(launcher_log)
             if config_path is None:
-                config_path = sweep_root / "configs" / f"{job_id}.yaml"
+                config_path = (
+                    Path(result_dir) / "run_config.yaml"
+                    if flat_layout
+                    else sweep_root / "configs" / f"{job_id}.yaml"
+                )
             return config_path.resolve(), Path(result_dir).resolve()
 
     config_path = _launcher_config_path(launcher_log)
@@ -141,6 +157,8 @@ def resolve_run_dir(launcher_log: Path) -> tuple[Path, Path]:
         )
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     result_root = Path(config["results_dir"])
+    if (result_root / "privacy_audit" / "signals.pt").is_file():
+        return config_path.resolve(), result_root.resolve()
     candidates = sorted(
         path.parent.parent
         for path in result_root.glob("*/privacy_audit/signals.pt")

@@ -21,6 +21,8 @@ FIRST_BATCH_ATTACKS = [
     "avg_cosine",
     "fedmia_loss",
     "fedmia_cosine",
+    "fedmia_text",
+    "fedmia_text_gradient",
     "nasr_passive",
     "transfer_representation",
     "rmia",
@@ -75,7 +77,7 @@ def test_parallel_scheduler_allows_multiple_jobs_on_one_gpu(tmp_path, monkeypatc
         def close():
             return None
 
-    def launch(job, gpu, _logs_root):
+    def launch(job, gpu):
         launched.add(job.run_id)
         launch_gpus.append(gpu)
         return sweep.ActiveRun(job, gpu, FinishedProcess(), LogFile())
@@ -109,6 +111,45 @@ def test_parallel_scheduler_allows_multiple_jobs_on_one_gpu(tmp_path, monkeypatc
     assert launch_gpus == [0, 0, 0]
 
 
+def test_launcher_keeps_config_and_log_in_one_run_directory(tmp_path, monkeypatch):
+    spec_path = REPOSITORY_ROOT / "configs" / "fedmia_prompt_methods_sweep.yaml"
+    import yaml
+
+    with spec_path.open("r", encoding="utf-8") as file:
+        spec = yaml.safe_load(file)
+    spec["results_root"] = str(tmp_path / "results")
+    jobs, results_root = build_jobs(spec, spec_path)
+    job = jobs[0]
+    captured = {}
+
+    class PendingProcess:
+        returncode = None
+
+        @staticmethod
+        def poll():
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return PendingProcess()
+
+    monkeypatch.setattr(sweep.subprocess, "Popen", fake_popen)
+    active = sweep._launch(job, 0)
+    active.log_file.close()
+
+    assert job.config_path == job.run_root / "run_config.yaml"
+    assert job.config_path.is_file()
+    assert (job.run_root / "run.log").is_file()
+    assert not (results_root / "configs").exists()
+    assert not (results_root / "launcher_logs").exists()
+    log_text = (job.run_root / "run.log").read_text(encoding="utf-8")
+    assert log_text.startswith("COMMAND ")
+    assert "HYPERPARAMETERS" not in log_text
+    assert captured["stdout"].name == str(job.run_root / "run.log")
+    assert captured["stderr"] == sweep.subprocess.STDOUT
+
+
 def test_complex_fedmia_spec_expands_stable_seventy_eight_run_grid():
     spec_path = REPOSITORY_ROOT / "configs" / "fedmia_complex_sweep.yaml"
     import yaml
@@ -135,6 +176,8 @@ def test_complex_fedmia_spec_expands_stable_seventy_eight_run_grid():
         assert job.config["audit"]["max_nonmember_samples"] == 2048
         assert "nasr_active" not in job.config["audit"]["attacks"]
         assert job.config["results_dir"] == str(job.run_root)
+        assert job.config["results_dir_is_run_dir"] is True
+        assert job.config_path == job.run_root / "run_config.yaml"
 
 
 def test_pathological_full_spec_expands_all_dataset_specific_schedules():
@@ -175,7 +218,7 @@ def test_pathological_full_spec_expands_all_dataset_specific_schedules():
     assert {job.dataset for job in food_jobs} == {"food101"}
 
 
-def test_prompt_method_fedmia_spec_expands_three_methods_and_two_attacks():
+def test_prompt_method_fedmia_spec_adds_direct_gradient_where_logits_are_tx():
     spec_path = REPOSITORY_ROOT / "configs" / "fedmia_prompt_methods_sweep.yaml"
     import yaml
 
@@ -183,20 +226,23 @@ def test_prompt_method_fedmia_spec_expands_three_methods_and_two_attacks():
         spec = yaml.safe_load(file)
     jobs, results_root = build_jobs(spec, spec_path)
 
-    assert len(jobs) == 45
-    assert len({job.run_id for job in jobs}) == 45
+    assert len(jobs) == 15
+    assert len({job.run_id for job in jobs}) == 15
     assert results_root == REPOSITORY_ROOT / "results" / "fedmia_prompt_methods"
     assert spec["jobs"] == 1
     assert spec["gpus"] == [0]
+    assert {job.seed for job in jobs} == {42}
+    assert all(job.config["partition_mode"] == "iid" for job in jobs)
     assert {job.method for job in jobs} == {"promptfl", "fedotp", "fedpgp"}
-    assert all(
-        job.config["audit"]["attacks"] == ["fedmia_loss", "fedmia_cosine"]
-        for job in jobs
-    )
+    for job in jobs:
+        expected = ["fedmia_loss", "fedmia_cosine", "fedmia_text"]
+        if job.method != "fedotp":
+            expected.append("fedmia_text_gradient")
+        assert job.config["audit"]["attacks"] == expected
     assert all(job.config["defense"]["name"] == "none" for job in jobs)
     assert all(job.method in job.run_id for job in jobs)
-    assert len(filter_jobs_by_method(jobs, "fedotp")) == 15
-    assert len(filter_jobs_by_dataset(jobs, "cifar100")) == 9
+    assert len(filter_jobs_by_method(jobs, "fedotp")) == 5
+    assert len(filter_jobs_by_dataset(jobs, "cifar100")) == 3
     for job in jobs:
         validate_config(job.config)
         if job.dataset == "cifar100":
@@ -231,7 +277,12 @@ def test_prompt_method_fewshot_spec_caps_system_pool_and_uses_dirichlet():
     assert all(job.config["dirichlet_alpha"] == 0.1 for job in jobs)
     for job in jobs:
         assert job.config["audit"]["audit_client_ids"] == "all"
-        assert job.config["audit"]["attacks"] == FIRST_BATCH_ATTACKS
+        expected_attacks = [
+            attack
+            for attack in FIRST_BATCH_ATTACKS
+            if attack != "fedmia_text_gradient" or job.method != "fedotp"
+        ]
+        assert job.config["audit"]["attacks"] == expected_attacks
         assert job.config["audit"]["candidate_sampling"] == "fedmia_mix"
         assert job.config["audit"]["nonmember_to_member_ratio"] == 1.0
         assert job.config["audit"]["max_member_samples"] == 2048
@@ -257,7 +308,7 @@ def test_fewshot_job_hyperparameters_report_effective_configuration():
     job = next(
         item
         for item in jobs
-        if item.dataset == "cifar100" and item.method == "fedotp"
+        if item.dataset == "cifar100" and item.method == "promptfl"
     )
 
     parameters = sweep._job_hyperparameters(job)
@@ -274,10 +325,16 @@ def test_fewshot_job_hyperparameters_report_effective_configuration():
         "local_epochs": 5,
     }
     assert parameters["optimization"]["learning_rate"] == 0.005
-    assert parameters["method_parameters"] == job.config["fedotp"]
+    assert parameters["method_parameters"] == job.config["promptfl"]
     assert parameters["privacy_audit"]["attacks"] == FIRST_BATCH_ATTACKS
     assert parameters["privacy_audit"]["candidate_sampling"] == "fedmia_mix"
     assert parameters["privacy_audit"]["nonmember_to_member_ratio"] == 1.0
+    assert parameters["privacy_audit"]["fedmia_text_probe_norm"] == 0.001
+    assert parameters["privacy_audit"]["fedmia_text_candidate_batch_size"] == 8
+    assert (
+        parameters["privacy_audit"]["fedmia_text_gradient_project_tangent"]
+        is False
+    )
     block = sweep._job_hyperparameters_block(job)
     assert block.startswith("=" * 88)
     assert f"HYPERPARAMETERS | {job.run_id}" in block
@@ -349,7 +406,8 @@ def test_sweep_summary_uses_tpr_at_one_percent_as_primary_table(tmp_path: Path):
     }
     jobs, results_root = build_jobs(spec, spec_path)
     for index, job in enumerate(jobs):
-        result_dir = job.run_root / f"completed_{index}"
+        # Cover both the current flat layout and legacy timestamped runs.
+        result_dir = job.run_root if index == 0 else job.run_root / "completed_1"
         (result_dir / "privacy_audit").mkdir(parents=True)
         with (result_dir / "training_metrics.csv").open(
             "w", encoding="utf-8", newline=""

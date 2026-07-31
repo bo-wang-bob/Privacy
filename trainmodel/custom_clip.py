@@ -710,6 +710,66 @@ class CustomCLIP(BaseModel):
         """Return the prompt matrix actually consumed by the text encoder."""
         return self.prompt_learner.effective_context()
 
+    def get_text_feature_contexts(self) -> tuple[torch.Tensor, ...]:
+        """Return the context tensors whose encoded mean defines text features."""
+        learner = self.prompt_learner
+        if self.parameterization == "fedotp":
+            return learner.global_ctx, learner.local_ctx
+        return (learner.effective_context(),)
+
+    @torch.no_grad()
+    def get_text_features_for_context_batch(
+        self,
+        contexts: torch.Tensor,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """Encode a batch of shared or class-specific prompt contexts."""
+        learner = self.prompt_learner
+        classes = learner.n_cls
+        if contexts.ndim == 3:
+            # (B, n_ctx, dim) -> (B, C, n_ctx, dim)
+            expanded = contexts.unsqueeze(1).expand(-1, classes, -1, -1)
+        elif contexts.ndim == 4 and contexts.shape[1] == classes:
+            expanded = contexts
+        else:
+            raise ValueError(
+                "Batched contexts must have shape (B, n_ctx, dim) or "
+                "(B, num_classes, n_ctx, dim)."
+            )
+        batch = expanded.shape[0]
+        prefix = learner.token_prefix.unsqueeze(0).expand(batch, -1, -1, -1)
+        suffix = learner.token_suffix.unsqueeze(0).expand(batch, -1, -1, -1)
+        prompt_embeds = torch.cat((prefix, expanded, suffix), dim=2)
+
+        suffix_mask = learner.suffix_attention_mask
+        prefix_mask = torch.ones(
+            classes,
+            1,
+            device=contexts.device,
+            dtype=suffix_mask.dtype,
+        )
+        context_mask = torch.ones(
+            classes,
+            learner.n_ctx,
+            device=contexts.device,
+            dtype=suffix_mask.dtype,
+        )
+        attention_mask = torch.cat(
+            (prefix_mask, context_mask, suffix_mask), dim=1
+        ).unsqueeze(0).expand(batch, -1, -1)
+        flat_prompts = prompt_embeds.reshape(
+            batch * classes, prompt_embeds.shape[2], prompt_embeds.shape[3]
+        )
+        flat_mask = attention_mask.reshape(batch * classes, attention_mask.shape[2])
+        features = self.text_encoder(flat_prompts, flat_mask, self.clip_model).reshape(
+            batch, classes, -1
+        )
+        if normalize:
+            features = features / features.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
+        return features
+
     @torch.no_grad()
     def get_text_features(self, normalize: bool = True) -> torch.Tensor:
         """

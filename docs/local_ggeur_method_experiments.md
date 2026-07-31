@@ -2,7 +2,7 @@
 
 > Historical development log. Its tables include a retired, unpublished
 > composite diagnostic and must not be used as current paper evidence. The
-> validated five-attack results are in `paper/aaai2027/veil.pdf`.
+> former VEIL manuscript artifacts have been removed from this repository.
 
 ## Local-GGEUR for Membership-Private Federated Prompt Learning
 

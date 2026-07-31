@@ -8,7 +8,7 @@ require_cuda: true
 gpu: 0
 seed: 42
 
-partition_mode: pathological
+partition_mode: iid
 use_full_dataset: true
 fpl_shots: null
 total_users: 10

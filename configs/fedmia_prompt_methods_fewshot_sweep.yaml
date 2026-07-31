@@ -12,7 +12,21 @@ target_client_ids: [0]
 
 methods:
   - promptfl
-  - fedotp
+  - name: fedotp
+    overrides:
+      audit:
+        # FedMIA-IV assumes cosine-classifier logits T x; FedOTP uses UOT logits.
+        attacks:
+          - loss_series
+          - grad_cosine
+          - avg_cosine
+          - fedmia_loss
+          - fedmia_cosine
+          - fedmia_text
+          - nasr_passive
+          - transfer_representation
+          - rmia
+          - quantile_mia
   - fedpgp
 
 # Few-shot means a single system-wide pool of at most 16 training examples per
@@ -75,6 +89,8 @@ common:
       - avg_cosine
       - fedmia_loss
       - fedmia_cosine
+      - fedmia_text
+      - fedmia_text_gradient
       - nasr_passive
       - transfer_representation
       - rmia
@@ -100,6 +116,13 @@ common:
     fedmia_tail: upper
     fedmia_loss_aggregation: mean
     fedmia_cosine_aggregation: mean
+    fedmia_text_aggregation: mean
+    fedmia_text_tail: upper
+    fedmia_text_probe_norm: 0.001
+    fedmia_text_candidate_batch_size: 8
+    fedmia_text_gradient_aggregation: mean
+    fedmia_text_gradient_tail: upper
+    fedmia_text_gradient_project_tangent: false
     calibration_fraction: 0.5
     auxiliary_fraction: 0.5
     qmia_epochs: 200

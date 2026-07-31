@@ -20,6 +20,23 @@ ATTACK_FIELDS = {
     "promptres": {"promptres", "promptres_effective_ranks"},
     "fedmia_loss": {"confidence"},
     "fedmia_cosine": {"cosine"},
+    "fedmia_text": {
+        "text_feature_cosine",
+        "text_feature_client_change_norms",
+        "text_feature_shape",
+        "text_feature_probe_norm",
+        "text_feature_zero_gradient_count",
+        "text_feature_zero_candidate_change_count",
+        "text_feature_batched_context_encoding",
+    },
+    "fedmia_text_gradient": {
+        "text_gradient_cosine",
+        "text_gradient_client_change_norms",
+        "text_gradient_shape",
+        "text_gradient_logit_scale",
+        "text_gradient_project_tangent",
+        "text_gradient_zero_candidate_change_count",
+    },
     "nasr_passive": {
         "confidence",
         "cosine",

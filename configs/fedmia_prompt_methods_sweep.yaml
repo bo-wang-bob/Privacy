@@ -8,16 +8,20 @@ gpus: [0]
 minimum_free_memory_mb: 7000
 jobs: 1
 
-# Three independent repetitions for mean/std reporting.
-seeds: [42, 1337, 2027]
+# Initial validation pass: run every dataset/method combination once.
+seeds: [42]
 target_client_ids: [0]
 
 methods:
   - promptfl
-  - fedotp
+  - name: fedotp
+    overrides:
+      audit:
+        # FedMIA-IV assumes cosine-classifier logits T x; FedOTP uses UOT logits.
+        attacks: [fedmia_loss, fedmia_cosine, fedmia_text]
   - fedpgp
 
-# Full-data pathological partitions and the schedules requested for the
+# Full-data IID partitions and the schedules requested for the
 # current benchmark. Oxford Flowers 102 is named "flowers" by the loader.
 datasets:
   - name: caltech101
@@ -59,7 +63,7 @@ common:
   data_root: ./data
   cache_dir: ./checkpoints/clip-vit-base-patch32
   require_cuda: true
-  partition_mode: pathological
+  partition_mode: iid
   use_full_dataset: true
   fpl_shots: null
   local_epochs: 1
@@ -79,6 +83,8 @@ common:
     attacks:
       - fedmia_loss
       - fedmia_cosine
+      - fedmia_text
+      - fedmia_text_gradient
     target_client_id: 0
     # For the 10-client datasets, pool exact per-class member/non-member pairs
     # from every client in the same training run.
@@ -92,7 +98,7 @@ common:
     max_member_samples: 128
     max_nonmember_samples: 128
     match_candidate_labels: true
-    # Keep only the round signals required to reproduce Loss/Cosine attacks.
+    # Keep only the round signals required to reproduce FedMIA-I/II/III/IV.
     # Use "full" only for one-off white-box debugging runs.
     signal_storage: compact
     # Paper-faithful one-tailed FedMIA: -loss and gradient cosine are both
@@ -100,6 +106,13 @@ common:
     fedmia_tail: upper
     fedmia_loss_aggregation: mean
     fedmia_cosine_aggregation: mean
+    fedmia_text_aggregation: mean
+    fedmia_text_tail: upper
+    fedmia_text_probe_norm: 0.001
+    fedmia_text_candidate_batch_size: 8
+    fedmia_text_gradient_aggregation: mean
+    fedmia_text_gradient_tail: upper
+    fedmia_text_gradient_project_tangent: false
     training_health_check: true
     fedmia_signal_health_check: true
   defense:

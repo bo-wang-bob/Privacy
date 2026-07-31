@@ -92,6 +92,28 @@ def _result_run_id(
     return now.strftime("%Y%m%d_%H%M%S_%f") + f"_{process_id}"
 
 
+def _result_directory(config: dict) -> str:
+    """Return the canonical output directory for a direct or sweep run."""
+    if bool(config.get("results_dir_is_run_dir", False)):
+        return str(config["results_dir"])
+    timestamp = _result_run_id()
+    configured_attacks = list(config.get("audit", {}).get("attacks", []))
+    if (
+        not bool(config.get("audit", {}).get("enabled", True))
+        or not configured_attacks
+    ):
+        attack_label = "no_attack"
+    elif len(configured_attacks) == 1:
+        attack_label = configured_attacks[0]
+    else:
+        attack_label = "multi_attack"
+    defense_label = str(config.get("defense", {}).get("name", "none")).lower()
+    return os.path.join(
+        config["results_dir"],
+        f"{config['dataset_name']}_{config['aggregator']}_{attack_label}_{defense_label}_{timestamp}",
+    )
+
+
 def _load_local_clip(cache_dir: str, device: torch.device):
     from transformers import CLIPModel, CLIPProcessor
 
@@ -294,7 +316,13 @@ def validate_config(config: dict) -> None:
         "full",
     }:
         raise ValueError("audit.signal_storage must be none, compact, or full.")
-    for key in ("fedmia_tail", "fedmia_loss_tail", "fedmia_cosine_tail"):
+    for key in (
+        "fedmia_tail",
+        "fedmia_loss_tail",
+        "fedmia_cosine_tail",
+        "fedmia_text_tail",
+        "fedmia_text_gradient_tail",
+    ):
         if key in audit and str(audit[key]).lower() not in {
             "upper",
             "lower",
@@ -304,6 +332,18 @@ def validate_config(config: dict) -> None:
     if not 0 < float(audit.get("fedmia_tail_calibration_fraction", 0.25)) < 1:
         raise ValueError(
             "audit.fedmia_tail_calibration_fraction must be between 0 and 1."
+        )
+    if float(audit.get("fedmia_text_probe_norm", 1e-3)) <= 0:
+        raise ValueError("audit.fedmia_text_probe_norm must be positive.")
+    if int(audit.get("fedmia_text_candidate_batch_size", 8)) <= 0:
+        raise ValueError(
+            "audit.fedmia_text_candidate_batch_size must be positive."
+        )
+    if not isinstance(
+        audit.get("fedmia_text_gradient_project_tangent", False), bool
+    ):
+        raise ValueError(
+            "audit.fedmia_text_gradient_project_tangent must be boolean."
         )
     if int(audit.get("promptres_background_rank", 0)) < 0:
         raise ValueError("audit.promptres_background_rank must be non-negative.")
@@ -331,6 +371,21 @@ def validate_config(config: dict) -> None:
             "PromptRes needs a prompt update; FedASK exposes only sketches outside "
             "the full_whitebox audit view."
         )
+    if (
+        attacks & {"fedmia_text", "fedmia_text_gradient"}
+        and method == "fedask"
+        and str(audit.get("audit_view", "protocol_plus_released_prompts")).lower()
+        != "full_whitebox"
+    ):
+        raise ValueError(
+            "FedMIA-III/IV must reconstruct each client's text-feature matrix; "
+            "FedASK exposes only sketches outside the full_whitebox audit view."
+        )
+    if "fedmia_text_gradient" in attacks and method == "fedotp":
+        raise ValueError(
+            "FedMIA-IV assumes logits = scale * image_features @ "
+            "text_features.T; FedOTP uses optimal-transport logits."
+        )
     for key in (
         "min_trainable_update_norm",
         "max_stagnant_loss_range",
@@ -343,13 +398,16 @@ def validate_config(config: dict) -> None:
     ).lower() == "released_prompt" and attacks & {
         "nasr_passive",
         "fedmia_cosine",
+        "fedmia_text",
+        "fedmia_text_gradient",
         "grad_cosine",
         "avg_cosine",
         "promptres",
     }:
         raise ValueError(
             "released_prompt audit view cannot run update-dependent attacks "
-            "nasr_passive, fedmia_cosine, grad_cosine, avg_cosine, or promptres."
+            "nasr_passive, fedmia_cosine, fedmia_text, fedmia_text_gradient, "
+            "grad_cosine, avg_cosine, or promptres."
         )
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
@@ -460,6 +518,8 @@ def validate_config(config: dict) -> None:
     spatial = {
         "fedmia_loss",
         "fedmia_cosine",
+        "fedmia_text",
+        "fedmia_text_gradient",
         "transfer_representation",
         "rmia",
         "yoqo",
@@ -553,21 +613,9 @@ def run(config: dict) -> list[dict]:
     )
     config["effective_train_mode"] = effective_train_mode
 
-    # Include microseconds and the process id so concurrent sweeps of the same
-    # method/defense cannot write into one directory and corrupt each other.
-    timestamp = _result_run_id()
-    configured_attacks = list(config.get("audit", {}).get("attacks", []))
-    if not bool(config.get("audit", {}).get("enabled", True)) or not configured_attacks:
-        attack_label = "no_attack"
-    elif len(configured_attacks) == 1:
-        attack_label = configured_attacks[0]
-    else:
-        attack_label = "multi_attack"
-    defense_label = str(config.get("defense", {}).get("name", "none")).lower()
-    result_dir = os.path.join(
-        config["results_dir"],
-        f"{config['dataset_name']}_{config['aggregator']}_{attack_label}_{defense_label}_{timestamp}",
-    )
+    # Sweep jobs already have a stable directory; direct runs receive a
+    # collision-free timestamped child from this helper.
+    result_dir = _result_directory(config)
     os.makedirs(result_dir, exist_ok=True)
     with open(
         os.path.join(result_dir, "run_config.yaml"), "w", encoding="utf-8"
@@ -756,6 +804,7 @@ def default_config() -> dict:
         "save_models": False,
         "eval_interval": 5,
         "results_dir": "./results",
+        "results_dir_is_run_dir": False,
         "audit": {
             "enabled": True,
             "audit_view": "protocol_plus_released_prompts",
@@ -771,6 +820,8 @@ def default_config() -> dict:
                 "nasr_active",
                 "fedmia_loss",
                 "fedmia_cosine",
+                "fedmia_text",
+                "fedmia_text_gradient",
                 "transfer_representation",
                 "codepoison",
                 "pipra",
@@ -789,6 +840,13 @@ def default_config() -> dict:
             "match_candidate_labels": False,
             "signal_storage": "compact",
             "fedmia_tail": "upper",
+            "fedmia_text_aggregation": "mean",
+            "fedmia_text_tail": "upper",
+            "fedmia_text_probe_norm": 1e-3,
+            "fedmia_text_candidate_batch_size": 8,
+            "fedmia_text_gradient_aggregation": "mean",
+            "fedmia_text_gradient_tail": "upper",
+            "fedmia_text_gradient_project_tangent": False,
             "fedmia_tail_calibration_fraction": 0.25,
             "training_health_check": True,
             "fedmia_signal_health_check": False,

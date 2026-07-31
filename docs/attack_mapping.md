@@ -22,6 +22,20 @@
 - 同一轮其他客户端构成 non-target/null 分布；
 - 对多个通信轮的单尾 CDF 分数支持 `mean`、`max`、`last` 与 `late3` 聚合。
 
+本仓库另外提供扩展攻击 `fedmia_text`（FedMIA-III）。它不是原 FedMIA
+论文定义的第三种攻击：实现先计算客户端训练前后归一化文本特征矩阵的变化，
+再沿候选样本 prompt gradient 执行固定范数的虚拟下降步，将候选变化映射到
+同一文本特征空间，并使用两个完整矩阵的 Frobenius 余弦作为逐轮测量值。
+后续的跨客户端零假设、3-sigma 过滤、CDF 和跨轮聚合与 FedMIA-I/II 相同。
+候选矩阵按批次即算即用，仅最终的客户端/候选相似度会写入信号文件。
+
+扩展攻击 `fedmia_text_gradient`（FedMIA-IV）直接利用余弦分类器
+`logits = scale * T x` 的解析梯度。对候选样本 `(x, y)`，其预测文本矩阵下降
+方向为 `-scale * (softmax(logits) - one_hot(y)) x^T`；攻击将该矩阵与客户端
+真实文本矩阵变化计算 Frobenius 余弦，再复用 FedMIA 的跨客户端零假设与跨轮
+聚合。该方法不使用 JVP。可选切空间投影用于去掉归一化文本行的径向分量。
+FedOTP 的 UOT 分类分数不是 `T x`，因此不运行 FedMIA-IV。
+
 早期实验曾自行组合两类 FedMIA 证据；该分数并非论文定义的攻击，现已从
 执行入口、配置和测试中移除。结果分析器仅在读取旧目录时识别并丢弃对应字段，
 它不会进入新生成的证据或实验表格。
@@ -42,7 +56,7 @@ FedMIA 官方仓库将四个相关基线按“度量、时间信息、空间信�
 官方绘图代码还会查看每一轮的攻击效果并报告其中的最大 TPR。那种选择依赖
 真实成员标签，不能作为部署时可实现的攻击规则，因此本仓库的单轮基线使用预先
 固定的轮次，而不实现 oracle best-round。四个基线都只使用目标客户端，不使用
-FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II 的对照意义。
+FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的对照意义。
 
 ## 3. Rethinking Membership Inference Attacks Against Transfer Learning
 

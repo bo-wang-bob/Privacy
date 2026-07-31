@@ -2,8 +2,8 @@
 
 > 论文阶段本方法正式更名为 **VEIL**（Variance-Echoed Instance-Less Prompt
 > Learning）；`local_ggeur` 是同一实现的历史配置名。本文记录的是五 seed
-> 开发阶段证据，不应与 AAAI 论文固定 seeds 42--44 的正式三数据集主表混用；
-> 论文数值由 `analysis_scripts/veil_paper_results.py` 另行严格选择和聚合。
+> 开发阶段证据。原 VEIL 论文及其结果聚合脚本已从仓库移除，本文仅作为
+> 历史实验记录保留。
 
 日期：2026-07-16
 
