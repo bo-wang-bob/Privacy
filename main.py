@@ -4,6 +4,7 @@ import argparse
 import copy
 import datetime
 import logging
+import math
 import os
 import random
 
@@ -26,6 +27,21 @@ from utils.privacy_accounting import (
 )
 
 logger = logging.getLogger(__name__)
+
+LAUNCHER_LOG_CAPTURE_ENV = "FEDMIA_LAUNCHER_LOG_CAPTURE"
+
+
+def _build_logging_handlers(result_dir: str) -> list[logging.Handler]:
+    """Use one canonical log file while keeping direct runs self-contained."""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if os.environ.get(LAUNCHER_LOG_CAPTURE_ENV) != "1":
+        handlers.insert(
+            0,
+            logging.FileHandler(
+                os.path.join(result_dir, "run.log"), encoding="utf-8"
+            ),
+        )
+    return handlers
 
 
 def _format_privacy_audit_summary(summaries: list[dict]) -> str:
@@ -219,12 +235,33 @@ def validate_config(config: dict) -> None:
     pooled_audit = audit_client_ids == "all" or (
         isinstance(audit_client_ids, list) and len(audit_client_ids) > 1
     )
+    candidate_sampling = str(audit.get("candidate_sampling", "legacy")).lower()
+    if candidate_sampling not in {"legacy", "fedmia_mix"}:
+        raise ValueError(
+            "audit.candidate_sampling must be legacy or fedmia_mix."
+        )
+    nonmember_ratio = float(audit.get("nonmember_to_member_ratio", 1.0))
+    if nonmember_ratio <= 0:
+        raise ValueError(
+            "audit.nonmember_to_member_ratio must be positive."
+        )
+    if candidate_sampling == "fedmia_mix" and bool(
+        audit.get("match_candidate_labels", False)
+    ):
+        raise ValueError(
+            "audit.candidate_sampling=fedmia_mix requires "
+            "match_candidate_labels=false to reproduce the reference protocol."
+        )
     if pooled_audit and attacks - POOLED_CLIENT_ATTACKS:
         raise ValueError(
             "Multi-client pooled auditing currently supports only: "
             + ", ".join(sorted(POOLED_CLIENT_ATTACKS))
         )
-    if pooled_audit and not bool(audit.get("match_candidate_labels", False)):
+    if (
+        pooled_audit
+        and candidate_sampling == "legacy"
+        and not bool(audit.get("match_candidate_labels", False))
+    ):
         raise ValueError(
             "Multi-client pooled auditing requires match_candidate_labels=true."
         )
@@ -239,6 +276,18 @@ def validate_config(config: dict) -> None:
         raise ValueError("audit.max_member_samples must be at least 2.")
     if int(audit.get("max_nonmember_samples", legacy_candidates)) < 2:
         raise ValueError("audit.max_nonmember_samples must be at least 2.")
+    if candidate_sampling == "fedmia_mix":
+        required_nonmembers = math.ceil(
+            int(audit.get("max_member_samples", legacy_candidates))
+            * nonmember_ratio
+        )
+        if int(audit.get("max_nonmember_samples", legacy_candidates)) < required_nonmembers:
+            raise ValueError(
+                "FedMIA mix sampling requires max_nonmember_samples >= "
+                "ceil(max_member_samples * nonmember_to_member_ratio), got "
+                f"{audit.get('max_nonmember_samples', legacy_candidates)} < "
+                f"{required_nonmembers}."
+            )
     if str(audit.get("signal_storage", "compact")).lower() not in {
         "none",
         "compact",
@@ -256,6 +305,32 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "audit.fedmia_tail_calibration_fraction must be between 0 and 1."
         )
+    if int(audit.get("promptres_background_rank", 0)) < 0:
+        raise ValueError("audit.promptres_background_rank must be non-negative.")
+    if str(audit.get("promptres_aggregation", "mean")).lower() not in {
+        "mean",
+        "max",
+        "last",
+    }:
+        raise ValueError("audit.promptres_aggregation must be mean, max, or last.")
+    if (
+        "promptres" in attacks
+        and int(audit.get("promptres_background_rank", 0)) > 0
+        and config["sample_users"] < 2
+    ):
+        raise ValueError(
+            "PromptRes background residualization requires two clients per round."
+        )
+    if (
+        "promptres" in attacks
+        and method == "fedask"
+        and str(audit.get("audit_view", "protocol_plus_released_prompts")).lower()
+        != "full_whitebox"
+    ):
+        raise ValueError(
+            "PromptRes needs a prompt update; FedASK exposes only sketches outside "
+            "the full_whitebox audit view."
+        )
     for key in (
         "min_trainable_update_norm",
         "max_stagnant_loss_range",
@@ -270,10 +345,11 @@ def validate_config(config: dict) -> None:
         "fedmia_cosine",
         "grad_cosine",
         "avg_cosine",
+        "promptres",
     }:
         raise ValueError(
             "released_prompt audit view cannot run update-dependent attacks "
-            "nasr_passive, fedmia_cosine, grad_cosine, or avg_cosine."
+            "nasr_passive, fedmia_cosine, grad_cosine, avg_cosine, or promptres."
         )
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
@@ -499,10 +575,7 @@ def run(config: dict) -> list[dict]:
         yaml.safe_dump(config, file, sort_keys=False, allow_unicode=True)
     logging.basicConfig(
         level=logging.INFO,
-        handlers=[
-            logging.FileHandler(os.path.join(result_dir, "run.log"), encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
+        handlers=_build_logging_handlers(result_dir),
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         force=True,
     )
@@ -711,6 +784,8 @@ def default_config() -> dict:
             "max_samples_per_group": 32,
             "audit_interval": 2,
             "calibration_fraction": 0.5,
+            "candidate_sampling": "legacy",
+            "nonmember_to_member_ratio": 1.0,
             "match_candidate_labels": False,
             "signal_storage": "compact",
             "fedmia_tail": "upper",
@@ -761,6 +836,8 @@ def default_config() -> dict:
             "promptmia_keys": 4,
             "promptmia_delta_min": 0.02,
             "promptmia_similarity_span": 0.05,
+            "promptres_background_rank": 0,
+            "promptres_aggregation": "mean",
         },
         "defense": {
             "name": "none",

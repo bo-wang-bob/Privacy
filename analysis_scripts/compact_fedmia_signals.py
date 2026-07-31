@@ -17,6 +17,7 @@ ATTACK_FIELDS = {
     "loss_series": {"confidence"},
     "grad_cosine": {"cosine"},
     "avg_cosine": {"cosine"},
+    "promptres": {"promptres", "promptres_effective_ranks"},
     "fedmia_loss": {"confidence"},
     "fedmia_cosine": {"cosine"},
     "nasr_passive": {

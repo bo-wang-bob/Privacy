@@ -1,5 +1,0 @@
-variant,accuracy,fedmia_loss,fedmia_cosine,nasr_passive,rmia,quantile_mia,worst_tpr,mean_tpr,result_dir
-Full VEIL,0.6215644820295984,0.0,0.0,0.03125,0.0,0.0,0.03125,0.00625,flowers_fedavg_multi_attack_veil_20260716_223813_837652_244415
-w/o Stage I,0.6209139697511791,0.0,0.0,0.03125,0.015625,0.0,0.03125,0.009375,flowers_fedavg_multi_attack_veil_20260716_224411_072480_246127
-w/o Stage II,0.6209139697511791,0.0,0.0,0.03125,0.015625,0.015625,0.03125,0.0125,flowers_fedavg_multi_attack_veil_20260716_224129_945920_245266
-w/o Stage III,0.651488046836884,0.0,0.0,0.0625,0.015625,0.03125,0.0625,0.021875,flowers_fedavg_multi_attack_veil_20260716_224928_741498_247830

@@ -232,6 +232,11 @@ def test_prompt_method_fewshot_spec_caps_system_pool_and_uses_dirichlet():
     for job in jobs:
         assert job.config["audit"]["audit_client_ids"] == "all"
         assert job.config["audit"]["attacks"] == FIRST_BATCH_ATTACKS
+        assert job.config["audit"]["candidate_sampling"] == "fedmia_mix"
+        assert job.config["audit"]["nonmember_to_member_ratio"] == 1.0
+        assert job.config["audit"]["max_member_samples"] == 2048
+        assert job.config["audit"]["max_nonmember_samples"] == 2048
+        assert job.config["audit"]["match_candidate_labels"] is False
         assert (job.config["total_users"], job.config["sample_users"]) == (10, 10)
         assert job.config["num_global_iters"] == 50
         assert job.config["local_epochs"] == 5
@@ -271,6 +276,8 @@ def test_fewshot_job_hyperparameters_report_effective_configuration():
     assert parameters["optimization"]["learning_rate"] == 0.005
     assert parameters["method_parameters"] == job.config["fedotp"]
     assert parameters["privacy_audit"]["attacks"] == FIRST_BATCH_ATTACKS
+    assert parameters["privacy_audit"]["candidate_sampling"] == "fedmia_mix"
+    assert parameters["privacy_audit"]["nonmember_to_member_ratio"] == 1.0
     block = sweep._job_hyperparameters_block(job)
     assert block.startswith("=" * 88)
     assert f"HYPERPARAMETERS | {job.run_id}" in block

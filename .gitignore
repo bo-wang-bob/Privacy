@@ -4,6 +4,7 @@ logs/
 checkpoints
 saved_models/
 analysis_reports/
+paper/
 
 # Local model weights and experiment artifacts
 *.pt
@@ -11,9 +12,6 @@ analysis_reports/
 *.ckpt
 *.safetensors
 *.onnx
-
-# Local reference papers (compiled project PDFs under subdirectories may be tracked)
-paper/*.pdf
 
 # Python environments and tooling artifacts
 .venv/

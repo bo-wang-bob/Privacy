@@ -1,5 +1,0 @@
-method,scope,runs,epsilon_min,epsilon_max,delta,formal_dp_enabled
-DP-FPL,global_epsilon,9,511.5129254649701,511.5129254649701,1e-05,True
-DP-FPL,local_epsilon,9,122.62403657608134,122.62403657608134,1e-05,True
-FedASK,epsilon,9,61.51292546497023,61.51292546497023,1e-05,True
-Prompt-DP,epsilon,9,46.51292546497023,81.51292546497022,1e-05,True

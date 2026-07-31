@@ -122,14 +122,20 @@ python main.py \
 ## 多客户端成员隐私审计
 
 设置 `audit.audit_client_ids: all` 或提供多个客户端 ID 时，审计器会先在每个
-客户端上独立执行攻击，再汇总所有预测。成员和非成员候选在客户端内按类别
-精确配对，避免客户端身份或类别分布直接泄露成员标签。
+客户端上独立执行攻击，再汇总所有预测。候选集支持两种明确区分的协议：
+
+- `candidate_sampling: legacy`：成员和非成员在客户端内按类别精确 1:1
+  配对，用于控制类别分布混杂；
+- `candidate_sampling: fedmia_mix`：沿用 FedMIA 的混合来源候选构造，以目标
+  客户端训练样本为成员，非成员由完整独立测试池和其他客户端训练集按来源
+  均衡抽取；本仓库默认成员与非成员数量为 1:1。
 
 当前支持池化执行的攻击为：
 
 - `loss_series`
 - `grad_cosine`
 - `avg_cosine`
+- `promptres`
 - `fedmia_loss`
 - `fedmia_cosine`
 - `nasr_passive`
@@ -137,16 +143,40 @@ python main.py \
 - `rmia`
 - `quantile_mia`
 
+`promptres` 实现文档中的正方向余弦平方分数，可选使用其他客户端更新进行
+leave-one-client-out 均值与截断 SVD 背景消除：
+
+```yaml
+audit:
+  attacks: [promptres]
+  promptres_background_rank: 0  # 0 为直接分数；正数启用背景残差化
+  promptres_aggregation: mean   # mean、max 或 last
+```
+
+无需数据集或 CLIP checkpoint 的第一阶段可行性验证：
+
+```bash
+python analysis_scripts/verify_promptres_toy.py
+```
+
 非 FedMIA 分数使用客户端内、无成员标签的经验 CDF 秩校准后再合并；FedMIA
 保留自身的零假设 CDF。汇总文件同时包含总体指标、客户端宏平均指标和逐客户
-端指标。多客户端审计需要：
+端指标。使用混合来源的 `fedmia_mix` 测评时可配置为：
 
 ```yaml
 audit:
   enabled: true
   audit_client_ids: all
-  match_candidate_labels: true
+  candidate_sampling: fedmia_mix
+  nonmember_to_member_ratio: 1.0
+  max_member_samples: 128
+  max_nonmember_samples: 128
+  match_candidate_labels: false
 ```
+
+严格标签配对协议仍可通过 `candidate_sampling: legacy` 与
+`match_candidate_labels: true` 使用。两种协议的结果不应直接混合比较；
+`privacy_audit/summary.json` 会记录实际成员/非成员数量、比例和各非成员来源。
 
 完整攻击定义和威胁模型见 [`docs/attack_mapping.md`](docs/attack_mapping.md)。
 
@@ -172,7 +202,7 @@ audit:
 每次运行会在 `results_dir` 下创建独立目录，主要包含：
 
 - `run_config.yaml`：合并命令行覆盖后的实际配置；
-- `run.log`：训练、评估与审计日志；
+- `run.log`：直接运行 `main.py` 时的训练、评估与审计日志；
 - `training_metrics.csv`：各评估轮次的损失与准确率；
 - `training_health.json`：训练状态健康检查；
 - `final_prompt.pt`：最终可训练提示参数；
@@ -184,6 +214,10 @@ audit:
 
 `signal_storage` 可设置为 `none`、`compact` 或 `full`，用于控制审计信号的
 保存范围。
+
+通过 sweep 脚本启动时，标准输出和错误统一保存在结果根目录下的
+`launcher_logs/<run_id>.log`，不再在单次运行目录中重复生成内容相同的
+`run.log`。进度日志按 `eval_interval` 输出；逐轮详情仅在 DEBUG 级别记录。
 
 ## 测试
 

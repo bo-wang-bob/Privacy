@@ -22,6 +22,7 @@ import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER_LOG_CAPTURE_ENV = "FEDMIA_LAUNCHER_LOG_CAPTURE"
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,10 @@ def _job_hyperparameters(job: SweepJob) -> dict[str, Any]:
             "attacks": audit.get("attacks", []),
             "audit_client_ids": audit.get("audit_client_ids"),
             "audit_interval": audit.get("audit_interval"),
+            "candidate_sampling": audit.get("candidate_sampling", "legacy"),
+            "nonmember_to_member_ratio": audit.get(
+                "nonmember_to_member_ratio"
+            ),
             "max_member_samples": audit.get("max_member_samples"),
             "max_nonmember_samples": audit.get("max_nonmember_samples"),
             "fedmia_tail": audit.get("fedmia_tail"),
@@ -567,6 +572,9 @@ def _launch(job: SweepJob, gpu: int, logs_root: Path) -> ActiveRun:
     log_file.flush()
     environment = os.environ.copy()
     environment["PYTHONUNBUFFERED"] = "1"
+    # The launcher log already captures the child's stdout and stderr. Tell
+    # main.py not to write the same messages to a second run.log file.
+    environment[LAUNCHER_LOG_CAPTURE_ENV] = "1"
     environment.setdefault("TOKENIZERS_PARALLELISM", "false")
     process = subprocess.Popen(
         command,

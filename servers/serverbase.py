@@ -27,6 +27,26 @@ from users.user import UserBase
 logger = logging.getLogger(__name__)
 
 
+def _format_round_progress(
+    round_index: int,
+    total_rounds: int,
+    loss: float,
+    accuracy: float,
+    selected_ids: list[int],
+    total_users: int,
+    audit_snapshots: int,
+) -> str:
+    if sorted(selected_ids) == list(range(total_users)):
+        selected = f"all({total_users})"
+    else:
+        selected = "[" + ",".join(str(user_id) for user_id in selected_ids) + "]"
+    return (
+        f"Progress | round={round_index + 1}/{total_rounds} | loss={loss:.4f} | "
+        f"accuracy={100.0 * accuracy:.2f}% | selected={selected} | "
+        f"audit_snapshots={audit_snapshots}"
+    )
+
+
 class ServerBase:
     """Federated prompt-tuning server with pluggable methods and privacy audits."""
 
@@ -205,7 +225,7 @@ class ServerBase:
         selected = random.sample(others, self.user_per_round - 1)
         return sorted([self.target_client_id, *selected])
 
-    def _evaluate(self, round_index: int) -> None:
+    def _evaluate(self, round_index: int, selected_ids: list[int]) -> None:
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
@@ -237,6 +257,18 @@ class ServerBase:
                     metrics["samples"],
                 )
             )
+        logger.info(
+            "%s",
+            _format_round_progress(
+                round_index=round_index,
+                total_rounds=self.num_glob_iters,
+                loss=float(metrics["loss"]),
+                accuracy=float(metrics["accuracy"]),
+                selected_ids=selected_ids,
+                total_users=self.total_users_num,
+                audit_snapshots=len(self.auditor.observations),
+            ),
+        )
 
     def _validate_training_health(
         self,
@@ -356,7 +388,7 @@ class ServerBase:
             selected_ids = self._sample_users()
             self.ctx.user_selected = selected_ids
             self.defense.prepare_round(selected_ids, round_index)
-            logger.info("Round %s selected clients: %s", round_index, selected_ids)
+            logger.debug("Round %s selected clients: %s", round_index, selected_ids)
 
             base_states = {
                 user_id: self._clone_state(self.ctx.get_base_model_state(user_id))
@@ -403,7 +435,7 @@ class ServerBase:
                 round_index % self.eval_interval == 0
                 or round_index == self.num_glob_iters - 1
             ):
-                self._evaluate(round_index)
+                self._evaluate(round_index, selected_ids)
 
         if self.train_mode == "centralized":
             final_state = self.ctx.new_model_state[0]

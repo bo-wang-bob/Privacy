@@ -1,4 +1,10 @@
-from main import _format_privacy_audit_summary
+import logging
+
+from main import (
+    LAUNCHER_LOG_CAPTURE_ENV,
+    _build_logging_handlers,
+    _format_privacy_audit_summary,
+)
 
 
 def test_privacy_audit_log_is_compact_and_multiline():
@@ -50,3 +56,29 @@ def test_privacy_audit_log_handles_no_results():
         _format_privacy_audit_summary([])
         == "Privacy audit completed: no attack results."
     )
+
+
+def test_direct_run_keeps_run_log(tmp_path, monkeypatch):
+    monkeypatch.delenv(LAUNCHER_LOG_CAPTURE_ENV, raising=False)
+
+    handlers = _build_logging_handlers(str(tmp_path))
+    try:
+        assert any(isinstance(handler, logging.FileHandler) for handler in handlers)
+        assert (tmp_path / "run.log").is_file()
+    finally:
+        for handler in handlers:
+            handler.close()
+
+
+def test_launcher_capture_avoids_duplicate_run_log(tmp_path, monkeypatch):
+    monkeypatch.setenv(LAUNCHER_LOG_CAPTURE_ENV, "1")
+
+    handlers = _build_logging_handlers(str(tmp_path))
+    try:
+        assert not any(
+            isinstance(handler, logging.FileHandler) for handler in handlers
+        )
+        assert not (tmp_path / "run.log").exists()
+    finally:
+        for handler in handlers:
+            handler.close()

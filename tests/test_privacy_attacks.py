@@ -714,11 +714,95 @@ def test_pooled_client_fedmia_uses_exact_per_class_pairs(tmp_path):
     assert header == "attack,sample_index,audit_client_id,membership,score"
 
 
+def test_pooled_fedmia_mix_defaults_to_one_to_one_source_balanced_candidates(
+    tmp_path,
+):
+    def candidates(count: int, offset: float):
+        images = torch.arange(
+            count * 3 * 4 * 4, dtype=torch.float32
+        ).reshape(count, 3, 4, 4)
+        labels = torch.arange(count) % 2
+        return TensorDataset(images + offset, labels)
+
+    users = [
+        SimpleNamespace(
+            id=client_id,
+            train_data=candidates(6, 100.0 * client_id),
+            test_data=candidates(3, 1000.0 + 100.0 * client_id),
+        )
+        for client_id in range(3)
+    ]
+    config = {
+        "enabled": True,
+        "attacks": ["fedmia_loss"],
+        "audit_client_ids": "all",
+        "candidate_sampling": "fedmia_mix",
+        "match_candidate_labels": False,
+        "max_member_samples": 4,
+        "max_nonmember_samples": 4,
+        "signal_storage": "none",
+        "seed": 31,
+    }
+    first = MembershipAuditor(
+        model=ToyPromptModel(),
+        users=users,
+        target_client_id=0,
+        device=torch.device("cpu"),
+        results_dir=str(tmp_path / "first"),
+        config=config,
+        num_classes=2,
+    )
+    second = MembershipAuditor(
+        model=ToyPromptModel(),
+        users=users,
+        target_client_id=0,
+        device=torch.device("cpu"),
+        results_dir=str(tmp_path / "second"),
+        config=config,
+        num_classes=2,
+    )
+
+    assert int((first.membership == 1).sum()) == 12
+    assert int((first.membership == 0).sum()) == 12
+    assert torch.equal(first.images, second.images)
+    assert torch.equal(first.labels, second.labels)
+    assert first.nonmember_source_priority == [
+        "independent_test",
+        "other_client_train",
+    ]
+    for client_id, sampling in first.candidate_sampling_by_client.items():
+        assert sampling["mode"] == "fedmia_mix"
+        assert sampling["member_count"] == 4
+        assert sampling["nonmember_count"] == 4
+        assert sampling["actual_nonmember_to_member_ratio"] == 1.0
+        source_counts = sampling["nonmember_source_counts"]
+        assert source_counts["independent_test"] == 2
+        assert sum(source_counts.values()) == 4
+        assert len(source_counts) == 3
+
+
+def test_validate_config_accepts_pooled_fedmia_mix_without_label_matching():
+    config = default_config()
+    config["audit"].update(
+        {
+            "attacks": ["fedmia_loss"],
+            "audit_client_ids": "all",
+            "candidate_sampling": "fedmia_mix",
+            "max_member_samples": 4,
+            "max_nonmember_samples": 4,
+            "match_candidate_labels": False,
+        }
+    )
+
+    validate_config(config)
+
+
 def test_pooled_client_first_batch_runs_from_one_training(tmp_path):
     attacks = [
         "loss_series",
         "grad_cosine",
         "avg_cosine",
+        "promptres",
         "fedmia_loss",
         "fedmia_cosine",
         "nasr_passive",

@@ -4,11 +4,12 @@ import copy
 import csv
 import json
 import logging
+import math
 import os
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 from privacy_attacks.code_poison import run_code_poison_attack
 from privacy_attacks.base import AttackResult
@@ -24,6 +25,7 @@ from privacy_attacks.imia import run_imia
 from privacy_attacks.model_utils import last_client_states
 from privacy_attacks.pipra import run_pipra
 from privacy_attacks.promptmia import run_promptmia
+from privacy_attacks.promptres import promptres_round_scores, run_promptres
 from privacy_attacks.quantile import run_quantile_mia
 from privacy_attacks.query_attacks import run_canary, run_yoqo
 from privacy_attacks.rmia import run_rmia
@@ -55,6 +57,7 @@ SUPPORTED_ATTACKS = {
     "yoqo",
     "canary",
     "promptmia",
+    "promptres",
 }
 
 # These attacks can be evaluated client by client from one shared observation
@@ -71,6 +74,7 @@ POOLED_CLIENT_ATTACKS = {
     "transfer_representation",
     "rmia",
     "quantile_mia",
+    "promptres",
 }
 
 _CLIENT_CANDIDATE_FIELDS = {
@@ -79,6 +83,7 @@ _CLIENT_CANDIDATE_FIELDS = {
     "gradient_difference",
     "probabilities",
     "representations",
+    "promptres",
 }
 _CANDIDATE_FIELDS = {
     "gradient_signature",
@@ -162,6 +167,7 @@ class MembershipAuditor:
             requested_attacks
             & {"grad_cosine", "avg_cosine", "nasr_passive", "fedmia_cosine"}
         )
+        self._needs_promptres = full_signals or "promptres" in requested_attacks
         self._needs_whitebox_features = full_signals or "nasr_passive" in requested_attacks
         self._needs_probabilities = full_signals or bool(
             requested_attacks & {"nasr_passive", "rmia", "quantile_mia"}
@@ -245,6 +251,25 @@ class MembershipAuditor:
         self.match_candidate_labels = bool(
             self.config.get("match_candidate_labels", False)
         )
+        self.candidate_sampling_mode = str(
+            self.config.get("candidate_sampling", "legacy")
+        ).lower()
+        if self.candidate_sampling_mode not in {"legacy", "fedmia_mix"}:
+            raise ValueError(
+                "audit.candidate_sampling must be legacy or fedmia_mix."
+            )
+        self.nonmember_to_member_ratio = float(
+            self.config.get("nonmember_to_member_ratio", 1.0)
+        )
+        if self.nonmember_to_member_ratio <= 0:
+            raise ValueError(
+                "audit.nonmember_to_member_ratio must be positive."
+            )
+        if self.candidate_sampling_mode == "fedmia_mix" and self.match_candidate_labels:
+            raise ValueError(
+                "FedMIA mix sampling reproduces the reference evaluation and "
+                "therefore requires match_candidate_labels=false."
+            )
         if self.audit_interval <= 0 or self.audit_batch_size <= 0:
             raise ValueError("audit_interval and audit_batch_size must be positive.")
         self.observations: list[dict] = []
@@ -262,7 +287,10 @@ class MembershipAuditor:
                     "max_member_samples and max_nonmember_samples must be at least 2."
                 )
             if self.pooled_client_audit:
-                if not self.match_candidate_labels:
+                if (
+                    self.candidate_sampling_mode == "legacy"
+                    and not self.match_candidate_labels
+                ):
                     raise ValueError(
                         "Multi-client pooled auditing requires exact label matching."
                     )
@@ -276,19 +304,33 @@ class MembershipAuditor:
                 for client_id in self.audit_client_ids:
                     target = users[client_id]
                     try:
-                        (
-                            member_images,
-                            member_labels,
-                            nonmember_images,
-                            nonmember_labels,
-                            sampling,
-                        ) = self._collect_exact_paired_candidates(
-                            target.train_data,
-                            target.test_data,
-                            max_members,
-                            max_nonmembers,
-                            client_id,
-                        )
+                        if self.candidate_sampling_mode == "fedmia_mix":
+                            (
+                                member_images,
+                                member_labels,
+                                nonmember_images,
+                                nonmember_labels,
+                                sampling,
+                            ) = self._collect_fedmia_mix_candidates(
+                                users,
+                                client_id,
+                                max_members,
+                                max_nonmembers,
+                            )
+                        else:
+                            (
+                                member_images,
+                                member_labels,
+                                nonmember_images,
+                                nonmember_labels,
+                                sampling,
+                            ) = self._collect_exact_paired_candidates(
+                                target.train_data,
+                                target.test_data,
+                                max_members,
+                                max_nonmembers,
+                                client_id,
+                            )
                     except ValueError as error:
                         if not self.allow_partial_client_audit:
                             raise
@@ -332,6 +374,12 @@ class MembershipAuditor:
                         support & other_support
                     )
                 if not eligible_client_ids:
+                    if self.candidate_sampling_mode == "fedmia_mix":
+                        raise ValueError(
+                            "FedMIA mix audit found no client with enough member and "
+                            "mixed non-member candidates. Increase fpl_shots, reduce "
+                            "the requested ratio, or provide a larger test split."
+                        )
                     raise ValueError(
                         "Few-shot privacy audit found no client with at least two "
                         "same-label member/non-member pairs. Increase fpl_shots or "
@@ -358,9 +406,69 @@ class MembershipAuditor:
                         for class_id in overlap
                     }
                 )
-                self.nonmember_source_priority = ["same_client_test"]
+                self.nonmember_source_priority = (
+                    ["independent_test", "other_client_train"]
+                    if self.candidate_sampling_mode == "fedmia_mix"
+                    else ["same_client_test"]
+                )
             else:
                 target = users[target_client_id]
+                if self.candidate_sampling_mode == "fedmia_mix":
+                    (
+                        member_images,
+                        member_labels,
+                        nonmember_images,
+                        nonmember_labels,
+                        sampling,
+                    ) = self._collect_fedmia_mix_candidates(
+                        users,
+                        target_client_id,
+                        max_members,
+                        max_nonmembers,
+                    )
+                    self.images = torch.cat(
+                        (member_images, nonmember_images)
+                    ).to(device)
+                    self.labels = torch.cat(
+                        (member_labels, nonmember_labels)
+                    ).to(device)
+                    self.membership = torch.cat(
+                        (
+                            torch.ones(member_labels.numel(), dtype=torch.long),
+                            torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+                        )
+                    )
+                    self.candidate_client_ids = torch.full(
+                        (self.labels.numel(),), target_client_id, dtype=torch.long
+                    )
+                    self.candidate_sampling_by_client = {
+                        str(target_client_id): sampling
+                    }
+                    candidate_support = set(member_labels.unique().tolist())
+                    other_training_support = set()
+                    for user in users:
+                        if user.id == target_client_id:
+                            continue
+                        grouped = group_idx_by_class(user.train_data, self.num_classes)
+                        other_training_support.update(
+                            class_id
+                            for class_id, indices in enumerate(grouped)
+                            if indices
+                        )
+                    self.null_client_candidate_label_overlap = sorted(
+                        candidate_support & other_training_support
+                    )
+                    self.null_client_candidate_label_overlap_by_client = {
+                        str(target_client_id): self.null_client_candidate_label_overlap
+                    }
+                    self.candidate_label_support = sorted(
+                        set(self.labels.detach().cpu().unique().tolist())
+                    )
+                    self.nonmember_source_priority = [
+                        "independent_test",
+                        "other_client_train",
+                    ]
+                    return
                 member_images, member_labels = self._collect_many(
                     [target.train_data], max_members
                 )
@@ -476,6 +584,129 @@ class MembershipAuditor:
         if limit - remaining < 2:
             raise ValueError("Each membership group needs at least two candidates.")
         return torch.cat(image_parts), torch.cat(label_parts)
+
+    def _collect_source_balanced(
+        self,
+        datasets: list,
+        source_names: list[str],
+        limit: int,
+        client_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
+        """Collect a deterministic, source-balanced FedMIA non-member pool.
+
+        The reference FedMIA CIFAR-100 evaluation uses one independent test
+        source and one training source for every non-target client. With ten
+        clients it samples the same number from each of those ten sources.
+        This helper preserves that construction for arbitrary client counts
+        and redistributes a short source's quota without duplicating samples.
+        """
+        if len(datasets) != len(source_names) or not datasets:
+            raise ValueError("FedMIA mix sampling requires named data sources.")
+        capacities = [len(dataset) for dataset in datasets]
+        if sum(capacities) < limit:
+            raise ValueError(
+                "FedMIA mix sampling cannot reach the requested non-member "
+                f"count {limit}; only {sum(capacities)} candidates are available."
+            )
+
+        counts = [0] * len(datasets)
+        remaining = int(limit)
+        while remaining:
+            allocated = False
+            for source_id, capacity in enumerate(capacities):
+                if counts[source_id] >= capacity:
+                    continue
+                counts[source_id] += 1
+                remaining -= 1
+                allocated = True
+                if remaining == 0:
+                    break
+            if not allocated:
+                raise AssertionError("FedMIA source-balanced allocation stalled.")
+
+        selected = []
+        for source_id, (dataset, count) in enumerate(zip(datasets, counts)):
+            if count == 0:
+                continue
+            generator = torch.Generator().manual_seed(
+                self.seed
+                + 999983 * (client_id + 1)
+                + 104729 * (source_id + 1)
+            )
+            indices = torch.randperm(len(dataset), generator=generator)[:count]
+            selected.append(Subset(dataset, indices.tolist()))
+        images, labels = self._collect_many(selected, limit)
+        return images, labels, {
+            name: int(count) for name, count in zip(source_names, counts)
+        }
+
+    def _collect_fedmia_mix_candidates(
+        self,
+        users: list,
+        client_id: int,
+        member_limit: int,
+        nonmember_limit: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict,
+    ]:
+        """Reproduce FedMIA's target-train versus mixed non-member protocol."""
+        target = users[client_id]
+        member_images, member_labels = self._collect_many(
+            [target.train_data], member_limit
+        )
+        requested_nonmembers = int(
+            math.ceil(member_labels.numel() * self.nonmember_to_member_ratio)
+        )
+        if requested_nonmembers > nonmember_limit:
+            raise ValueError(
+                "FedMIA mix sampling needs max_nonmember_samples >= "
+                "ceil(actual_members * nonmember_to_member_ratio); requested "
+                f"{requested_nonmembers}, configured {nonmember_limit}."
+            )
+
+        test_datasets = [user.test_data for user in users if len(user.test_data)]
+        if not test_datasets:
+            raise ValueError("FedMIA mix sampling requires an independent test pool.")
+        independent_test = ConcatDataset(test_datasets)
+        nonmember_datasets = [independent_test]
+        source_names = ["independent_test"]
+        for user in users:
+            if user.id == client_id:
+                continue
+            nonmember_datasets.append(user.train_data)
+            source_names.append(f"other_client_train:{user.id}")
+        nonmember_images, nonmember_labels, source_counts = (
+            self._collect_source_balanced(
+                nonmember_datasets,
+                source_names,
+                requested_nonmembers,
+                client_id,
+            )
+        )
+        return (
+            member_images,
+            member_labels,
+            nonmember_images,
+            nonmember_labels,
+            {
+                "client_id": int(client_id),
+                "mode": "fedmia_mix",
+                "member_count": int(member_labels.numel()),
+                "nonmember_count": int(nonmember_labels.numel()),
+                "requested_nonmember_to_member_ratio": float(
+                    self.nonmember_to_member_ratio
+                ),
+                "actual_nonmember_to_member_ratio": float(
+                    nonmember_labels.numel() / member_labels.numel()
+                ),
+                "nonmember_source_counts": source_counts,
+                "sampling_seed": int(self.seed),
+            },
+        )
 
     def _collect_exact_paired_candidates(
         self,
@@ -836,7 +1067,11 @@ class MembershipAuditor:
             "fedpgp",
         }:
             observable_names = [name for name in names if name.endswith("global_ctx")]
-        needs_gradients = self._needs_cosine or self._needs_whitebox_features
+        needs_gradients = (
+            self._needs_cosine
+            or self._needs_whitebox_features
+            or self._needs_promptres
+        )
         sample_gradients = None
         signatures = None
         if needs_gradients:
@@ -853,6 +1088,8 @@ class MembershipAuditor:
         gradient_difference = []
         probabilities = []
         representations = []
+        promptres_updates = []
+        promptres_gradients = []
         observable_states = {}
         for user_id in selected_ids:
             state = self._observable_client_state(
@@ -908,6 +1145,9 @@ class MembershipAuditor:
                         (compared_gradients @ update)
                         / (sample_norm * update_norm)
                     )
+                if self._needs_promptres:
+                    promptres_updates.append(update)
+                    promptres_gradients.append(compared_gradients)
                 if self._needs_whitebox_features:
                     update_sq = update.square().sum()
                     gradient_difference.append(
@@ -957,6 +1197,30 @@ class MembershipAuditor:
             observation["probabilities"] = torch.stack(probabilities)
         if self._needs_representations:
             observation["representations"] = torch.stack(representations)
+        if self._needs_promptres:
+            updates = torch.stack(promptres_updates)
+            configured_rank = int(self.config.get("promptres_background_rank", 0))
+            if configured_rank > 0 and updates.shape[0] < 2:
+                raise ValueError(
+                    "PromptRes background residualization needs another selected client."
+                )
+            promptres_scores = []
+            effective_ranks = []
+            for position in range(len(selected_ids)):
+                references = torch.cat(
+                    (updates[:position], updates[position + 1 :]), dim=0
+                )
+                rank = configured_rank if references.shape[0] else 0
+                scores, used_rank = promptres_round_scores(
+                    updates[position],
+                    promptres_gradients[position],
+                    references if rank else None,
+                    background_rank=rank,
+                )
+                promptres_scores.append(scores)
+                effective_ranks.append(used_rank)
+            observation["promptres"] = torch.stack(promptres_scores)
+            observation["promptres_effective_ranks"] = effective_ranks
         if self._needs_client_states:
             observation["client_states"] = {
                 user_id: {
@@ -981,7 +1245,7 @@ class MembershipAuditor:
             }
             observation["audit_view"] = self.audit_view
         self.observations.append(observation)
-        logger.info("Collected privacy signals for round %s", round_index)
+        logger.debug("Collected privacy signals for round %s", round_index)
 
     def _run_fedmia_signal(
         self,
@@ -1173,6 +1437,13 @@ class MembershipAuditor:
                 attack,
                 self.config.get("fedmia_baseline_single_round", "last"),
             )
+        if attack == "promptres":
+            return run_promptres(
+                observations,
+                membership,
+                client_id,
+                str(self.config.get("promptres_aggregation", "mean")),
+            )
         if attack == "nasr_passive":
             return run_passive_whitebox(
                 observations,
@@ -1313,6 +1584,13 @@ class MembershipAuditor:
                 self.target_client_id,
                 attack,
                 self.config.get("fedmia_baseline_single_round", "last"),
+            )
+        if attack == "promptres":
+            return run_promptres(
+                self.observations,
+                self.membership,
+                self.target_client_id,
+                str(self.config.get("promptres_aggregation", "mean")),
             )
         if attack == "fedmia_loss":
             return self._run_fedmia_signal(
@@ -1638,12 +1916,23 @@ class MembershipAuditor:
                         ),
                     },
                     "candidate_sampling": {
+                        "mode": self.candidate_sampling_mode,
+                        "requested_nonmember_to_member_ratio": (
+                            self.nonmember_to_member_ratio
+                            if self.candidate_sampling_mode == "fedmia_mix"
+                            else None
+                        ),
+                        "actual_nonmember_to_member_ratio": (
+                            nonmember_count / member_count
+                        ),
                         "label_histograms_matched": (
                             self.match_candidate_labels
                             and histograms_exactly_matched
                         ),
                         "label_matching_mode": (
-                            "exact_paired_per_client"
+                            "fedmia_mix_unmatched"
+                            if self.candidate_sampling_mode == "fedmia_mix"
+                            else "exact_paired_per_client"
                             if self.pooled_client_audit
                             else "exact_proportional"
                             if self.match_candidate_labels
