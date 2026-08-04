@@ -13,8 +13,6 @@ class CLIPImageMLP(nn.Module):
 
     model_type = "clip_mlp"
     trainable_state_filename = "final_mlp.pt"
-    audit_feature_logits_normalized = False
-    audit_logit_scale = 1.0
 
     def __init__(
         self,
@@ -104,42 +102,6 @@ class CLIPImageMLP(nn.Module):
         return self.forward_from_image_features(
             image_features, return_intermediate=return_intermediate
         )
-
-    def get_audit_feature_matrix(self, normalize: bool = True) -> torch.Tensor:
-        """Return per-class decision vectors, including the final-layer bias."""
-        final_layer = cast(nn.Linear, self.classifier[3])
-        features = torch.cat(
-            (final_layer.weight, final_layer.bias.unsqueeze(1)), dim=1
-        )
-        return F.normalize(features, dim=1) if normalize else features
-
-    def get_audit_input_features(self, images: torch.Tensor) -> torch.Tensor:
-        """Return hidden features augmented so logits equal ``H @ W.T``."""
-        return self.get_audit_input_features_from_image_features(
-            self.encode_images(images)
-        )
-
-    def get_audit_input_features_from_image_features(
-        self, image_features: torch.Tensor
-    ) -> torch.Tensor:
-        """Return augmented hidden features from cached CLIP representations."""
-        hidden = self.hidden_features_from_image_features(image_features)
-        return torch.cat(
-            (
-                hidden,
-                torch.ones(
-                    hidden.shape[0],
-                    1,
-                    device=hidden.device,
-                    dtype=hidden.dtype,
-                ),
-            ),
-            dim=1,
-        )
-
-    def get_audit_feature_parameter_names(self) -> list[str]:
-        """Parameters represented by :meth:`get_audit_feature_matrix`."""
-        return ["classifier.3.weight", "classifier.3.bias"]
 
     def get_semantic_features(
         self,

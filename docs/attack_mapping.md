@@ -22,20 +22,6 @@
 - 同一轮其他客户端构成 non-target/null 分布；
 - 对多个通信轮的单尾 CDF 分数支持 `mean`、`max`、`last` 与 `late3` 聚合。
 
-本仓库另外提供扩展攻击 `fedmia_text`（FedMIA-III）。它不是原 FedMIA
-论文定义的第三种攻击：实现先计算客户端训练前后归一化文本特征矩阵的变化，
-再沿候选样本 prompt gradient 执行固定范数的虚拟下降步，将候选变化映射到
-同一文本特征空间，并使用两个完整矩阵的 Frobenius 余弦作为逐轮测量值。
-后续的跨客户端零假设、3-sigma 过滤、CDF 和跨轮聚合与 FedMIA-I/II 相同。
-候选矩阵按批次即算即用，仅最终的客户端/候选相似度会写入信号文件。
-
-扩展攻击 `fedmia_text_gradient`（FedMIA-IV）直接利用余弦分类器
-`logits = scale * T x` 的解析梯度。对候选样本 `(x, y)`，其预测文本矩阵下降
-方向为 `-scale * (softmax(logits) - one_hot(y)) x^T`；攻击将该矩阵与客户端
-真实文本矩阵变化计算 Frobenius 余弦，再复用 FedMIA 的跨客户端零假设与跨轮
-聚合。该方法不使用 JVP。可选切空间投影用于去掉归一化文本行的径向分量。
-FedOTP 的 UOT 分类分数不是 `T x`，因此不运行 FedMIA-IV。
-
 早期实验曾自行组合两类 FedMIA 证据；该分数并非论文定义的攻击，现已从
 执行入口、配置和测试中移除。结果分析器仅在读取旧目录时识别并丢弃对应字段，
 它不会进入新生成的证据或实验表格。
@@ -143,10 +129,6 @@ FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的�
 - representation、Transfer 和 QMIA 使用 `logits`、隐藏表示以及隐藏表示与真实类
   决策向量的逐维乘积；
 - PIPRA 使用隐藏表示和真实类最后一层权重作为对齐的样本/类别语义表示；
-- FedMIA-III 将原文本特征矩阵替换为最后一层的类别决策矩阵 `[W | b]`，候选
-  虚拟更新只作用于该矩阵对应的可观察参数；
-- FedMIA-IV 使用增广隐藏表示 `[h(x) | 1]`。此时
-  `logits = [h(x) | 1] [W | b]^T`，因此候选类别矩阵梯度是精确解析梯度；
 - PromptMIA 将最后一层类别决策向量视为 key-like vectors，测量隔离本地训练后
   沿候选梯度方向的有符号更新；
 - YOQO 和 Canary 保留冻结 CLIP 参数，但允许梯度对输入传播，因此仍可优化查询；
@@ -154,6 +136,17 @@ FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的�
 
 这些映射保留每种攻击的观测权限和 FedAvg 协议边界，但不把 MLP 类别向量称为
 文本 prompt。完整入口见 `configs/clip_mlp_privacy.yaml`。
+
+## 16-shot 视觉 CLIP Adapter 场景
+
+`model_type: visual_adapter` 冻结 CLIP，只通过 FedAvg 训练视觉残差瓶颈，且配置
+强制 `fpl_shots: 16` 与 `use_full_dataset: false`。损失、概率、表示、更新余弦、
+Nasr、PromptRes、PIPRA、RMIA、IMIA、YOQO、Canary 和 CodePoison 均复用其原有
+观测协议，但影子模型与 probe 只重置或更新 adapter 参数。
+
+PromptMIA 使用 adapter 第一层的输入投影向量作为 key-like vectors。普通训练时
+冻结 CLIP 不保留反向图；YOQO 与 Canary 优化输入时会临时保留输入到冻结 CLIP
+的梯度。完整入口见 `configs/visual_adapter_privacy.yaml`。
 
 ### ProjRes 严格单轮入口
 

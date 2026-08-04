@@ -820,30 +820,6 @@ def test_validate_config_accepts_pooled_fedmia_mix_without_label_matching():
     validate_config(config)
 
 
-def test_fedmia_four_does_not_compute_candidate_prompt_gradients(
-    tmp_path, monkeypatch
-):
-    def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("FedMIA-IV must not compute prompt gradients")
-
-    monkeypatch.setattr(
-        MembershipAuditor, "_candidate_gradients", fail_if_called
-    )
-    server = _defended_server(
-        tmp_path / "fedmia-four-direct",
-        defense="none",
-        attack="fedmia_text_gradient",
-    )
-
-    summaries = server.train()
-
-    assert [summary["attack"] for summary in summaries] == [
-        "fedmia_text_gradient"
-    ]
-    metadata = summaries[0]["metadata"]["text_matrix_gradient"]
-    assert metadata["requires_jvp"] is False
-
-
 def test_pooled_client_first_batch_runs_from_one_training(tmp_path):
     attacks = [
         "loss_series",
@@ -852,8 +828,6 @@ def test_pooled_client_first_batch_runs_from_one_training(tmp_path):
         "promptres",
         "fedmia_loss",
         "fedmia_cosine",
-        "fedmia_text",
-        "fedmia_text_gradient",
         "nasr_passive",
         "transfer_representation",
         "rmia",
@@ -897,19 +871,6 @@ def test_pooled_client_first_batch_runs_from_one_training(tmp_path):
         rows = list(csv.DictReader(file))
     assert {row["attack"] for row in rows} == set(attacks)
     assert {int(row["audit_client_id"]) for row in rows} == {0, 1, 2, 3}
-    signals = torch.load(
-        path / "privacy_audit" / "signals.pt",
-        map_location="cpu",
-        weights_only=True,
-    )
-    for observation in signals["observations"]:
-        assert observation["text_feature_cosine"].shape[0] == 4
-        assert observation["text_feature_cosine"].shape[1] == 32
-        assert observation["text_feature_client_change_norms"].shape == (4,)
-        assert observation["text_feature_shape"] == [2, 4]
-        assert not observation["text_feature_cosine"].requires_grad
-
-
 def test_pooled_client_audit_still_rejects_blackbox_loss():
     config = default_config()
     config["audit"]["audit_client_ids"] = "all"

@@ -150,8 +150,10 @@ def validate_config(config: dict) -> None:
     if config["train_mode"] not in {"centralized", "local"}:
         raise ValueError("train_mode must be 'centralized' or 'local'.")
     model_type = str(config.get("model_type", "prompt")).lower()
-    if model_type not in {"prompt", "clip_mlp"}:
-        raise ValueError("model_type must be prompt or clip_mlp.")
+    if model_type not in {"prompt", "clip_mlp", "visual_adapter"}:
+        raise ValueError(
+            "model_type must be prompt, clip_mlp, or visual_adapter."
+        )
     method = config["aggregator"].lower()
     supported_methods = {
         "promptfl",
@@ -245,6 +247,30 @@ def validate_config(config: dict) -> None:
             raise ValueError("clip_mlp.hidden_dim must be positive.")
         if not 0 <= float(mlp_config.get("dropout", 0.0)) < 1:
             raise ValueError("clip_mlp.dropout must be in [0, 1).")
+    if model_type == "visual_adapter":
+        adapter_config = dict(config.get("visual_adapter", {}))
+        if method != "fedavg" or config["train_mode"] != "centralized":
+            raise ValueError(
+                "visual_adapter requires centralized training with "
+                "aggregator=fedavg."
+            )
+        if bool(config.get("use_full_dataset", False)) or fpl_shots != 16:
+            raise ValueError(
+                "visual_adapter requires the FPL-style 16-shot setting: "
+                "use_full_dataset=false and fpl_shots=16."
+            )
+        reduction = int(adapter_config.get("reduction", 4))
+        if reduction <= 0:
+            raise ValueError("visual_adapter.reduction must be positive.")
+        feature_dim = int(adapter_config.get("feature_dim", 512))
+        if feature_dim <= 0 or feature_dim % reduction != 0:
+            raise ValueError(
+                "visual_adapter.feature_dim must be positive and divisible "
+                "by visual_adapter.reduction."
+            )
+        alpha = float(adapter_config.get("alpha", 0.2))
+        if not 0 <= alpha <= 1:
+            raise ValueError("visual_adapter.alpha must be in [0, 1].")
     if float(config.get("dirichlet_alpha", 0.1)) <= 0:
         raise ValueError("dirichlet_alpha must be positive.")
     audit = config.get("audit", {})
@@ -310,12 +336,11 @@ def validate_config(config: dict) -> None:
             "avg_cosine",
             "fedmia_loss",
             "fedmia_cosine",
-            "fedmia_text",
-            "fedmia_text_gradient",
         }
-        if model_type != "clip_mlp":
+        if model_type not in {"clip_mlp", "visual_adapter"}:
             raise ValueError(
-                "audit.candidate_sampling=low_fpr_full requires clip_mlp."
+                "audit.candidate_sampling=low_fpr_full requires a frozen-CLIP "
+                "feature model."
             )
         if pooled_audit:
             raise ValueError(
@@ -377,8 +402,6 @@ def validate_config(config: dict) -> None:
         "fedmia_tail",
         "fedmia_loss_tail",
         "fedmia_cosine_tail",
-        "fedmia_text_tail",
-        "fedmia_text_gradient_tail",
     ):
         if key in audit and str(audit[key]).lower() not in {
             "upper",
@@ -389,18 +412,6 @@ def validate_config(config: dict) -> None:
     if not 0 < float(audit.get("fedmia_tail_calibration_fraction", 0.25)) < 1:
         raise ValueError(
             "audit.fedmia_tail_calibration_fraction must be between 0 and 1."
-        )
-    if float(audit.get("fedmia_text_probe_norm", 1e-3)) <= 0:
-        raise ValueError("audit.fedmia_text_probe_norm must be positive.")
-    if int(audit.get("fedmia_text_candidate_batch_size", 8)) <= 0:
-        raise ValueError(
-            "audit.fedmia_text_candidate_batch_size must be positive."
-        )
-    if not isinstance(
-        audit.get("fedmia_text_gradient_project_tangent", False), bool
-    ):
-        raise ValueError(
-            "audit.fedmia_text_gradient_project_tangent must be boolean."
         )
     if int(audit.get("promptres_background_rank", 0)) < 0:
         raise ValueError("audit.promptres_background_rank must be non-negative.")
@@ -428,21 +439,6 @@ def validate_config(config: dict) -> None:
             "PromptRes needs a prompt update; FedASK exposes only sketches outside "
             "the full_whitebox audit view."
         )
-    if (
-        attacks & {"fedmia_text", "fedmia_text_gradient"}
-        and method == "fedask"
-        and str(audit.get("audit_view", "protocol_plus_released_prompts")).lower()
-        != "full_whitebox"
-    ):
-        raise ValueError(
-            "FedMIA-III/IV must reconstruct each client's text-feature matrix; "
-            "FedASK exposes only sketches outside the full_whitebox audit view."
-        )
-    if "fedmia_text_gradient" in attacks and method == "fedotp":
-        raise ValueError(
-            "FedMIA-IV assumes logits = scale * image_features @ "
-            "text_features.T; FedOTP uses optimal-transport logits."
-        )
     for key in (
         "min_trainable_update_norm",
         "max_stagnant_loss_range",
@@ -455,24 +451,21 @@ def validate_config(config: dict) -> None:
     ).lower() == "released_prompt" and attacks & {
         "nasr_passive",
         "fedmia_cosine",
-        "fedmia_text",
-        "fedmia_text_gradient",
         "grad_cosine",
         "avg_cosine",
         "promptres",
     }:
         raise ValueError(
             "released_prompt audit view cannot run update-dependent attacks "
-            "nasr_passive, fedmia_cosine, fedmia_text, fedmia_text_gradient, "
-            "grad_cosine, avg_cosine, or promptres."
+            "nasr_passive, fedmia_cosine, grad_cosine, avg_cosine, or promptres."
         )
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
-    if model_type == "clip_mlp" and defense_name != "none":
+    if model_type in {"clip_mlp", "visual_adapter"} and defense_name != "none":
         raise ValueError(
-            "clip_mlp attack experiments currently require defense.name=none."
+            f"{model_type} attack experiments currently require defense.name=none."
         )
     if defense_name in FEDMIA_BASELINE_DEFENSES and (
         method not in {"fedavg", "promptfl"}
@@ -579,8 +572,6 @@ def validate_config(config: dict) -> None:
     spatial = {
         "fedmia_loss",
         "fedmia_cosine",
-        "fedmia_text",
-        "fedmia_text_gradient",
         "transfer_representation",
         "rmia",
         "yoqo",
@@ -604,6 +595,10 @@ def validate_config(config: dict) -> None:
 def run(config: dict) -> list[dict]:
     from trainmodel.custom_clip import CustomCLIP, get_default_prompt_template
     from trainmodel.clip_mlp import CLIPImageMLP
+    from trainmodel.visual_adapter import (
+        VisualCLIPAdapter,
+        build_visual_adapter_text_features,
+    )
     from trainmodel.clip_feature_cache import (
         collate_clip_features,
         precompute_federated_clip_features,
@@ -730,7 +725,8 @@ def run(config: dict) -> list[dict]:
         )
 
     processor, clip_model = _load_local_clip(config["cache_dir"], device)
-    if str(config.get("model_type", "prompt")).lower() == "clip_mlp":
+    model_type = str(config.get("model_type", "prompt")).lower()
+    if model_type == "clip_mlp":
         mlp_config = dict(config.get("clip_mlp", {}))
         model = CLIPImageMLP(
             clip_model=clip_model,
@@ -738,6 +734,26 @@ def run(config: dict) -> list[dict]:
             hidden_dim=int(mlp_config.get("hidden_dim", 512)),
             dropout=float(mlp_config.get("dropout", 0.0)),
             normalize_features=bool(mlp_config.get("normalize_features", False)),
+            device=device,
+        )
+    elif model_type == "visual_adapter":
+        adapter_config = dict(config.get("visual_adapter", {}))
+        text_features = build_visual_adapter_text_features(
+            clip_model=clip_model,
+            processor=processor,
+            classnames=class_names,
+            dataset_name=config["dataset_name"],
+            device=device,
+            template=adapter_config.get("template"),
+        )
+        model = VisualCLIPAdapter(
+            clip_model=clip_model,
+            text_features=text_features,
+            classnames=class_names,
+            feature_dim=int(adapter_config.get("feature_dim", 512)),
+            reduction=int(adapter_config.get("reduction", 4)),
+            alpha=float(adapter_config.get("alpha", 0.2)),
+            output_relu=bool(adapter_config.get("output_relu", True)),
             device=device,
         )
     else:
@@ -769,8 +785,8 @@ def run(config: dict) -> list[dict]:
         return processed["pixel_values"], torch.as_tensor(labels, dtype=torch.long)
 
     if (
-        str(config.get("model_type", "prompt")).lower() == "clip_mlp"
-        and bool(config.get("clip_mlp", {}).get("precompute_features", True))
+        model_type in {"clip_mlp", "visual_adapter"}
+        and bool(config.get(model_type, {}).get("precompute_features", True))
     ):
         train_sets, test_sets, _feature_summary = (
             precompute_federated_clip_features(
@@ -854,6 +870,14 @@ def default_config() -> dict:
             "normalize_features": False,
             "precompute_features": True,
         },
+        "visual_adapter": {
+            "feature_dim": 512,
+            "reduction": 4,
+            "alpha": 0.2,
+            "output_relu": True,
+            "precompute_features": True,
+            "template": None,
+        },
         "promptfl": {},
         "fedotp": {
             "epsilon": 0.01,
@@ -919,8 +943,6 @@ def default_config() -> dict:
                 "nasr_active",
                 "fedmia_loss",
                 "fedmia_cosine",
-                "fedmia_text",
-                "fedmia_text_gradient",
                 "transfer_representation",
                 "codepoison",
                 "pipra",
@@ -939,13 +961,6 @@ def default_config() -> dict:
             "match_candidate_labels": False,
             "signal_storage": "compact",
             "fedmia_tail": "upper",
-            "fedmia_text_aggregation": "mean",
-            "fedmia_text_tail": "upper",
-            "fedmia_text_probe_norm": 1e-3,
-            "fedmia_text_candidate_batch_size": 8,
-            "fedmia_text_gradient_aggregation": "mean",
-            "fedmia_text_gradient_tail": "upper",
-            "fedmia_text_gradient_project_tangent": False,
             "fedmia_tail_calibration_fraction": 0.25,
             "training_health_check": True,
             "fedmia_signal_health_check": False,
@@ -1074,9 +1089,13 @@ def parse_args() -> dict:
         help="Use complete official train/test splits; requires fpl_shots=null.",
     )
     parser.add_argument("--learning_rate", type=float)
-    parser.add_argument("--model_type", choices=["prompt", "clip_mlp"])
+    parser.add_argument(
+        "--model_type", choices=["prompt", "clip_mlp", "visual_adapter"]
+    )
     parser.add_argument("--mlp_hidden_dim", type=int)
     parser.add_argument("--mlp_dropout", type=float)
+    parser.add_argument("--adapter_reduction", type=int)
+    parser.add_argument("--adapter_alpha", type=float)
     parser.add_argument(
         "--aggregator",
         choices=["promptfl", "fedotp", "fedpgp", "fedavg", "dpfpl", "fedask"],
@@ -1162,6 +1181,10 @@ def parse_args() -> dict:
         config["clip_mlp"]["hidden_dim"] = args.mlp_hidden_dim
     if args.mlp_dropout is not None:
         config["clip_mlp"]["dropout"] = args.mlp_dropout
+    if args.adapter_reduction is not None:
+        config["visual_adapter"]["reduction"] = args.adapter_reduction
+    if args.adapter_alpha is not None:
+        config["visual_adapter"]["alpha"] = args.adapter_alpha
     if args.model_type == "clip_mlp":
         config["train_mode"] = "centralized"
         config["aggregator"] = "fedavg"
@@ -1170,6 +1193,11 @@ def parse_args() -> dict:
         if args.attack is None and args.audit_attacks is None:
             config["audit"]["enabled"] = False
             config["audit"]["attacks"] = []
+    elif args.model_type == "visual_adapter":
+        config["train_mode"] = "centralized"
+        config["aggregator"] = "fedavg"
+        config["fpl_shots"] = 16
+        config["use_full_dataset"] = False
     # A direct few-shot/alpha override denotes the Dirichlet experiment
     # family unless the caller explicitly selected another partition mode.
     if args.fpl_shots is not None and args.use_full_dataset is None:

@@ -108,6 +108,15 @@ def _balanced_indices(membership: torch.Tensor, max_samples: int) -> torch.Tenso
     return torch.cat((members[:per_group], nonmembers[:per_group]))
 
 
+def _adaptation_description(model: torch.nn.Module) -> str:
+    model_type = str(getattr(model, "model_type", ""))
+    if model_type == "clip_mlp":
+        return "MLP class-decision-vector update response"
+    if model_type == "visual_adapter":
+        return "visual-adapter input-projection update response"
+    return "shared CoOp text-prompt token update response"
+
+
 def run_promptmia(
     base_model: torch.nn.Module,
     final_state: dict[str, torch.Tensor],
@@ -181,11 +190,7 @@ def run_promptmia(
             "similarity_span": similarity_span,
             "isolated_probe": True,
             "paper_architecture": "keyed visual prompt pool",
-            "adaptation": (
-                "MLP class-decision-vector update response"
-                if str(getattr(base_model, "model_type", "")) == "clip_mlp"
-                else "shared CoOp text-prompt token update response"
-            ),
+            "adaptation": _adaptation_description(base_model),
             "score": "signed_projected_client_update",
             "mean_benign_max_similarity": sum(observed_similarities)
             / max(1, len(observed_similarities)),

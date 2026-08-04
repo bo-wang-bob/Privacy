@@ -21,8 +21,6 @@ FIRST_BATCH_ATTACKS = [
     "avg_cosine",
     "fedmia_loss",
     "fedmia_cosine",
-    "fedmia_text",
-    "fedmia_text_gradient",
     "nasr_passive",
     "transfer_representation",
     "rmia",
@@ -218,7 +216,7 @@ def test_pathological_full_spec_expands_all_dataset_specific_schedules():
     assert {job.dataset for job in food_jobs} == {"food101"}
 
 
-def test_prompt_method_fedmia_spec_adds_direct_gradient_where_logits_are_tx():
+def test_prompt_method_fedmia_spec_runs_loss_and_gradient_measurements():
     spec_path = REPOSITORY_ROOT / "configs" / "fedmia_prompt_methods_sweep.yaml"
     import yaml
 
@@ -235,10 +233,10 @@ def test_prompt_method_fedmia_spec_adds_direct_gradient_where_logits_are_tx():
     assert all(job.config["partition_mode"] == "iid" for job in jobs)
     assert {job.method for job in jobs} == {"promptfl", "fedotp", "fedpgp"}
     for job in jobs:
-        expected = ["fedmia_loss", "fedmia_cosine", "fedmia_text"]
-        if job.method != "fedotp":
-            expected.append("fedmia_text_gradient")
-        assert job.config["audit"]["attacks"] == expected
+        assert job.config["audit"]["attacks"] == [
+            "fedmia_loss",
+            "fedmia_cosine",
+        ]
     assert all(job.config["defense"]["name"] == "none" for job in jobs)
     assert all(job.method in job.run_id for job in jobs)
     assert len(filter_jobs_by_method(jobs, "fedotp")) == 5
@@ -277,12 +275,7 @@ def test_prompt_method_fewshot_spec_caps_system_pool_and_uses_dirichlet():
     assert all(job.config["dirichlet_alpha"] == 0.1 for job in jobs)
     for job in jobs:
         assert job.config["audit"]["audit_client_ids"] == "all"
-        expected_attacks = [
-            attack
-            for attack in FIRST_BATCH_ATTACKS
-            if attack != "fedmia_text_gradient" or job.method != "fedotp"
-        ]
-        assert job.config["audit"]["attacks"] == expected_attacks
+        assert job.config["audit"]["attacks"] == FIRST_BATCH_ATTACKS
         assert job.config["audit"]["candidate_sampling"] == "fedmia_mix"
         assert job.config["audit"]["nonmember_to_member_ratio"] == 1.0
         assert job.config["audit"]["max_member_samples"] == 2048
@@ -329,12 +322,6 @@ def test_fewshot_job_hyperparameters_report_effective_configuration():
     assert parameters["privacy_audit"]["attacks"] == FIRST_BATCH_ATTACKS
     assert parameters["privacy_audit"]["candidate_sampling"] == "fedmia_mix"
     assert parameters["privacy_audit"]["nonmember_to_member_ratio"] == 1.0
-    assert parameters["privacy_audit"]["fedmia_text_probe_norm"] == 0.001
-    assert parameters["privacy_audit"]["fedmia_text_candidate_batch_size"] == 8
-    assert (
-        parameters["privacy_audit"]["fedmia_text_gradient_project_tangent"]
-        is False
-    )
     block = sweep._job_hyperparameters_block(job)
     assert block.startswith("=" * 88)
     assert f"HYPERPARAMETERS | {job.run_id}" in block

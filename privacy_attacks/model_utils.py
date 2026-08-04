@@ -5,6 +5,19 @@ import torch
 import torch.nn.functional as F
 
 
+def trainable_scope_name(model: torch.nn.Module) -> str:
+    model_type = str(getattr(model, "model_type", "prompt"))
+    if model_type == "clip_mlp":
+        return "mlp_only"
+    if model_type == "visual_adapter":
+        return "visual_adapter_only"
+    return "prompt_only"
+
+
+def uses_prompt_parameters(model: torch.nn.Module) -> bool:
+    return trainable_scope_name(model) == "prompt_only"
+
+
 def last_client_states(
     observations: list[dict], target_client_id: int
 ) -> tuple[dict[str, torch.Tensor], list[dict[str, torch.Tensor]], int]:

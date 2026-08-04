@@ -252,30 +252,6 @@ def test_clip_mlp_runs_complete_fedavg_training_and_saves_only_mlp(tmp_path):
     )
 
 
-def test_clip_mlp_audit_feature_factorization_reconstructs_logits():
-    model = _model().eval()
-    images = torch.randn(4, 1, 2, 3)
-    logits = model(images)
-    inputs = model.get_audit_input_features(images)
-    classes = model.get_audit_feature_matrix(normalize=False)
-    assert torch.allclose(logits, inputs @ classes.t(), atol=1e-6)
-
-
-def test_clip_mlp_fedmia_input_features_are_recomputed_after_head_changes():
-    model = _model().eval()
-    auditor = MembershipAuditor.__new__(MembershipAuditor)
-    auditor.labels = torch.tensor([0, 1])
-    auditor.images = torch.randn(2, 1, 2, 3)
-    auditor.audit_batch_size = 2
-    auditor.device = torch.device("cpu")
-    auditor._fedmia_candidate_image_features = None
-    before = auditor._candidate_image_feature_matrix(model)
-    with torch.no_grad():
-        model.classifier[0].bias.add_(5.0)
-    after = auditor._candidate_image_feature_matrix(model)
-    assert not torch.equal(before, after)
-
-
 def test_clip_mlp_low_fpr_full_uses_all_candidates_and_caches_clip(tmp_path):
     def dataset(count: int, offset: float) -> TensorDataset:
         images = torch.linspace(
@@ -365,8 +341,6 @@ def test_all_attacks_run_in_toy_clip_mlp_fedavg(tmp_path):
         "nasr_active",
         "fedmia_loss",
         "fedmia_cosine",
-        "fedmia_text",
-        "fedmia_text_gradient",
         "transfer_representation",
         "codepoison",
         "pipra",
@@ -453,9 +427,5 @@ def test_all_attacks_run_in_toy_clip_mlp_fedavg(tmp_path):
         summary["attack"]: summary["metadata"].get("signal_space")
         for summary in summaries
     }
-    assert signal_spaces["fedmia_text"] == "normalized_class_decision_matrix"
-    assert signal_spaces["fedmia_text_gradient"] == (
-        "exact_augmented_hidden_class_matrix_gradient"
-    )
     assert signal_spaces["promptmia"] == "class_decision_vectors"
     assert (tmp_path / "final_mlp.pt").exists()

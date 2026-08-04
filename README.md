@@ -119,6 +119,20 @@ python main.py --config configs/clip_mlp_privacy.yaml
 python main.py --model_type clip_mlp --attack fedmia_cosine
 ```
 
+### 16-shot 视觉 CLIP Adapter
+
+该模式冻结 CLIP 图像和文本编码器，只用 FedAvg 训练
+`Linear -> ReLU -> Linear -> ReLU` 视觉瓶颈，并按 `alpha` 将适配特征与原始
+图像特征残差混合。它固定复用 FPL 的每类 16-shot 划分：
+
+```bash
+python main.py --config configs/visual_adapter_privacy.yaml
+```
+
+CIFAR-100 与 Caltech101 默认使用 `a photo of a {class}.`；OxfordPets 使用
+`a photo of a {class}, a type of pet.`。可通过 `visual_adapter.template` 覆盖。
+命令行可使用 `--adapter_reduction` 和 `--adapter_alpha` 调整瓶颈与混合比例。
+
 论文 ProjRes 在第一层 MLP 参数上的严格单轮 FedSGD 实现使用独立入口。它只取
 `classifier.0.weight` 的一个真实 batch 更新，并以该层输入的 CLIP 表示计算
 原始 L1 投影残差：
@@ -149,13 +163,7 @@ bash scripts/run_clip_mlp_fedmia_attacks.sh \
 
 每个作业开始时都会输出完整参数块，并把可复现配置保存到
 `results/clip_mlp_fedmia_attacks/runs/<run_id>/run_config.yaml`。默认攻击列表可通过
-`--attacks` 覆盖。例如同时加入仓库扩展的
-FedMIA-III/IV：
-
-```bash
-bash scripts/run_clip_mlp_fedmia_attacks.sh \
-  --attacks blackbox_loss,loss_series,grad_cosine,avg_cosine,fedmia_loss,fedmia_cosine,fedmia_text,fedmia_text_gradient
-```
+`--attacks` 覆盖。
 
 严格 ProjRes 结果写入每个作业的
 `privacy_audit/projres_strict.json`。可使用 `--projres-threshold` 调整阈值；仅运行
@@ -220,8 +228,6 @@ python main.py \
 - `promptres`
 - `fedmia_loss`
 - `fedmia_cosine`
-- `fedmia_text`
-- `fedmia_text_gradient`
 - `nasr_passive`
 - `transfer_representation`
 - `rmia`
@@ -242,35 +248,6 @@ audit:
 ```bash
 python analysis_scripts/verify_promptres_toy.py
 ```
-
-`fedmia_text`（本仓库扩展，简称 FedMIA-III）把攻击空间从提示参数扩展到 CLIP 文本特征
-矩阵。每轮先计算各客户端训练前后的归一化文本特征矩阵变化，再沿候选样本
-的提示梯度执行一个小幅虚拟下降步，并比较两者的 Frobenius 余弦相似度。
-其他客户端的同类分数继续作为 FedMIA 的逐轮零假设：
-
-```yaml
-audit:
-  attacks: [fedmia_loss, fedmia_cosine, fedmia_text, fedmia_text_gradient]
-  fedmia_text_probe_norm: 0.001
-  fedmia_text_candidate_batch_size: 8
-  fedmia_text_aggregation: mean
-  fedmia_text_tail: upper
-  fedmia_text_gradient_aggregation: mean
-  fedmia_text_gradient_tail: upper
-  fedmia_text_gradient_project_tangent: false
-```
-
-FedMIA-III 只保存每个客户端与候选样本的最终相似度，不保存完整候选文本
-特征矩阵。它需要协议能够重建逐客户端提示；`released_prompt` 视图不支持，
-FedASK 在非 `full_whitebox` 视图下也不支持。
-
-`fedmia_text_gradient`（FedMIA-IV）在假设分类 logit 为
-`scale * image_features @ text_features.T` 时，直接计算候选样本交叉熵对文本
-矩阵的负梯度 `-scale * (softmax(logits) - one_hot(label)) x.T`，并与客户端
-实际文本矩阵变化计算 Frobenius 余弦。它不使用 JVP，也不重新编码候选 prompt；
-可选的 `fedmia_text_gradient_project_tangent=true` 会将每一类梯度投影到归一化
-文本特征的切空间。FedOTP 使用最优传输 logit，不满足这一假设，因此不支持
-FedMIA-IV。
 
 非 FedMIA 分数使用客户端内、无成员标签的经验 CDF 秩校准后再合并；FedMIA
 保留自身的零假设 CDF。汇总文件同时包含总体指标、客户端宏平均指标和逐客户
@@ -297,8 +274,11 @@ audit:
 
 实验主要通过 YAML 管理，常用字段包括：
 
-- `model_type`：`prompt` 或冻结 CLIP 图像编码器的 `clip_mlp`；
+- `model_type`：`prompt`、冻结 CLIP 图像编码器的 `clip_mlp`，或
+  16-shot `visual_adapter`；
 - `clip_mlp`：两层 MLP 的隐藏维度、dropout 与特征归一化设置；
+- `visual_adapter`：视觉特征维度、瓶颈 reduction、残差混合系数 `alpha`、输出
+  ReLU、特征缓存和可选文本模板；该模式固定使用 `fpl_shots: 16`；
 - `aggregator`：联邦训练方法；
 - `total_users`、`sample_users`：客户端总数和每轮参与数；
 - `partition_mode`：`iid`、`dirichlet`、`pathological` 或 `auto`；
@@ -322,6 +302,7 @@ audit:
 - `training_health.json`：训练状态健康检查；
 - `final_prompt.pt`：最终可训练提示参数；
 - `final_mlp.pt`：`clip_mlp` 基线最终可训练的两层 MLP 参数；
+- `final_visual_adapter.pt`：视觉 CLIP Adapter 最终可训练的瓶颈参数；
 - `federated_method_summary.json`：联邦方法配置与诊断；
 - `defense_summary.json`：防御配置、统计与隐私会计；
 - `privacy_audit/summary.json`：攻击指标和逐客户端元数据；

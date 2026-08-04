@@ -11,8 +11,6 @@ from privacy_attacks.metrics import membership_metrics, stratified_split
 FEDMIA_MEASUREMENT_NAMES = {
     "confidence": "fedmia_loss",
     "cosine": "fedmia_cosine",
-    "text_feature_cosine": "fedmia_text",
-    "text_gradient_cosine": "fedmia_text_gradient",
 }
 
 
@@ -112,103 +110,6 @@ def run_fedmia(
     if selected_tail == "lower":
         scores = 1.0 - scores
     name = FEDMIA_MEASUREMENT_NAMES[measurement]
-    text_feature_metadata = None
-    if measurement == "text_feature_cosine":
-        relevant = [
-            observation
-            for observation in observations
-            if target_client_id in observation["client_ids"].tolist()
-            and measurement in observation
-        ]
-        text_feature_metadata = {
-            "matrix_shapes": [
-                observation.get("text_feature_shape") for observation in relevant
-            ],
-            "probe_norms": [
-                float(observation.get("text_feature_probe_norm", 0.0))
-                for observation in relevant
-            ],
-            "zero_gradient_counts": [
-                int(observation.get("text_feature_zero_gradient_count", 0))
-                for observation in relevant
-            ],
-            "zero_candidate_change_counts": [
-                int(
-                    observation.get(
-                        "text_feature_zero_candidate_change_count", 0
-                    )
-                )
-                for observation in relevant
-            ],
-            "target_client_change_norms": [
-                (
-                    float(
-                        observation["text_feature_client_change_norms"][
-                            observation["client_ids"].tolist().index(
-                                target_client_id
-                            )
-                        ]
-                    )
-                    if "text_feature_client_change_norms" in observation
-                    else None
-                )
-                for observation in relevant
-            ],
-            "batched_context_encoding": [
-                bool(
-                    observation.get(
-                        "text_feature_batched_context_encoding", False
-                    )
-                )
-                for observation in relevant
-            ],
-        }
-    text_gradient_metadata = None
-    if measurement == "text_gradient_cosine":
-        relevant = [
-            observation
-            for observation in observations
-            if target_client_id in observation["client_ids"].tolist()
-            and measurement in observation
-        ]
-        text_gradient_metadata = {
-            "matrix_shapes": [
-                observation.get("text_gradient_shape")
-                for observation in relevant
-            ],
-            "logit_scales": [
-                float(observation.get("text_gradient_logit_scale", 1.0))
-                for observation in relevant
-            ],
-            "project_tangent": [
-                bool(observation.get("text_gradient_project_tangent", False))
-                for observation in relevant
-            ],
-            "zero_candidate_change_counts": [
-                int(
-                    observation.get(
-                        "text_gradient_zero_candidate_change_count", 0
-                    )
-                )
-                for observation in relevant
-            ],
-            "target_client_change_norms": [
-                (
-                    float(
-                        observation["text_gradient_client_change_norms"][
-                            observation["client_ids"].tolist().index(
-                                target_client_id
-                            )
-                        ]
-                    )
-                    if "text_gradient_client_change_norms" in observation
-                    else None
-                )
-                for observation in relevant
-            ],
-            "candidate_direction": "negative_cross_entropy_gradient_wrt_text_matrix",
-            "requires_jvp": False,
-        }
     return AttackResult(
         name=name,
         scores=scores,
@@ -224,7 +125,5 @@ def run_fedmia(
             "selected_tail": selected_tail,
             "tail_calibration": calibration_metadata,
             "target_client_id": int(target_client_id),
-            "text_feature_probe": text_feature_metadata,
-            "text_matrix_gradient": text_gradient_metadata,
         },
     )

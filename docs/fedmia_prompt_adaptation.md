@@ -17,13 +17,6 @@
 
 `grad_cosine` 与 `avg_cosine` 依赖客户端更新，因此不能用于仅发布最终 prompt 的 `released_prompt` 审计视图。`blackbox_loss` 与 `loss_series` 可以在该视图中退化为最终发布状态上的查询。
 
-Prompt 方法 sweep 还包含两个仓库扩展：`fedmia_text`（FedMIA-III）将候选
-prompt 梯度通过虚拟下降步映射为文本矩阵变化；`fedmia_text_gradient`
-（FedMIA-IV）则直接使用 `logits = scale * T x` 的解析交叉熵下降方向
-`-scale * (softmax(logits) - one_hot(y)) x^T`。二者都与客户端真实文本矩阵
-变化计算 Frobenius 余弦，再使用同一套跨客户端 null CDF。FedMIA-IV 不使用
-JVP；FedOTP 的 UOT logit 不满足 `T x` 假设，所以对应任务只运行到 FedMIA-III。
-
 ## 防御定义与兼容性
 
 | 运行名 | prompt 适配 | 主要参数 |

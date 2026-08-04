@@ -11,7 +11,9 @@ from privacy_attacks.model_utils import (
     model_from_state,
     probabilities_for,
     scaled_confidence,
+    trainable_scope_name,
     train_cross_entropy,
+    uses_prompt_parameters,
 )
 
 
@@ -243,14 +245,8 @@ def run_canary(
             "canaries_per_sample": max(1, num_canaries),
             "optimization_steps": max(1, optimization_steps),
             "reference_models": len(out_models),
-            "prompt_only_surrogates": (
-                str(getattr(base_model, "model_type", "")) != "clip_mlp"
-            ),
-            "trainable_scope": (
-                "mlp_only"
-                if str(getattr(base_model, "model_type", "")) == "clip_mlp"
-                else "prompt_only"
-            ),
+            "prompt_only_surrogates": uses_prompt_parameters(base_model),
+            "trainable_scope": trainable_scope_name(base_model),
             "epsilon": epsilon,
         },
     )

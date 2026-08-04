@@ -10,7 +10,9 @@ from privacy_attacks.model_utils import (
     probabilities_for,
     reset_trainable_parameters,
     scaled_confidence,
+    trainable_scope_name,
     train_cross_entropy,
+    uses_prompt_parameters,
 )
 
 
@@ -161,13 +163,7 @@ def run_imia(
             "imitation_steps": imitation_steps,
             "pivot_steps": pivot_steps,
             "pivot_samples": int(pivots.numel()),
-            "prompt_only_models": (
-                str(getattr(target_model, "model_type", "")) != "clip_mlp"
-            ),
-            "trainable_scope": (
-                "mlp_only"
-                if str(getattr(target_model, "model_type", "")) == "clip_mlp"
-                else "prompt_only"
-            ),
+            "prompt_only_models": uses_prompt_parameters(target_model),
+            "trainable_scope": trainable_scope_name(target_model),
         },
     )

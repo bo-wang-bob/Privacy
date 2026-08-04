@@ -1,26 +1,28 @@
-model_type: clip_mlp
+model_type: visual_adapter
 train_mode: centralized
 dataset_name: caltech101
 data_root: ./data
-batch_size: 32
+batch_size: 16
 eval_batch_size: 64
-learning_rate: 0.01
+learning_rate: 0.001
 num_global_iters: 20
 local_epochs: 2
 total_users: 10
 sample_users: 10
 aggregator: fedavg
 
-clip_mlp:
-  hidden_dim: 512
-  dropout: 0.0
-  normalize_features: false
+visual_adapter:
+  feature_dim: 512
+  reduction: 4
+  alpha: 0.2
+  output_relu: true
   precompute_features: true
+  template: null
 
 partition_mode: dirichlet
 dirichlet_alpha: 0.1
-use_full_dataset: true
-fpl_shots: null
+use_full_dataset: false
+fpl_shots: 16
 gpu: 0
 seed: 42
 cache_dir: ./checkpoints/clip-vit-base-patch32

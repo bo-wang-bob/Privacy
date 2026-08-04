@@ -8,6 +8,7 @@ from privacy_attacks.model_utils import (
     balanced_evaluation_indices,
     reset_trainable_parameters,
     semantic_features,
+    trainable_scope_name,
     train_cross_entropy,
 )
 
@@ -169,10 +170,6 @@ def run_pipra(
             "attack_epochs": max(1, attack_epochs),
             "output_free": True,
             "auxiliary_nonmembers": int(auxiliary.numel()),
-            "trainable_scope": (
-                "mlp_only"
-                if str(getattr(target_model, "model_type", "")) == "clip_mlp"
-                else "prompt_only"
-            ),
+            "trainable_scope": trainable_scope_name(target_model),
         },
     )

@@ -20,11 +20,6 @@ from privacy_attacks.features import (
     trainable_names,
 )
 from privacy_attacks.fedmia import FEDMIA_MEASUREMENT_NAMES, run_fedmia
-from privacy_attacks.fedmia_text import (
-    direct_text_gradient_round_scores,
-    fedmia_text_round_scores,
-    text_feature_matrix,
-)
 from privacy_attacks.fedmia_baselines import run_fedmia_baseline
 from privacy_attacks.imia import run_imia
 from privacy_attacks.model_utils import last_client_states
@@ -53,8 +48,6 @@ SUPPORTED_ATTACKS = {
     "nasr_active",
     "fedmia_loss",
     "fedmia_cosine",
-    "fedmia_text",
-    "fedmia_text_gradient",
     "transfer_representation",
     "codepoison",
     "pipra",
@@ -78,8 +71,6 @@ POOLED_CLIENT_ATTACKS = {
     "nasr_passive",
     "fedmia_loss",
     "fedmia_cosine",
-    "fedmia_text",
-    "fedmia_text_gradient",
     "transfer_representation",
     "rmia",
     "quantile_mia",
@@ -89,8 +80,6 @@ POOLED_CLIENT_ATTACKS = {
 _CLIENT_CANDIDATE_FIELDS = {
     "confidence",
     "cosine",
-    "text_feature_cosine",
-    "text_gradient_cosine",
     "gradient_difference",
     "probabilities",
     "representations",
@@ -149,8 +138,6 @@ class MembershipAuditor:
                     "nasr_active",
                     "fedmia_loss",
                     "fedmia_cosine",
-                    "fedmia_text",
-                    "fedmia_text_gradient",
                     "transfer_representation",
                     "codepoison",
                     "pipra",
@@ -181,10 +168,6 @@ class MembershipAuditor:
             requested_attacks
             & {"grad_cosine", "avg_cosine", "nasr_passive", "fedmia_cosine"}
         )
-        # Candidate virtual text encodings are intentionally opt-in: collecting
-        # them is substantially more expensive than retaining ordinary signals.
-        self._needs_text_feature = "fedmia_text" in requested_attacks
-        self._needs_text_gradient = "fedmia_text_gradient" in requested_attacks
         self._needs_promptres = full_signals or "promptres" in requested_attacks
         self._needs_whitebox_features = full_signals or "nasr_passive" in requested_attacks
         self._needs_probabilities = full_signals or bool(
@@ -298,7 +281,6 @@ class MembershipAuditor:
         self.observations: list[dict] = []
         self.results = []
         self.errors: dict[str, str] = {}
-        self._fedmia_candidate_image_features: torch.Tensor | None = None
         self.candidate_inputs_are_features = False
 
         if self.enabled:
@@ -605,12 +587,12 @@ class MembershipAuditor:
             "avg_cosine",
             "fedmia_loss",
             "fedmia_cosine",
-            "fedmia_text",
-            "fedmia_text_gradient",
         }
         unsupported = sorted(set(self.attacks) - supported)
-        if self.model_type != "clip_mlp":
-            raise ValueError("low_fpr_full currently requires model_type=clip_mlp.")
+        if self.model_type not in {"clip_mlp", "visual_adapter"}:
+            raise ValueError(
+                "low_fpr_full currently requires a frozen-CLIP feature model."
+            )
         if self.pooled_client_audit:
             raise ValueError("low_fpr_full currently supports one target client.")
         if unsupported:
@@ -1130,76 +1112,6 @@ class MembershipAuditor:
             torch.cat(loss_parts),
         )
 
-    @torch.no_grad()
-    def _candidate_image_feature_matrix(
-        self, model: torch.nn.Module
-    ) -> torch.Tensor:
-        """Encode fixed candidates in the space paired with class features."""
-        feature_getter = getattr(
-            model,
-            (
-                "get_audit_input_features_from_image_features"
-                if getattr(self, "candidate_inputs_are_features", False)
-                else "get_audit_input_features"
-            ),
-            None,
-        )
-        if (
-            feature_getter is None
-            and self._fedmia_candidate_image_features is not None
-        ):
-            return self._fedmia_candidate_image_features
-        feature_parts = []
-        model.eval()
-        for start in range(0, self.labels.numel(), self.audit_batch_size):
-            stop = start + self.audit_batch_size
-            if feature_getter is not None:
-                features = feature_getter(
-                    self.images[start:stop].to(self.device)
-                )
-                if not isinstance(features, torch.Tensor) or features.ndim != 2:
-                    raise ValueError("Audit input features must be a matrix.")
-                feature_parts.append(features.detach().cpu())
-                continue
-            try:
-                output = model(
-                    self.images[start:stop].to(self.device),
-                    return_intermediate=True,
-                )
-            except TypeError as error:
-                raise TypeError(
-                    "FedMIA-IV requires model(images, return_intermediate=True) "
-                    "to return image features."
-                ) from error
-            if not isinstance(output, tuple) or len(output) != 3:
-                raise TypeError(
-                    "FedMIA-IV requires logits, image features, and text features."
-                )
-            image_features = output[1]
-            if not isinstance(image_features, torch.Tensor) or image_features.ndim != 2:
-                raise ValueError("FedMIA-IV image features must be a matrix.")
-            feature_parts.append(
-                F.normalize(image_features.detach(), dim=1).cpu()
-            )
-        features = torch.cat(feature_parts)
-        if feature_getter is None:
-            self._fedmia_candidate_image_features = features
-        return features
-
-    @staticmethod
-    def _direct_text_logit_scale(model: torch.nn.Module) -> float:
-        """Read CLIP's positive logit scale, or use one for lightweight models."""
-        audit_scale = getattr(model, "audit_logit_scale", None)
-        if audit_scale is not None:
-            return float(audit_scale)
-        clip_model = getattr(model, "clip_model", None)
-        raw_scale = getattr(clip_model, "logit_scale", None)
-        if raw_scale is None:
-            return 1.0
-        scale = float(raw_scale.detach().to(torch.float64).exp().cpu())
-        temperature = float(getattr(model, "_hamp_output_temperature", 1.0))
-        return scale / max(temperature, 1e-12)
-
     def _candidate_gradients(
         self,
         model: torch.nn.Module,
@@ -1397,52 +1309,8 @@ class MembershipAuditor:
                 self.model, observable_names
             )
 
-        feature_names = observable_names
-        feature_name_getter = getattr(
-            self.model, "get_audit_feature_parameter_names", None
-        )
-        if feature_name_getter is not None:
-            requested_feature_names = list(feature_name_getter())
-            feature_names = [
-                name for name in requested_feature_names if name in observable_names
-            ]
-            if self._needs_text_feature and not feature_names:
-                raise ValueError(
-                    "FedMIA-III cannot observe the model's class-feature parameters."
-                )
-        feature_sample_gradients = None
-        if self._needs_text_feature:
-            self.model.load_state_dict(observable_base_state, strict=False)
-            self.model.eval()
-            feature_sample_gradients, _, _ = self._candidate_gradients(
-                self.model, feature_names
-            )
-
-        base_text_features = None
-        base_direct_features = None
-        text_feature_metadata = None
-        direct_feature_normalize = bool(
-            getattr(self.model, "audit_feature_logits_normalized", True)
-        )
-        if self._needs_text_feature:
-            if feature_sample_gradients is None:
-                raise AssertionError("FedMIA-III lost its candidate gradients.")
-            self.model.load_state_dict(observable_base_state, strict=False)
-            base_text_features = text_feature_matrix(
-                self.model, normalize=True
-            ).detach().cpu()
-        if self._needs_text_gradient:
-            self.model.load_state_dict(observable_base_state, strict=False)
-            base_direct_features = text_feature_matrix(
-                self.model, normalize=direct_feature_normalize
-            ).detach().cpu()
-
         confidence = []
         cosine = []
-        client_text_changes = []
-        direct_feature_client_changes = []
-        text_feature_client_change_norms = []
-        direct_feature_client_change_norms = []
         gradient_difference = []
         probabilities = []
         representations = []
@@ -1456,41 +1324,6 @@ class MembershipAuditor:
             )
             if self._needs_client_states:
                 observable_states[user_id] = state
-            if self._needs_text_feature or self._needs_text_gradient:
-                client_base = (
-                    base_state if base_states is None else base_states[user_id]
-                )
-                visible_client_base = self._observable_base_state(client_base)
-                for name in observable_names:
-                    if not torch.equal(
-                        visible_client_base[name].detach().cpu(),
-                        observable_base_state[name].detach().cpu(),
-                    ):
-                        raise ValueError(
-                            "FedMIA-III/IV require selected clients to share the "
-                            "same protocol-visible base prompt in each round."
-                        )
-                self.model.load_state_dict(state, strict=False)
-                if self._needs_text_feature:
-                    if base_text_features is None:
-                        raise AssertionError("FedMIA-III lost base class features.")
-                    updated_text_features = text_feature_matrix(
-                        self.model, normalize=True
-                    ).detach().cpu()
-                    client_text_change = updated_text_features - base_text_features
-                    client_text_changes.append(client_text_change)
-                    text_feature_client_change_norms.append(
-                        client_text_change.norm()
-                    )
-                if self._needs_text_gradient:
-                    if base_direct_features is None:
-                        raise AssertionError("FedMIA-IV lost base class features.")
-                    updated_direct_features = text_feature_matrix(
-                        self.model, normalize=direct_feature_normalize
-                    ).detach().cpu()
-                    direct_change = updated_direct_features - base_direct_features
-                    direct_feature_client_changes.append(direct_change)
-                    direct_feature_client_change_norms.append(direct_change.norm())
             if needs_gradients:
                 client_base = (
                     base_state if base_states is None else base_states[user_id]
@@ -1555,7 +1388,6 @@ class MembershipAuditor:
                             .square()
                             .sum(dim=1)
                         )
-
             needs_outputs = (
                 self._needs_confidence
                 or self._needs_probabilities
@@ -1595,77 +1427,6 @@ class MembershipAuditor:
                 )
             else:
                 observation["cosine"] = torch.stack(cosine)
-        if self._needs_text_feature:
-            if feature_sample_gradients is None:
-                raise AssertionError("FedMIA-III lost its candidate gradients.")
-            text_feature_cosine, text_feature_metadata = fedmia_text_round_scores(
-                self.model,
-                observable_base_state,
-                feature_names,
-                feature_sample_gradients,
-                torch.stack(client_text_changes),
-                probe_norm=float(
-                    self.config.get("fedmia_text_probe_norm", 1e-3)
-                ),
-                candidate_batch_size=int(
-                    self.config.get("fedmia_text_candidate_batch_size", 8)
-                ),
-            )
-            observation["text_feature_cosine"] = text_feature_cosine
-            observation["text_feature_client_change_norms"] = torch.stack(
-                text_feature_client_change_norms
-            )
-            observation["text_feature_shape"] = text_feature_metadata[
-                "text_feature_shape"
-            ]
-            observation["text_feature_probe_norm"] = text_feature_metadata[
-                "probe_norm"
-            ]
-            observation["text_feature_zero_gradient_count"] = (
-                text_feature_metadata["zero_gradient_count"]
-            )
-            observation["text_feature_zero_candidate_change_count"] = (
-                text_feature_metadata["zero_candidate_change_count"]
-            )
-            observation["text_feature_batched_context_encoding"] = (
-                text_feature_metadata["batched_context_encoding"]
-            )
-        if self._needs_text_gradient:
-            if base_direct_features is None:
-                raise AssertionError("FedMIA-IV lost its base class features.")
-            self.model.load_state_dict(observable_base_state, strict=False)
-            self.model.eval()
-            text_gradient_cosine, text_gradient_metadata = (
-                direct_text_gradient_round_scores(
-                    base_direct_features,
-                    self._candidate_image_feature_matrix(self.model),
-                    self.labels.detach().cpu(),
-                    torch.stack(direct_feature_client_changes),
-                    logit_scale=self._direct_text_logit_scale(self.model),
-                    project_tangent=bool(
-                        self.config.get(
-                            "fedmia_text_gradient_project_tangent", False
-                        )
-                    ),
-                    candidate_batch_size=self.audit_batch_size,
-                )
-            )
-            observation["text_gradient_cosine"] = text_gradient_cosine
-            observation["text_gradient_client_change_norms"] = torch.stack(
-                direct_feature_client_change_norms
-            )
-            observation["text_gradient_shape"] = text_gradient_metadata[
-                "text_feature_shape"
-            ]
-            observation["text_gradient_logit_scale"] = text_gradient_metadata[
-                "logit_scale"
-            ]
-            observation["text_gradient_project_tangent"] = (
-                text_gradient_metadata["project_tangent"]
-            )
-            observation["text_gradient_zero_candidate_change_count"] = (
-                text_gradient_metadata["zero_candidate_change_count"]
-            )
         if self._needs_whitebox_features:
             if signatures is None:
                 raise AssertionError("White-box audit lost its gradient signatures.")
@@ -2050,32 +1811,6 @@ class MembershipAuditor:
                         )
                     ),
                 )
-            if attack == "fedmia_text":
-                return self._run_fedmia_signal(
-                    "text_feature_cosine",
-                    str(self.config.get("fedmia_text_aggregation", "mean")),
-                    str(
-                        self.config.get(
-                            "fedmia_text_tail",
-                            self.config.get("fedmia_tail", "upper"),
-                        )
-                    ),
-                )
-            if attack == "fedmia_text_gradient":
-                return self._run_fedmia_signal(
-                    "text_gradient_cosine",
-                    str(
-                        self.config.get(
-                            "fedmia_text_gradient_aggregation", "mean"
-                        )
-                    ),
-                    str(
-                        self.config.get(
-                            "fedmia_text_gradient_tail",
-                            self.config.get("fedmia_tail", "upper"),
-                        )
-                    ),
-                )
             return self._run_pooled_client_attack(attack)
         if attack in {
             "blackbox_loss",
@@ -2114,32 +1849,6 @@ class MembershipAuditor:
                 str(
                     self.config.get(
                         "fedmia_cosine_tail", self.config.get("fedmia_tail", "upper")
-                    )
-                ),
-            )
-        if attack == "fedmia_text":
-            return self._run_fedmia_signal(
-                "text_feature_cosine",
-                str(self.config.get("fedmia_text_aggregation", "mean")),
-                str(
-                    self.config.get(
-                        "fedmia_text_tail",
-                        self.config.get("fedmia_tail", "upper"),
-                    )
-                ),
-            )
-        if attack == "fedmia_text_gradient":
-            return self._run_fedmia_signal(
-                "text_gradient_cosine",
-                str(
-                    self.config.get(
-                        "fedmia_text_gradient_aggregation", "mean"
-                    )
-                ),
-                str(
-                    self.config.get(
-                        "fedmia_text_gradient_tail",
-                        self.config.get("fedmia_tail", "upper"),
                     )
                 ),
             )
@@ -2335,18 +2044,17 @@ class MembershipAuditor:
                 result.metadata.setdefault("model_type", self.model_type)
                 if self.model_type == "clip_mlp":
                     result.metadata.setdefault("trainable_scope", "mlp_only")
-                    if attack == "fedmia_text":
-                        result.metadata.setdefault(
-                            "signal_space", "normalized_class_decision_matrix"
-                        )
-                    elif attack == "fedmia_text_gradient":
-                        result.metadata.setdefault(
-                            "signal_space",
-                            "exact_augmented_hidden_class_matrix_gradient",
-                        )
-                    elif attack == "promptmia":
+                    if attack == "promptmia":
                         result.metadata.setdefault(
                             "signal_space", "class_decision_vectors"
+                        )
+                elif self.model_type == "visual_adapter":
+                    result.metadata.setdefault(
+                        "trainable_scope", "visual_adapter_only"
+                    )
+                    if attack == "promptmia":
+                        result.metadata.setdefault(
+                            "signal_space", "adapter_input_projection_vectors"
                         )
                 self.results.append(result)
                 if self.device.type == "cuda":
@@ -2367,8 +2075,6 @@ class MembershipAuditor:
             in {
                 "fedmia_loss",
                 "fedmia_cosine",
-                "fedmia_text",
-                "fedmia_text_gradient",
             }
             and item["score_degenerate"]
         ]
