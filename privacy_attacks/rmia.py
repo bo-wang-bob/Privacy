@@ -14,7 +14,7 @@ def run_rmia(
     offline_a: float = 0.3,
     gamma: float = 1.0,
 ) -> AttackResult:
-    """Offline RMIA using same-round non-target prompts as reference models."""
+    """Offline RMIA using same-round non-target clients as reference models."""
     if offline_a < 0.0 or offline_a > 1.0:
         raise ValueError("RMIA offline_a must be in [0, 1].")
     auxiliary, evaluation = balanced_evaluation_indices(

@@ -4,6 +4,8 @@ logs/
 checkpoints
 saved_models/
 analysis_reports/
+analysis_scripts/
+AGENTS.md
 paper/
 
 # Local model weights and experiment artifacts

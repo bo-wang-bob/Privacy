@@ -65,7 +65,7 @@ def run_imia(
     learning_rate: float = 0.02,
     pivots_per_class: int = 4,
 ) -> AttackResult:
-    """Non-adaptive IMIA using prompt-only target-informed imitative models."""
+    """Non-adaptive IMIA using target-informed parameter-efficient models."""
     auxiliary, evaluation = balanced_evaluation_indices(
         membership, auxiliary_fraction, seed
     )
@@ -161,6 +161,13 @@ def run_imia(
             "imitation_steps": imitation_steps,
             "pivot_steps": pivot_steps,
             "pivot_samples": int(pivots.numel()),
-            "prompt_only_models": True,
+            "prompt_only_models": (
+                str(getattr(target_model, "model_type", "")) != "clip_mlp"
+            ),
+            "trainable_scope": (
+                "mlp_only"
+                if str(getattr(target_model, "model_type", "")) == "clip_mlp"
+                else "prompt_only"
+            ),
         },
     )

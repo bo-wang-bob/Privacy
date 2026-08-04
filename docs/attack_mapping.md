@@ -127,3 +127,40 @@ FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的�
 ## Shared evaluation
 
 所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC、TPR@10% FPR 和 TPR@0.1% FPR 作为诊断信息。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
+
+## CLIP 图像编码器 + 两层 MLP 场景
+
+`model_type: clip_mlp` 冻结 CLIP，只训练两层 MLP 分类头。普通 FedAvg 上传并
+按样本数聚合 `classifier.0.{weight,bias}` 和
+`classifier.3.{weight,bias}`。攻击适配遵循以下映射：
+
+`clip_mlp.precompute_features: true`（默认）会在训练开始前把各客户端训练集和
+测试集完整编码成 CPU 上的 CLIP 向量。模型对二维输入走向量快路径，所以本地
+训练、Server 测试和审计不会在每轮重复运行冻结图像编码器。
+
+- loss、confidence、概率序列、更新余弦、PromptRes 和 Nasr 白盒特征直接作用于
+  全部可训练 MLP 参数；
+- representation、Transfer 和 QMIA 使用 `logits`、隐藏表示以及隐藏表示与真实类
+  决策向量的逐维乘积；
+- PIPRA 使用隐藏表示和真实类最后一层权重作为对齐的样本/类别语义表示；
+- FedMIA-III 将原文本特征矩阵替换为最后一层的类别决策矩阵 `[W | b]`，候选
+  虚拟更新只作用于该矩阵对应的可观察参数；
+- FedMIA-IV 使用增广隐藏表示 `[h(x) | 1]`。此时
+  `logits = [h(x) | 1] [W | b]^T`，因此候选类别矩阵梯度是精确解析梯度；
+- PromptMIA 将最后一层类别决策向量视为 key-like vectors，测量隔离本地训练后
+  沿候选梯度方向的有符号更新；
+- YOQO 和 Canary 保留冻结 CLIP 参数，但允许梯度对输入传播，因此仍可优化查询；
+- IMIA、RMIA、CodePoison 和主动 Nasr 复用仅训练 MLP 的影子模型或隔离 probe。
+
+这些映射保留每种攻击的观测权限和 FedAvg 协议边界，但不把 MLP 类别向量称为
+文本 prompt。完整入口见 `configs/clip_mlp_privacy.yaml`。
+
+### ProjRes 严格单轮入口
+
+`privacy_attacks/projres_mlp.py` 另行实现 Deng 等人的 ProjRes Algorithm 1。
+它攻击第一层 `classifier.0.weight`：从一次 vanilla FedSGD 更新的行空间恢复训练
+batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。成员集合严格等于
+产生该更新的实际 batch，不使用客户端的整个历史训练集代替。真实数据入口是
+`scripts/validate_projres_mlp_real.py`，配置是 `configs/clip_mlp_projres.yaml`；完整
+边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
+余弦相似度的 `promptres`。

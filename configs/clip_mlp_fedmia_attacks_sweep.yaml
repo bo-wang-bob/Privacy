@@ -1,0 +1,92 @@
+name: clip_mlp_fedmia_attacks
+base_config: configs/clip_mlp_low_fpr_attacks.yaml
+results_root: results/clip_mlp_fedmia_attacks
+
+gpus: [0]
+jobs: 1
+seeds: [42]
+target_client_ids: [0]
+
+# Match the full-data datasets and schedules used by the prompt-method sweep.
+datasets:
+  - name: caltech101
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: oxfordpets
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: flowers
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: food101
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 100
+  - name: cifar100
+    overrides:
+      total_users: 50
+      sample_users: 10
+      num_global_iters: 400
+
+common:
+  model_type: clip_mlp
+  train_mode: centralized
+  aggregator: fedavg
+  data_root: ./data
+  cache_dir: ./checkpoints/clip-vit-base-patch32
+  require_cuda: true
+  partition_mode: dirichlet
+  dirichlet_alpha: 0.1
+  use_full_dataset: true
+  fpl_shots: null
+  local_epochs: 2
+  learning_rate: 0.01
+  batch_size: 32
+  eval_batch_size: 64
+  eval_interval: 1
+  save_models: false
+  clip_mlp:
+    hidden_dim: 512
+    dropout: 0.0
+    normalize_features: false
+    precompute_features: true
+  audit:
+    enabled: true
+    strict: true
+    target_client_id: 0
+    ensure_target_participation: true
+    attacks:
+      - blackbox_loss
+      - loss_series
+      - grad_cosine
+      - avg_cosine
+      - fedmia_loss
+      - fedmia_cosine
+    candidate_sampling: low_fpr_full
+    low_fpr_min_nonmembers: 1000
+    match_candidate_labels: false
+    audit_batch_size: 64
+    audit_interval: 1
+    signal_storage: compact
+    fedmia_tail: upper
+    fedmia_tail_calibration_fraction: 0.25
+    training_health_check: true
+
+# ProjRes remains a separate strict one-batch/one-step experiment because its
+# threat model is not the multi-round FedAvg trace used by the other attacks.
+projres:
+  enabled: true
+  threshold: 0.01
+  max_candidates: 32
+  min_nonmembers: 1000
+  max_nonmembers: 0
+
+defenses:
+  - name: none

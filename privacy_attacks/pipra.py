@@ -65,7 +65,7 @@ def run_pipra(
     attack_learning_rate: float = 0.01,
     temperature: float = 0.1,
 ) -> AttackResult:
-    """Output-free PIPRA with prompt-only shadow training."""
+    """Output-free PIPRA with parameter-efficient shadow-model training."""
     auxiliary, evaluation = balanced_evaluation_indices(
         membership, auxiliary_fraction, seed
     )
@@ -164,9 +164,15 @@ def run_pipra(
         sample_indices=evaluation.detach().cpu(),
         metadata={
             "shadow_prompts": shadow_prompts,
+            "shadow_models": shadow_prompts,
             "shadow_steps": shadow_steps,
             "attack_epochs": max(1, attack_epochs),
             "output_free": True,
             "auxiliary_nonmembers": int(auxiliary.numel()),
+            "trainable_scope": (
+                "mlp_only"
+                if str(getattr(target_model, "model_type", "")) == "clip_mlp"
+                else "prompt_only"
+            ),
         },
     )

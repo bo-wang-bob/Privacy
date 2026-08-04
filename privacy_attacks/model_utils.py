@@ -17,7 +17,7 @@ def last_client_states(
                 if client_id != target_client_id
             ]
             return states[target_client_id], references, int(observation["round"])
-    raise ValueError("No stored prompt state is available for the target client.")
+    raise ValueError("No stored trainable model state is available for the target client.")
 
 
 def model_from_state(
@@ -97,7 +97,15 @@ def semantic_features(
     images: torch.Tensor,
     labels: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract image and label-conditioned prompt features without using predictions."""
+    """Extract aligned sample and label-conditioned model features."""
+    getter = getattr(model, "get_semantic_features", None)
+    if getter is not None:
+        sample_features, class_features = getter(images, labels)
+        if sample_features.shape != class_features.shape:
+            raise ValueError(
+                "Semantic sample and class features must have matching shapes."
+            )
+        return sample_features, class_features
     if hasattr(model, "clip_model") and hasattr(model, "get_text_features"):
         image_features = model.clip_model.get_image_features(pixel_values=images)
         text_features = model.get_text_features(normalize=True)
@@ -107,7 +115,7 @@ def semantic_features(
     output = model(images, return_intermediate=True)
     if not isinstance(output, tuple) or len(output) != 3:
         raise TypeError(
-            "PIPRA/PromptMIA need a model that returns image and prompt features."
+            "PIPRA/PromptMIA need a model that returns aligned semantic features."
         )
     _, image_features, text_features = output
     return F.normalize(image_features, dim=1), F.normalize(text_features[labels], dim=1)

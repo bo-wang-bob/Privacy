@@ -10,20 +10,27 @@ def text_feature_matrix(
     model: torch.nn.Module,
     normalize: bool = True,
 ) -> torch.Tensor:
-    """Return one detached text-feature row per class."""
-    getter = getattr(model, "get_text_features", None)
+    """Return one detached class-feature row per class.
+
+    Prompt models expose encoded text rows; classifier models may instead
+    expose their class decision vectors through ``get_audit_feature_matrix``.
+    """
+    getter = getattr(model, "get_audit_feature_matrix", None)
+    if getter is None:
+        getter = getattr(model, "get_text_features", None)
     if getter is None:
         raise TypeError(
-            "Text-matrix FedMIA requires get_text_features(normalize=...)."
+            "Feature-matrix FedMIA requires get_audit_feature_matrix() or "
+            "get_text_features()."
         )
     features = getter(normalize=normalize)
     if not isinstance(features, torch.Tensor) or features.ndim != 2:
         raise ValueError(
-            "Text-matrix FedMIA features must have shape "
+            "Feature-matrix FedMIA features must have shape "
             "(num_classes, feature_dim)."
         )
     if not torch.isfinite(features).all():
-        raise ValueError("Text-matrix FedMIA features contain non-finite values.")
+        raise ValueError("Feature-matrix FedMIA features contain non-finite values.")
     return features.detach()
 
 
@@ -206,7 +213,7 @@ def _parameter_slices(
         slices.append((name, parameter, offset, stop))
         offset = stop
     if not slices:
-        raise ValueError("FedMIA-III needs an observable trainable prompt parameter.")
+        raise ValueError("FedMIA-III needs an observable trainable parameter.")
     return slices, offset
 
 

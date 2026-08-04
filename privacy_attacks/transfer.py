@@ -11,7 +11,7 @@ def run_transfer_representation_attack(
     calibration_fraction: float,
     seed: int,
 ) -> AttackResult:
-    """Shadow-prompt representation discrepancy adapted from Wu et al."""
+    """Shadow-client representation discrepancy adapted from Wu et al."""
     discrepancies = []
     used_rounds = []
     for observation in observations:
@@ -28,7 +28,7 @@ def run_transfer_representation_attack(
         discrepancies.append(torch.cat((difference, l2), dim=1))
         used_rounds.append(int(observation["round"]))
     if not discrepancies:
-        raise ValueError("Transfer attack needs target and shadow prompt updates.")
+        raise ValueError("Transfer attack needs target and shadow client updates.")
     features = torch.cat(
         (torch.stack(discrepancies).mean(dim=0), discrepancies[-1]), dim=1
     )

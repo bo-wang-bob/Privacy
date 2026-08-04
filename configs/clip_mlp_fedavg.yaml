@@ -1,0 +1,38 @@
+model_type: clip_mlp
+train_mode: centralized
+dataset_name: caltech101
+data_root: ./data
+batch_size: 32
+eval_batch_size: 64
+learning_rate: 0.01
+num_global_iters: 20
+local_epochs: 2
+total_users: 10
+sample_users: 10
+aggregator: fedavg
+
+clip_mlp:
+  hidden_dim: 512
+  dropout: 0.0
+  normalize_features: false
+  precompute_features: true
+
+partition_mode: dirichlet
+dirichlet_alpha: 0.1
+use_full_dataset: true
+fpl_shots: null
+gpu: 0
+seed: 42
+cache_dir: ./checkpoints/clip-vit-base-patch32
+model_load_path: null
+save_models: false
+eval_interval: 1
+results_dir: ./results
+
+audit:
+  enabled: false
+  attacks: []
+  training_health_check: true
+
+defense:
+  name: none

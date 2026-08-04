@@ -73,6 +73,20 @@ def generate_adversarial_keys(
 def _prompt_parameter(
     model: torch.nn.Module, feature_dimension: int
 ) -> torch.nn.Parameter:
+    getter = getattr(model, "get_audit_key_parameter", None)
+    if getter is not None:
+        parameter = getter()
+        if (
+            not isinstance(parameter, torch.nn.Parameter)
+            or not parameter.requires_grad
+            or parameter.ndim < 2
+            or parameter.shape[-1] != feature_dimension
+        ):
+            raise ValueError(
+                "The model's audit key parameter is incompatible with its "
+                "semantic feature dimension."
+            )
+        return parameter
     candidates = [
         parameter for parameter in model.parameters()
         if parameter.requires_grad
@@ -81,7 +95,8 @@ def _prompt_parameter(
     ]
     if not candidates:
         raise ValueError(
-            "PromptMIA needs a trainable prompt whose last dimension matches the query feature."
+            "PromptMIA needs trainable key-like vectors whose last dimension "
+            "matches the query feature."
         )
     return candidates[0]
 
@@ -106,7 +121,7 @@ def run_promptmia(
     similarity_span: float = 0.05,
     seed: int = 42,
 ) -> AttackResult:
-    """PromptMIA active probe adapted from key pools to shared CoOp prompt tokens."""
+    """PromptMIA active probe over prompt tokens or classifier decision vectors."""
     indices = _balanced_indices(membership, max_samples)
     scores = []
     observed_similarities = []
@@ -149,10 +164,9 @@ def run_promptmia(
         alignment = F.cosine_similarity(
             update.flatten(), candidate_gradient.detach().flatten(), dim=0
         )
-        # In a shared CoOp prompt there is no discrete key-selection event.
-        # Membership is measured by the signed update mass in the
-        # candidate-gradient direction, which preserves the PromptMIA signal
-        # while avoiding an unsigned magnitude shortcut.
+        # In shared prompts and ordinary classifier heads there is no discrete
+        # key-selection event. Membership is measured by signed update mass in
+        # the candidate-gradient direction.
         signed_projected_update = update_norm.mean() * alignment
         scores.append(float(signed_projected_update.cpu()))
         observed_similarities.append(benign_maximum)
@@ -167,7 +181,11 @@ def run_promptmia(
             "similarity_span": similarity_span,
             "isolated_probe": True,
             "paper_architecture": "keyed visual prompt pool",
-            "adaptation": "shared CoOp text-prompt token update response",
+            "adaptation": (
+                "MLP class-decision-vector update response"
+                if str(getattr(base_model, "model_type", "")) == "clip_mlp"
+                else "shared CoOp text-prompt token update response"
+            ),
             "score": "signed_projected_client_update",
             "mean_benign_max_similarity": sum(observed_similarities)
             / max(1, len(observed_similarities)),

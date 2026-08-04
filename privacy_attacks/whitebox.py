@@ -14,7 +14,7 @@ def run_passive_whitebox(
     calibration_fraction: float,
     seed: int,
 ) -> AttackResult:
-    """Nasr-style supervised white-box attack specialized to prompt gradients."""
+    """Nasr-style supervised white-box attack over trainable-model gradients."""
     features = []
     used_rounds = []
     for observation in observations:

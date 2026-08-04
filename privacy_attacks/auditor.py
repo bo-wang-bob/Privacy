@@ -103,7 +103,7 @@ _CANDIDATE_FIELDS = {
 
 
 class MembershipAuditor:
-    """Collect once, then run all configured prompt-tuning membership attacks."""
+    """Collect once, then run configured parameter-efficient membership attacks."""
 
     def __init__(
         self,
@@ -122,6 +122,7 @@ class MembershipAuditor:
         self.defense_config = dict(defense_config or {"name": "none"})
         self.defense_name = str(self.defense_config.get("name", "none")).lower()
         self.federated_method = str(federated_method).lower()
+        self.model_type = str(getattr(model, "model_type", "prompt"))
         self.audit_view = str(
             self.config.get("audit_view", "protocol_plus_released_prompts")
         ).lower()
@@ -271,9 +272,14 @@ class MembershipAuditor:
         self.candidate_sampling_mode = str(
             self.config.get("candidate_sampling", "legacy")
         ).lower()
-        if self.candidate_sampling_mode not in {"legacy", "fedmia_mix"}:
+        if self.candidate_sampling_mode not in {
+            "legacy",
+            "fedmia_mix",
+            "low_fpr_full",
+        }:
             raise ValueError(
-                "audit.candidate_sampling must be legacy or fedmia_mix."
+                "audit.candidate_sampling must be legacy, fedmia_mix, or "
+                "low_fpr_full."
             )
         self.nonmember_to_member_ratio = float(
             self.config.get("nonmember_to_member_ratio", 1.0)
@@ -293,8 +299,12 @@ class MembershipAuditor:
         self.results = []
         self.errors: dict[str, str] = {}
         self._fedmia_candidate_image_features: torch.Tensor | None = None
+        self.candidate_inputs_are_features = False
 
         if self.enabled:
+            if self.candidate_sampling_mode == "low_fpr_full":
+                self._initialize_low_fpr_full_candidates(users, target_client_id)
+                return
             legacy_max = int(self.config.get("max_samples_per_group", 32))
             max_members = int(self.config.get("max_member_samples", legacy_max))
             max_nonmembers = int(
@@ -317,6 +327,7 @@ class MembershipAuditor:
                 membership_parts = []
                 client_parts = []
                 self.candidate_sampling_by_client = {}
+
                 per_client_overlap = {}
                 eligible_client_ids = []
                 for client_id in self.audit_client_ids:
@@ -547,6 +558,134 @@ class MembershipAuditor:
                     (self.labels.numel(),), target_client_id, dtype=torch.long
                 )
                 self.candidate_sampling_by_client = {}
+
+    @torch.no_grad()
+    def _collect_encoded_candidates(
+        self,
+        datasets: list,
+        source_names: list[str],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, int]]:
+        """Encode complete datasets once for a scalable MLP-only audit."""
+        if len(datasets) != len(source_names) or not datasets:
+            raise ValueError("Low-FPR candidate sources must be non-empty and named.")
+        feature_parts = []
+        label_parts = []
+        source_counts: dict[str, int] = {}
+        self.model.eval()
+        for dataset, source in zip(datasets, source_names):
+            if len(dataset) == 0:
+                source_counts[source] = 0
+                continue
+            count = 0
+            loader = DataLoader(
+                dataset,
+                batch_size=self.audit_batch_size,
+                shuffle=False,
+                collate_fn=self.collate_fn,
+            )
+            for images, labels in loader:
+                features = self.model.encode_images(images.to(self.device))
+                feature_parts.append(features.detach().cpu())
+                labels = labels.detach().cpu().long()
+                label_parts.append(labels)
+                count += int(labels.numel())
+            source_counts[source] = count
+        if not label_parts or sum(source_counts.values()) < 2:
+            raise ValueError("Each low-FPR membership group needs two candidates.")
+        return torch.cat(feature_parts), torch.cat(label_parts), source_counts
+
+    def _initialize_low_fpr_full_candidates(
+        self, users: list, target_client_id: int
+    ) -> None:
+        """Use all target members and all disjoint non-members for low FPR."""
+        supported = {
+            "blackbox_loss",
+            "loss_series",
+            "grad_cosine",
+            "avg_cosine",
+            "fedmia_loss",
+            "fedmia_cosine",
+            "fedmia_text",
+            "fedmia_text_gradient",
+        }
+        unsupported = sorted(set(self.attacks) - supported)
+        if self.model_type != "clip_mlp":
+            raise ValueError("low_fpr_full currently requires model_type=clip_mlp.")
+        if self.pooled_client_audit:
+            raise ValueError("low_fpr_full currently supports one target client.")
+        if unsupported:
+            raise ValueError(
+                "low_fpr_full does not support: " + ", ".join(unsupported)
+            )
+        target = users[target_client_id]
+        member_features, member_labels, member_sources = (
+            self._collect_encoded_candidates(
+                [target.train_data], [f"target_train:{target_client_id}"]
+            )
+        )
+        nonmember_datasets = []
+        nonmember_source_names = []
+        for user in users:
+            if len(user.test_data):
+                nonmember_datasets.append(user.test_data)
+                nonmember_source_names.append(f"independent_test:{user.id}")
+        for user in users:
+            if user.id != target_client_id and len(user.train_data):
+                nonmember_datasets.append(user.train_data)
+                nonmember_source_names.append(f"other_client_train:{user.id}")
+        nonmember_features, nonmember_labels, nonmember_sources = (
+            self._collect_encoded_candidates(
+                nonmember_datasets, nonmember_source_names
+            )
+        )
+        minimum_nonmembers = int(
+            self.config.get("low_fpr_min_nonmembers", 1000)
+        )
+        if minimum_nonmembers < 1000:
+            raise ValueError(
+                "low_fpr_min_nonmembers must be at least 1000 to resolve 0.1% FPR."
+            )
+        if nonmember_labels.numel() < minimum_nonmembers:
+            raise ValueError(
+                "low_fpr_full needs at least "
+                f"{minimum_nonmembers} non-members, but only found "
+                f"{nonmember_labels.numel()}."
+            )
+        self.images = torch.cat((member_features, nonmember_features))
+        self.labels = torch.cat((member_labels, nonmember_labels))
+        self.membership = torch.cat(
+            (
+                torch.ones(member_labels.numel(), dtype=torch.long),
+                torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+            )
+        )
+        self.candidate_client_ids = torch.full(
+            (self.labels.numel(),), target_client_id, dtype=torch.long
+        )
+        self.candidate_inputs_are_features = True
+        self.candidate_sampling_by_client = {
+            str(target_client_id): {
+                "mode": "low_fpr_full",
+                "member_count": int(member_labels.numel()),
+                "nonmember_count": int(nonmember_labels.numel()),
+                "member_source_counts": member_sources,
+                "nonmember_source_counts": nonmember_sources,
+                "minimum_nonmembers": minimum_nonmembers,
+                "fpr_resolution": 1.0 / int(nonmember_labels.numel()),
+            }
+        }
+        self.candidate_label_support = sorted(
+            set(self.labels.detach().cpu().unique().tolist())
+        )
+        member_support = set(member_labels.unique().tolist())
+        nonmember_support = set(nonmember_labels.unique().tolist())
+        self.null_client_candidate_label_overlap = sorted(
+            member_support & nonmember_support
+        )
+        self.null_client_candidate_label_overlap_by_client = {
+            str(target_client_id): self.null_client_candidate_label_overlap
+        }
+        self.nonmember_source_priority = nonmember_source_names
 
     @staticmethod
     def _unused_few_shot_training_pool(users) -> Subset | None:
@@ -945,11 +1084,35 @@ class MembershipAuditor:
         logits_parts = []
         representation_parts = []
         loss_parts = []
+        feature_forward = getattr(model, "forward_from_image_features", None)
+        feature_representation = getattr(
+            model, "get_audit_representation_from_image_features", None
+        )
         for start in range(0, self.labels.numel(), self.audit_batch_size):
             stop = start + self.audit_batch_size
             images = self.images[start:stop].to(self.device)
             labels = self.labels[start:stop].to(self.device)
-            if require_representation:
+            if getattr(self, "candidate_inputs_are_features", False):
+                if feature_forward is None:
+                    raise TypeError(
+                        "Cached audit features require forward_from_image_features."
+                    )
+                if require_representation:
+                    if feature_representation is None:
+                        raise TypeError(
+                            "Cached audit features require an MLP representation getter."
+                        )
+                    logits, representation = feature_representation(images, labels)
+                    losses = F.cross_entropy(logits, labels, reduction="none")
+                    compact = F.adaptive_avg_pool1d(
+                        representation.unsqueeze(1),
+                        min(64, representation.shape[1]),
+                    ).squeeze(1)
+                    representation_parts.append(compact.detach().cpu())
+                else:
+                    logits = feature_forward(images)
+                    losses = F.cross_entropy(logits, labels, reduction="none")
+            elif require_representation:
                 logits, representation, losses = logits_and_representation(
                     model, images, labels
                 )
@@ -971,13 +1134,33 @@ class MembershipAuditor:
     def _candidate_image_feature_matrix(
         self, model: torch.nn.Module
     ) -> torch.Tensor:
-        """Encode the fixed candidate images once for direct text gradients."""
-        if self._fedmia_candidate_image_features is not None:
+        """Encode fixed candidates in the space paired with class features."""
+        feature_getter = getattr(
+            model,
+            (
+                "get_audit_input_features_from_image_features"
+                if getattr(self, "candidate_inputs_are_features", False)
+                else "get_audit_input_features"
+            ),
+            None,
+        )
+        if (
+            feature_getter is None
+            and self._fedmia_candidate_image_features is not None
+        ):
             return self._fedmia_candidate_image_features
         feature_parts = []
         model.eval()
         for start in range(0, self.labels.numel(), self.audit_batch_size):
             stop = start + self.audit_batch_size
+            if feature_getter is not None:
+                features = feature_getter(
+                    self.images[start:stop].to(self.device)
+                )
+                if not isinstance(features, torch.Tensor) or features.ndim != 2:
+                    raise ValueError("Audit input features must be a matrix.")
+                feature_parts.append(features.detach().cpu())
+                continue
             try:
                 output = model(
                     self.images[start:stop].to(self.device),
@@ -998,12 +1181,17 @@ class MembershipAuditor:
             feature_parts.append(
                 F.normalize(image_features.detach(), dim=1).cpu()
             )
-        self._fedmia_candidate_image_features = torch.cat(feature_parts)
-        return self._fedmia_candidate_image_features
+        features = torch.cat(feature_parts)
+        if feature_getter is None:
+            self._fedmia_candidate_image_features = features
+        return features
 
     @staticmethod
     def _direct_text_logit_scale(model: torch.nn.Module) -> float:
         """Read CLIP's positive logit scale, or use one for lightweight models."""
+        audit_scale = getattr(model, "audit_logit_scale", None)
+        if audit_scale is not None:
+            return float(audit_scale)
         clip_model = getattr(model, "clip_model", None)
         raw_scale = getattr(clip_model, "logit_scale", None)
         if raw_scale is None:
@@ -1021,6 +1209,18 @@ class MembershipAuditor:
         gradient_parts = []
         signature_parts = []
         loss_parts = []
+        feature_forward = (
+            getattr(model, "forward_from_image_features", None)
+            if getattr(self, "candidate_inputs_are_features", False)
+            else None
+        )
+        if (
+            getattr(self, "candidate_inputs_are_features", False)
+            and feature_forward is None
+        ):
+            raise TypeError(
+                "Cached audit features require forward_from_image_features."
+            )
         for start in range(0, self.labels.numel(), self.audit_batch_size):
             stop = start + self.audit_batch_size
             gradients, signatures, losses = per_sample_prompt_gradients(
@@ -1028,6 +1228,7 @@ class MembershipAuditor:
                 self.images[start:stop].to(self.device),
                 self.labels[start:stop].to(self.device),
                 parameter_names,
+                forward=feature_forward,
             )
             gradient_parts.append(gradients)
             signature_parts.append(signatures)
@@ -1037,6 +1238,55 @@ class MembershipAuditor:
             torch.cat(signature_parts),
             torch.cat(loss_parts),
         )
+
+    def _cached_feature_gradient_cosines(
+        self,
+        model: torch.nn.Module,
+        parameter_names: list[str],
+        updates: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute exact MLP gradient cosines without retaining all gradients."""
+        if not updates:
+            raise ValueError("At least one client update is required.")
+        feature_forward = getattr(model, "forward_from_image_features", None)
+        if feature_forward is None:
+            raise TypeError("Cached features require forward_from_image_features.")
+        update_matrix = torch.stack([update.detach().cpu() for update in updates])
+        update_norms = update_matrix.norm(dim=1).clamp_min(1e-12)
+        score_parts = []
+        gradient_batch_size = int(
+            self.config.get("low_fpr_gradient_batch_size", 8)
+        )
+        if gradient_batch_size <= 0:
+            raise ValueError("low_fpr_gradient_batch_size must be positive.")
+        for start in range(0, self.labels.numel(), gradient_batch_size):
+            stop = start + gradient_batch_size
+            gradients, _, _ = per_sample_prompt_gradients(
+                model,
+                self.images[start:stop].to(self.device),
+                self.labels[start:stop].to(self.device),
+                parameter_names,
+                forward=feature_forward,
+            )
+            compared = gradients
+            compared_updates = update_matrix
+            if update_matrix.shape[1] != gradients.shape[1]:
+                width = min(64, update_matrix.shape[1], gradients.shape[1])
+                compared_updates = F.adaptive_avg_pool1d(
+                    update_matrix.unsqueeze(1), width
+                ).squeeze(1)
+                compared = F.adaptive_avg_pool1d(
+                    gradients.unsqueeze(1), width
+                ).squeeze(1)
+                batch_update_norms = compared_updates.norm(dim=1).clamp_min(1e-12)
+            else:
+                batch_update_norms = update_norms
+            gradient_norms = compared.norm(dim=1).clamp_min(1e-12)
+            score_parts.append(
+                (compared @ compared_updates.t())
+                / (gradient_norms[:, None] * batch_update_norms[None, :])
+            )
+        return torch.cat(score_parts).t().contiguous()
 
     @staticmethod
     def _clone_prompt_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -1132,14 +1382,13 @@ class MembershipAuditor:
             observable_names = [name for name in names if name.endswith("global_ctx")]
         needs_gradients = (
             self._needs_cosine
-            or self._needs_text_feature
             or self._needs_whitebox_features
             or self._needs_promptres
         )
         sample_gradients = None
         signatures = None
         observable_base_state = self._observable_base_state(base_state)
-        if needs_gradients:
+        if needs_gradients and not self.candidate_inputs_are_features:
             self.model.load_state_dict(
                 observable_base_state, strict=False
             )
@@ -1148,25 +1397,58 @@ class MembershipAuditor:
                 self.model, observable_names
             )
 
+        feature_names = observable_names
+        feature_name_getter = getattr(
+            self.model, "get_audit_feature_parameter_names", None
+        )
+        if feature_name_getter is not None:
+            requested_feature_names = list(feature_name_getter())
+            feature_names = [
+                name for name in requested_feature_names if name in observable_names
+            ]
+            if self._needs_text_feature and not feature_names:
+                raise ValueError(
+                    "FedMIA-III cannot observe the model's class-feature parameters."
+                )
+        feature_sample_gradients = None
+        if self._needs_text_feature:
+            self.model.load_state_dict(observable_base_state, strict=False)
+            self.model.eval()
+            feature_sample_gradients, _, _ = self._candidate_gradients(
+                self.model, feature_names
+            )
+
         base_text_features = None
+        base_direct_features = None
         text_feature_metadata = None
-        if self._needs_text_feature or self._needs_text_gradient:
-            if self._needs_text_feature and sample_gradients is None:
+        direct_feature_normalize = bool(
+            getattr(self.model, "audit_feature_logits_normalized", True)
+        )
+        if self._needs_text_feature:
+            if feature_sample_gradients is None:
                 raise AssertionError("FedMIA-III lost its candidate gradients.")
             self.model.load_state_dict(observable_base_state, strict=False)
             base_text_features = text_feature_matrix(
                 self.model, normalize=True
             ).detach().cpu()
+        if self._needs_text_gradient:
+            self.model.load_state_dict(observable_base_state, strict=False)
+            base_direct_features = text_feature_matrix(
+                self.model, normalize=direct_feature_normalize
+            ).detach().cpu()
 
         confidence = []
         cosine = []
         client_text_changes = []
+        direct_feature_client_changes = []
         text_feature_client_change_norms = []
+        direct_feature_client_change_norms = []
         gradient_difference = []
         probabilities = []
         representations = []
         promptres_updates = []
         promptres_gradients = []
+        cached_feature_updates = []
         observable_states = {}
         for user_id in selected_ids:
             state = self._observable_client_state(
@@ -1175,8 +1457,6 @@ class MembershipAuditor:
             if self._needs_client_states:
                 observable_states[user_id] = state
             if self._needs_text_feature or self._needs_text_gradient:
-                if base_text_features is None:
-                    raise AssertionError("FedMIA-III/IV lost base text features.")
                 client_base = (
                     base_state if base_states is None else base_states[user_id]
                 )
@@ -1191,17 +1471,27 @@ class MembershipAuditor:
                             "same protocol-visible base prompt in each round."
                         )
                 self.model.load_state_dict(state, strict=False)
-                updated_text_features = text_feature_matrix(
-                    self.model, normalize=True
-                ).detach().cpu()
-                client_text_change = updated_text_features - base_text_features
-                client_text_changes.append(client_text_change)
-                text_feature_client_change_norms.append(
-                    client_text_change.norm()
-                )
+                if self._needs_text_feature:
+                    if base_text_features is None:
+                        raise AssertionError("FedMIA-III lost base class features.")
+                    updated_text_features = text_feature_matrix(
+                        self.model, normalize=True
+                    ).detach().cpu()
+                    client_text_change = updated_text_features - base_text_features
+                    client_text_changes.append(client_text_change)
+                    text_feature_client_change_norms.append(
+                        client_text_change.norm()
+                    )
+                if self._needs_text_gradient:
+                    if base_direct_features is None:
+                        raise AssertionError("FedMIA-IV lost base class features.")
+                    updated_direct_features = text_feature_matrix(
+                        self.model, normalize=direct_feature_normalize
+                    ).detach().cpu()
+                    direct_change = updated_direct_features - base_direct_features
+                    direct_feature_client_changes.append(direct_change)
+                    direct_feature_client_change_norms.append(direct_change.norm())
             if needs_gradients:
-                if sample_gradients is None:
-                    raise AssertionError("Gradient-dependent audit lost its gradients.")
                 client_base = (
                     base_state if base_states is None else base_states[user_id]
                 )
@@ -1231,33 +1521,40 @@ class MembershipAuditor:
                     update = flatten_state_delta(
                         client_base, state, observable_names
                     )
-                compared_gradients = sample_gradients
-                if update.numel() != sample_gradients.shape[1]:
-                    width = min(64, update.numel(), sample_gradients.shape[1])
-                    update = F.adaptive_avg_pool1d(
-                        update.view(1, 1, -1), width
-                    ).flatten()
-                    compared_gradients = F.adaptive_avg_pool1d(
-                        sample_gradients.unsqueeze(1), width
-                    ).squeeze(1)
-                update_norm = update.norm().clamp_min(1e-12)
-                sample_norm = compared_gradients.norm(dim=1).clamp_min(1e-12)
-                if self._needs_cosine:
-                    cosine.append(
-                        (compared_gradients @ update)
-                        / (sample_norm * update_norm)
-                    )
-                if self._needs_promptres:
-                    promptres_updates.append(update)
-                    promptres_gradients.append(compared_gradients)
-                if self._needs_whitebox_features:
-                    update_sq = update.square().sum()
-                    gradient_difference.append(
-                        update_sq
-                        - (update.unsqueeze(0) - compared_gradients)
-                        .square()
-                        .sum(dim=1)
-                    )
+                if self.candidate_inputs_are_features:
+                    cached_feature_updates.append(update)
+                else:
+                    if sample_gradients is None:
+                        raise AssertionError(
+                            "Gradient-dependent audit lost its gradients."
+                        )
+                    compared_gradients = sample_gradients
+                    if update.numel() != sample_gradients.shape[1]:
+                        width = min(64, update.numel(), sample_gradients.shape[1])
+                        update = F.adaptive_avg_pool1d(
+                            update.view(1, 1, -1), width
+                        ).flatten()
+                        compared_gradients = F.adaptive_avg_pool1d(
+                            sample_gradients.unsqueeze(1), width
+                        ).squeeze(1)
+                    update_norm = update.norm().clamp_min(1e-12)
+                    sample_norm = compared_gradients.norm(dim=1).clamp_min(1e-12)
+                    if self._needs_cosine:
+                        cosine.append(
+                            (compared_gradients @ update)
+                            / (sample_norm * update_norm)
+                        )
+                    if self._needs_promptres:
+                        promptres_updates.append(update)
+                        promptres_gradients.append(compared_gradients)
+                    if self._needs_whitebox_features:
+                        update_sq = update.square().sum()
+                        gradient_difference.append(
+                            update_sq
+                            - (update.unsqueeze(0) - compared_gradients)
+                            .square()
+                            .sum(dim=1)
+                        )
 
             needs_outputs = (
                 self._needs_confidence
@@ -1288,15 +1585,24 @@ class MembershipAuditor:
         if self._needs_confidence:
             observation["confidence"] = torch.stack(confidence)
         if self._needs_cosine:
-            observation["cosine"] = torch.stack(cosine)
+            if self.candidate_inputs_are_features:
+                self.model.load_state_dict(observable_base_state, strict=False)
+                self.model.eval()
+                observation["cosine"] = self._cached_feature_gradient_cosines(
+                    self.model,
+                    observable_names,
+                    cached_feature_updates,
+                )
+            else:
+                observation["cosine"] = torch.stack(cosine)
         if self._needs_text_feature:
-            if sample_gradients is None:
+            if feature_sample_gradients is None:
                 raise AssertionError("FedMIA-III lost its candidate gradients.")
             text_feature_cosine, text_feature_metadata = fedmia_text_round_scores(
                 self.model,
                 observable_base_state,
-                observable_names,
-                sample_gradients,
+                feature_names,
+                feature_sample_gradients,
                 torch.stack(client_text_changes),
                 probe_norm=float(
                     self.config.get("fedmia_text_probe_norm", 1e-3)
@@ -1325,14 +1631,16 @@ class MembershipAuditor:
                 text_feature_metadata["batched_context_encoding"]
             )
         if self._needs_text_gradient:
-            if base_text_features is None:
-                raise AssertionError("FedMIA-IV lost its base text features.")
+            if base_direct_features is None:
+                raise AssertionError("FedMIA-IV lost its base class features.")
+            self.model.load_state_dict(observable_base_state, strict=False)
+            self.model.eval()
             text_gradient_cosine, text_gradient_metadata = (
                 direct_text_gradient_round_scores(
-                    base_text_features,
+                    base_direct_features,
                     self._candidate_image_feature_matrix(self.model),
                     self.labels.detach().cpu(),
-                    torch.stack(client_text_changes),
+                    torch.stack(direct_feature_client_changes),
                     logit_scale=self._direct_text_logit_scale(self.model),
                     project_tangent=bool(
                         self.config.get(
@@ -1344,7 +1652,7 @@ class MembershipAuditor:
             )
             observation["text_gradient_cosine"] = text_gradient_cosine
             observation["text_gradient_client_change_norms"] = torch.stack(
-                text_feature_client_change_norms
+                direct_feature_client_change_norms
             )
             observation["text_gradient_shape"] = text_gradient_metadata[
                 "text_feature_shape"
@@ -2023,7 +2331,24 @@ class MembershipAuditor:
             try:
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
-                self.results.append(self._run(attack, final_model, final_state))
+                result = self._run(attack, final_model, final_state)
+                result.metadata.setdefault("model_type", self.model_type)
+                if self.model_type == "clip_mlp":
+                    result.metadata.setdefault("trainable_scope", "mlp_only")
+                    if attack == "fedmia_text":
+                        result.metadata.setdefault(
+                            "signal_space", "normalized_class_decision_matrix"
+                        )
+                    elif attack == "fedmia_text_gradient":
+                        result.metadata.setdefault(
+                            "signal_space",
+                            "exact_augmented_hidden_class_matrix_gradient",
+                        )
+                    elif attack == "promptmia":
+                        result.metadata.setdefault(
+                            "signal_space", "class_decision_vectors"
+                        )
+                self.results.append(result)
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
             except Exception as error:
@@ -2093,6 +2418,7 @@ class MembershipAuditor:
                     ),
                     "defense": self.defense_name,
                     "federated_method": self.federated_method,
+                    "model_type": self.model_type,
                     "audit_view": self.audit_view,
                     "signal_storage": {
                         "mode": self.signal_storage,

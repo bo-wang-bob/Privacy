@@ -58,12 +58,12 @@ def run_yoqo(
     reference_models: int = 2,
     loss_threshold: float | None = 0.5,
 ) -> AttackResult:
-    """Offline YOQO: craft with OUT prompt models, query one target hard label."""
+    """Offline YOQO: craft with OUT client models, query one target hard label."""
     target_state, reference_states, round_index = last_client_states(
         observations, target_client_id
     )
     if not reference_states:
-        raise ValueError("YOQO needs at least one non-target prompt model.")
+        raise ValueError("YOQO needs at least one non-target client model.")
     device = images.device
     target_model = model_from_state(base_model, target_state, device).eval()
     out_models = [
@@ -167,12 +167,12 @@ def run_canary(
     epsilon: float = 0.1,
     reference_models: int = 2,
 ) -> AttackResult:
-    """Adaptive Canary using prompt-only IN/OUT surrogate pairs."""
+    """Adaptive Canary using parameter-efficient IN/OUT surrogate pairs."""
     target_state, reference_states, round_index = last_client_states(
         observations, target_client_id
     )
     if not reference_states:
-        raise ValueError("Canary needs at least one non-target prompt model.")
+        raise ValueError("Canary needs at least one non-target client model.")
     device = images.device
     target_model = model_from_state(base_model, target_state, device).eval()
     out_models = [
@@ -243,7 +243,14 @@ def run_canary(
             "canaries_per_sample": max(1, num_canaries),
             "optimization_steps": max(1, optimization_steps),
             "reference_models": len(out_models),
-            "prompt_only_surrogates": True,
+            "prompt_only_surrogates": (
+                str(getattr(base_model, "model_type", "")) != "clip_mlp"
+            ),
+            "trainable_scope": (
+                "mlp_only"
+                if str(getattr(base_model, "model_type", "")) == "clip_mlp"
+                else "prompt_only"
+            ),
             "epsilon": epsilon,
         },
     )

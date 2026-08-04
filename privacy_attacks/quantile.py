@@ -36,7 +36,7 @@ def run_quantile_mia(
     epochs: int = 200,
     learning_rate: float = 0.01,
 ) -> AttackResult:
-    """NeurIPS QMIA adapted to prompt-model confidence and CLIP representations."""
+    """NeurIPS QMIA adapted to client confidence and learned representations."""
     if not 0.0 < quantile < 1.0:
         raise ValueError("QMIA quantile must be between zero and one.")
     auxiliary, evaluation = balanced_evaluation_indices(

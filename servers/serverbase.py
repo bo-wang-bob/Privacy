@@ -101,7 +101,7 @@ class ServerBase:
         self.audit_config = audit_config or {"enabled": True}
         self.defense_config = defense_config or {"name": "none"}
         self.target_client_id = int(self.audit_config.get("target_client_id", 0))
-        self.ensure_target = bool(
+        self.ensure_target = bool(self.audit_config.get("enabled", True)) and bool(
             self.audit_config.get("ensure_target_participation", True)
         )
         os.makedirs(results_dir, exist_ok=True)
@@ -195,7 +195,9 @@ class ServerBase:
             federated_method=self.federated_method,
             num_classes=self.num_classes,
         )
-        self.code_poison_enabled = "codepoison" in self.auditor.attacks
+        self.code_poison_enabled = (
+            self.auditor.enabled and "codepoison" in self.auditor.attacks
+        )
         self.private_probe_steps = planned_private_probe_steps(self.audit_config)
         if self.federated_method in {"dpfpl", "fedask"}:
             self.defense.additional_private_steps = self.private_probe_steps
@@ -447,12 +449,22 @@ class ServerBase:
         self.model.load_state_dict(final_state, strict=False)
         torch.save(
             self._clone_state(final_state, cpu=True),
-            os.path.join(self.results_dir, "final_prompt.pt"),
+            os.path.join(
+                self.results_dir,
+                str(
+                    getattr(
+                        self.model,
+                        "trainable_state_filename",
+                        "final_prompt.pt",
+                    )
+                ),
+            ),
         )
         defense_summary = self.defense.save_summary(self.results_dir)
         logger.info("Privacy defense completed: %s", defense_summary)
         method_summary = {
             "federated_method": self.federated_method,
+            "model_type": str(getattr(self.model, "model_type", "prompt")),
             "configuration": self.method_config,
             "training_health": training_health,
             "state_scope": (

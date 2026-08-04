@@ -5,7 +5,7 @@ from context.context import Context
 
 
 def aggregate_fedavg_model_states(ctx: Context, aggregation_ids: list[int]) -> None:
-    """Sample-weighted FedAvg over prompt parameters only."""
+    """Sample-weighted FedAvg over all and only trainable parameters."""
     if not aggregation_ids:
         raise ValueError("FedAvg requires at least one client update.")
 

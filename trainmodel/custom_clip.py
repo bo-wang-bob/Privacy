@@ -717,6 +717,28 @@ class CustomCLIP(BaseModel):
             return learner.global_ctx, learner.local_ctx
         return (learner.effective_context(),)
 
+    def get_text_features_from_context(
+        self,
+        context: torch.Tensor,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """Differentiably encode one supplied prompt context.
+
+        Unlike :meth:`get_text_features`, this method deliberately retains the
+        autograd graph. It is used by projection-residual diagnostics to apply
+        Jacobian-vector and vector-Jacobian products without materializing the
+        full text-feature Jacobian.
+        """
+        prompt_embeds, attention_mask = self.prompt_learner(context)
+        features = self.text_encoder(
+            prompt_embeds, attention_mask, self.clip_model
+        )
+        if normalize:
+            features = features / features.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
+        return features
+
     @torch.no_grad()
     def get_text_features_for_context_batch(
         self,

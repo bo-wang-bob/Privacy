@@ -113,6 +113,23 @@ def test_attack_summary_marks_unresolvable_low_fpr_as_not_reportable():
     assert not summary["metric_availability"]["tpr_at_fpr_0.001"]["resolvable"]
 
 
+def test_attack_summary_reports_point_one_percent_fpr_with_1000_nonmembers():
+    labels = torch.cat((torch.ones(10), torch.zeros(1000))).long()
+    scores = torch.cat((torch.linspace(1.0, 0.9, 10), torch.linspace(0.8, 0.0, 1000)))
+    summary = AttackResult(
+        name="fedmia_loss",
+        scores=scores,
+        labels=labels,
+        sample_indices=torch.arange(labels.numel()),
+    ).to_summary()
+
+    availability = summary["metric_availability"]["tpr_at_fpr_0.001"]
+    assert availability["resolvable"]
+    assert availability["minimum_nonmembers"] == 1000
+    assert summary["fpr_resolution"] == pytest.approx(0.001)
+    assert summary["reportable_metrics"]["tpr_at_fpr_0.001"] == 1.0
+
+
 def test_training_health_rejects_uniform_zero_update_run(tmp_path):
     server = ServerBase.__new__(ServerBase)
     server.audit_config = {"training_health_check": True}

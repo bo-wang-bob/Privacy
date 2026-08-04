@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import torch
 import torch.nn.functional as F
@@ -40,7 +40,7 @@ def _compress_vector(vector: torch.Tensor, max_size: int = 64) -> torch.Tensor:
 
 
 def gradient_signature(gradients: list[torch.Tensor]) -> torch.Tensor:
-    """Prompt-aware white-box signature: token norms plus global statistics."""
+    """Compact white-box signature: row norms plus global statistics."""
     parts = []
     flat = []
     for gradient in gradients:
@@ -68,6 +68,7 @@ def per_sample_prompt_gradients(
     images: torch.Tensor,
     labels: torch.Tensor,
     parameter_names: Iterable[str] | None = None,
+    forward: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return flattened gradients, compact signatures, and losses per sample."""
     allowed = None if parameter_names is None else set(parameter_names)
@@ -84,9 +85,10 @@ def per_sample_prompt_gradients(
     signatures = []
     losses = []
     model.eval()
+    model_forward = model if forward is None else forward
     for image, label in zip(images, labels):
         model.zero_grad(set_to_none=True)
-        logits = model(image.unsqueeze(0))
+        logits = model_forward(image.unsqueeze(0))
         loss = F.cross_entropy(logits, label.view(1))
         gradients = torch.autograd.grad(loss, parameters, retain_graph=False)
         flattened.append(
@@ -104,6 +106,14 @@ def logits_and_representation(
     labels: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     model.eval()
+    representation_getter = getattr(model, "get_audit_representation", None)
+    if representation_getter is not None:
+        logits, representation = representation_getter(images, labels)
+        losses = F.cross_entropy(logits, labels, reduction="none")
+        compact = F.adaptive_avg_pool1d(
+            representation.unsqueeze(1), min(64, representation.shape[1])
+        ).squeeze(1)
+        return logits.detach().cpu(), compact.detach().cpu(), losses.detach().cpu()
     try:
         output = model(images, return_intermediate=True)
     except TypeError:

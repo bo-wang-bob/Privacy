@@ -90,6 +90,88 @@ python main.py \
 将 `promptfl` 替换为 `fedavg`、`fedotp`、`fedpgp`、`dpfpl` 或 `fedask`
 即可选择其他联邦方法。各方法专用参数位于配置文件的同名段中。
 
+### CLIP 图像编码器 + 两层 MLP 的 FedAvg 基线
+
+该基线冻结完整 CLIP，只训练并聚合 `Linear -> ReLU -> Linear` 分类头，并使用
+官方完整训练集而不做 few-shot 截断。默认还会在 Server 创建前一次性编码全部
+训练/测试图片，之后的本地训练、周期测试和成员审计只读取 CPU 中的 CLIP 向量：
+
+```bash
+python main.py --config configs/clip_mlp_fedavg.yaml
+```
+
+也可以在命令行切换模型；`--model_type clip_mlp` 会自动选择普通集中式
+FedAvg、全量数据，并在未显式指定攻击时关闭隐私审计：
+
+```bash
+python main.py --model_type clip_mlp --mlp_hidden_dim 512 --attack none
+```
+
+该模型也支持仓库内全部隐私攻击。运行完整攻击集合：
+
+```bash
+python main.py --config configs/clip_mlp_privacy.yaml
+```
+
+运行单个攻击时可直接覆盖：
+
+```bash
+python main.py --model_type clip_mlp --attack fedmia_cosine
+```
+
+论文 ProjRes 在第一层 MLP 参数上的严格单轮 FedSGD 实现使用独立入口。它只取
+`classifier.0.weight` 的一个真实 batch 更新，并以该层输入的 CLIP 表示计算
+原始 L1 投影残差：
+
+```bash
+bash scripts/run_projres_mlp_real.sh
+```
+
+默认配置见 `configs/clip_mlp_projres.yaml`，严格威胁模型与公式映射见
+`docs/projres_mlp_strict.md`。这里的严格 ProjRes 与通用审计器中的余弦
+`promptres` 不是同一种算法。
+
+在 MLP FedAvg 上运行损失、时序损失、单轮/时序梯度余弦、FedMIA-I/II，
+并在随后使用相同配置执行严格单批次 ProjRes：
+
+```bash
+bash scripts/run_clip_mlp_fedmia_attacks.sh
+```
+
+该入口现在是多数据集 sweep，默认运行 Caltech101、OxfordPets、Flowers102、
+Food101 和 CIFAR100。可以只选择其中一部分，也可以仅打印所有有效参数和命令：
+
+```bash
+bash scripts/run_clip_mlp_fedmia_attacks.sh \
+  --datasets caltech101,flowers \
+  --dry-run
+```
+
+每个作业开始时都会输出完整参数块，并把可复现配置保存到
+`results/clip_mlp_fedmia_attacks/runs/<run_id>/run_config.yaml`。默认攻击列表可通过
+`--attacks` 覆盖。例如同时加入仓库扩展的
+FedMIA-III/IV：
+
+```bash
+bash scripts/run_clip_mlp_fedmia_attacks.sh \
+  --attacks blackbox_loss,loss_series,grad_cosine,avg_cosine,fedmia_loss,fedmia_cosine,fedmia_text,fedmia_text_gradient
+```
+
+严格 ProjRes 结果写入每个作业的
+`privacy_audit/projres_strict.json`。可使用 `--projres-threshold` 调整阈值；仅运行
+通用审计攻击时传入 `--skip-projres`。普通攻击汇总写入
+`summary_by_run.csv` / `summary_aggregate.csv`，ProjRes 汇总写入
+`summary_projres.csv`；不会生成 HTML 文件。
+
+该脚本默认加载 `configs/clip_mlp_fedmia_attacks_sweep.yaml`，其基础配置是
+`configs/clip_mlp_low_fpr_attacks.yaml`：通用攻击使用目标客户端
+完整训练集作为成员，并使用所有客户端测试集及其他客户端训练集作为互斥非成员；
+全部联邦训练集和测试集在训练开始前只编码一次，后续 FedAvg、测试及攻击均复用
+向量。协议强制至少 1000 个非成员，因此
+`TPR@0.1%FPR` 的经验分辨率达到要求；实际成员数、非成员数和
+`fpr_resolution` 会写入 `privacy_audit/summary.json`。严格 ProjRes 的成员仍只能
+来自产生上传梯度的实际 batch，但它也使用完整非成员池计算低 FPR 指标。
+
 ### 运行单个攻击与防御
 
 ```bash
@@ -215,6 +297,8 @@ audit:
 
 实验主要通过 YAML 管理，常用字段包括：
 
+- `model_type`：`prompt` 或冻结 CLIP 图像编码器的 `clip_mlp`；
+- `clip_mlp`：两层 MLP 的隐藏维度、dropout 与特征归一化设置；
 - `aggregator`：联邦训练方法；
 - `total_users`、`sample_users`：客户端总数和每轮参与数；
 - `partition_mode`：`iid`、`dirichlet`、`pathological` 或 `auto`；
@@ -237,6 +321,7 @@ audit:
 - `training_metrics.csv`：各评估轮次的损失与准确率；
 - `training_health.json`：训练状态健康检查；
 - `final_prompt.pt`：最终可训练提示参数；
+- `final_mlp.pt`：`clip_mlp` 基线最终可训练的两层 MLP 参数；
 - `federated_method_summary.json`：联邦方法配置与诊断；
 - `defense_summary.json`：防御配置、统计与隐私会计；
 - `privacy_audit/summary.json`：攻击指标和逐客户端元数据；

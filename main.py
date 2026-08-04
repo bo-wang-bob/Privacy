@@ -114,7 +114,11 @@ def _result_directory(config: dict) -> str:
     )
 
 
-def _load_local_clip(cache_dir: str, device: torch.device):
+def _load_local_clip(
+    cache_dir: str,
+    device: torch.device,
+    attn_implementation: str | None = None,
+):
     from transformers import CLIPModel, CLIPProcessor
 
     try:
@@ -124,10 +128,15 @@ def _load_local_clip(cache_dir: str, device: torch.device):
             use_fast=True,
             local_files_only=True,
         )
+        model_arguments = {
+            "cache_dir": cache_dir,
+            "local_files_only": True,
+        }
+        if attn_implementation is not None:
+            model_arguments["attn_implementation"] = attn_implementation
         clip_model = CLIPModel.from_pretrained(
             "openai/clip-vit-base-patch32",
-            cache_dir=cache_dir,
-            local_files_only=True,
+            **model_arguments,
         ).to(device)
     except OSError as error:
         raise RuntimeError(
@@ -140,6 +149,9 @@ def _load_local_clip(cache_dir: str, device: torch.device):
 def validate_config(config: dict) -> None:
     if config["train_mode"] not in {"centralized", "local"}:
         raise ValueError("train_mode must be 'centralized' or 'local'.")
+    model_type = str(config.get("model_type", "prompt")).lower()
+    if model_type not in {"prompt", "clip_mlp"}:
+        raise ValueError("model_type must be prompt or clip_mlp.")
     method = config["aggregator"].lower()
     supported_methods = {
         "promptfl",
@@ -218,6 +230,21 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "use_full_dataset=true requires fpl_shots=null so training is not capped."
         )
+    if model_type == "clip_mlp":
+        mlp_config = dict(config.get("clip_mlp", {}))
+        if method != "fedavg" or config["train_mode"] != "centralized":
+            raise ValueError(
+                "clip_mlp requires centralized training with aggregator=fedavg."
+            )
+        if not bool(config.get("use_full_dataset", False)) or fpl_shots is not None:
+            raise ValueError(
+                "clip_mlp uses the full dataset and requires "
+                "use_full_dataset=true and fpl_shots=null."
+            )
+        if int(mlp_config.get("hidden_dim", 512)) <= 0:
+            raise ValueError("clip_mlp.hidden_dim must be positive.")
+        if not 0 <= float(mlp_config.get("dropout", 0.0)) < 1:
+            raise ValueError("clip_mlp.dropout must be in [0, 1).")
     if float(config.get("dirichlet_alpha", 0.1)) <= 0:
         raise ValueError("dirichlet_alpha must be positive.")
     audit = config.get("audit", {})
@@ -258,9 +285,10 @@ def validate_config(config: dict) -> None:
         isinstance(audit_client_ids, list) and len(audit_client_ids) > 1
     )
     candidate_sampling = str(audit.get("candidate_sampling", "legacy")).lower()
-    if candidate_sampling not in {"legacy", "fedmia_mix"}:
+    if candidate_sampling not in {"legacy", "fedmia_mix", "low_fpr_full"}:
         raise ValueError(
-            "audit.candidate_sampling must be legacy or fedmia_mix."
+            "audit.candidate_sampling must be legacy, fedmia_mix, or "
+            "low_fpr_full."
         )
     nonmember_ratio = float(audit.get("nonmember_to_member_ratio", 1.0))
     if nonmember_ratio <= 0:
@@ -274,6 +302,35 @@ def validate_config(config: dict) -> None:
             "audit.candidate_sampling=fedmia_mix requires "
             "match_candidate_labels=false to reproduce the reference protocol."
         )
+    if candidate_sampling == "low_fpr_full":
+        low_fpr_attacks = {
+            "blackbox_loss",
+            "loss_series",
+            "grad_cosine",
+            "avg_cosine",
+            "fedmia_loss",
+            "fedmia_cosine",
+            "fedmia_text",
+            "fedmia_text_gradient",
+        }
+        if model_type != "clip_mlp":
+            raise ValueError(
+                "audit.candidate_sampling=low_fpr_full requires clip_mlp."
+            )
+        if pooled_audit:
+            raise ValueError(
+                "audit.candidate_sampling=low_fpr_full supports one target client."
+            )
+        unsupported_low_fpr = sorted(attacks - low_fpr_attacks)
+        if unsupported_low_fpr:
+            raise ValueError(
+                "low_fpr_full does not support: "
+                + ", ".join(unsupported_low_fpr)
+            )
+        if int(audit.get("low_fpr_min_nonmembers", 1000)) < 1000:
+            raise ValueError(
+                "audit.low_fpr_min_nonmembers must be at least 1000."
+            )
     if pooled_audit and attacks - POOLED_CLIENT_ATTACKS:
         raise ValueError(
             "Multi-client pooled auditing currently supports only: "
@@ -413,6 +470,10 @@ def validate_config(config: dict) -> None:
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
+    if model_type == "clip_mlp" and defense_name != "none":
+        raise ValueError(
+            "clip_mlp attack experiments currently require defense.name=none."
+        )
     if defense_name in FEDMIA_BASELINE_DEFENSES and (
         method not in {"fedavg", "promptfl"}
         or config["train_mode"] != "centralized"
@@ -542,6 +603,11 @@ def validate_config(config: dict) -> None:
 
 def run(config: dict) -> list[dict]:
     from trainmodel.custom_clip import CustomCLIP, get_default_prompt_template
+    from trainmodel.clip_mlp import CLIPImageMLP
+    from trainmodel.clip_feature_cache import (
+        collate_clip_features,
+        precompute_federated_clip_features,
+    )
 
     validate_config(config)
     config = copy.deepcopy(config)
@@ -664,32 +730,58 @@ def run(config: dict) -> list[dict]:
         )
 
     processor, clip_model = _load_local_clip(config["cache_dir"], device)
-    parameterization = {
-        "fedavg": "full",
-        "promptfl": "promptfl",
-        "fedotp": "fedotp",
-        "fedpgp": "fedpgp",
-        "dpfpl": "dpfpl",
-        "fedask": "fedask",
-    }[method]
-    model = CustomCLIP(
-        clip_model=clip_model,
-        processor=processor,
-        classnames=class_names,
-        device=device,
-        n_ctx=config["n_ctx"],
-        template=get_default_prompt_template(config["dataset_name"]),
-        class_specific_ctx=config["class_specific_ctx"],
-        parameterization=parameterization,
-        low_rank=int(method_config.get("rank", 4)),
-        low_rank_scaling=float(method_config.get("scaling", 1.0)),
-        method_config=method_config,
-    )
+    if str(config.get("model_type", "prompt")).lower() == "clip_mlp":
+        mlp_config = dict(config.get("clip_mlp", {}))
+        model = CLIPImageMLP(
+            clip_model=clip_model,
+            num_classes=len(class_names),
+            hidden_dim=int(mlp_config.get("hidden_dim", 512)),
+            dropout=float(mlp_config.get("dropout", 0.0)),
+            normalize_features=bool(mlp_config.get("normalize_features", False)),
+            device=device,
+        )
+    else:
+        parameterization = {
+            "fedavg": "full",
+            "promptfl": "promptfl",
+            "fedotp": "fedotp",
+            "fedpgp": "fedpgp",
+            "dpfpl": "dpfpl",
+            "fedask": "fedask",
+        }[method]
+        model = CustomCLIP(
+            clip_model=clip_model,
+            processor=processor,
+            classnames=class_names,
+            device=device,
+            n_ctx=config["n_ctx"],
+            template=get_default_prompt_template(config["dataset_name"]),
+            class_specific_ctx=config["class_specific_ctx"],
+            parameterization=parameterization,
+            low_rank=int(method_config.get("rank", 4)),
+            low_rank_scaling=float(method_config.get("scaling", 1.0)),
+            method_config=method_config,
+        )
 
     def collate_fn(batch):
         images, labels = zip(*batch)
         processed = processor(images=list(images), return_tensors="pt")
         return processed["pixel_values"], torch.as_tensor(labels, dtype=torch.long)
+
+    if (
+        str(config.get("model_type", "prompt")).lower() == "clip_mlp"
+        and bool(config.get("clip_mlp", {}).get("precompute_features", True))
+    ):
+        train_sets, test_sets, _feature_summary = (
+            precompute_federated_clip_features(
+                model,
+                train_sets,
+                test_sets,
+                collate_fn,
+                int(config.get("eval_batch_size", 64)),
+            )
+        )
+        collate_fn = collate_clip_features
 
     audit_config = dict(config.get("audit", {}))
     audit_config.setdefault("seed", seed)
@@ -744,6 +836,7 @@ def run(config: dict) -> list[dict]:
 
 def default_config() -> dict:
     return {
+        "model_type": "prompt",
         "train_mode": "centralized",
         "dataset_name": "caltech101",
         "data_root": "./data",
@@ -755,6 +848,12 @@ def default_config() -> dict:
         "total_users": 10,
         "sample_users": 10,
         "aggregator": "fedavg",
+        "clip_mlp": {
+            "hidden_dim": 512,
+            "dropout": 0.0,
+            "normalize_features": False,
+            "precompute_features": True,
+        },
         "promptfl": {},
         "fedotp": {
             "epsilon": 0.01,
@@ -975,6 +1074,9 @@ def parse_args() -> dict:
         help="Use complete official train/test splits; requires fpl_shots=null.",
     )
     parser.add_argument("--learning_rate", type=float)
+    parser.add_argument("--model_type", choices=["prompt", "clip_mlp"])
+    parser.add_argument("--mlp_hidden_dim", type=int)
+    parser.add_argument("--mlp_dropout", type=float)
     parser.add_argument(
         "--aggregator",
         choices=["promptfl", "fedotp", "fedpgp", "fedavg", "dpfpl", "fedask"],
@@ -1050,11 +1152,24 @@ def parse_args() -> dict:
         "partition_mode",
         "use_full_dataset",
         "learning_rate",
+        "model_type",
         "aggregator",
     ):
         value = getattr(args, key)
         if value is not None:
             config[key] = value
+    if args.mlp_hidden_dim is not None:
+        config["clip_mlp"]["hidden_dim"] = args.mlp_hidden_dim
+    if args.mlp_dropout is not None:
+        config["clip_mlp"]["dropout"] = args.mlp_dropout
+    if args.model_type == "clip_mlp":
+        config["train_mode"] = "centralized"
+        config["aggregator"] = "fedavg"
+        config["fpl_shots"] = None
+        config["use_full_dataset"] = True
+        if args.attack is None and args.audit_attacks is None:
+            config["audit"]["enabled"] = False
+            config["audit"]["attacks"] = []
     # A direct few-shot/alpha override denotes the Dirichlet experiment
     # family unless the caller explicitly selected another partition mode.
     if args.fpl_shots is not None and args.use_full_dataset is None:
