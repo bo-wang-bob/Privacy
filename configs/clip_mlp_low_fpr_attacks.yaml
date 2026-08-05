@@ -2,9 +2,9 @@ model_type: clip_mlp
 train_mode: centralized
 dataset_name: caltech101
 data_root: ./data
-batch_size: 32
-eval_batch_size: 64
-learning_rate: 0.01
+batch_size: 128
+eval_batch_size: 512
+learning_rate: 0.001
 num_global_iters: 20
 local_epochs: 2
 total_users: 10
@@ -17,6 +17,8 @@ clip_mlp:
   normalize_features: false
   # Encode every image once at startup; all rounds and evaluations use vectors.
   precompute_features: true
+  # Keep raw-image CLIP encoding separate from the larger cached-vector batches.
+  precompute_batch_size: 64
 
 partition_mode: dirichlet
 dirichlet_alpha: 0.1
@@ -27,7 +29,7 @@ seed: 42
 cache_dir: ./checkpoints/clip-vit-base-patch32
 model_load_path: null
 save_models: false
-eval_interval: 1
+eval_interval: 5
 results_dir: ./results
 
 audit:
@@ -48,8 +50,9 @@ audit:
   candidate_sampling: low_fpr_full
   low_fpr_min_nonmembers: 1000
   match_candidate_labels: false
-  audit_batch_size: 64
-  audit_interval: 1
+  audit_batch_size: 512
+  audit_interval: 5
+  low_fpr_gradient_batch_size: 16
   signal_storage: compact
   fedmia_tail: upper
   fedmia_tail_calibration_fraction: 0.25

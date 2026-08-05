@@ -5,8 +5,8 @@ data_root: ./data
 batch_size: 128
 eval_batch_size: 512
 learning_rate: 0.001
-num_global_iters: 20
-local_epochs: 2
+num_global_iters: 50
+local_epochs: 5
 total_users: 10
 sample_users: 10
 aggregator: fedavg
@@ -17,6 +17,7 @@ visual_adapter:
   alpha: 0.2
   output_relu: true
   precompute_features: true
+  # Keep raw-image CLIP encoding separate from the larger cached-vector batches.
   precompute_batch_size: 64
   template: null
 
@@ -43,26 +44,18 @@ audit:
     - loss_series
     - grad_cosine
     - avg_cosine
-    - nasr_passive
-    - nasr_active
     - fedmia_loss
     - fedmia_cosine
-    - transfer_representation
-    - codepoison
-    - pipra
-    - rmia
-    - imia
-    - quantile_mia
-    - yoqo
-    - canary
-    - promptmia
-    - promptres
-  max_samples_per_group: 32
+  candidate_sampling: low_fpr_full
+  low_fpr_min_nonmembers: 1000
+  match_candidate_labels: false
   audit_batch_size: 512
   audit_interval: 5
-  calibration_fraction: 0.5
-  auxiliary_fraction: 0.5
+  low_fpr_gradient_batch_size: 16
   signal_storage: compact
+  fedmia_tail: upper
+  fedmia_tail_calibration_fraction: 0.25
+  training_health_check: true
 
 defense:
   name: none

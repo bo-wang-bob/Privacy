@@ -247,6 +247,8 @@ def validate_config(config: dict) -> None:
             raise ValueError("clip_mlp.hidden_dim must be positive.")
         if not 0 <= float(mlp_config.get("dropout", 0.0)) < 1:
             raise ValueError("clip_mlp.dropout must be in [0, 1).")
+        if int(mlp_config.get("precompute_batch_size", 64)) <= 0:
+            raise ValueError("clip_mlp.precompute_batch_size must be positive.")
     if model_type == "visual_adapter":
         adapter_config = dict(config.get("visual_adapter", {}))
         if method != "fedavg" or config["train_mode"] != "centralized":
@@ -271,6 +273,10 @@ def validate_config(config: dict) -> None:
         alpha = float(adapter_config.get("alpha", 0.2))
         if not 0 <= alpha <= 1:
             raise ValueError("visual_adapter.alpha must be in [0, 1].")
+        if int(adapter_config.get("precompute_batch_size", 64)) <= 0:
+            raise ValueError(
+                "visual_adapter.precompute_batch_size must be positive."
+            )
     if float(config.get("dirichlet_alpha", 0.1)) <= 0:
         raise ValueError("dirichlet_alpha must be positive.")
     audit = config.get("audit", {})
@@ -794,7 +800,11 @@ def run(config: dict) -> list[dict]:
                 train_sets,
                 test_sets,
                 collate_fn,
-                int(config.get("eval_batch_size", 64)),
+                int(
+                    config.get(model_type, {}).get(
+                        "precompute_batch_size", 64
+                    )
+                ),
             )
         )
         collate_fn = collate_clip_features
@@ -869,6 +879,7 @@ def default_config() -> dict:
             "dropout": 0.0,
             "normalize_features": False,
             "precompute_features": True,
+            "precompute_batch_size": 64,
         },
         "visual_adapter": {
             "feature_dim": 512,
@@ -876,6 +887,7 @@ def default_config() -> dict:
             "alpha": 0.2,
             "output_relu": True,
             "precompute_features": True,
+            "precompute_batch_size": 64,
             "template": None,
         },
         "promptfl": {},

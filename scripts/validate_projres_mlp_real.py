@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the strict one-round ProjRes attack on the frozen-CLIP + MLP model."""
+"""Run strict one-round ProjRes on a frozen-CLIP MLP or visual adapter."""
 
 from __future__ import annotations
 
@@ -27,17 +27,21 @@ from privacy_attacks.projres_mlp import (
     strict_mlp_projres,
 )
 from trainmodel.clip_mlp import CLIPImageMLP
+from trainmodel.visual_adapter import (
+    VisualCLIPAdapter,
+    build_visual_adapter_text_features,
+)
 from utils.data_loader import generate_dirichlet_split, generate_iid_split
 
 
-logger = logging.getLogger("projres_mlp_validation")
+logger = logging.getLogger("projres_validation")
 
 
 def _load_config(path: Path) -> dict:
     config = default_config()
     with path.open("r", encoding="utf-8") as file:
         loaded = yaml.safe_load(file) or {}
-    for nested in ("clip_mlp", "audit", "defense"):
+    for nested in ("clip_mlp", "visual_adapter", "audit", "defense"):
         config[nested] = config.get(nested, {}) | loaded.pop(nested, {})
     config.update(loaded)
     return config
@@ -63,11 +67,17 @@ def _resolved_config(args: argparse.Namespace) -> dict:
 
 def _validate_strict_config(config: dict) -> None:
     validate_config(config)
-    if str(config.get("model_type", "")).lower() != "clip_mlp":
-        raise ValueError("Strict MLP ProjRes requires model_type=clip_mlp.")
+    model_type = str(config.get("model_type", "")).lower()
+    if model_type not in {"clip_mlp", "visual_adapter"}:
+        raise ValueError(
+            "Strict ProjRes requires model_type=clip_mlp or visual_adapter."
+        )
     if str(config.get("aggregator", "")).lower() != "fedavg":
-        raise ValueError("Strict MLP ProjRes requires aggregator=fedavg.")
-    if float(config.get("clip_mlp", {}).get("dropout", 0.0)) != 0.0:
+        raise ValueError("Strict ProjRes requires aggregator=fedavg.")
+    if (
+        model_type == "clip_mlp"
+        and float(config.get("clip_mlp", {}).get("dropout", 0.0)) != 0.0
+    ):
         raise ValueError("Strict MLP ProjRes requires clip_mlp.dropout=0.")
     if config.get("model_load_path"):
         raise ValueError(
@@ -79,8 +89,8 @@ def _split_data(config: dict):
     arguments = {
         "root_dir": config["data_root"],
         "fpl": True,
-        "fpl_shots": None,
-        "use_full_dataset": True,
+        "fpl_shots": config.get("fpl_shots"),
+        "use_full_dataset": bool(config.get("use_full_dataset", False)),
     }
     mode = str(config.get("partition_mode", "iid")).lower()
     if mode == "iid" or (
@@ -90,7 +100,7 @@ def _split_data(config: dict):
             config["dataset_name"], int(config["total_users"]), **arguments
         )
     if mode not in {"auto", "dirichlet"}:
-        raise ValueError("Strict MLP ProjRes supports iid or dirichlet splits.")
+        raise ValueError("Strict ProjRes supports iid or dirichlet splits.")
     return generate_dirichlet_split(
         config["dataset_name"],
         int(config["total_users"]),
@@ -141,7 +151,7 @@ def _metric_payload(
 
 @torch.no_grad()
 def _candidate_features(
-    model: CLIPImageMLP,
+    model: torch.nn.Module,
     pixels: torch.Tensor,
     batch_size: int,
 ) -> torch.Tensor:
@@ -155,7 +165,7 @@ def _candidate_features(
 
 @torch.no_grad()
 def _encode_nonmember_pool(
-    model: CLIPImageMLP,
+    model: torch.nn.Module,
     processor,
     datasets: list,
     source_names: list[str],
@@ -205,13 +215,35 @@ def _encode_nonmember_pool(
     return torch.cat(feature_parts), torch.cat(label_parts), source_counts
 
 
+def _clone_trainable_model(model: torch.nn.Module) -> torch.nn.Module:
+    model_type = str(getattr(model, "model_type", ""))
+    if model_type == "clip_mlp":
+        return model.clone_head_only()
+    if model_type == "visual_adapter":
+        return model.clone_adapter_only()
+    raise ValueError(f"Unsupported ProjRes model type {model_type!r}.")
+
+
+def _attacked_layer(
+    model: torch.nn.Module,
+) -> tuple[str, torch.nn.Linear]:
+    model_type = str(getattr(model, "model_type", ""))
+    if model_type == "clip_mlp":
+        return "classifier.0.weight", model.classifier[0]
+    if model_type == "visual_adapter":
+        # This is the Adapter downsampling layer used in the paper's
+        # derivation: dW has the input hidden representations in its row span.
+        return "adapter.net.0.weight", model.adapter.net[0]
+    raise ValueError(f"Unsupported ProjRes model type {model_type!r}.")
+
+
 def _run_client(
     client_id: int,
     config: dict,
     train_sets,
     test_sets,
     processor,
-    global_model: CLIPImageMLP,
+    global_model: torch.nn.Module,
     device: torch.device,
     threshold: float,
     max_candidates: int,
@@ -241,7 +273,8 @@ def _run_client(
     selected_member_pixels = member_pixels[:member_count]
     selected_member_labels = member_labels[:member_count]
 
-    local_model = global_model.clone_head_only().to(device)
+    local_model = _clone_trainable_model(global_model).to(device)
+    attacked_parameter, first_layer = _attacked_layer(local_model)
     member_features = _candidate_features(
         local_model,
         selected_member_pixels.to(device),
@@ -288,6 +321,7 @@ def _run_client(
         member_pixels.to(device),
         member_labels.to(device),
         float(config["learning_rate"]),
+        parameter_name=attacked_parameter,
     )
     attack = strict_mlp_projres(
         step.observed_update,
@@ -309,7 +343,6 @@ def _run_client(
     metrics = _metric_payload(
         labels, attack.scores, attack.l1_residuals, attack.predictions
     )
-    first_layer = local_model.classifier[0]
     batch_size = int(member_labels.numel())
     input_dimension = int(first_layer.in_features)
     output_dimension = int(first_layer.out_features)
@@ -323,6 +356,7 @@ def _run_client(
     )
     return {
         "client_id": client_id,
+        "model_type": str(config["model_type"]),
         "threat_model": {
             "server": "honest-but-curious",
             "rounds_observed": 1,
@@ -365,7 +399,9 @@ def _run_client(
     }
 
 
-def _aggregate(results: list[dict[str, object]]) -> dict[str, object]:
+def _aggregate(
+    results: list[dict[str, object]], model_type: str
+) -> dict[str, object]:
     labels = torch.cat(
         [torch.tensor(row["raw"]["labels"], dtype=torch.long) for row in results]
     )
@@ -396,7 +432,8 @@ def _aggregate(results: list[dict[str, object]]) -> dict[str, object]:
         for key in numeric_keys
     }
     return {
-        "experiment": "strict_mlp_projres_all_clients",
+        "experiment": f"strict_{model_type}_projres_all_clients",
+        "model_type": model_type,
         "pooled_metrics": pooled,
         "client_macro_metrics": macro,
         "per_client": results,
@@ -424,15 +461,37 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 
     train_sets, test_sets, class_names = _split_data(config)
     processor, clip_model = _load_local_clip(config["cache_dir"], device)
-    mlp_config = config["clip_mlp"]
-    global_model = CLIPImageMLP(
-        clip_model=clip_model,
-        num_classes=len(class_names),
-        hidden_dim=int(mlp_config["hidden_dim"]),
-        dropout=float(mlp_config["dropout"]),
-        normalize_features=bool(mlp_config.get("normalize_features", False)),
-        device=device,
-    ).to(device)
+    model_type = str(config["model_type"]).lower()
+    if model_type == "clip_mlp":
+        mlp_config = config["clip_mlp"]
+        global_model = CLIPImageMLP(
+            clip_model=clip_model,
+            num_classes=len(class_names),
+            hidden_dim=int(mlp_config["hidden_dim"]),
+            dropout=float(mlp_config["dropout"]),
+            normalize_features=bool(mlp_config.get("normalize_features", False)),
+            device=device,
+        ).to(device)
+    else:
+        adapter_config = config["visual_adapter"]
+        text_features = build_visual_adapter_text_features(
+            clip_model=clip_model,
+            processor=processor,
+            classnames=class_names,
+            dataset_name=config["dataset_name"],
+            device=device,
+            template=adapter_config.get("template"),
+        )
+        global_model = VisualCLIPAdapter(
+            clip_model=clip_model,
+            text_features=text_features,
+            classnames=class_names,
+            feature_dim=int(adapter_config.get("feature_dim", 512)),
+            reduction=int(adapter_config.get("reduction", 4)),
+            alpha=float(adapter_config.get("alpha", 0.2)),
+            output_relu=bool(adapter_config.get("output_relu", True)),
+            device=device,
+        ).to(device)
     selected = (
         list(range(len(train_sets)))
         if str(args.target_client).lower() == "all"
@@ -462,13 +521,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             torch.cuda.empty_cache()
     if len(results) == 1:
         return {
-            "experiment": "strict_mlp_projres_single_client",
+            "experiment": f"strict_{model_type}_projres_single_client",
+            "model_type": model_type,
             "dataset_name": config["dataset_name"],
             "seed": seed,
             "device": str(device),
             "result": results[0],
         }
-    output = _aggregate(results)
+    output = _aggregate(results, model_type)
     output.update(
         {
             "dataset_name": config["dataset_name"],
@@ -526,7 +586,7 @@ def main() -> int:
     if args.output is not None:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(payload + "\n", encoding="utf-8")
-        logger.info("Saved strict MLP ProjRes results to %s", args.output)
+        logger.info("Saved strict ProjRes results to %s", args.output)
     print(payload)
     return 0
 

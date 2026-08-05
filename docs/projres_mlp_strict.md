@@ -1,13 +1,15 @@
-# MLP 参数上的严格 ProjRes 实现
+# CLIP-MLP 与 Visual Adapter 上的严格 ProjRes 实现
 
 本实现对应论文 *Toward Efficient Membership Inference Attacks against
 Federated Large Language Models: A Projection Residual Approach* 的 Algorithm
-1，并把论文中的 adapter down-projection 层严格映射到新模型的第一层分类
-MLP：`classifier.0.weight`。
+1。论文中的 adapter down-projection 层在 Visual Adapter 中直接对应
+`adapter.net.0.weight`；在 CLIP-MLP 对照模型中对应第一层分类 MLP
+`classifier.0.weight`。
 
 ## 数学映射
 
-冻结 CLIP 产生批表示 `X ∈ R^(p×n)`。第一层是 PyTorch
+冻结 CLIP 产生批表示 `X ∈ R^(p×n)`，它就是 Visual Adapter 的输入隐藏
+表示。被攻击的 down-projection 是 PyTorch
 `Linear(n, m)`，其权重梯度为：
 
 ```text
@@ -52,8 +54,10 @@ member iff r(x) < tau
   客户端的数据集”；
 - 不使用其他客户端更新、代理梯度、shadow model、学习型攻击头或成员标签
   来构造攻击子空间；
-- CLIP 全冻结，只有两层 MLP 可训练，攻击只读取第一层权重更新；
-- 不设置 few-shot，使用完整数据集。
+- CLIP 全冻结；Visual Adapter 只读取首个 down-projection 权重更新，
+  CLIP-MLP 对照模型只读取第一层分类 MLP 权重更新；
+- 数据协议与对应正常训练保持一致：CLIP-MLP 使用完整数据集，Visual
+  Adapter 使用系统级 16-shot FPL 设置。
 
 这也是为什么该入口独立于仓库的通用多轮审计器。通用 `promptres` 是余弦
 代理攻击，不等同于本文的投影残差算法。
@@ -74,6 +78,16 @@ python scripts/validate_projres_mlp_real.py \
   --output results/projres_mlp_client0.json
 ```
 
+Visual Adapter 单客户端示例：
+
+```bash
+python scripts/validate_projres_mlp_real.py \
+  --config configs/visual_adapter_low_fpr_attacks.yaml \
+  --target-client 0 \
+  --threshold 0.01 \
+  --output results/projres_visual_adapter_client0.json
+```
+
 输出是 JSON，不生成 HTML。除 AUC/低 FPR TPR 外，还记录原始残差、固定阈值
 准确率、梯度秩、第一层维度，以及 `update / learning_rate` 与 autograd 梯度
 的一致性误差。
@@ -87,7 +101,7 @@ python scripts/validate_projres_mlp_real.py \
 ## 适用边界
 
 论文给出的有利秩条件在这里是 `p <= m` 且 `p < n`：batch 大小 `p` 不超过
-第一层输出维度 `m`，并小于 CLIP 表示维度 `n`。默认配置为
-`p=16, m=128, n=512`。若改成多 batch、本地多步、动量、裁剪、噪声或安全
-聚合，上传更新不再是单个 batch 梯度的常数倍，就不再属于本入口声明的严格
-实验设置。
+第一层输出维度 `m`，并小于 CLIP 表示维度 `n`。Visual Adapter 的默认
+down-projection 为 `n=512, m=128`，实际 `p` 是目标客户端首个 batch 的大小。
+若改成多 batch、本地多步、动量、裁剪、噪声或安全聚合，上传更新不再是单个
+batch 梯度的常数倍，就不再属于本入口声明的严格实验设置。

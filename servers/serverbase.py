@@ -98,7 +98,8 @@ class ServerBase:
         self.results_dir = results_dir
         self.save_models_enabled = save_models
         self.eval_interval = eval_interval
-        self.audit_config = audit_config or {"enabled": True}
+        self.audit_config = dict(audit_config or {"enabled": True})
+        self.audit_config.setdefault("total_rounds", num_glob_iters)
         self.defense_config = defense_config or {"name": "none"}
         self.target_client_id = int(self.audit_config.get("target_client_id", 0))
         self.ensure_target = bool(self.audit_config.get("enabled", True)) and bool(

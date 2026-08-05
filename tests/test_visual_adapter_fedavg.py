@@ -11,7 +11,12 @@ from aggregator.aggregator_builder import build_aggregator
 from aggregator.fedavg_aggregator import aggregate_fedavg_model_states
 from context.context import Context
 from main import default_config, validate_config
+from privacy_attacks.auditor import MembershipAuditor
 from servers.serverbase import ServerBase
+from trainmodel.clip_feature_cache import (
+    collate_clip_features,
+    precompute_federated_clip_features,
+)
 from trainmodel.visual_adapter import (
     VisualAdapter,
     VisualCLIPAdapter,
@@ -25,8 +30,10 @@ class TinyCLIP(nn.Module):
         self.config = SimpleNamespace(projection_dim=4)
         self.encoder = nn.Linear(6, 4)
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
+        self.encoded_samples = 0
 
     def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        self.encoded_samples += int(pixel_values.shape[0])
         return self.encoder(pixel_values.flatten(1))
 
 
@@ -122,6 +129,62 @@ def test_visual_adapter_copy_and_fedavg_cover_only_adapter_parameters():
         torch.equal(value, torch.full_like(value, 4.0))
         for value in ctx.new_model_state[0].values()
     )
+
+
+def test_visual_adapter_precompute_is_reused_by_training_evaluation_and_audit(
+    tmp_path,
+):
+    images = torch.randn(1027, 1, 2, 3)
+    labels = torch.arange(1027) % 3
+    raw_train = [
+        TensorDataset(images[:7], labels[:7]),
+        TensorDataset(images[7:27], labels[7:27]),
+    ]
+    raw_test = [
+        TensorDataset(images[27:527], labels[27:527]),
+        TensorDataset(images[527:], labels[527:]),
+    ]
+    model = _model()
+    encoded_train, encoded_test, _ = precompute_federated_clip_features(
+        model,
+        raw_train,
+        raw_test,
+        collate_fn=None,
+        batch_size=64,
+    )
+    assert model.clip_model.encoded_samples == 1027
+
+    users = [
+        SimpleNamespace(
+            id=index,
+            train_data=encoded_train[index],
+            test_data=encoded_test[index],
+        )
+        for index in range(2)
+    ]
+    auditor = MembershipAuditor(
+        model=model,
+        users=users,
+        target_client_id=0,
+        device=torch.device("cpu"),
+        results_dir=str(tmp_path),
+        collate_fn=collate_clip_features,
+        config={
+            "enabled": True,
+            "attacks": ["blackbox_loss"],
+            "candidate_sampling": "low_fpr_full",
+            "low_fpr_min_nonmembers": 1000,
+            "audit_batch_size": 512,
+        },
+        defense_config={"name": "none"},
+        federated_method="fedavg",
+        num_classes=3,
+    )
+
+    assert auditor.images.shape == (1027, 4)
+    assert model.clip_model.encoded_samples == 1027
+    auditor._candidate_outputs(auditor.model, require_representation=False)
+    assert model.clip_model.encoded_samples == 1027
 
 
 def test_visual_adapter_config_requires_fpl_16shot_fedavg():

@@ -1,42 +1,42 @@
-name: clip_mlp_fedmia_attacks
-base_config: configs/clip_mlp_low_fpr_attacks.yaml
-results_root: results/clip_mlp_fedmia_attacks
+name: visual_adapter_fedmia_attacks
+base_config: configs/visual_adapter_low_fpr_attacks.yaml
+results_root: results/visual_adapter_fedmia_attacks
 
 gpus: [0]
 jobs: 1
 seeds: [42]
 target_client_ids: [0]
 
-# Match the full-data datasets and schedules used by the prompt-method sweep.
+# Visual Adapter follows the FPL-style system-wide 16-shot protocol.
 datasets:
   - name: caltech101
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 100
+      num_global_iters: 50
   - name: oxfordpets
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 100
+      num_global_iters: 50
   - name: flowers
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 100
+      num_global_iters: 50
   - name: food101
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 100
+      num_global_iters: 50
   - name: cifar100
     overrides:
-      total_users: 50
+      total_users: 10
       sample_users: 10
-      num_global_iters: 400
+      num_global_iters: 50
 
 common:
-  model_type: clip_mlp
+  model_type: visual_adapter
   train_mode: centralized
   aggregator: fedavg
   data_root: ./data
@@ -44,20 +44,22 @@ common:
   require_cuda: true
   partition_mode: dirichlet
   dirichlet_alpha: 0.1
-  use_full_dataset: true
-  fpl_shots: null
-  local_epochs: 2
+  use_full_dataset: false
+  fpl_shots: 16
+  local_epochs: 5
   learning_rate: 0.001
   batch_size: 128
   eval_batch_size: 512
   eval_interval: 5
   save_models: false
-  clip_mlp:
-    hidden_dim: 512
-    dropout: 0.0
-    normalize_features: false
+  visual_adapter:
+    feature_dim: 512
+    reduction: 4
+    alpha: 0.2
+    output_relu: true
     precompute_features: true
     precompute_batch_size: 64
+    template: null
   audit:
     enabled: true
     strict: true
@@ -86,8 +88,8 @@ common:
     fedmia_tail_calibration_fraction: 0.25
     training_health_check: true
 
-# ProjRes remains a separate strict one-batch/one-step experiment because its
-# threat model is not the multi-round FedAvg trace used by the other attacks.
+# ProjRes attacks the visual Adapter's first downsampling layer, matching the
+# paper's one-batch/one-step FedSGD threat model.
 projres:
   enabled: true
   threshold: 0.01

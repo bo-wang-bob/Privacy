@@ -9,7 +9,7 @@ import os
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import ConcatDataset, DataLoader, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Subset, TensorDataset
 
 from privacy_attacks.code_poison import run_code_poison_attack
 from privacy_attacks.base import AttackResult
@@ -247,7 +247,38 @@ class MembershipAuditor:
         self.requested_audit_client_ids = list(self.audit_client_ids)
         self.skipped_audit_clients: dict[str, str] = {}
         self.audit_interval = int(self.config.get("audit_interval", 1))
+        configured_attack_intervals = self.config.get(
+            "attack_audit_intervals", {}
+        )
+        if not isinstance(configured_attack_intervals, dict):
+            raise ValueError("audit.attack_audit_intervals must be a mapping.")
+        unknown_interval_attacks = sorted(
+            set(configured_attack_intervals) - SUPPORTED_ATTACKS
+        )
+        if unknown_interval_attacks:
+            raise ValueError(
+                "Unsupported attacks in audit.attack_audit_intervals: "
+                + ", ".join(unknown_interval_attacks)
+            )
+        self.attack_audit_intervals = {}
+        for attack, configured_interval in configured_attack_intervals.items():
+            if isinstance(configured_interval, bool):
+                raise ValueError(
+                    f"Audit interval for {attack} must be a positive integer."
+                )
+            try:
+                interval = int(configured_interval)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    f"Audit interval for {attack} must be a positive integer."
+                ) from error
+            if interval <= 0 or str(configured_interval).strip() != str(interval):
+                raise ValueError(
+                    f"Audit interval for {attack} must be a positive integer."
+                )
+            self.attack_audit_intervals[str(attack)] = interval
         self.audit_batch_size = int(self.config.get("audit_batch_size", 64))
+        self.total_rounds = int(self.config.get("total_rounds", 0))
         self.calibration_fraction = float(self.config.get("calibration_fraction", 0.5))
         self.match_candidate_labels = bool(
             self.config.get("match_candidate_labels", False)
@@ -558,6 +589,22 @@ class MembershipAuditor:
             if len(dataset) == 0:
                 source_counts[source] = 0
                 continue
+            # The main CLIP-MLP/Adapter path has already encoded these images
+            # into CPU-resident TensorDatasets. Reuse their backing tensors
+            # directly instead of copying every vector CPU -> GPU -> CPU.
+            if isinstance(dataset, TensorDataset) and len(dataset.tensors) >= 2:
+                cached_features, cached_labels = dataset.tensors[:2]
+                if (
+                    cached_features.ndim == 2
+                    and cached_features.shape[1]
+                    == int(getattr(self.model, "projection_dim", -1))
+                    and cached_labels.ndim == 1
+                ):
+                    feature_parts.append(cached_features.detach().cpu())
+                    labels = cached_labels.detach().cpu().long()
+                    label_parts.append(labels)
+                    source_counts[source] = int(labels.numel())
+                    continue
             count = 0
             loader = DataLoader(
                 dataset,
@@ -1054,7 +1101,29 @@ class MembershipAuditor:
         return images, labels
 
     def should_observe(self, round_index: int) -> bool:
-        return self.enabled and round_index % self.audit_interval == 0
+        is_final_round = (
+            self.total_rounds > 0 and round_index == self.total_rounds - 1
+        )
+        return self.enabled and (
+            is_final_round
+            or any(
+                round_index % self._audit_interval_for_attack(attack) == 0
+                for attack in self.attacks
+            )
+        )
+
+    def _audit_interval_for_attack(self, attack: str) -> int:
+        return self.attack_audit_intervals.get(attack, self.audit_interval)
+
+    def _observations_for_attack(self, attack: str) -> list[dict]:
+        interval = self._audit_interval_for_attack(attack)
+        final_round = self.total_rounds - 1 if self.total_rounds > 0 else None
+        return [
+            observation
+            for observation in self.observations
+            if int(observation["round"]) % interval == 0
+            or observation["round"] == final_round
+        ]
 
     @torch.no_grad()
     def _candidate_outputs(
@@ -1493,9 +1562,11 @@ class MembershipAuditor:
         aggregation: str,
         tail: str,
     ) -> AttackResult:
+        attack = FEDMIA_MEASUREMENT_NAMES[measurement]
+        observations = self._observations_for_attack(attack)
         if not self.pooled_client_audit:
             return run_fedmia(
-                self.observations,
+                observations,
                 self.membership,
                 self.target_client_id,
                 measurement,
@@ -1516,7 +1587,7 @@ class MembershipAuditor:
             has_usable_round = any(
                 client_id in observation["client_ids"].tolist()
                 and observation["client_ids"].numel() >= 2
-                for observation in self.observations
+                for observation in observations
             )
             if not has_usable_round and self.allow_partial_client_audit:
                 error = (
@@ -1531,7 +1602,7 @@ class MembershipAuditor:
                 )
                 continue
             result = run_fedmia(
-                self.observations,
+                observations,
                 self.membership[indices],
                 client_id,
                 measurement,
@@ -1549,7 +1620,7 @@ class MembershipAuditor:
                 "FedMIA could not evaluate any few-shot client. At least one "
                 "audited client must participate in a round with another client."
             )
-        name = FEDMIA_MEASUREMENT_NAMES[measurement]
+        name = attack
         per_client_metrics = {
             str(client_id): self._pooled_client_metadata(result)
             for client_id, result in zip(evaluated_client_ids, client_results)
@@ -1664,7 +1735,7 @@ class MembershipAuditor:
         indices: torch.Tensor,
     ) -> AttackResult:
         observations = self._slice_candidate_observations(
-            self.observations, indices
+            self._observations_for_attack(attack), indices
         )
         membership = self.membership[indices]
         labels = self.labels[indices]
@@ -1812,6 +1883,7 @@ class MembershipAuditor:
                     ),
                 )
             return self._run_pooled_client_attack(attack)
+        observations = self._observations_for_attack(attack)
         if attack in {
             "blackbox_loss",
             "loss_series",
@@ -1819,7 +1891,7 @@ class MembershipAuditor:
             "avg_cosine",
         }:
             return run_fedmia_baseline(
-                self.observations,
+                observations,
                 self.membership,
                 self.target_client_id,
                 attack,
@@ -1827,7 +1899,7 @@ class MembershipAuditor:
             )
         if attack == "promptres":
             return run_promptres(
-                self.observations,
+                observations,
                 self.membership,
                 self.target_client_id,
                 str(self.config.get("promptres_aggregation", "mean")),
@@ -1854,7 +1926,7 @@ class MembershipAuditor:
             )
         if attack == "nasr_passive":
             return run_passive_whitebox(
-                self.observations,
+                observations,
                 self.membership,
                 self.target_client_id,
                 self.calibration_fraction,
@@ -1877,7 +1949,7 @@ class MembershipAuditor:
             )
         if attack == "transfer_representation":
             return run_transfer_representation_attack(
-                self.observations,
+                observations,
                 self.membership,
                 self.target_client_id,
                 self.calibration_fraction,
@@ -1894,7 +1966,7 @@ class MembershipAuditor:
             )
         if attack == "rmia":
             return run_rmia(
-                self.observations,
+                observations,
                 self.membership,
                 self.labels,
                 self.target_client_id,
@@ -1905,7 +1977,7 @@ class MembershipAuditor:
             )
         if attack == "quantile_mia":
             return run_quantile_mia(
-                self.observations,
+                observations,
                 self.membership,
                 self.labels,
                 self.target_client_id,
@@ -1919,7 +1991,7 @@ class MembershipAuditor:
             target_model = copy.deepcopy(final_model)
             try:
                 target_state, _, _ = last_client_states(
-                    self.observations, self.target_client_id
+                    observations, self.target_client_id
                 )
                 target_model.load_state_dict(target_state, strict=False)
             except ValueError:
@@ -1960,7 +2032,7 @@ class MembershipAuditor:
         if attack == "yoqo":
             return run_yoqo(
                 final_model,
-                self.observations,
+                observations,
                 self.target_client_id,
                 self.images,
                 self.labels,
@@ -1980,7 +2052,7 @@ class MembershipAuditor:
         if attack == "canary":
             return run_canary(
                 final_model,
-                self.observations,
+                observations,
                 self.target_client_id,
                 self.images,
                 self.labels,
@@ -2129,6 +2201,15 @@ class MembershipAuditor:
                     "signal_storage": {
                         "mode": self.signal_storage,
                         "signals_file_written": self.signal_storage != "none",
+                        "default_audit_interval": self.audit_interval,
+                        "attack_audit_intervals": {
+                            attack: self._audit_interval_for_attack(attack)
+                            for attack in self.attacks
+                        },
+                        "stored_rounds": [
+                            int(observation["round"])
+                            for observation in self.observations
+                        ],
                         "stored_observation_fields": sorted(
                             {
                                 key

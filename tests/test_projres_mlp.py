@@ -6,11 +6,14 @@ import pytest
 import torch
 from torch import nn
 
+from main import default_config
 from privacy_attacks.projres_mlp import (
     one_batch_fedsgd_step,
     strict_mlp_projres,
 )
+from scripts.validate_projres_mlp_real import _validate_strict_config
 from trainmodel.clip_mlp import CLIPImageMLP
+from trainmodel.visual_adapter import VisualCLIPAdapter
 
 
 class TinyCLIP(nn.Module):
@@ -137,6 +140,51 @@ def test_one_batch_step_is_exact_vanilla_fedsgd_on_first_mlp_weight():
         torch.equal(model.clip_model.state_dict()[name], value)
         for name, value in backbone_before.items()
     )
+
+
+def test_one_batch_step_and_projres_support_visual_adapter_downsampling_layer():
+    torch.manual_seed(5)
+    clip = TinyCLIP()
+    clip.logit_scale = nn.Parameter(torch.tensor(1.0))
+    model = VisualCLIPAdapter(
+        clip,
+        torch.randn(3, 4),
+        reduction=2,
+        alpha=0.2,
+        output_relu=True,
+    )
+    with torch.no_grad():
+        model.adapter.net[0].weight.fill_(0.2)
+        model.adapter.net[2].weight.fill_(0.2)
+    member = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    candidates = torch.cat(
+        (member, torch.tensor([[0.0, 0.0, 0.0, 1.0], [1.0, -1.0, 0.0, 0.0]]))
+    )
+
+    step = one_batch_fedsgd_step(
+        model,
+        member,
+        torch.tensor([1]),
+        learning_rate=0.1,
+        parameter_name="adapter.net.0.weight",
+    )
+    result = strict_mlp_projres(
+        step.observed_update,
+        candidates,
+        threshold=1e-4,
+        max_rank=1,
+    )
+
+    assert step.parameter_name == "adapter.net.0.weight"
+    assert step.update_gradient_relative_error < 1e-5
+    assert result.predictions.tolist() == [1, 0, 0]
+
+
+def test_strict_projres_configuration_accepts_visual_adapter():
+    config = default_config()
+    config["model_type"] = "visual_adapter"
+
+    _validate_strict_config(config)
 
 
 def test_observed_one_sample_fedsgd_update_recovers_its_layer_input():

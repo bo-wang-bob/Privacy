@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run multi-dataset CLIP-MLP FedMIA experiments plus strict ProjRes."""
+"""Run multi-dataset frozen-CLIP FedMIA experiments and optional ProjRes."""
 
 from __future__ import annotations
 
@@ -79,6 +79,7 @@ def build_jobs(
     cache_dir: str | None = None,
     num_global_iters: int | None = None,
     dirichlet_alpha: float | None = None,
+    learning_rate: float | None = None,
 ) -> tuple[list[SweepJob], Path]:
     del spec_path
     base_path = _resolve_path(
@@ -97,7 +98,7 @@ def build_jobs(
         raise ValueError("sweep seeds and target_client_ids must be non-empty.")
     defenses = spec.get("defenses", [{"name": "none"}])
     if len(defenses) != 1 or str(defenses[0].get("name", "none")).lower() != "none":
-        raise ValueError("The CLIP-MLP attack sweep supports defense=none only.")
+        raise ValueError("The frozen-CLIP attack sweep supports defense=none only.")
 
     jobs = []
     for entry, seed, target in itertools.product(datasets, seeds, targets):
@@ -120,6 +121,10 @@ def build_jobs(
                 raise ValueError("--dirichlet-alpha must be positive.")
             config["dirichlet_alpha"] = dirichlet_alpha
             config["partition_mode"] = "dirichlet"
+        if learning_rate is not None:
+            if learning_rate <= 0:
+                raise ValueError("--learning-rate must be positive.")
+            config["learning_rate"] = learning_rate
         config["seed"] = seed
         config["aggregator"] = "fedavg"
         config["defense"] = _deep_merge(config.get("defense", {}), {"name": "none"})
@@ -202,7 +207,9 @@ def _flatten(value: dict[str, Any], prefix: str = "") -> list[tuple[str, Any]]:
 
 def _job_hyperparameters_block(job: SweepJob) -> str:
     config = job.config
+    model_type = str(config.get("model_type", "clip_mlp"))
     selected = {
+        "model_type": model_type,
         "dataset": job.dataset,
         "seed": job.seed,
         "data": {
@@ -223,7 +230,7 @@ def _job_hyperparameters_block(job: SweepJob) -> str:
             "eval_batch_size": config.get("eval_batch_size"),
             "eval_interval": config.get("eval_interval"),
         },
-        "clip_mlp": config.get("clip_mlp", {}),
+        model_type: config.get(model_type, {}),
         "privacy_audit": config.get("audit", {}),
     }
     rows = _flatten(selected)
@@ -367,6 +374,11 @@ def _command_text(command: list[str]) -> str:
 
 def _projres_parameters_block(job, projres: dict[str, Any]) -> str:
     divider = "=" * 88
+    model_type = str(job.config.get("model_type", "clip_mlp"))
+    attacked_layer = {
+        "clip_mlp": "classifier.0.weight",
+        "visual_adapter": "adapter.net.0.weight",
+    }.get(model_type, "first_trainable_linear_weight")
     return "\n".join(
         (
             divider,
@@ -376,6 +388,7 @@ def _projres_parameters_block(job, projres: dict[str, Any]) -> str:
             f"  max_candidates     : {projres.get('max_candidates', 32)}",
             f"  min_nonmembers     : {projres.get('min_nonmembers', 1000)}",
             f"  max_nonmembers     : {projres.get('max_nonmembers', 0)}",
+            f"  attacked_layer     : {attacked_layer}",
             "  threat_model       : one batch, one vanilla FedSGD step",
             divider,
         )
@@ -561,6 +574,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir")
     parser.add_argument("--rounds", "--num-global-iters", type=int)
     parser.add_argument("--dirichlet-alpha", type=float)
+    parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--projres-threshold", type=float)
     parser.add_argument("--projres-max-candidates", type=int)
     parser.add_argument("--projres-min-out", type=int)
@@ -586,6 +600,7 @@ def main() -> int:
     if args.seed is not None:
         spec["seeds"] = [args.seed]
     projres = dict(spec.get("projres", {}))
+    projres_enabled = bool(projres.get("enabled", True)) and not args.skip_projres
     overrides = {
         "threshold": args.projres_threshold,
         "max_candidates": args.projres_max_candidates,
@@ -605,6 +620,7 @@ def main() -> int:
         cache_dir=args.cache_dir,
         num_global_iters=args.rounds,
         dirichlet_alpha=args.dirichlet_alpha,
+        learning_rate=args.learning_rate,
     )
     jobs = filter_jobs_by_dataset(jobs, args.datasets)
     if args.max_runs is not None:
@@ -619,7 +635,7 @@ def main() -> int:
     if args.dry_run:
         for index, job in enumerate(jobs):
             print(_job_hyperparameters_block(job))
-            if not args.skip_projres and bool(projres.get("enabled", True)):
+            if projres_enabled:
                 print(_projres_parameters_block(job, projres))
             for command in _commands(
                 job, gpus[index % len(gpus)], projres, args.skip_projres
@@ -630,7 +646,7 @@ def main() -> int:
         return 0
     if args.summarize_only:
         complete, attack_rows = summarize(jobs, results_root)
-        projres_rows = 0 if args.skip_projres else summarize_projres(jobs, results_root)
+        projres_rows = summarize_projres(jobs, results_root) if projres_enabled else 0
         print(
             f"Summarized runs={complete}/{len(jobs)}, generic_rows={attack_rows}, "
             f"projres_rows={projres_rows}."
@@ -659,7 +675,7 @@ def main() -> int:
             print(f"{'finished' if succeeded else 'FAILED'} {run_id}: {message}")
             failures += int(not succeeded)
     complete, attack_rows = summarize(jobs, results_root)
-    projres_rows = 0 if args.skip_projres else summarize_projres(jobs, results_root)
+    projres_rows = summarize_projres(jobs, results_root) if projres_enabled else 0
     print(
         f"Summary complete: runs={complete}/{len(jobs)}, "
         f"generic_rows={attack_rows}, projres_rows={projres_rows}, failures={failures}"

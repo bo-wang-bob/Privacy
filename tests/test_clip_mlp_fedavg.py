@@ -133,6 +133,7 @@ def test_clip_mlp_precomputes_all_images_and_reuses_vectors_for_train_and_test(
     server.train()
 
     assert model.clip_model.encoded_samples == 12
+    assert server.auditor.total_rounds == 2
 
 
 def test_fedavg_sample_weights_all_mlp_parameters():
@@ -330,6 +331,94 @@ def test_clip_mlp_low_fpr_full_uses_all_candidates_and_caches_clip(tmp_path):
     assert observation["cosine"].shape == (2, 1027)
     assert model.clip_model.encoded_samples == encoded_before_outputs
 
+
+def test_clip_mlp_low_fpr_reuses_precomputed_cpu_feature_tensors(tmp_path):
+    def features(count: int) -> TensorDataset:
+        return TensorDataset(
+            torch.randn(count, 4),
+            torch.arange(count) % 3,
+        )
+
+    model = _model()
+    users = [
+        SimpleNamespace(id=0, train_data=features(7), test_data=features(500)),
+        SimpleNamespace(id=1, train_data=features(20), test_data=features(500)),
+    ]
+    auditor = MembershipAuditor(
+        model=model,
+        users=users,
+        target_client_id=0,
+        device=torch.device("cpu"),
+        results_dir=str(tmp_path),
+        config={
+            "enabled": True,
+            "attacks": ["blackbox_loss"],
+            "candidate_sampling": "low_fpr_full",
+            "low_fpr_min_nonmembers": 1000,
+            "audit_batch_size": 512,
+            "audit_interval": 5,
+            "total_rounds": 12,
+        },
+        defense_config={"name": "none"},
+        federated_method="fedavg",
+        num_classes=3,
+    )
+
+    assert auditor.images.shape == (1027, 4)
+    assert model.clip_model.encoded_samples == 0
+    assert [auditor.should_observe(index) for index in (0, 1, 5, 10, 11)] == [
+        True,
+        False,
+        True,
+        True,
+        True,
+    ]
+
+
+def test_attack_specific_audit_intervals_filter_shared_observations():
+    auditor = MembershipAuditor.__new__(MembershipAuditor)
+    auditor.enabled = True
+    auditor.total_rounds = 10
+    auditor.audit_interval = 5
+    auditor.attacks = [
+        "blackbox_loss",
+        "loss_series",
+        "grad_cosine",
+        "avg_cosine",
+        "fedmia_loss",
+        "fedmia_cosine",
+    ]
+    auditor.attack_audit_intervals = {
+        "loss_series": 1,
+        "avg_cosine": 1,
+        "fedmia_loss": 1,
+        "fedmia_cosine": 1,
+    }
+    auditor.observations = [{"round": round_index} for round_index in range(10)]
+
+    assert [
+        round_index
+        for round_index in range(10)
+        if auditor.should_observe(round_index)
+    ] == list(range(10))
+    assert [
+        observation["round"]
+        for observation in auditor._observations_for_attack("blackbox_loss")
+    ] == [0, 5, 9]
+    assert [
+        observation["round"]
+        for observation in auditor._observations_for_attack("grad_cosine")
+    ] == [0, 5, 9]
+    for attack in (
+        "loss_series",
+        "avg_cosine",
+        "fedmia_loss",
+        "fedmia_cosine",
+    ):
+        assert [
+            observation["round"]
+            for observation in auditor._observations_for_attack(attack)
+        ] == list(range(10))
 
 def test_all_attacks_run_in_toy_clip_mlp_fedavg(tmp_path):
     attacks = [
