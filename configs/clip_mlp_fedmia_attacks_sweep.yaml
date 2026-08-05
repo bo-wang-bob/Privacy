@@ -78,6 +78,7 @@ common:
     attack_audit_intervals:
       loss_series: 1
       avg_cosine: 1
+      # FedMIA Eq. (12) aggregates t=1..T, so both variants need every round.
       fedmia_loss: 1
       fedmia_cosine: 1
     low_fpr_gradient_batch_size: 16

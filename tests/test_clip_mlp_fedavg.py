@@ -367,19 +367,23 @@ def test_clip_mlp_low_fpr_reuses_precomputed_cpu_feature_tensors(tmp_path):
     assert auditor.images.shape == (1027, 4)
     assert model.clip_model.encoded_samples == 0
     assert [auditor.should_observe(index) for index in (0, 1, 5, 10, 11)] == [
-        True,
         False,
-        True,
-        True,
+        False,
+        False,
+        False,
         True,
     ]
 
 
-def test_attack_specific_audit_intervals_filter_shared_observations():
+def test_attack_specific_audit_intervals_schedule_only_required_rounds():
     auditor = MembershipAuditor.__new__(MembershipAuditor)
     auditor.enabled = True
     auditor.total_rounds = 10
     auditor.audit_interval = 5
+    auditor.config = {}
+    auditor.signal_storage = "compact"
+    auditor.pooled_client_audit = False
+    auditor.target_client_id = 0
     auditor.attacks = [
         "blackbox_loss",
         "loss_series",
@@ -404,21 +408,36 @@ def test_attack_specific_audit_intervals_filter_shared_observations():
     assert [
         observation["round"]
         for observation in auditor._observations_for_attack("blackbox_loss")
-    ] == [0, 5, 9]
+    ] == [9]
     assert [
         observation["round"]
         for observation in auditor._observations_for_attack("grad_cosine")
-    ] == [0, 5, 9]
-    for attack in (
-        "loss_series",
-        "avg_cosine",
-        "fedmia_loss",
-        "fedmia_cosine",
-    ):
+    ] == [9]
+    for attack in ("loss_series", "avg_cosine"):
         assert [
             observation["round"]
             for observation in auditor._observations_for_attack(attack)
         ] == list(range(10))
+    for attack in ("fedmia_loss", "fedmia_cosine"):
+        assert [
+            observation["round"]
+            for observation in auditor._observations_for_attack(attack)
+        ] == list(range(10))
+    assert auditor._attacks_for_round(1) == [
+        "loss_series",
+        "avg_cosine",
+        "fedmia_loss",
+        "fedmia_cosine",
+    ]
+    assert auditor._attacks_for_round(5) == auditor._attacks_for_round(1)
+    assert auditor._attacks_for_round(9) == auditor.attacks
+    selected_ids = list(range(10))
+    assert auditor._audit_client_ids_for_attacks(
+        ["loss_series", "avg_cosine"], selected_ids
+    ) == [0]
+    assert auditor._audit_client_ids_for_attacks(
+        auditor._attacks_for_round(1), selected_ids
+    ) == selected_ids
 
 def test_all_attacks_run_in_toy_clip_mlp_fedavg(tmp_path):
     attacks = [

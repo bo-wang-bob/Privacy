@@ -90,6 +90,41 @@ _CANDIDATE_FIELDS = {
     "candidate_labels",
 }
 
+_FEDMIA_BASELINE_ATTACKS = {
+    "blackbox_loss",
+    "loss_series",
+    "grad_cosine",
+    "avg_cosine",
+}
+_SINGLE_ROUND_ATTACKS = {"blackbox_loss", "grad_cosine"}
+
+
+def _signal_needs(attacks: set[str], full_signals: bool = False) -> dict[str, bool]:
+    """Return only the signal families needed by the attacks due this round."""
+    return {
+        "confidence": full_signals
+        or bool(
+            attacks
+            & {"blackbox_loss", "loss_series", "nasr_passive", "fedmia_loss"}
+        ),
+        "cosine": full_signals
+        or bool(
+            attacks
+            & {"grad_cosine", "avg_cosine", "nasr_passive", "fedmia_cosine"}
+        ),
+        "promptres": full_signals or "promptres" in attacks,
+        "whitebox_features": full_signals or "nasr_passive" in attacks,
+        "probabilities": full_signals
+        or bool(attacks & {"nasr_passive", "rmia", "quantile_mia"}),
+        "representations": full_signals
+        or bool(
+            attacks
+            & {"nasr_passive", "transfer_representation", "quantile_mia"}
+        ),
+        "client_states": full_signals
+        or bool(attacks & {"pipra", "imia", "yoqo", "canary", "promptmia"}),
+    }
+
 
 class MembershipAuditor:
     """Collect once, then run configured parameter-efficient membership attacks."""
@@ -160,26 +195,14 @@ class MembershipAuditor:
             raise ValueError("audit.signal_storage must be none, compact, or full.")
         full_signals = self.signal_storage == "full"
         requested_attacks = set(self.attacks)
-        self._needs_confidence = full_signals or bool(
-            requested_attacks
-            & {"blackbox_loss", "loss_series", "nasr_passive", "fedmia_loss"}
-        )
-        self._needs_cosine = full_signals or bool(
-            requested_attacks
-            & {"grad_cosine", "avg_cosine", "nasr_passive", "fedmia_cosine"}
-        )
-        self._needs_promptres = full_signals or "promptres" in requested_attacks
-        self._needs_whitebox_features = full_signals or "nasr_passive" in requested_attacks
-        self._needs_probabilities = full_signals or bool(
-            requested_attacks & {"nasr_passive", "rmia", "quantile_mia"}
-        )
-        self._needs_representations = full_signals or bool(
-            requested_attacks
-            & {"nasr_passive", "transfer_representation", "quantile_mia"}
-        )
-        self._needs_client_states = full_signals or bool(
-            requested_attacks & {"pipra", "imia", "yoqo", "canary", "promptmia"}
-        )
+        configured_needs = _signal_needs(requested_attacks, full_signals)
+        self._needs_confidence = configured_needs["confidence"]
+        self._needs_cosine = configured_needs["cosine"]
+        self._needs_promptres = configured_needs["promptres"]
+        self._needs_whitebox_features = configured_needs["whitebox_features"]
+        self._needs_probabilities = configured_needs["probabilities"]
+        self._needs_representations = configured_needs["representations"]
+        self._needs_client_states = configured_needs["client_states"]
         if not 0 <= target_client_id < len(users):
             raise ValueError("target_client_id is outside the client range.")
         configured_client_ids = self.config.get("audit_client_ids")
@@ -1100,29 +1123,79 @@ class MembershipAuditor:
             raise AssertionError("Label-matched membership collection drifted.")
         return images, labels
 
-    def should_observe(self, round_index: int) -> bool:
+    def _single_round_index_for_attack(self, attack: str) -> int | None:
+        if attack not in _SINGLE_ROUND_ATTACKS:
+            return None
+        selector = self.config.get("fedmia_baseline_single_round", "last")
+        if isinstance(selector, str):
+            normalized = selector.lower()
+            if normalized == "last":
+                return self.total_rounds - 1 if self.total_rounds > 0 else None
+            if normalized == "first":
+                return 0
+            try:
+                selector = int(normalized)
+            except ValueError as error:
+                raise ValueError(
+                    "FedMIA single-round baselines require 'first', 'last', or "
+                    "an observed integer round."
+                ) from error
+        return int(selector)
+
+    def _attack_is_due(self, attack: str, round_index: int) -> bool:
+        single_round = self._single_round_index_for_attack(attack)
+        if attack in _SINGLE_ROUND_ATTACKS and single_round is not None:
+            return round_index == single_round
         is_final_round = (
             self.total_rounds > 0 and round_index == self.total_rounds - 1
         )
-        return self.enabled and (
-            is_final_round
-            or any(
-                round_index % self._audit_interval_for_attack(attack) == 0
-                for attack in self.attacks
-            )
+        return is_final_round or (
+            round_index % self._audit_interval_for_attack(attack) == 0
         )
+
+    def _attacks_for_round(self, round_index: int) -> list[str]:
+        return [
+            attack
+            for attack in self.attacks
+            if self._attack_is_due(attack, round_index)
+        ]
+
+    def should_observe(self, round_index: int) -> bool:
+        return self.enabled and bool(self._attacks_for_round(round_index))
+
+    def _audit_client_ids_for_attacks(
+        self, active_attacks: list[str], selected_ids: list[int]
+    ) -> list[int]:
+        if (
+            self.signal_storage != "full"
+            and not self.pooled_client_audit
+            and set(active_attacks).issubset(_FEDMIA_BASELINE_ATTACKS)
+        ):
+            return [
+                user_id
+                for user_id in selected_ids
+                if user_id == self.target_client_id
+            ]
+        return list(selected_ids)
 
     def _audit_interval_for_attack(self, attack: str) -> int:
         return self.attack_audit_intervals.get(attack, self.audit_interval)
 
+    def _attack_schedule_metadata(self, attack: str) -> dict:
+        single_round = self._single_round_index_for_attack(attack)
+        if attack in _SINGLE_ROUND_ATTACKS and single_round is not None:
+            return {"mode": "single_round", "round": single_round}
+        return {
+            "mode": "interval",
+            "interval": self._audit_interval_for_attack(attack),
+            "include_final_round": self.total_rounds > 0,
+        }
+
     def _observations_for_attack(self, attack: str) -> list[dict]:
-        interval = self._audit_interval_for_attack(attack)
-        final_round = self.total_rounds - 1 if self.total_rounds > 0 else None
         return [
             observation
             for observation in self.observations
-            if int(observation["round"]) % interval == 0
-            or observation["round"] == final_round
+            if self._attack_is_due(attack, int(observation["round"]))
         ]
 
     @torch.no_grad()
@@ -1309,14 +1382,22 @@ class MembershipAuditor:
         protocol_messages: dict[int, dict] | None = None,
         released_states: dict[int, dict[str, torch.Tensor]] | None = None,
     ) -> None:
-        if not self.should_observe(round_index):
+        active_attacks = self._attacks_for_round(round_index)
+        if not self.enabled or not active_attacks:
+            return
+        full_signals = self.signal_storage == "full"
+        needs = _signal_needs(set(active_attacks), full_signals)
+        selected_ids = self._audit_client_ids_for_attacks(
+            active_attacks, selected_ids
+        )
+        if not selected_ids:
             return
         names = trainable_names(self.model)
         observable_names = names
         needs_gradients = (
-            self._needs_cosine
-            or self._needs_whitebox_features
-            or self._needs_promptres
+            needs["cosine"]
+            or needs["whitebox_features"]
+            or needs["promptres"]
         )
         sample_gradients = None
         signatures = None
@@ -1343,7 +1424,7 @@ class MembershipAuditor:
             state = self._observable_client_state(
                 user_id, updated_states[user_id], released_states
             )
-            if self._needs_client_states:
+            if needs["client_states"]:
                 observable_states[user_id] = state
             if needs_gradients:
                 client_base = (
@@ -1393,15 +1474,15 @@ class MembershipAuditor:
                         ).squeeze(1)
                     update_norm = update.norm().clamp_min(1e-12)
                     sample_norm = compared_gradients.norm(dim=1).clamp_min(1e-12)
-                    if self._needs_cosine:
+                    if needs["cosine"]:
                         cosine.append(
                             (compared_gradients @ update)
                             / (sample_norm * update_norm)
                         )
-                    if self._needs_promptres:
+                    if needs["promptres"]:
                         promptres_updates.append(update)
                         promptres_gradients.append(compared_gradients)
-                    if self._needs_whitebox_features:
+                    if needs["whitebox_features"]:
                         update_sq = update.square().sum()
                         gradient_difference.append(
                             update_sq
@@ -1410,21 +1491,21 @@ class MembershipAuditor:
                             .sum(dim=1)
                         )
             needs_outputs = (
-                self._needs_confidence
-                or self._needs_probabilities
-                or self._needs_representations
+                needs["confidence"]
+                or needs["probabilities"]
+                or needs["representations"]
             )
             if needs_outputs:
                 self.model.load_state_dict(state, strict=False)
                 logits, representation, losses = self._candidate_outputs(
                     self.model,
-                    require_representation=self._needs_representations,
+                    require_representation=needs["representations"],
                 )
-                if self._needs_confidence:
+                if needs["confidence"]:
                     confidence.append(-losses)
-                if self._needs_probabilities:
+                if needs["probabilities"]:
                     probabilities.append(torch.softmax(logits, dim=1))
-                if self._needs_representations:
+                if needs["representations"]:
                     if representation is None:
                         raise AssertionError(
                             "Representation-dependent audit lost its features."
@@ -1435,9 +1516,9 @@ class MembershipAuditor:
             "round": int(round_index),
             "client_ids": torch.tensor(selected_ids, dtype=torch.long),
         }
-        if self._needs_confidence:
+        if needs["confidence"]:
             observation["confidence"] = torch.stack(confidence)
-        if self._needs_cosine:
+        if needs["cosine"]:
             if self.candidate_inputs_are_features:
                 self.model.load_state_dict(observable_base_state, strict=False)
                 self.model.eval()
@@ -1448,17 +1529,17 @@ class MembershipAuditor:
                 )
             else:
                 observation["cosine"] = torch.stack(cosine)
-        if self._needs_whitebox_features:
+        if needs["whitebox_features"]:
             if signatures is None:
                 raise AssertionError("White-box audit lost its gradient signatures.")
             observation["gradient_difference"] = torch.stack(gradient_difference)
             observation["gradient_signature"] = signatures
             observation["candidate_labels"] = self.labels.detach().cpu().clone()
-        if self._needs_probabilities:
+        if needs["probabilities"]:
             observation["probabilities"] = torch.stack(probabilities)
-        if self._needs_representations:
+        if needs["representations"]:
             observation["representations"] = torch.stack(representations)
-        if self._needs_promptres:
+        if needs["promptres"]:
             updates = torch.stack(promptres_updates)
             configured_rank = int(self.config.get("promptres_background_rank", 0))
             if configured_rank > 0 and updates.shape[0] < 2:
@@ -1482,7 +1563,7 @@ class MembershipAuditor:
                 effective_ranks.append(used_rank)
             observation["promptres"] = torch.stack(promptres_scores)
             observation["promptres_effective_ranks"] = effective_ranks
-        if self._needs_client_states:
+        if needs["client_states"]:
             observation["client_states"] = {
                 user_id: {
                     name: tensor.detach().cpu().clone()
@@ -2152,14 +2233,23 @@ class MembershipAuditor:
                     "audit_view": self.audit_view,
                     "signal_storage": {
                         "mode": self.signal_storage,
+                        "collection_mode": "attack_on_demand",
                         "signals_file_written": self.signal_storage != "none",
                         "default_audit_interval": self.audit_interval,
                         "attack_audit_intervals": {
                             attack: self._audit_interval_for_attack(attack)
                             for attack in self.attacks
                         },
+                        "attack_schedules": {
+                            attack: self._attack_schedule_metadata(attack)
+                            for attack in self.attacks
+                        },
                         "stored_rounds": [
                             int(observation["round"])
+                            for observation in self.observations
+                        ],
+                        "stored_client_counts": [
+                            int(observation["client_ids"].numel())
                             for observation in self.observations
                         ],
                         "stored_observation_fields": sorted(

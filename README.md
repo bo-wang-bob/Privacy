@@ -224,6 +224,12 @@ bash scripts/run_all_clip_fedmia_attacks.sh \
 `low_fpr_full` 协议。完整攻击集合仍分别使用
 `configs/clip_mlp_privacy.yaml` 和 `configs/visual_adapter_privacy.yaml`。
 
+审计信号按攻击需求调度：`blackbox_loss` 和 `grad_cosine` 默认只使用最终轮，
+`loss_series`、`avg_cosine`、`fedmia_loss` 和 `fedmia_cosine` 按论文定义逐轮
+采集；其中两个时序基线只需要目标客户端，而 FedMIA 需要全部当轮客户端。
+如果只选择单轮攻击或时序基线，调度器不会计算其他信号；默认六种攻击一起运行
+时，由于 FedMIA 使用全部通信轮，仍会逐轮审计所有客户端。
+
 ## 多客户端成员隐私审计
 
 设置 `audit.audit_client_ids: all` 或提供多个客户端 ID 时，审计器会先在每个
