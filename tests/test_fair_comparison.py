@@ -52,10 +52,10 @@ def _config():
 
 def test_validate_fair_configs_allows_method_specific_fields():
     first = _config()
-    first["aggregator"] = "dpfpl"
+    first["aggregator"] = "fedavg"
     second = copy.deepcopy(first)
-    second["aggregator"] = "fedask"
-    second["fedask"] = {"rank": 16}
+    second["aggregator"] = "promptfl"
+    second["promptfl"] = {"paper_template": True}
     validate_fair_configs([first, second])
 
 

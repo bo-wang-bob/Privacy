@@ -18,10 +18,7 @@ from privacy_defenses import (
     DefenseController,
     attach_hamp_output_transform,
 )
-from utils.privacy_accounting import (
-    gaussian_rdp_epsilon,
-    planned_private_probe_steps,
-)
+from utils.privacy_accounting import planned_private_probe_steps
 from users.user import UserBase
 
 logger = logging.getLogger(__name__)
@@ -200,13 +197,10 @@ class ServerBase:
             self.auditor.enabled and "codepoison" in self.auditor.attacks
         )
         self.private_probe_steps = planned_private_probe_steps(self.audit_config)
-        if self.federated_method in {"dpfpl", "fedask"}:
-            self.defense.additional_private_steps = self.private_probe_steps
-        else:
-            target_user = self.ctx.users[self.target_client_id]
-            self.defense.additional_private_steps = self.private_probe_steps * (
-                target_user.local_epochs * len(target_user.trainloader)
-            )
+        target_user = self.ctx.users[self.target_client_id]
+        self.defense.additional_private_steps = self.private_probe_steps * (
+            target_user.local_epochs * len(target_user.trainloader)
+        )
 
     @staticmethod
     def _clone_state(state: dict[str, torch.Tensor], cpu: bool = False):
@@ -468,133 +462,11 @@ class ServerBase:
             "model_type": str(getattr(self.model, "model_type", "prompt")),
             "configuration": self.method_config,
             "training_health": training_health,
-            "state_scope": (
-                "global_plus_persistent_per_client_local"
-                if self.federated_method in {"dpfpl", "fedotp", "fedpgp"}
-                else "shared_global"
-            ),
+            "state_scope": "shared_global",
         }
         if self.federated_method == "promptfl":
             method_summary["paper_alignment"] = (
                 "CoOp-style shared soft text prompt with sample-weighted FedAvg"
-            )
-        elif self.federated_method == "fedotp":
-            method_summary["paper_alignment"] = (
-                "global/local full-rank prompts with fixed-plan entropic "
-                "unbalanced optimal transport; only global_ctx is communicated"
-            )
-        elif self.federated_method == "fedpgp":
-            method_summary["paper_alignment"] = (
-                "aggregated global prompt plus persistent low-rank local "
-                "adaptation and CLIP-guided prompt-wise contrastive loss"
-            )
-        if self.federated_method == "dpfpl":
-            method_summary["privacy_mechanisms"] = {
-                "local": "RGP low-rank gradient clipping and Gaussian perturbation",
-                "global": "client update clipping and server Gaussian perturbation",
-                "delta": float(self.method_config.get("delta", 1e-5)),
-            }
-            local_steps = self.num_glob_iters * int(
-                self.method_config.get("local_steps", 1)
-            )
-            if self.defense.name == "mist":
-                local_steps += self.num_glob_iters * int(
-                    self.defense_config.get("mist_cross_steps", 1)
-                )
-            local_steps += self.private_probe_steps
-            delta = float(self.method_config.get("delta", 1e-5))
-            local_epsilon = gaussian_rdp_epsilon(
-                float(self.method_config.get("local_noise_multiplier", 1.0)),
-                local_steps,
-                delta,
-                mechanisms_per_step=2,
-            )
-            global_epsilon = gaussian_rdp_epsilon(
-                float(self.method_config.get("global_noise_multiplier", 1.0)),
-                self.num_glob_iters,
-                delta,
-            )
-            method_summary["privacy_accounting"] = {
-                "local_epsilon_upper_bound": (
-                    local_epsilon if math.isfinite(local_epsilon) else None
-                ),
-                "global_epsilon_upper_bound": (
-                    global_epsilon if math.isfinite(global_epsilon) else None
-                ),
-                "delta": delta,
-                "formal_dp_enabled": bool(
-                    float(self.method_config.get("local_noise_multiplier", 1.0)) > 0
-                    and float(self.method_config.get("global_noise_multiplier", 1.0))
-                    > 0
-                    and not self.method_config.get("reproducible_dp_noise", False)
-                    and not self.defense_config.get("reproducible_dp_noise", False)
-                    and self.defense.name not in {"cofedmid", "soft"}
-                ),
-                "accountant": "conservative Gaussian RDP; no subsampling amplification",
-                "active_audit_probe_steps": self.private_probe_steps,
-                "formal_dp_caveat": (
-                    "SOFT/CoFedMID use data-dependent selection not covered by this accountant."
-                    if self.defense.name in {"cofedmid", "soft"}
-                    else None
-                ),
-            }
-        elif self.federated_method == "fedask":
-            method_summary["privacy_mechanisms"] = {
-                "local": "full-prompt per-sample clipping/noise followed by asymmetric B update",
-                "aggregation": "two-stage randomized sketch and SVD reconstruction",
-                "delta": float(self.method_config.get("delta", 1e-5)),
-            }
-            local_steps = self.num_glob_iters * int(
-                self.method_config.get("local_steps", self.ctx.users[0].local_epochs)
-            )
-            if self.defense.name == "mist":
-                local_steps += self.num_glob_iters * int(
-                    self.defense_config.get("mist_cross_steps", 1)
-                )
-            local_steps += self.private_probe_steps
-            delta = float(self.method_config.get("delta", 1e-5))
-            epsilon = gaussian_rdp_epsilon(
-                float(self.method_config.get("noise_multiplier", 1.0)),
-                local_steps,
-                delta,
-            )
-            method_summary["privacy_accounting"] = {
-                "epsilon_upper_bound": epsilon if math.isfinite(epsilon) else None,
-                "delta": delta,
-                "formal_dp_enabled": bool(
-                    float(self.method_config.get("noise_multiplier", 1.0)) > 0
-                    and not self.method_config.get("reproducible_dp_noise", False)
-                    and not self.defense_config.get("reproducible_dp_noise", False)
-                    and self.defense.name not in {"cofedmid", "soft"}
-                ),
-                "accountant": "conservative Gaussian RDP; no client/data subsampling amplification",
-                "active_audit_probe_steps": self.private_probe_steps,
-                "formal_dp_caveat": (
-                    "SOFT/CoFedMID use data-dependent selection not covered by this accountant."
-                    if self.defense.name in {"cofedmid", "soft"}
-                    else None
-                ),
-            }
-        if hasattr(self.aggregator, "last_reconstruction_error"):
-            method_summary["last_reconstruction_error"] = float(
-                self.aggregator.last_reconstruction_error
-            )
-            method_summary["last_pretruncation_error"] = float(
-                self.aggregator.last_pretruncation_error
-            )
-            method_summary["last_subspace_rank"] = int(
-                self.aggregator.last_subspace_rank
-            )
-            method_summary["rank_based_minimum_oversampling"] = int(
-                self.aggregator.last_required_oversampling
-            )
-            method_summary["rank_based_width_condition_met"] = bool(
-                int(self.method_config.get("oversampling", 2))
-                >= self.aggregator.last_required_oversampling
-            )
-        if hasattr(self.aggregator, "last_clip_fraction"):
-            method_summary["last_global_clip_fraction"] = float(
-                self.aggregator.last_clip_fraction
             )
         with open(
             os.path.join(self.results_dir, "federated_method_summary.json"),

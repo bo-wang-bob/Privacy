@@ -1169,15 +1169,7 @@ class DefenseController:
         round_index: int,
     ) -> None:
         if self.name == "mist":
-            method = (
-                users[selected_ids[0]].federated_method if selected_ids else "fedavg"
-            )
-            if method in {"dpfpl", "fedask"}:
-                self._private_mist_refinement(
-                    users, updated_states, selected_ids, round_index
-                )
-            else:
-                self._mist_refinement(users, updated_states, selected_ids, round_index)
+            self._mist_refinement(users, updated_states, selected_ids, round_index)
         elif self.name == "cofedmid":
             self._cofedmid_perturb(updated_states, selected_ids, round_index)
         elif self.name in {"local_ggeur", "mirage", "veil"}:
@@ -1324,38 +1316,6 @@ class DefenseController:
                 offset += count
             self._record("local_ggeur_upload_delta_norm", float(flat.norm().detach()))
 
-    def _private_mist_refinement(
-        self,
-        users: list,
-        updated_states: dict[int, dict[str, torch.Tensor]],
-        selected_ids: list[int],
-        round_index: int,
-    ) -> None:
-        if len(selected_ids) < 2:
-            raise ValueError("MIST requires at least two selected client submodels.")
-        snapshots = {}
-        for user_id in selected_ids:
-            snapshot = copy.deepcopy(users[user_id].model).to(self.device)
-            snapshot.load_state_dict(updated_states[user_id], strict=False)
-            snapshot.eval()
-            for parameter in snapshot.parameters():
-                parameter.requires_grad_(False)
-            snapshots[user_id] = snapshot
-        for user_id in selected_ids:
-            user = users[user_id]
-            user.model.load_state_dict(updated_states[user_id], strict=False)
-            user.private_mist_refine(
-                snapshots,
-                round_index=round_index,
-                steps=int(self.config.get("mist_cross_steps", 1)),
-                weight=float(self.config.get("mist_cross_weight", 1.0)),
-            )
-            updated_states[user_id] = {
-                name: tensor.detach().clone()
-                for name, tensor in user.model.state_dict().items()
-                if name in updated_states[user_id]
-            }
-
     def after_probe_training(
         self,
         model: torch.nn.Module,
@@ -1374,9 +1334,6 @@ class DefenseController:
                 (name, parameter)
                 for name, parameter in model.named_parameters()
                 if parameter.requires_grad
-                and not (
-                    self.federated_method == "fedask" and name.endswith("fedask_A")
-                )
             ]
             for parameter_index, (_name, parameter) in enumerate(parameters):
                 count = parameter.numel()
@@ -1479,8 +1436,6 @@ class DefenseController:
         weight_norm_sq = float(weights.square().sum())
         parameter_names = list(updated_states[selected_ids[0]])
         for name_index, name in enumerate(parameter_names):
-            if self.federated_method == "fedask" and name.endswith("fedask_A"):
-                continue
             shape = updated_states[selected_ids[0]][name].shape
             count = updated_states[selected_ids[0]][name].numel()
             perturb_count = max(1, min(count, int(math.floor(ratio * count))))
@@ -1516,17 +1471,6 @@ class DefenseController:
             return None
         noise = float(self.config.get("dp_noise_multiplier", 1.0))
         mechanisms = 1
-        if self.federated_method == "dpfpl":
-            noise = max(
-                noise,
-                float(self.method_config.get("local_noise_multiplier", 1.0)),
-            )
-            mechanisms = 2
-        elif self.federated_method == "fedask":
-            noise = max(
-                noise,
-                float(self.method_config.get("noise_multiplier", 1.0)),
-            )
         delta = float(
             self.method_config.get("delta", self.config.get("dp_delta", 1e-5))
         )

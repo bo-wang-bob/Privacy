@@ -1273,40 +1273,9 @@ class MembershipAuditor:
     def _clone_prompt_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {name: tensor.detach().clone() for name, tensor in state.items()}
 
-    def _global_prompt_public_state(
-        self, source: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor]:
-        """Build an explicit global-only model from protocol-visible parameters.
-
-        Initial private parameters are not a protocol message and must not be
-        mixed with a later global prompt.  FedOTP duplicates the public global
-        prompt into its two OT slots; additive private adapters are neutralized.
-        """
-        state = self._clone_prompt_state(self.initial_prompt_state)
-        global_context = None
-        for name, tensor in source.items():
-            if name.endswith("global_ctx"):
-                state[name] = tensor.detach().clone()
-                global_context = tensor.detach().clone()
-        if self.federated_method == "fedotp" and global_context is not None:
-            for name in state:
-                if name.endswith("local_ctx"):
-                    state[name] = global_context.clone()
-        elif self.federated_method in {"fedpgp", "dpfpl"}:
-            for name in state:
-                if name.endswith(("local_ctx", "fedpgp_u", "fedpgp_v")):
-                    state[name] = torch.zeros_like(state[name])
-        return state
-
     def _observable_base_state(
         self, base_state: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
-        if self.audit_view != "full_whitebox" and self.federated_method in {
-            "dpfpl",
-            "fedotp",
-            "fedpgp",
-        }:
-            return self._global_prompt_public_state(base_state)
         return base_state
 
     def _observable_client_state(
@@ -1323,22 +1292,11 @@ class MembershipAuditor:
         ):
             # The full FedAvg model update is itself a protocol message.
             return updated_state
-        if (
-            self.audit_view == "protocol_plus_released_prompts"
-            and self.federated_method in {"fedotp", "fedpgp"}
-        ):
-            # The server sees each client's global prompt update, but FedOTP's
-            # local_ctx and FedPGP's low-rank U/V never leave that client.
-            return self._global_prompt_public_state(updated_state)
         if not released_states:
             raise ValueError("Released prompt state is required by this audit view.")
         released = released_states.get(user_id, released_states.get(0))
         if released is None:
             raise ValueError(f"No released prompt is available for client {user_id}.")
-        if self.federated_method == "dpfpl":
-            return self._global_prompt_public_state(released)
-        if self.federated_method in {"fedotp", "fedpgp"}:
-            return self._global_prompt_public_state(released)
         return released
 
     def observe_round(
@@ -1355,12 +1313,6 @@ class MembershipAuditor:
             return
         names = trainable_names(self.model)
         observable_names = names
-        if self.audit_view != "full_whitebox" and self.federated_method in {
-            "dpfpl",
-            "fedotp",
-            "fedpgp",
-        }:
-            observable_names = [name for name in names if name.endswith("global_ctx")]
         needs_gradients = (
             self._needs_cosine
             or self._needs_whitebox_features
@@ -2244,12 +2196,7 @@ class MembershipAuditor:
                             self.match_candidate_labels
                             and distributions_exactly_matched
                         ),
-                        "personalized_public_model_projection": (
-                            "global_only_neutral_private_parameters"
-                            if self.audit_view != "full_whitebox"
-                            and self.federated_method in {"fedotp", "fedpgp", "dpfpl"}
-                            else None
-                        ),
+                        "personalized_public_model_projection": None,
                         "null_clients_share_candidate_training_labels": bool(
                             self.null_client_candidate_label_overlap
                         ),

@@ -99,11 +99,7 @@ def _method_name(config: dict[str, Any]) -> str:
     if defense == "none":
         return {
             "promptfl": "PromptFL",
-            "fedotp": "FedOTP",
-            "fedpgp": "FedPGP",
             "fedavg": "FedAvg",
-            "dpfpl": "DP-FPL",
-            "fedask": "FedASK",
         }.get(aggregator, aggregator)
     return f"{aggregator}+{defense}"
 

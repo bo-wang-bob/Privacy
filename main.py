@@ -21,10 +21,6 @@ from utils.data_loader import (
     generate_iid_split,
     generate_pathological_split,
 )
-from utils.privacy_accounting import (
-    calibrate_gaussian_noise,
-    planned_private_probe_steps,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -155,67 +151,9 @@ def validate_config(config: dict) -> None:
             "model_type must be prompt, clip_mlp, or visual_adapter."
         )
     method = config["aggregator"].lower()
-    supported_methods = {
-        "promptfl",
-        "fedotp",
-        "fedpgp",
-        "fedavg",
-        "dpfpl",
-        "fedask",
-    }
+    supported_methods = {"fedavg", "promptfl"}
     if method not in supported_methods:
-        raise ValueError(
-            "aggregator must be promptfl, fedotp, fedpgp, fedavg, dpfpl, or fedask."
-        )
-    method_config = config.get(method, {})
-    if method in {"dpfpl", "fedask"} and int(method_config.get("rank", 4)) <= 0:
-        raise ValueError(f"{method}.rank must be positive.")
-    if method in {"dpfpl", "fedask"} and int(method_config.get("local_steps", 1)) <= 0:
-        raise ValueError(f"{method}.local_steps must be positive.")
-    if method == "dpfpl":
-        for key in ("local_clip_norm", "global_clip_norm"):
-            if float(method_config.get(key, 1.0)) <= 0:
-                raise ValueError(f"dpfpl.{key} must be positive.")
-        for key in ("local_noise_multiplier", "global_noise_multiplier"):
-            if float(method_config.get(key, 1.0)) < 0:
-                raise ValueError(f"dpfpl.{key} must be non-negative.")
-        for key in ("local_target_epsilon", "global_target_epsilon"):
-            value = method_config.get(key)
-            if value is not None and float(value) <= 0:
-                raise ValueError(f"dpfpl.{key} must be positive when set.")
-    if method == "fedask":
-        if float(method_config.get("scaling", 1.0)) <= 0:
-            raise ValueError("fedask.scaling must be positive.")
-        if float(method_config.get("clip_norm", 1.0)) <= 0:
-            raise ValueError("fedask.clip_norm must be positive.")
-        if float(method_config.get("noise_multiplier", 1.0)) < 0:
-            raise ValueError("fedask.noise_multiplier must be non-negative.")
-        if int(method_config.get("oversampling", 2)) < 0:
-            raise ValueError("fedask.oversampling must be non-negative.")
-        target = method_config.get("target_epsilon")
-        if target is not None and float(target) <= 0:
-            raise ValueError("fedask.target_epsilon must be positive when set.")
-    if method == "fedotp":
-        if float(method_config.get("epsilon", 0.01)) <= 0:
-            raise ValueError("fedotp.epsilon must be positive.")
-        if not 0 < float(method_config.get("transported_mass", 0.8)) <= 1:
-            raise ValueError("fedotp.transported_mass must be in (0, 1].")
-        if int(method_config.get("max_iterations", 100)) <= 0:
-            raise ValueError("fedotp.max_iterations must be positive.")
-        if float(method_config.get("threshold", 1e-3)) <= 0:
-            raise ValueError("fedotp.threshold must be positive.")
-    if method == "fedpgp":
-        if int(method_config.get("rank", 8)) <= 0:
-            raise ValueError("fedpgp.rank must be positive.")
-        if float(method_config.get("contrastive_weight", 0.5)) < 0:
-            raise ValueError("fedpgp.contrastive_weight must be non-negative.")
-        if float(method_config.get("temperature", 0.5)) <= 0:
-            raise ValueError("fedpgp.temperature must be positive.")
-    if (
-        method in {"dpfpl", "fedask"}
-        and not 0 < float(method_config.get("delta", 1e-5)) < 1
-    ):
-        raise ValueError(f"{method}.delta must be in (0, 1).")
+        raise ValueError("aggregator must be fedavg or promptfl.")
     if config["total_users"] <= 1:
         raise ValueError("total_users must be greater than one.")
     if not 1 <= config["sample_users"] <= config["total_users"]:
@@ -435,16 +373,6 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "PromptRes background residualization requires two clients per round."
         )
-    if (
-        "promptres" in attacks
-        and method == "fedask"
-        and str(audit.get("audit_view", "protocol_plus_released_prompts")).lower()
-        != "full_whitebox"
-    ):
-        raise ValueError(
-            "PromptRes needs a prompt update; FedASK exposes only sketches outside "
-            "the full_whitebox audit view."
-        )
     for key in (
         "min_trainable_update_norm",
         "max_stagnant_loss_range",
@@ -481,11 +409,6 @@ def validate_config(config: dict) -> None:
             "FedMIA baseline defenses require centralized FedAvg and must be "
             "evaluated as standalone comparisons, not stacked with personalized "
             "or private prompt algorithms."
-        )
-    if method in {"fedotp", "fedpgp"} and defense_name != "none":
-        raise ValueError(
-            f"{method} paper training currently requires defense.name=none; "
-            "stacking a defense would change its published objective."
         )
     if defense_name == "mist" and config["sample_users"] < 2:
         raise ValueError("MIST requires at least two selected client submodels.")
@@ -591,7 +514,6 @@ def validate_config(config: dict) -> None:
         audit.get("enabled", True)
         and attacks & spatial
         and config["train_mode"] != "centralized"
-        and method != "dpfpl"
     ):
         raise ValueError(
             "Cross-client membership attacks require a shared centralized FedAvg model."
@@ -630,52 +552,10 @@ def run(config: dict) -> list[dict]:
     method = config["aggregator"].lower()
     method_config = dict(config.get(method, {}))
     method_config.setdefault("seed", seed)
-    extra_steps = (
-        int(config.get("defense", {}).get("mist_cross_steps", 1))
-        if str(config.get("defense", {}).get("name", "none")).lower() == "mist"
-        else 0
-    )
-    audit_probe_steps = planned_private_probe_steps(config.get("audit"))
-    delta = float(method_config.get("delta", 1e-5))
-    if method == "dpfpl":
-        local_steps = (
-            config["num_global_iters"]
-            * (int(method_config.get("local_steps", 1)) + extra_steps)
-            + audit_probe_steps
-        )
-        if method_config.get("local_target_epsilon") is not None:
-            method_config["local_noise_multiplier"] = calibrate_gaussian_noise(
-                float(method_config["local_target_epsilon"]),
-                local_steps,
-                delta,
-                mechanisms_per_step=2,
-            )
-        if method_config.get("global_target_epsilon") is not None:
-            method_config["global_noise_multiplier"] = calibrate_gaussian_noise(
-                float(method_config["global_target_epsilon"]),
-                config["num_global_iters"],
-                delta,
-            )
-    elif method == "fedask" and method_config.get("target_epsilon") is not None:
-        local_steps = (
-            config["num_global_iters"]
-            * (
-                int(method_config.get("local_steps", config["local_epochs"]))
-                + extra_steps
-            )
-            + audit_probe_steps
-        )
-        method_config["noise_multiplier"] = calibrate_gaussian_noise(
-            float(method_config["target_epsilon"]),
-            local_steps,
-            delta,
-        )
     config[method] = method_config
     effective_train_mode = (
-        "local"
-        if method in {"dpfpl", "fedotp", "fedpgp"}
-        else "centralized"
-        if method in {"fedask", "promptfl"}
+        "centralized"
+        if method == "promptfl"
         else config["train_mode"]
     )
     config["effective_train_mode"] = effective_train_mode
@@ -766,10 +646,6 @@ def run(config: dict) -> list[dict]:
         parameterization = {
             "fedavg": "full",
             "promptfl": "promptfl",
-            "fedotp": "fedotp",
-            "fedpgp": "fedpgp",
-            "dpfpl": "dpfpl",
-            "fedask": "fedask",
         }[method]
         model = CustomCLIP(
             clip_model=clip_model,
@@ -780,8 +656,6 @@ def run(config: dict) -> list[dict]:
             template=get_default_prompt_template(config["dataset_name"]),
             class_specific_ctx=config["class_specific_ctx"],
             parameterization=parameterization,
-            low_rank=int(method_config.get("rank", 4)),
-            low_rank_scaling=float(method_config.get("scaling", 1.0)),
             method_config=method_config,
         )
 
@@ -891,40 +765,6 @@ def default_config() -> dict:
             "template": None,
         },
         "promptfl": {},
-        "fedotp": {
-            "epsilon": 0.01,
-            "transported_mass": 0.8,
-            "max_iterations": 100,
-            "threshold": 0.001,
-        },
-        "fedpgp": {
-            "rank": 8,
-            "contrastive_weight": 0.5,
-            "temperature": 0.5,
-        },
-        "dpfpl": {
-            "rank": 4,
-            "local_steps": 1,
-            "local_clip_norm": 1.0,
-            "local_noise_multiplier": 1.0,
-            "local_target_epsilon": None,
-            "global_clip_norm": 1.0,
-            "global_noise_multiplier": 1.0,
-            "global_target_epsilon": None,
-            "delta": 1e-5,
-            "reproducible_dp_noise": False,
-        },
-        "fedask": {
-            "rank": 4,
-            "oversampling": 2,
-            "scaling": 1.0,
-            "local_steps": 2,
-            "clip_norm": 1.0,
-            "noise_multiplier": 1.0,
-            "target_epsilon": None,
-            "delta": 1e-5,
-            "reproducible_dp_noise": False,
-        },
         "dirichlet_alpha": 0.1,
         "partition_mode": "auto",
         "use_full_dataset": False,
@@ -1076,7 +916,7 @@ def parse_args() -> dict:
     parser = argparse.ArgumentParser(
         description="Federated prompt tuning membership-privacy benchmark"
     )
-    parser.add_argument("--config", default="configs/fedprompt_privacy.yaml")
+    parser.add_argument("--config", default="configs/clip_mlp_privacy.yaml")
     parser.add_argument("--dataset_name")
     parser.add_argument("--data_root")
     parser.add_argument("--cache_dir")
@@ -1110,7 +950,7 @@ def parse_args() -> dict:
     parser.add_argument("--adapter_alpha", type=float)
     parser.add_argument(
         "--aggregator",
-        choices=["promptfl", "fedotp", "fedpgp", "fedavg", "dpfpl", "fedask"],
+        choices=["fedavg", "promptfl"],
     )
     parser.add_argument("--target_client_id", type=int)
     parser.add_argument("--audit_attacks", help="Comma-separated attack names")

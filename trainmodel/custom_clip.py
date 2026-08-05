@@ -1,5 +1,3 @@
-import math
-
 import torch
 import torch.nn as nn
 from typing import Tuple, List, Union, Optional, cast
@@ -60,70 +58,6 @@ def format_prompt_template(template: str, class_name: str) -> str:
     return template.format(class_name)
 
 
-def entropic_partial_transport(
-    similarities: torch.Tensor,
-    epsilon: float,
-    transported_mass: float,
-    max_iterations: int,
-    threshold: float,
-) -> torch.Tensor:
-    """FedOTP's entropic unbalanced OT plan with one relaxed marginal.
-
-    ``similarities`` has shape ``(B, M, N)`` for B class/image pairs,
-    M visual patches and N prompts. The returned plan is detached in the model
-    forward, matching the paper's alternating step that fixes the OT plan while
-    optimizing prompt vectors.
-    """
-    if similarities.ndim != 3:
-        raise ValueError("FedOTP similarities must have shape (batch, patches, prompts).")
-    if epsilon <= 0 or max_iterations <= 0 or threshold <= 0:
-        raise ValueError("FedOTP epsilon, max_iterations, and threshold must be positive.")
-    if not 0 < transported_mass <= 1:
-        raise ValueError("FedOTP transported_mass must be in (0, 1].")
-
-    batch, patches, prompts = similarities.shape
-    if patches <= 0 or prompts <= 0:
-        raise ValueError("FedOTP requires at least one patch and one prompt.")
-    # The paper configuration uses epsilon=0.01.  Forming the Gibbs kernel in
-    # float32 makes most CLIP-scale similarities underflow to zero, while an
-    # absolute denominator clamp changes the Sinkhorn equations.  Keep the
-    # complete scaling iteration in log space and float64; the returned plan is
-    # cast back only after its marginals have been formed.
-    working = similarities.to(torch.float64)
-    log_kernel = -(1.0 - working) / float(epsilon)
-    log_source = working.new_full((batch, patches), -math.log(patches))
-    log_target = working.new_full(
-        (batch, prompts), math.log(transported_mass / prompts)
-    )
-    log_left = torch.zeros_like(log_source)
-    log_right = torch.zeros_like(log_target)
-    for _ in range(max_iterations):
-        previous = log_right
-        log_left = torch.minimum(
-            log_source
-            - torch.logsumexp(log_kernel + log_right.unsqueeze(-2), dim=-1),
-            torch.zeros_like(log_left),
-        )
-        log_right = log_target - torch.logsumexp(
-            log_kernel + log_left.unsqueeze(-1), dim=-2
-        )
-        if float((log_right - previous).abs().mean()) < threshold:
-            break
-    plan = torch.exp(
-        log_left.unsqueeze(-1) + log_kernel + log_right.unsqueeze(-2)
-    ).to(similarities.dtype)
-    if not bool(torch.isfinite(plan).all()):
-        raise FloatingPointError("FedOTP transport plan contains non-finite values.")
-    expected_mass = similarities.new_full((batch,), transported_mass)
-    actual_mass = plan.sum(dim=(1, 2))
-    tolerance = max(1e-5, 10.0 * torch.finfo(similarities.dtype).eps)
-    if not torch.allclose(actual_mass, expected_mass, atol=tolerance, rtol=1e-4):
-        raise FloatingPointError(
-            "FedOTP transport plan did not preserve the requested mass."
-        )
-    return plan
-
-
 class PromptLearner(nn.Module):
     """
     Learnable prompt module for CLIP text encoder.
@@ -152,8 +86,6 @@ class PromptLearner(nn.Module):
         template: str = DEFAULT_PROMPT_TEMPLATE,
         class_specific_ctx: bool = False,
         parameterization: str = "full",
-        low_rank: int = 4,
-        low_rank_scaling: float = 1.0,
         device: torch.device = torch.device("cpu"),
     ):
         super().__init__()
@@ -164,8 +96,6 @@ class PromptLearner(nn.Module):
         self.n_ctx: int = n_ctx
         self.class_specific_ctx = class_specific_ctx
         self.parameterization = parameterization.lower()
-        self.low_rank = int(low_rank)
-        self.low_rank_scaling = float(low_rank_scaling)
         self.device = device
 
         # Get text embedding dimension from CLIP model config
@@ -177,49 +107,9 @@ class PromptLearner(nn.Module):
         else:
             ctx_shape = (n_ctx, d)
         initial_ctx = torch.randn(*ctx_shape, device=device) * 0.02
-        if self.parameterization in {"full", "promptfl"}:
-            self.ctx = nn.Parameter(initial_ctx)
-        elif self.parameterization == "fedotp":
-            self.global_ctx = nn.Parameter(initial_ctx.clone())
-            local_ctx = torch.empty_like(initial_ctx)
-            nn.init.normal_(local_ctx, std=0.02)
-            self.local_ctx = nn.Parameter(local_ctx)
-        elif self.parameterization == "fedpgp":
-            self.global_ctx = nn.Parameter(initial_ctx.clone())
-            rank = min(self.low_rank, n_ctx, d)
-            if rank <= 0:
-                raise ValueError("FedPGP low_rank must be positive.")
-            self.low_rank = rank
-            if self.class_specific_ctx:
-                u_shape = (self.n_cls, n_ctx, rank)
-                v_shape = (self.n_cls, rank, d)
-            else:
-                u_shape = (n_ctx, rank)
-                v_shape = (rank, d)
-            self.fedpgp_u = nn.Parameter(torch.empty(*u_shape, device=device))
-            self.fedpgp_v = nn.Parameter(torch.empty(*v_shape, device=device))
-            nn.init.normal_(self.fedpgp_u, std=0.02)
-            nn.init.normal_(self.fedpgp_v, std=0.02)
-        elif self.parameterization == "dpfpl":
-            self.global_ctx = nn.Parameter(initial_ctx.clone())
-            self.local_ctx = nn.Parameter(torch.zeros_like(initial_ctx))
-        elif self.parameterization == "fedask":
-            rows = int(initial_ctx.numel() // initial_ctx.shape[-1])
-            rank = min(self.low_rank, rows, int(initial_ctx.shape[-1]))
-            if rank <= 0:
-                raise ValueError("FedASK low_rank must be positive.")
-            self.low_rank = rank
-            self.register_buffer("base_ctx", initial_ctx.clone())
-            self.fedask_A = nn.Parameter(
-                torch.randn(rank, initial_ctx.shape[-1], device=device) * 0.02
-            )
-            self.fedask_B = nn.Parameter(torch.zeros(rows, rank, device=device))
-            self.fedask_scaling = self.low_rank_scaling
-        else:
-            raise ValueError(
-                "parameterization must be one of: full, promptfl, fedotp, "
-                "fedpgp, dpfpl, fedask."
-            )
+        if self.parameterization not in {"full", "promptfl"}:
+            raise ValueError("parameterization must be full or promptfl.")
+        self.ctx = nn.Parameter(initial_ctx)
 
         # logger.info(
         #     f"PromptLearner initialized: n_cls={self.n_cls}, n_ctx={n_ctx}, hidden_size={d}, device={device}"
@@ -227,7 +117,7 @@ class PromptLearner(nn.Module):
 
         # Step 1: Construct full text for each class (used to get suffix token ids and EOS position)
         display_class_names = [to_display_name(name) for name in classnames]
-        paper_prompt = self.parameterization in {"promptfl", "fedotp", "fedpgp"}
+        paper_prompt = self.parameterization == "promptfl"
         if paper_prompt:
             placeholder = " ".join(["X"] * self.n_ctx)
             texts = [f"{placeholder} {name}." for name in display_class_names]
@@ -251,7 +141,7 @@ class PromptLearner(nn.Module):
         # Step 3: Extract prefix - only take the first token (BOS/start token)
         token_prefix: torch.Tensor = token_emb[:, :1, :]  # (K, 1, d)
 
-        # PromptFL/FedOTP/FedPGP replace placeholder tokens, as in CoOp. The
+        # PromptFL replaces placeholder tokens, as in CoOp. The
         # legacy full parameterization retains its historical behavior of
         # prepending learned tokens to the configured handcrafted template.
         suffix_start = 1 + self.n_ctx if paper_prompt else 1
@@ -266,13 +156,6 @@ class PromptLearner(nn.Module):
         self.register_buffer("token_prefix", token_prefix.to(device))
         self.register_buffer("token_suffix", token_suffix.to(device))
         self.register_buffer("suffix_attention_mask", suffix_attention_mask.to(device))
-        if paper_prompt:
-            # Fixed placeholder-token prompt used as the task-agnostic anchor
-            # by the FedPGP reference implementation.
-            self.register_buffer(
-                "paper_anchor_context",
-                token_emb[:, 1 : 1 + self.n_ctx, :].to(device),
-            )
         self.register_buffer(
             "ctx_positions",
             torch.arange(1, 1 + self.n_ctx, device=device, dtype=torch.long),
@@ -283,16 +166,7 @@ class PromptLearner(nn.Module):
         return self.ctx_positions
 
     def effective_context(self) -> torch.Tensor:
-        if self.parameterization in {"full", "promptfl"}:
-            return self.ctx
-        if self.parameterization == "fedotp":
-            return (self.global_ctx + self.local_ctx) / 2.0
-        if self.parameterization == "fedpgp":
-            return self.global_ctx + torch.matmul(self.fedpgp_u, self.fedpgp_v)
-        if self.parameterization == "dpfpl":
-            return self.global_ctx + self.local_ctx
-        adapter = self.fedask_scaling * (self.fedask_B @ self.fedask_A)
-        return self.base_ctx + adapter.reshape_as(self.base_ctx)
+        return self.ctx
 
     def forward(
         self, ctx_override: Optional[torch.Tensor] = None
@@ -509,8 +383,6 @@ class CustomCLIP(BaseModel):
         template: str = DEFAULT_PROMPT_TEMPLATE,
         class_specific_ctx: bool = False,
         parameterization: str = "full",
-        low_rank: int = 4,
-        low_rank_scaling: float = 1.0,
         method_config: Optional[dict] = None,
         device=torch.device("cpu"),
     ):
@@ -527,8 +399,6 @@ class CustomCLIP(BaseModel):
         self.template = template
         self.class_specific_ctx = class_specific_ctx
         self.parameterization = parameterization.lower()
-        self.low_rank = int(low_rank)
-        self.low_rank_scaling = float(low_rank_scaling)
         self.method_config = dict(method_config or {})
         self.processor = processor
         self.device = device
@@ -542,34 +412,11 @@ class CustomCLIP(BaseModel):
             template=self.template,
             class_specific_ctx=self.class_specific_ctx,
             parameterization=self.parameterization,
-            low_rank=self.low_rank,
-            low_rank_scaling=self.low_rank_scaling,
             device=self.device,
         )
 
         # Initialize text encoder wrapper
         self.text_encoder = TextEncoder(device=self.device)
-
-        self.fedotp_epsilon = float(self.method_config.get("epsilon", 0.01))
-        self.fedotp_transported_mass = float(
-            self.method_config.get("transported_mass", 0.8)
-        )
-        self.fedotp_max_iterations = int(
-            self.method_config.get("max_iterations", 100)
-        )
-        self.fedotp_threshold = float(self.method_config.get("threshold", 1e-3))
-        self.fedpgp_contrastive_weight = float(
-            self.method_config.get("contrastive_weight", 0.5)
-        )
-        self.fedpgp_temperature = float(
-            self.method_config.get("temperature", 0.5)
-        )
-        if self.parameterization == "fedpgp":
-            with torch.no_grad():
-                anchor_features = self._text_features_for_context(
-                    self.prompt_learner.paper_anchor_context
-                )
-            self.register_buffer("fedpgp_anchor_features", anchor_features)
 
         # logger.info(
         #     f"CustomCLIP initialized: n_classes={len(classnames)}, n_ctx={n_ctx}, device={device}"
@@ -594,9 +441,6 @@ class CustomCLIP(BaseModel):
             text_features: (K, projection_dim) - Text features
         """
         x = x.to(self.device)
-
-        if self.parameterization == "fedotp" and context is None:
-            return self._forward_fedotp(x, return_intermediate=return_intermediate)
 
         # Extract image features using frozen CLIP image encoder
         image_features = self.clip_model.get_image_features(pixel_values=x)  # type: ignore
@@ -631,76 +475,6 @@ class CustomCLIP(BaseModel):
             self.text_encoder(prompt_embeds, attn_mask, self.clip_model), dim=-1
         )
 
-    def _forward_fedotp(
-        self,
-        x: torch.Tensor,
-        return_intermediate: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
-        """FedOTP global/local prompt cooperation over CLIP patch features."""
-        vision = self.clip_model.vision_model(pixel_values=x)
-        last_hidden = cast(torch.Tensor, vision.last_hidden_state)
-        pooled = cast(torch.Tensor, vision.pooler_output)
-        image_features = F.normalize(self.clip_model.visual_projection(pooled), dim=-1)
-        patch_hidden = last_hidden[:, 1:, :]
-        patch_hidden = self.clip_model.vision_model.post_layernorm(patch_hidden)
-        patch_features = F.normalize(
-            self.clip_model.visual_projection(patch_hidden), dim=-1
-        )
-
-        learner = self.prompt_learner
-        global_text = self._text_features_for_context(learner.global_ctx)
-        local_text = self._text_features_for_context(learner.local_ctx)
-        text_features = torch.stack((global_text, local_text), dim=0)
-
-        # (B, C, M, N), then solve one UOT problem per image/class pair.
-        similarities = torch.einsum(
-            "bmd,ncd->bcmn", patch_features, text_features
-        )
-        batch, classes, patches, prompts = similarities.shape
-        flat = similarities.reshape(batch * classes, patches, prompts)
-        with torch.no_grad():
-            plan = entropic_partial_transport(
-                flat,
-                epsilon=self.fedotp_epsilon,
-                transported_mass=self.fedotp_transported_mass,
-                max_iterations=self.fedotp_max_iterations,
-                threshold=self.fedotp_threshold,
-            )
-        scores = (plan * flat).sum(dim=(1, 2)).reshape(batch, classes)
-        logits = self.clip_model.logit_scale.exp() * scores
-        if not self.training:
-            logits = logits / float(getattr(self, "_hamp_output_temperature", 1.0))
-        if return_intermediate:
-            return logits, image_features, F.normalize(
-                text_features.mean(dim=0), dim=-1
-            )
-        return logits
-
-    def fedpgp_contrastive_loss(self) -> torch.Tensor:
-        """Prompt-wise contrastive objective from the FedPGP paper."""
-        if self.parameterization != "fedpgp":
-            raise ValueError("fedpgp_contrastive_loss requires FedPGP parameterization.")
-        learner = self.prompt_learner
-        global_text = self._text_features_for_context(learner.global_ctx)
-        personalized_text = self._text_features_for_context(
-            learner.effective_context()
-        )
-        positive = F.cosine_similarity(
-            self.fedpgp_anchor_features, global_text, dim=-1
-        )
-        negative = F.cosine_similarity(global_text, personalized_text, dim=-1)
-        logits = torch.stack((positive, negative), dim=-1) / self.fedpgp_temperature
-        targets = torch.zeros(logits.shape[0], dtype=torch.long, device=logits.device)
-        return F.cross_entropy(logits, targets)
-
-    def fedpgp_training_loss(
-        self, images: torch.Tensor, labels: torch.Tensor
-    ) -> torch.Tensor:
-        logits = cast(torch.Tensor, self(images))
-        return F.cross_entropy(logits, labels) + (
-            self.fedpgp_contrastive_weight * self.fedpgp_contrastive_loss()
-        )
-
     def forward(self, x: torch.Tensor, return_intermediate: bool = False):
         return self.forward_with_context(
             x, context=None, return_intermediate=return_intermediate
@@ -712,10 +486,7 @@ class CustomCLIP(BaseModel):
 
     def get_text_feature_contexts(self) -> tuple[torch.Tensor, ...]:
         """Return the context tensors whose encoded mean defines text features."""
-        learner = self.prompt_learner
-        if self.parameterization == "fedotp":
-            return learner.global_ctx, learner.local_ctx
-        return (learner.effective_context(),)
+        return (self.prompt_learner.effective_context(),)
 
     def get_text_features_from_context(
         self,
@@ -803,17 +574,10 @@ class CustomCLIP(BaseModel):
         Returns:
             text_features: (K, projection_dim) - one vector per class.
         """
-        if self.parameterization == "fedotp":
-            learner = self.prompt_learner
-            text_features = (
-                self._text_features_for_context(learner.global_ctx)
-                + self._text_features_for_context(learner.local_ctx)
-            ) / 2.0
-        else:
-            prompt_embeds, attn_mask = self.prompt_learner()
-            text_features = self.text_encoder(
-                prompt_embeds, attn_mask, self.clip_model
-            )
+        prompt_embeds, attn_mask = self.prompt_learner()
+        text_features = self.text_encoder(
+            prompt_embeds, attn_mask, self.clip_model
+        )
         if normalize:
             text_features = text_features / text_features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
         return text_features
@@ -881,8 +645,6 @@ class CustomCLIP(BaseModel):
             template=self.template,
             class_specific_ctx=self.class_specific_ctx,
             parameterization=self.parameterization,
-            low_rank=self.low_rank,
-            low_rank_scaling=self.low_rank_scaling,
             method_config=self.method_config,
             device=self.device,
         )

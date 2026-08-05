@@ -11,7 +11,7 @@ SEISMOGRAPH 防御。
 
 | 模块 | 支持内容 |
 | --- | --- |
-| 联邦训练 | FedAvg、PromptFL、FedOTP、FedPGP、DP-FPL、FedASK |
+| 联邦训练 | FedAvg、PromptFL |
 | 数据划分 | IID、Dirichlet non-IID、pathological label split、全量和 few-shot 训练 |
 | 隐私审计 | 单客户端攻击和多客户端池化攻击；统一输出 AUC 与低 FPR 下的 TPR |
 | 隐私防御 | 更新扰动、稀疏化、Mixup、采样、数据增强、CoFedMID、Prompt-DP、MIST、SOFT、HAMP、VEIL |
@@ -77,19 +77,6 @@ Caltech256、FGVC-Aircraft 和 DTD。不同数据集的目录约定见
 
 ## 快速开始
 
-### 仅运行联邦提示学习
-
-以下命令使用 PromptFL 训练，不启用攻击或防御：
-
-```bash
-python main.py \
-  --config configs/federated_prompt_paper.yaml \
-  --aggregator promptfl
-```
-
-将 `promptfl` 替换为 `fedavg`、`fedotp`、`fedpgp`、`dpfpl` 或 `fedask`
-即可选择其他联邦方法。各方法专用参数位于配置文件的同名段中。
-
 ### CLIP 图像编码器 + 两层 MLP 的 FedAvg 基线
 
 该基线冻结完整 CLIP，只训练并聚合 `Linear -> ReLU -> Linear` 分类头，并使用
@@ -99,6 +86,10 @@ python main.py \
 ```bash
 python main.py --config configs/clip_mlp_fedavg.yaml
 ```
+
+当前性能配置使用训练 batch 128、缓存向量评估/审计 batch 512，并每 5 轮评估和
+审计一次（最后一轮始终补做）。原始图片的一次性 CLIP 编码仍单独使用
+`precompute_batch_size: 64`，因此增大向量 batch 不会同步放大视觉主干的显存峰值。
 
 也可以在命令行切换模型；`--model_type clip_mlp` 会自动选择普通集中式
 FedAvg、全量数据，并在未显式指定攻击时关闭隐私审计：
@@ -129,9 +120,18 @@ python main.py --model_type clip_mlp --attack fedmia_cosine
 python main.py --config configs/visual_adapter_privacy.yaml
 ```
 
+Visual Adapter 使用同一套预计算与缓存策略：CLIP 图像特征在启动时只计算一次，
+训练、周期评估及隐私审计均直接复用特征张量；低 FPR 审计还会直接引用 CPU 缓存，
+不再先复制到 GPU 后又复制回 CPU。
+
 CIFAR-100 与 Caltech101 默认使用 `a photo of a {class}.`；OxfordPets 使用
 `a photo of a {class}, a type of pet.`。可通过 `visual_adapter.template` 覆盖。
 命令行可使用 `--adapter_reduction` 和 `--adapter_alpha` 调整瓶颈与混合比例。
+
+`PromptFL` 是针对可训练 `prompt_learner` 定义的算法，不能直接应用到 MLP
+分类头或视觉 Adapter。两种
+冻结 CLIP 微调模型当前都使用普通集中式 FedAvg；它们之间可比较的是相同训练
+协议下的成员推理攻击，而不是把 prompt 专用的本地参数化强行替换到分类头上。
 
 论文 ProjRes 在第一层 MLP 参数上的严格单轮 FedSGD 实现使用独立入口。它只取
 `classifier.0.weight` 的一个真实 batch 更新，并以该层输入的 CLIP 表示计算
@@ -180,34 +180,49 @@ bash scripts/run_clip_mlp_fedmia_attacks.sh \
 `fpr_resolution` 会写入 `privacy_audit/summary.json`。严格 ProjRes 的成员仍只能
 来自产生上传梯度的实际 batch，但它也使用完整非成员池计算低 FPR 指标。
 
-### 运行单个攻击与防御
+Visual Adapter 对应的 16-shot 五数据集 sweep 使用相同参数接口，但不会运行
+MLP 专用的严格 ProjRes：
 
 ```bash
-python main.py \
-  --config configs/fedprompt_privacy.yaml \
-  --aggregator promptfl \
-  --attack fedmia_loss \
-  --defense none
+bash scripts/run_visual_adapter_fedmia_attacks.sh
 ```
 
-`--attack none` 可关闭攻击，`--defense none` 可关闭防御。也可以通过
-`--audit_attacks` 传入逗号分隔的多个攻击名称。
-
-### 运行 Few-shot 多客户端审计
+推荐使用统一的终极入口，一条命令依次完成 CLIP+MLP 和 CLIP+Adapter 的全部
+数据集 sweep；默认学习率统一为 `0.001`：
 
 ```bash
-./scripts/run_fedmia_prompt_methods_fewshot.sh
+bash scripts/run_all_clip_fedmia_attacks.sh
 ```
 
-该脚本默认运行 PromptFL。可覆盖方法、few-shot 数量、Dirichlet 系数和轮数：
+该入口默认运行两个模型和五个数据集。可通过 `--models clip_mlp` 或
+`--models visual_adapter` 只运行一个模型，并可用 `--learning-rate` 临时覆盖
+学习率。MLP 会额外运行严格 ProjRes，Adapter 会自动跳过这一架构专属攻击。
+
+常用筛选、覆盖和并行命令：
 
 ```bash
-./scripts/run_fedmia_prompt_methods_fewshot.sh \
-  --methods promptfl,fedotp,fedpgp \
-  --fpl-shots 8 \
-  --dirichlet-alpha 0.5 \
-  --rounds 75
+# 只打印两个模型的完整作业命令
+bash scripts/run_all_clip_fedmia_attacks.sh --dry-run
+
+# 只跑指定数据集与 FedMIA-I/II
+bash scripts/run_all_clip_fedmia_attacks.sh \
+  --datasets cifar100 \
+  --attacks fedmia_loss,fedmia_cosine
+
+# 两张 GPU 同时调度多个数据集作业
+bash scripts/run_all_clip_fedmia_attacks.sh --gpus 0,1 --jobs 2
+
+# 只运行 Adapter，并覆盖轮数与学习率
+bash scripts/run_all_clip_fedmia_attacks.sh \
+  --models visual_adapter \
+  --rounds 50 \
+  --learning-rate 0.0005
 ```
+
+两个 sweep 默认运行 `blackbox_loss`、`loss_series`、`grad_cosine`、
+`avg_cosine`、`fedmia_loss` 和 `fedmia_cosine`，并使用至少 1000 个非成员的
+`low_fpr_full` 协议。完整攻击集合仍分别使用
+`configs/clip_mlp_privacy.yaml` 和 `configs/visual_adapter_privacy.yaml`。
 
 ## 多客户端成员隐私审计
 
@@ -287,10 +302,8 @@ audit:
 - `defense`：独立防御名称和参数；
 - `results_dir`：运行输出根目录。
 
-命令行参数会覆盖 YAML 中对应字段。可用配置位于 [`configs/`](configs/)，
-联邦方法与防御的实现说明分别见
-[`docs/federated_methods.md`](docs/federated_methods.md) 和
-[`docs/defenses.md`](docs/defenses.md)。
+命令行参数会覆盖 YAML 中对应字段。`configs/` 只保留 CLIP-MLP 与 Visual
+Adapter 的单次运行、低 FPR sweep，以及 MLP 严格 ProjRes 配置。
 
 ## 输出文件
 

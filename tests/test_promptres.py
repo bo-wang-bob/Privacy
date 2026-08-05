@@ -1,14 +1,6 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import torch
-import yaml
-
-from analysis_scripts.run_fedmia_complex_sweep import (
-    build_jobs,
-    filter_jobs_by_method,
-)
 from analysis_scripts.verify_promptres_toy import run_toy_verification
 from main import default_config, validate_config
 from privacy_attacks.promptres import (
@@ -117,24 +109,3 @@ def test_promptres_rejects_background_rank_without_reference_client():
         assert "two clients" in str(error)
     else:
         raise AssertionError("PromptRes background unexpectedly accepted one client")
-
-
-def test_promptres_real_fewshot_sweep_matches_prompt_methods_design():
-    spec_path = Path("configs/promptres_prompt_methods_fewshot_sweep.yaml")
-    spec = yaml.safe_load(spec_path.read_text(encoding="utf-8"))
-    jobs, _ = build_jobs(spec, spec_path)
-    promptfl_jobs = filter_jobs_by_method(jobs, "promptfl")
-
-    assert len(jobs) == 45
-    assert len(promptfl_jobs) == 15
-    for job in promptfl_jobs:
-        validate_config(job.config)
-        assert job.config["fpl_shots"] == 16
-        assert job.config["num_global_iters"] == 50
-        assert job.config["audit"]["attacks"] == ["promptres"]
-        assert job.config["audit"]["audit_client_ids"] == "all"
-        assert job.config["audit"]["candidate_sampling"] == "fedmia_mix"
-        assert job.config["audit"]["nonmember_to_member_ratio"] == 1.0
-        assert job.config["audit"]["max_member_samples"] == 2048
-        assert job.config["audit"]["max_nonmember_samples"] == 2048
-        assert job.config["audit"]["match_candidate_labels"] is False

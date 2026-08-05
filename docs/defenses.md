@@ -19,33 +19,13 @@
 
 这些实现是针对“冻结 CLIP、只训练共享 CoOp prompt”的场景适配。SOFT 原论文处理文本，因此本仓库使用保持图像语义的视觉混淆；HAMP 原论文测试阶段使用随机低置信度分数重排，本仓库使用可微温度映射，使主动梯度攻击仍能正常运行并得到分数，而不是因输出不可导而失败。
 
-## 运行模式
-
-攻击与防御都通过命令行单独选择：
-
-```powershell
-# 一个攻击 + 一个防御
-python main.py --config configs/fedprompt_privacy_quick.yaml --attack fedmia_loss --defense cofedmid
-
-# 仅攻击
-python main.py --config configs/fedprompt_privacy_quick.yaml --attack pipra --defense none
-
-# 仅防御，不运行成员推理审计
-python main.py --config configs/fedprompt_privacy_quick.yaml --attack none --defense prompt_dp
-
-# 普通联邦 prompt 训练，不运行攻击和防御
-python main.py --config configs/fedprompt_privacy_quick.yaml --attack none --defense none
-```
-
-`--attack` 支持 `privacy_attacks/auditor.py` 中列出的全部攻击。旧的 `--audit_attacks a,b,c` 参数仍保留用于兼容批量审计，但新实验建议使用单数形式 `--attack`。
-
 ## 常用防御参数
 
 参数放在 YAML 的 `defense:` 节点中；命令行 `--defense` 只覆盖方法名。
 
 ### FedMIA 比较基线
 
-这六个基线只允许在共享模型的集中式 `FedAvg` 协议下单独运行；代码会拒绝把它们叠加到 DP-FPL、FedASK 或每客户端独立模型上，以免改变论文比较方法的含义。所有更新操作仅处理 `requires_grad=True` 的 prompt 参数，冻结的 CLIP 权重不会训练、稀疏化或加噪。
+这六个基线只允许在共享模型的集中式 `FedAvg` 协议下单独运行。所有更新操作仅处理 `requires_grad=True` 的 prompt 参数，冻结的 CLIP 权重不会训练、稀疏化或加噪。
 
 - `perturb_clip_norm`：上传前 prompt delta 的全局 L2 裁剪阈值；`perturb_noise_std`：裁剪后加入的高斯噪声绝对标准差。FedMIA 报告的噪声标准差范围为 0.01–0.5。
 - `sparse_ratio`：按绝对值从小到大置零的比例，取值 `[0, 1)`；论文考察 0.1–0.99。
@@ -53,7 +33,7 @@ python main.py --config configs/fedprompt_privacy_quick.yaml --attack none --def
 - `sampling_ratio`：每批保留的数据比例，取值 `(0, 1]`；论文考察 0.1–1.0。
 - `data_aug_strength`：随机平移幅度；`data_aug_flip_probability`：水平翻转概率；`data_aug_color_jitter`：亮度与对比度扰动强度。
 
-`data_aug` 没有重新调用图像处理器，而是在已归一化的 NCHW CLIP 输入上实施确定性可复现的张量变换，因此不需要数据集或模型特定的反归一化逻辑。正式比较配置见 `configs/fedmia_prompt_benchmark.yaml`。
+`data_aug` 没有重新调用图像处理器，而是在已归一化的 NCHW CLIP 输入上实施确定性可复现的张量变换，因此不需要数据集或模型特定的反归一化逻辑。
 
 ### CoFedMID
 
@@ -63,7 +43,7 @@ python main.py --config configs/fedprompt_privacy_quick.yaml --attack none --def
 - `cofedmid_entropy_weight`：回收样本置信度正则强度。
 - `cofedmid_exp3_gamma`：EXP3 探索强度。
 - `cofedmid_noise_std`：上传 prompt 的高斯扰动标准差。
-- `cofedmid_perturb_ratio`：从 prompt 尾部开始扰动的参数比例。FedAvg 下扰动按样本权重严格抵消；FedASK 只扰动 `B`，保持客户端 `A` 固定。DP-FPL 的全局更新随后还会经过裁剪，因此不宣称扰动严格中性。
+- `cofedmid_perturb_ratio`：从 prompt 尾部开始扰动的参数比例。FedAvg 下扰动按样本权重严格抵消。
 
 类别分配遵循论文 class-guided partition 的两个约束：防御联盟联合覆盖完整类别空间，且客户端子集之间的两两重叠尽量平衡。默认 CIFAR100、4 客户端、首轮 50 类/客户端时，最大两两重叠为 17 类；这避免了连续切片导致两个客户端类别子集完全相同。
 
