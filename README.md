@@ -161,15 +161,17 @@ bash scripts/run_clip_mlp_fedmia_attacks.sh \
   --dry-run
 ```
 
-每个作业开始时都会输出完整参数块，并把可复现配置保存到
-`results/clip_mlp_fedmia_attacks/runs/<run_id>/run_config.yaml`。默认攻击列表可通过
-`--attacks` 覆盖。
+每个训练任务都会创建一个新的时间戳目录，例如
+`results/2026-08-05_14-30-52-123456_clip_mlp_caltech101_fedavg_seed42_target0_<hash>/`。
+目录名同时标明任务启动时间、模型实现、数据集、联邦方法、随机种子和目标客户端；
+重新运行不会复用或覆盖之前的任务目录。可复现配置保存在该目录的
+`run_config.yaml`，默认攻击列表可通过 `--attacks` 覆盖。
 
 严格 ProjRes 结果写入每个作业的
 `privacy_audit/projres_strict.json`。可使用 `--projres-threshold` 调整阈值；仅运行
-通用审计攻击时传入 `--skip-projres`。普通攻击汇总写入
-`summary_by_run.csv` / `summary_aggregate.csv`，ProjRes 汇总写入
-`summary_projres.csv`；不会生成 HTML 文件。
+通用审计攻击时传入 `--skip-projres`。普通攻击汇总以实验组为文件名前缀写入
+`results/<实验组>_summary_by_run.csv` / `<实验组>_summary_aggregate.csv`，
+ProjRes 汇总写入 `<实验组>_summary_projres.csv`；不会生成 HTML 文件。
 
 该脚本默认加载 `configs/clip_mlp_fedmia_attacks_sweep.yaml`，其基础配置是
 `configs/clip_mlp_low_fpr_attacks.yaml`：通用攻击使用目标客户端
@@ -331,12 +333,12 @@ Adapter 的单次运行、低 FPR sweep，以及 MLP 严格 ProjRes 配置。
 `signal_storage` 可设置为 `none`、`compact` 或 `full`，用于控制审计信号的
 保存范围。
 
-通过 sweep 脚本启动时，每个任务只使用 `runs/<run_id>/` 一个目录。展开后的
-实际配置保存为其中的 `run_config.yaml`，标准输出和错误保存为其中的
-`run.log`，训练指标与审计结果也直接写入同一目录，不再创建独立的
-`configs/`、`launcher_logs/` 或时间戳子目录。完整超参数只保留在
-`run_config.yaml`，不在日志中重复打印。进度日志按 `eval_interval` 输出；
-逐轮详情仅在 DEBUG 级别记录。
+通过 sweep 脚本启动时，每个训练任务只使用一个
+`results/<时间>_<模型>_<数据集>_<方法>_seed<种子>_target<客户端>_<hash>/`
+目录。展开后的实际配置保存为其中的 `run_config.yaml`，标准输出和错误保存为
+其中的 `run.log`，训练指标、健康检查、隐私审计结果和 `projres_strict.log`
+也直接写入该任务目录，不再创建独立的 `configs/` 或 `launcher_logs/`。
+进度日志按 `eval_interval` 输出；逐轮详情仅在 DEBUG 级别记录。
 
 ## 测试
 

@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import datetime
 import hashlib
 import itertools
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -24,6 +26,9 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _OUTPUT_LOCK = threading.Lock()
+_CHILD_TIMESTAMP = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:,\d{3,6})?)\s+"
+)
 
 
 @dataclass(frozen=True)
@@ -62,14 +67,25 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _stable_run_id(config: dict[str, Any], dataset: str, seed: int, target: int) -> str:
+def _timestamped_run_id(
+    config: dict[str, Any],
+    dataset: str,
+    seed: int,
+    target: int,
+    started_at: datetime.datetime,
+) -> str:
     canonical = copy.deepcopy(config)
     canonical.pop("gpu", None)
     canonical.pop("results_dir", None)
     digest = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:10]
-    return f"{dataset}_none_seed{seed}_target{target}_{digest}"
+    timestamp = started_at.strftime("%Y-%m-%d_%H-%M-%S-%f")
+    model_type = str(config.get("model_type", "clip_mlp"))
+    method = str(config.get("aggregator", "fedavg")).lower()
+    return (
+        f"{timestamp}_{model_type}_{dataset}_{method}_seed{seed}_target{target}_{digest}"
+    )
 
 
 def build_jobs(
@@ -80,15 +96,15 @@ def build_jobs(
     num_global_iters: int | None = None,
     dirichlet_alpha: float | None = None,
     learning_rate: float | None = None,
+    started_at: datetime.datetime | None = None,
 ) -> tuple[list[SweepJob], Path]:
     del spec_path
     base_path = _resolve_path(
         spec.get("base_config", "configs/clip_mlp_low_fpr_attacks.yaml")
     )
     base = _deep_merge(_load_yaml(base_path), spec.get("common", {}))
-    results_root = _resolve_path(
-        spec.get("results_root", "results/clip_mlp_fedmia_attacks")
-    )
+    results_root = _resolve_path(spec.get("results_root", "results"))
+    sweep_name = str(spec.get("name", "clip_mlp_fedmia_attacks"))
     datasets = spec.get("datasets", [])
     if not isinstance(datasets, list) or not datasets:
         raise ValueError("sweep.datasets must be a non-empty list.")
@@ -101,6 +117,7 @@ def build_jobs(
         raise ValueError("The frozen-CLIP attack sweep supports defense=none only.")
 
     jobs = []
+    invocation_time = started_at or datetime.datetime.now()
     for entry, seed, target in itertools.product(datasets, seeds, targets):
         if not isinstance(entry, dict) or "name" not in entry:
             raise ValueError("Each dataset entry must be a mapping with a name.")
@@ -127,11 +144,14 @@ def build_jobs(
             config["learning_rate"] = learning_rate
         config["seed"] = seed
         config["aggregator"] = "fedavg"
+        config["sweep_name"] = sweep_name
         config["defense"] = _deep_merge(config.get("defense", {}), {"name": "none"})
         config.setdefault("audit", {})["target_client_id"] = target
         dataset = str(config["dataset_name"])
-        run_id = _stable_run_id(config, dataset, seed, target)
-        run_root = results_root / "runs" / run_id
+        run_id = _timestamped_run_id(
+            config, dataset, seed, target, invocation_time
+        )
+        run_root = results_root / run_id
         config["results_dir"] = str(run_root)
         config["results_dir_is_run_dir"] = True
         jobs.append(
@@ -148,6 +168,42 @@ def build_jobs(
             )
         )
     return jobs, results_root
+
+
+def discover_existing_jobs(
+    results_root: Path, sweep_name: str | None = None
+) -> list[SweepJob]:
+    """Reconstruct prior timestamped jobs for summarize-only runs."""
+    jobs = []
+    config_paths = list(results_root.glob("*/run_config.yaml"))
+    if sweep_name:
+        legacy_root = results_root / sweep_name / "runs"
+        config_paths.extend(legacy_root.glob("*/run_config.yaml"))
+    for config_path in sorted(set(config_paths)):
+        config = _load_yaml(config_path)
+        configured_sweep = config.get("sweep_name")
+        is_legacy_sweep_path = bool(
+            sweep_name
+            and config_path.parent.parent == results_root / sweep_name / "runs"
+        )
+        if sweep_name and configured_sweep != sweep_name and not is_legacy_sweep_path:
+            continue
+        run_root = config_path.parent
+        audit = config.get("audit", {})
+        jobs.append(
+            SweepJob(
+                run_id=run_root.name,
+                config=config,
+                dataset=str(config.get("dataset_name", "unknown")).lower(),
+                method=str(config.get("aggregator", "fedavg")).lower(),
+                seed=int(config.get("seed", 42)),
+                target_client_id=int(audit.get("target_client_id", 0)),
+                defense=str(config.get("defense", {}).get("name", "none")),
+                run_root=run_root,
+                config_path=config_path,
+            )
+        )
+    return jobs
 
 
 def filter_jobs_by_dataset(jobs: list[SweepJob], names: str | None) -> list[SweepJob]:
@@ -240,7 +296,9 @@ def _job_hyperparameters_block(job: SweepJob) -> str:
     return f"{divider}\nHYPERPARAMETERS | {job.run_id}\n{divider}\n{body}\n{divider}"
 
 
-def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
+def summarize(
+    jobs: list[SweepJob], results_root: Path, summary_prefix: str
+) -> tuple[int, int]:
     rows = []
     complete = 0
     for job in jobs:
@@ -284,7 +342,7 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         "tpr_at_fpr_0.001", "member_count", "nonmember_count",
         "fpr_resolution", "result_dir",
     ]
-    with (results_root / "summary_by_run.csv").open(
+    with (results_root / f"{summary_prefix}_summary_by_run.csv").open(
         "w", encoding="utf-8", newline=""
     ) as file:
         writer = csv.DictWriter(file, fieldnames=fields)
@@ -306,7 +364,7 @@ def summarize(jobs: list[SweepJob], results_root: Path) -> tuple[int, int]:
         "dataset", "attack", "runs", "final_accuracy_mean", "final_accuracy_std",
         "auc_mean", "auc_std", "tpr_at_fpr_0.001_mean", "tpr_at_fpr_0.001_std",
     ]
-    with (results_root / "summary_aggregate.csv").open(
+    with (results_root / f"{summary_prefix}_summary_aggregate.csv").open(
         "w", encoding="utf-8", newline=""
     ) as file:
         writer = csv.DictWriter(file, fieldnames=aggregate_fields)
@@ -372,6 +430,33 @@ def _command_text(command: list[str]) -> str:
     return shlex.join(command)
 
 
+def _log_context(job: SweepJob, phase: str, gpu: int) -> str:
+    model_type = str(job.config.get("model_type", "clip_mlp"))
+    return (
+        f"model={model_type} | dataset={job.dataset} | method={job.method} | "
+        f"run={job.run_id} | phase={phase} | gpu={gpu}"
+    )
+
+
+def _format_scoped_log_line(
+    line: str,
+    context: str,
+    *,
+    now: datetime.datetime | None = None,
+) -> str:
+    """Attach experiment identity to every child-process output line."""
+    text = line.rstrip("\r\n")
+    match = _CHILD_TIMESTAMP.match(text)
+    if match is not None:
+        timestamp = match.group("timestamp")
+        text = text[match.end() :]
+    else:
+        timestamp = (now or datetime.datetime.now()).strftime(
+            "%Y-%m-%d %H:%M:%S,%f"
+        )[:-3]
+    return f"{timestamp} | {context} | {text}\n"
+
+
 def _projres_parameters_block(job, projres: dict[str, Any]) -> str:
     divider = "=" * 88
     model_type = str(job.config.get("model_type", "clip_mlp"))
@@ -400,6 +485,7 @@ def _run_logged(
     log_path: Path,
     *,
     stream_output: bool = False,
+    context: str = "experiment=unknown",
 ) -> int:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     environment = os.environ.copy()
@@ -409,7 +495,11 @@ def _run_logged(
     environment["FEDMIA_LAUNCHER_LOG_CAPTURE"] = "1"
     environment.setdefault("TOKENIZERS_PARALLELISM", "false")
     with log_path.open("w", encoding="utf-8") as log_file:
-        log_file.write("COMMAND " + _command_text(command) + "\n")
+        log_file.write(
+            _format_scoped_log_line(
+                "COMMAND " + _command_text(command), context
+            )
+        )
         log_file.flush()
         if not stream_output:
             completed = subprocess.run(
@@ -433,10 +523,11 @@ def _run_logged(
         if process.stdout is None:
             raise RuntimeError("Failed to capture child-process output.")
         for line in process.stdout:
-            log_file.write(line)
+            formatted = _format_scoped_log_line(line, context)
+            log_file.write(formatted)
             log_file.flush()
             with _OUTPUT_LOCK:
-                sys.stdout.write(line)
+                sys.stdout.write(formatted)
                 sys.stdout.flush()
         return int(process.wait())
 
@@ -448,7 +539,10 @@ def _announce_job_start(
     skip_projres: bool,
 ) -> None:
     blocks = [
-        f"STARTING JOB | {job.run_id} | gpu:{gpu}",
+        (
+            f"STARTING JOB | {_log_context(job, 'all', gpu)} | "
+            f"seed={job.seed} | target_client={job.target_client_id}"
+        ),
         _job_hyperparameters_block(job),
     ]
     if not skip_projres and bool(projres.get("enabled", True)):
@@ -459,10 +553,12 @@ def _announce_job_start(
         print("\n".join(blocks), flush=True)
 
 
-def _announce_phase(job: SweepJob, phase: str, log_path: Path) -> None:
+def _announce_phase(
+    job: SweepJob, phase: str, phase_key: str, gpu: int, log_path: Path
+) -> None:
     with _OUTPUT_LOCK:
         print(
-            f"RUNNING {phase} | {job.run_id} | log={log_path}",
+            f"RUNNING {phase} | {_log_context(job, phase_key, gpu)} | log={log_path}",
             flush=True,
         )
 
@@ -485,21 +581,25 @@ def _run_job(
             if stale.is_file():
                 stale.unlink()
         main_log = job.run_root / "run.log"
-        _announce_phase(job, "FEDAVG + GENERIC AUDIT", main_log)
+        main_phase = "training+membership_audit"
+        _announce_phase(job, "FEDAVG + GENERIC AUDIT", main_phase, gpu, main_log)
         return_code = _run_logged(
             main_command,
             main_log,
             stream_output=stream_output,
+            context=_log_context(job, main_phase, gpu),
         )
         if return_code != 0 or _completed_result(job) is None:
             return job.run_id, False, "main.py failed"
     if projres_command is not None and (force or not _projres_path(job).is_file()):
         projres_log = job.run_root / "projres_strict.log"
-        _announce_phase(job, "STRICT PROJRES", projres_log)
+        projres_phase = "projres_strict"
+        _announce_phase(job, "STRICT PROJRES", projres_phase, gpu, projres_log)
         return_code = _run_logged(
             projres_command,
             projres_log,
             stream_output=stream_output,
+            context=_log_context(job, projres_phase, gpu),
         )
         if return_code != 0 or not _projres_path(job).is_file():
             return job.run_id, False, "strict ProjRes failed"
@@ -512,7 +612,7 @@ def _projres_metrics(payload: dict[str, Any]) -> dict[str, Any]:
     return payload["pooled_metrics"]
 
 
-def summarize_projres(jobs, results_root: Path) -> int:
+def summarize_projres(jobs, results_root: Path, summary_prefix: str) -> int:
     rows = []
     for job in jobs:
         path = _projres_path(job)
@@ -538,7 +638,7 @@ def summarize_projres(jobs, results_root: Path) -> int:
             }
         )
     results_root.mkdir(parents=True, exist_ok=True)
-    path = results_root / "summary_projres.csv"
+    path = results_root / f"{summary_prefix}_summary_projres.csv"
     fields = [
         "run_id",
         "dataset",
@@ -591,6 +691,7 @@ def main() -> int:
     args = parse_args()
     spec_path = _resolve_path(args.spec)
     spec = copy.deepcopy(_load_yaml(spec_path))
+    sweep_name = str(spec.get("name", "clip_mlp_fedmia_attacks"))
     if args.attacks is not None:
         spec.setdefault("common", {}).setdefault("audit", {})["attacks"] = (
             _parse_csv(args.attacks)
@@ -645,8 +746,17 @@ def main() -> int:
         print(f"Expanded {len(jobs)} jobs; results_root={results_root}")
         return 0
     if args.summarize_only:
-        complete, attack_rows = summarize(jobs, results_root)
-        projres_rows = summarize_projres(jobs, results_root) if projres_enabled else 0
+        jobs = filter_jobs_by_dataset(
+            discover_existing_jobs(results_root, sweep_name), args.datasets
+        )
+        if args.max_runs is not None:
+            jobs = jobs[-args.max_runs :]
+        complete, attack_rows = summarize(jobs, results_root, sweep_name)
+        projres_rows = (
+            summarize_projres(jobs, results_root, sweep_name)
+            if projres_enabled
+            else 0
+        )
         print(
             f"Summarized runs={complete}/{len(jobs)}, generic_rows={attack_rows}, "
             f"projres_rows={projres_rows}."
@@ -666,7 +776,7 @@ def main() -> int:
                 projres,
                 args.skip_projres,
                 args.force,
-                workers == 1,
+                True,
             ): job
             for index, job in enumerate(jobs)
         }
@@ -674,8 +784,12 @@ def main() -> int:
             run_id, succeeded, message = future.result()
             print(f"{'finished' if succeeded else 'FAILED'} {run_id}: {message}")
             failures += int(not succeeded)
-    complete, attack_rows = summarize(jobs, results_root)
-    projres_rows = summarize_projres(jobs, results_root) if projres_enabled else 0
+    complete, attack_rows = summarize(jobs, results_root, sweep_name)
+    projres_rows = (
+        summarize_projres(jobs, results_root, sweep_name)
+        if projres_enabled
+        else 0
+    )
     print(
         f"Summary complete: runs={complete}/{len(jobs)}, "
         f"generic_rows={attack_rows}, projres_rows={projres_rows}, failures={failures}"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 from pathlib import Path
 import shlex
 import subprocess
@@ -54,11 +55,19 @@ def test_visual_adapter_attack_sweep_has_five_16shot_jobs_with_projres():
 def test_visual_adapter_sweep_builds_valid_fpl_16shot_configs():
     with SPEC.open("r", encoding="utf-8") as file:
         spec = yaml.safe_load(file)
-    jobs, results_root = sweep.build_jobs(spec, SPEC)
+    started_at = datetime.datetime(2026, 8, 5, 14, 30, 52, 123456)
+    jobs, results_root = sweep.build_jobs(spec, SPEC, started_at=started_at)
 
     assert len(jobs) == 5
-    assert results_root == REPOSITORY_ROOT / "results" / "visual_adapter_fedmia_attacks"
+    assert results_root == REPOSITORY_ROOT / "results"
     for job in jobs:
+        assert job.run_id.startswith(
+            "2026-08-05_14-30-52-123456_visual_adapter_"
+        )
+        assert f"_{job.dataset}_fedavg_seed42_target0_" in job.run_id
+        assert job.run_root.name == job.run_id
+        assert job.run_root.parent == REPOSITORY_ROOT / "results"
+        assert job.config["sweep_name"] == "visual_adapter_fedmia_attacks"
         assert job.config["model_type"] == "visual_adapter"
         assert job.config["aggregator"] == "fedavg"
         assert job.config["fpl_shots"] == 16
@@ -71,6 +80,52 @@ def test_visual_adapter_sweep_builds_valid_fpl_16shot_configs():
         assert job.config["audit"]["audit_batch_size"] == 512
         assert job.config["audit"]["audit_interval"] == 5
         validate_config(job.config)
+
+
+def test_summarize_only_can_rediscover_timestamped_training_tasks(tmp_path):
+    run_root = (
+        tmp_path
+        / "2026-08-05_14-30-52-123456_clip_mlp_flowers_fedavg_seed7_target2_deadbeef00"
+    )
+    run_root.mkdir(parents=True)
+    config = {
+        "model_type": "clip_mlp",
+        "dataset_name": "flowers",
+        "aggregator": "fedavg",
+        "seed": 7,
+        "defense": {"name": "none"},
+        "audit": {"target_client_id": 2, "attacks": ["fedmia_loss"]},
+    }
+    with (run_root / "run_config.yaml").open("w", encoding="utf-8") as file:
+        yaml.safe_dump(config, file)
+
+    jobs = sweep.discover_existing_jobs(tmp_path)
+
+    assert len(jobs) == 1
+    assert jobs[0].run_root == run_root
+    assert jobs[0].dataset == "flowers"
+    assert jobs[0].seed == 7
+    assert jobs[0].target_client_id == 2
+
+
+def test_summarize_only_can_rediscover_legacy_grouped_tasks(tmp_path):
+    run_root = tmp_path / "clip_mlp_fedmia_attacks" / "runs" / "legacy_run"
+    run_root.mkdir(parents=True)
+    config = {
+        "model_type": "clip_mlp",
+        "dataset_name": "caltech101",
+        "aggregator": "fedavg",
+        "seed": 42,
+        "defense": {"name": "none"},
+        "audit": {"target_client_id": 0, "attacks": ["fedmia_loss"]},
+    }
+    with (run_root / "run_config.yaml").open("w", encoding="utf-8") as file:
+        yaml.safe_dump(config, file)
+
+    jobs = sweep.discover_existing_jobs(tmp_path, "clip_mlp_fedmia_attacks")
+
+    assert len(jobs) == 1
+    assert jobs[0].run_root == run_root
 
 
 def test_visual_adapter_attack_sweep_supports_common_overrides():

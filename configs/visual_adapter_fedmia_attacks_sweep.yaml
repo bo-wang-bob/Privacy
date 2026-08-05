@@ -1,6 +1,6 @@
 name: visual_adapter_fedmia_attacks
 base_config: configs/visual_adapter_low_fpr_attacks.yaml
-results_root: results/visual_adapter_fedmia_attacks
+results_root: results
 
 gpus: [0]
 jobs: 1

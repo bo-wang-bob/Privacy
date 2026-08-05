@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import datetime
 import shlex
 import subprocess
 import sys
@@ -114,13 +115,15 @@ def test_normal_run_prints_parameters_only_when_each_job_starts(
 
     sweep._run_job(first, 0, {"enabled": False}, True, False)
     first_output = capsys.readouterr().out
-    assert "STARTING JOB | first_dataset_run | gpu:0" in first_output
+    assert "model=clip_mlp | dataset=first_dataset" in first_output
+    assert "run=first_dataset_run | phase=all | gpu=0" in first_output
     assert "first_dataset" in first_output
     assert "second_dataset" not in first_output
 
     sweep._run_job(second, 1, {"enabled": False}, True, False)
     second_output = capsys.readouterr().out
-    assert "STARTING JOB | second_dataset_run | gpu:1" in second_output
+    assert "model=clip_mlp | dataset=second_dataset" in second_output
+    assert "run=second_dataset_run | phase=all | gpu=1" in second_output
     assert "second_dataset" in second_output
     assert "first_dataset" not in second_output
 
@@ -133,10 +136,36 @@ def test_single_job_log_runner_tees_child_output_to_terminal_and_file(
         [sys.executable, "-c", "print('live training progress')"],
         log_path,
         stream_output=True,
+        context="model=clip_mlp | dataset=flowers | run=test | phase=train | gpu=0",
     )
 
     assert return_code == 0
     assert "live training progress" in capsys.readouterr().out
     log_text = log_path.read_text(encoding="utf-8")
-    assert log_text.startswith("COMMAND ")
+    assert "| model=clip_mlp | dataset=flowers | run=test | phase=train | gpu=0 | COMMAND " in log_text
     assert "live training progress" in log_text
+
+
+def test_scoped_log_line_reuses_child_timestamp_and_adds_experiment_identity():
+    line = sweep._format_scoped_log_line(
+        "2026-08-05 12:34:56,789 INFO trainer: round=1\n",
+        "model=visual_adapter | dataset=food101 | run=abc | phase=train | gpu=1",
+    )
+
+    assert line == (
+        "2026-08-05 12:34:56,789 | model=visual_adapter | dataset=food101 | "
+        "run=abc | phase=train | gpu=1 | INFO trainer: round=1\n"
+    )
+
+
+def test_scoped_log_line_timestamps_plain_child_output():
+    line = sweep._format_scoped_log_line(
+        "plain progress\n",
+        "model=clip_mlp | dataset=cifar100 | run=xyz | phase=projres | gpu=0",
+        now=datetime.datetime(2026, 8, 5, 12, 34, 56, 123000),
+    )
+
+    assert line == (
+        "2026-08-05 12:34:56,123 | model=clip_mlp | dataset=cifar100 | "
+        "run=xyz | phase=projres | gpu=0 | plain progress\n"
+    )

@@ -1,6 +1,6 @@
 name: clip_mlp_fedmia_attacks
 base_config: configs/clip_mlp_low_fpr_attacks.yaml
-results_root: results/clip_mlp_fedmia_attacks
+results_root: results
 
 gpus: [0]
 jobs: 1
