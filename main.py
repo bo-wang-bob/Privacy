@@ -300,6 +300,25 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "audit.low_fpr_min_nonmembers must be at least 1000."
             )
+        low_fpr_min_nonmembers = int(
+            audit.get("low_fpr_min_nonmembers", 1000)
+        )
+        low_fpr_max_members = int(audit.get("low_fpr_max_members", 0))
+        low_fpr_max_nonmembers = int(
+            audit.get("low_fpr_max_nonmembers", 0)
+        )
+        if low_fpr_max_members < 0 or low_fpr_max_members == 1:
+            raise ValueError(
+                "audit.low_fpr_max_members must be 0 (unlimited) or at least 2."
+            )
+        if (
+            low_fpr_max_nonmembers < 0
+            or 0 < low_fpr_max_nonmembers < low_fpr_min_nonmembers
+        ):
+            raise ValueError(
+                "audit.low_fpr_max_nonmembers must be 0 (unlimited) or at "
+                "least audit.low_fpr_min_nonmembers."
+            )
     if pooled_audit and attacks - POOLED_CLIENT_ATTACKS:
         raise ValueError(
             "Multi-client pooled auditing currently supports only: "
@@ -811,6 +830,9 @@ def default_config() -> dict:
             "candidate_sampling": "legacy",
             "nonmember_to_member_ratio": 1.0,
             "match_candidate_labels": False,
+            "low_fpr_min_nonmembers": 1000,
+            "low_fpr_max_members": 0,
+            "low_fpr_max_nonmembers": 0,
             "signal_storage": "compact",
             "fedmia_tail": "upper",
             "fedmia_tail_calibration_fraction": 0.25,

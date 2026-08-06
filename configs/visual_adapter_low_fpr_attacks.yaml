@@ -21,7 +21,9 @@ visual_adapter:
   precompute_batch_size: 64
   template: null
 
-partition_mode: dirichlet
+# Use an IID client split so membership is not confounded by client label skew.
+partition_mode: iid
+# Retained for config/CLI compatibility; ignored when partition_mode=iid.
 dirichlet_alpha: 0.1
 use_full_dataset: false
 fpl_shots: 16
@@ -48,6 +50,8 @@ audit:
     - fedmia_cosine
   candidate_sampling: low_fpr_full
   low_fpr_min_nonmembers: 1000
+  low_fpr_max_members: 5000
+  low_fpr_max_nonmembers: 20000
   match_candidate_labels: false
   audit_batch_size: 512
   audit_interval: 5

@@ -37,6 +37,9 @@ def test_ultimate_sweep_expands_both_models_all_datasets_and_mlp_projres():
     assert output.count("optimization.learning_rate") == 10
     assert len(re.findall(r"optimization\.learning_rate\s+: 0\.1$", output, re.M)) == 5
     assert len(re.findall(r"optimization\.learning_rate\s+: 0\.01$", output, re.M)) == 5
+    assert len(re.findall(r"data\.partition_mode\s+: iid$", output, re.M)) == 10
+    assert output.count("privacy_audit.low_fpr_max_members") == 10
+    assert output.count("privacy_audit.low_fpr_max_nonmembers") == 10
     assert output.count("privacy_audit.audit_interval") == 10
     assert output.count("privacy_audit.attack_audit_intervals.loss_series") == 10
     assert output.count("privacy_audit.attack_audit_intervals.avg_cosine") == 10

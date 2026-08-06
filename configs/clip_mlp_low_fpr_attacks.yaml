@@ -20,7 +20,9 @@ clip_mlp:
   # Keep raw-image CLIP encoding separate from the larger cached-vector batches.
   precompute_batch_size: 64
 
-partition_mode: dirichlet
+# Use an IID client split so membership is not confounded by client label skew.
+partition_mode: iid
+# Retained for config/CLI compatibility; ignored when partition_mode=iid.
 dirichlet_alpha: 0.1
 use_full_dataset: true
 fpl_shots: null
@@ -45,10 +47,12 @@ audit:
     - avg_cosine
     - fedmia_loss
     - fedmia_cosine
-  # Use every target-client training example as a member. Use every disjoint
-  # test example and every other-client training example as a non-member.
+  # Build the candidate pool from every target-client member and every disjoint
+  # non-member, then apply deterministic class-stratified caps when needed.
   candidate_sampling: low_fpr_full
   low_fpr_min_nonmembers: 1000
+  low_fpr_max_members: 5000
+  low_fpr_max_nonmembers: 20000
   match_candidate_labels: false
   audit_batch_size: 512
   audit_interval: 5

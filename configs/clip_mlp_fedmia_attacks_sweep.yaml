@@ -42,7 +42,10 @@ common:
   data_root: ./data
   cache_dir: ./checkpoints/clip-vit-base-patch32
   require_cuda: true
-  partition_mode: dirichlet
+  # Use an IID client split for record-level MIA evaluation. This avoids
+  # letting attacks exploit the target client's non-IID label distribution.
+  partition_mode: iid
+  # Retained for config/CLI compatibility; ignored when partition_mode=iid.
   dirichlet_alpha: 0.1
   use_full_dataset: true
   fpl_shots: null
@@ -72,6 +75,9 @@ common:
       - fedmia_cosine
     candidate_sampling: low_fpr_full
     low_fpr_min_nonmembers: 1000
+    # Deterministic class-stratified caps. Smaller datasets still use all data.
+    low_fpr_max_members: 5000
+    low_fpr_max_nonmembers: 20000
     match_candidate_labels: false
     audit_batch_size: 512
     audit_interval: 5

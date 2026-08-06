@@ -188,6 +188,32 @@ def test_clip_mlp_config_requires_plain_full_dataset_fedavg():
         validate_config(invalid)
 
 
+def test_low_fpr_candidate_caps_must_preserve_minimum_fpr_resolution():
+    config = default_config()
+    config.update(
+        {
+            "model_type": "clip_mlp",
+            "aggregator": "fedavg",
+            "train_mode": "centralized",
+            "use_full_dataset": True,
+            "fpl_shots": None,
+        }
+    )
+    config["audit"].update(
+        {
+            "enabled": True,
+            "attacks": ["blackbox_loss"],
+            "candidate_sampling": "low_fpr_full",
+            "low_fpr_min_nonmembers": 1000,
+            "low_fpr_max_members": 5000,
+            "low_fpr_max_nonmembers": 999,
+        }
+    )
+
+    with pytest.raises(ValueError, match="low_fpr_max_nonmembers"):
+        validate_config(config)
+
+
 def test_clip_mlp_runs_complete_fedavg_training_and_saves_only_mlp(tmp_path):
     images = torch.randn(12, 1, 2, 3)
     labels = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2])
@@ -330,6 +356,81 @@ def test_clip_mlp_low_fpr_full_uses_all_candidates_and_caches_clip(tmp_path):
     assert observation["confidence"].shape == (2, 1027)
     assert observation["cosine"].shape == (2, 1027)
     assert model.clip_model.encoded_samples == encoded_before_outputs
+
+
+def test_clip_mlp_low_fpr_caps_use_reproducible_stratified_candidates(tmp_path):
+    def features(count: int, offset: int = 0) -> TensorDataset:
+        labels = (torch.arange(count) + offset) % 4
+        vectors = torch.arange(count * 4, dtype=torch.float32).reshape(count, 4)
+        return TensorDataset(vectors, labels)
+
+    users = [
+        SimpleNamespace(
+            id=0,
+            train_data=features(120),
+            test_data=features(550),
+        ),
+        SimpleNamespace(
+            id=1,
+            train_data=features(200, 1),
+            test_data=features(550, 2),
+        ),
+    ]
+    config = {
+        "enabled": True,
+        "attacks": ["blackbox_loss"],
+        "candidate_sampling": "low_fpr_full",
+        "low_fpr_min_nonmembers": 1000,
+        "low_fpr_max_members": 50,
+        "low_fpr_max_nonmembers": 1000,
+        "audit_batch_size": 512,
+        "seed": 17,
+    }
+
+    first = MembershipAuditor(
+        model=_model(),
+        users=users,
+        target_client_id=0,
+        device=torch.device("cpu"),
+        results_dir=str(tmp_path / "first"),
+        config=config,
+        defense_config={"name": "none"},
+        federated_method="fedavg",
+        num_classes=4,
+    )
+    second = MembershipAuditor(
+        model=_model(),
+        users=users,
+        target_client_id=0,
+        device=torch.device("cpu"),
+        results_dir=str(tmp_path / "second"),
+        config=config,
+        defense_config={"name": "none"},
+        federated_method="fedavg",
+        num_classes=4,
+    )
+
+    assert first.images.shape == (1050, 4)
+    assert int((first.membership == 1).sum()) == 50
+    assert int((first.membership == 0).sum()) == 1000
+    assert torch.equal(first.images, second.images)
+    assert torch.equal(
+        first.low_fpr_candidate_selection["member_pool_indices"],
+        second.low_fpr_candidate_selection["member_pool_indices"],
+    )
+    assert torch.equal(
+        first.low_fpr_candidate_selection["nonmember_pool_indices"],
+        second.low_fpr_candidate_selection["nonmember_pool_indices"],
+    )
+    sampling = first.candidate_sampling_by_client["0"]
+    assert sampling["member_pool_count"] == 120
+    assert sampling["nonmember_pool_count"] == 1300
+    assert sum(sampling["member_source_counts"].values()) == 50
+    assert sum(sampling["nonmember_source_counts"].values()) == 1000
+    member_histogram = torch.bincount(first.labels[:50], minlength=4)
+    nonmember_histogram = torch.bincount(first.labels[50:], minlength=4)
+    assert int(member_histogram.max() - member_histogram.min()) <= 1
+    assert int(nonmember_histogram.max() - nonmember_histogram.min()) <= 1
 
 
 def test_clip_mlp_low_fpr_reuses_precomputed_cpu_feature_tensors(tmp_path):

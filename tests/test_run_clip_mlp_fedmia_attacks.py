@@ -47,6 +47,7 @@ def test_mlp_attack_sweep_has_five_datasets_and_two_phases_per_dataset():
         assert f"dataset" in output and dataset in output
         assert any(dataset in command[command.index("--config") + 1] for command in commands)
     assert "clip_mlp.precompute_features" in output
+    assert "data.partition_mode" in output and ": iid" in output
     assert "optimization.batch_size" in output and ": 128" in output
     assert "optimization.learning_rate" in output and ": 0.001" in output
     assert "optimization.eval_batch_size" in output and ": 512" in output
@@ -54,6 +55,11 @@ def test_mlp_attack_sweep_has_five_datasets_and_two_phases_per_dataset():
     assert "clip_mlp.precompute_batch_size" in output and ": 64" in output
     assert "privacy_audit.audit_interval" in output
     assert "privacy_audit.audit_batch_size" in output
+    assert "privacy_audit.low_fpr_max_members" in output and ": 5000" in output
+    assert (
+        "privacy_audit.low_fpr_max_nonmembers" in output
+        and ": 20000" in output
+    )
     assert "blackbox_loss, loss_series, grad_cosine, avg_cosine" in output
 
 

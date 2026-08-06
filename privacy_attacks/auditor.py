@@ -330,12 +330,42 @@ class MembershipAuditor:
                 "FedMIA mix sampling reproduces the reference evaluation and "
                 "therefore requires match_candidate_labels=false."
             )
+        self.low_fpr_min_nonmembers = int(
+            self.config.get("low_fpr_min_nonmembers", 1000)
+        )
+        self.low_fpr_max_members = int(
+            self.config.get("low_fpr_max_members", 0)
+        )
+        self.low_fpr_max_nonmembers = int(
+            self.config.get("low_fpr_max_nonmembers", 0)
+        )
+        if self.candidate_sampling_mode == "low_fpr_full":
+            if self.low_fpr_min_nonmembers < 1000:
+                raise ValueError(
+                    "low_fpr_min_nonmembers must be at least 1000 to resolve "
+                    "0.1% FPR."
+                )
+            if self.low_fpr_max_members < 0 or self.low_fpr_max_members == 1:
+                raise ValueError(
+                    "low_fpr_max_members must be 0 (unlimited) or at least 2."
+                )
+            if (
+                self.low_fpr_max_nonmembers < 0
+                or 0
+                < self.low_fpr_max_nonmembers
+                < self.low_fpr_min_nonmembers
+            ):
+                raise ValueError(
+                    "low_fpr_max_nonmembers must be 0 (unlimited) or at least "
+                    "low_fpr_min_nonmembers."
+                )
         if self.audit_interval <= 0 or self.audit_batch_size <= 0:
             raise ValueError("audit_interval and audit_batch_size must be positive.")
         self.observations: list[dict] = []
         self.results = []
         self.errors: dict[str, str] = {}
         self.candidate_inputs_are_features = False
+        self.low_fpr_candidate_selection: dict | None = None
 
         if self.enabled:
             if self.candidate_sampling_mode == "low_fpr_full":
@@ -646,10 +676,67 @@ class MembershipAuditor:
             raise ValueError("Each low-FPR membership group needs two candidates.")
         return torch.cat(feature_parts), torch.cat(label_parts), source_counts
 
+    @staticmethod
+    def _stratified_subsample_indices(
+        labels: torch.Tensor,
+        maximum: int,
+        seed: int,
+    ) -> torch.Tensor:
+        """Select an exact-size proportional, deterministic stratified sample."""
+        labels = labels.detach().cpu().long().reshape(-1)
+        sample_count = int(labels.numel())
+        if maximum <= 0 or sample_count <= maximum:
+            return torch.arange(sample_count, dtype=torch.long)
+
+        classes, counts = torch.unique(labels, sorted=True, return_counts=True)
+        ideal = counts.to(torch.float64) * (float(maximum) / sample_count)
+        allocation = torch.floor(ideal).to(torch.long)
+        remaining = maximum - int(allocation.sum())
+        if remaining:
+            fractions = (ideal - allocation).tolist()
+            order = sorted(
+                range(len(classes)),
+                key=lambda index: (-fractions[index], int(classes[index])),
+            )
+            for index in order[:remaining]:
+                allocation[index] += 1
+
+        generator = torch.Generator().manual_seed(int(seed))
+        selected_parts = []
+        for class_id, class_sample_count in zip(classes, allocation):
+            take = int(class_sample_count)
+            if take == 0:
+                continue
+            class_indices = torch.nonzero(
+                labels == class_id, as_tuple=False
+            ).flatten()
+            order = torch.randperm(class_indices.numel(), generator=generator)
+            selected_parts.append(class_indices[order[:take]])
+        selected = torch.cat(selected_parts)
+        order = torch.randperm(selected.numel(), generator=generator)
+        return selected[order]
+
+    @staticmethod
+    def _selected_source_counts(
+        selected_indices: torch.Tensor,
+        source_counts: dict[str, int],
+    ) -> dict[str, int]:
+        """Count selected pool positions using source-order boundaries."""
+        selected_indices = selected_indices.detach().cpu().long()
+        selected_counts = {}
+        start = 0
+        for source, count in source_counts.items():
+            stop = start + int(count)
+            selected_counts[source] = int(
+                ((selected_indices >= start) & (selected_indices < stop)).sum()
+            )
+            start = stop
+        return selected_counts
+
     def _initialize_low_fpr_full_candidates(
         self, users: list, target_client_id: int
     ) -> None:
-        """Use all target members and all disjoint non-members for low FPR."""
+        """Build the full low-FPR pool, then apply reproducible optional caps."""
         supported = {
             "blackbox_loss",
             "loss_series",
@@ -690,19 +777,61 @@ class MembershipAuditor:
                 nonmember_datasets, nonmember_source_names
             )
         )
-        minimum_nonmembers = int(
-            self.config.get("low_fpr_min_nonmembers", 1000)
-        )
-        if minimum_nonmembers < 1000:
-            raise ValueError(
-                "low_fpr_min_nonmembers must be at least 1000 to resolve 0.1% FPR."
-            )
+        minimum_nonmembers = self.low_fpr_min_nonmembers
         if nonmember_labels.numel() < minimum_nonmembers:
             raise ValueError(
                 "low_fpr_full needs at least "
                 f"{minimum_nonmembers} non-members, but only found "
                 f"{nonmember_labels.numel()}."
             )
+        member_pool_count = int(member_labels.numel())
+        nonmember_pool_count = int(nonmember_labels.numel())
+        member_pool_indices = self._stratified_subsample_indices(
+            member_labels,
+            self.low_fpr_max_members,
+            self.seed + 104729,
+        )
+        nonmember_pool_indices = self._stratified_subsample_indices(
+            nonmember_labels,
+            self.low_fpr_max_nonmembers,
+            self.seed + 130363,
+        )
+        selected_member_sources = self._selected_source_counts(
+            member_pool_indices, member_sources
+        )
+        selected_nonmember_sources = self._selected_source_counts(
+            nonmember_pool_indices, nonmember_sources
+        )
+        member_features = member_features.index_select(0, member_pool_indices)
+        member_labels = member_labels.index_select(0, member_pool_indices)
+        nonmember_features = nonmember_features.index_select(
+            0, nonmember_pool_indices
+        )
+        nonmember_labels = nonmember_labels.index_select(
+            0, nonmember_pool_indices
+        )
+        self.low_fpr_candidate_selection = {
+            "seed": self.seed,
+            "member_sampling_seed": self.seed + 104729,
+            "nonmember_sampling_seed": self.seed + 130363,
+            "index_convention": (
+                "zero-based positions in each complete concatenated candidate "
+                "pool; source boundaries follow the ordered pool_source_counts"
+            ),
+            "member_pool_indices": member_pool_indices,
+            "nonmember_pool_indices": nonmember_pool_indices,
+            "member_pool_source_counts": member_sources,
+            "nonmember_pool_source_counts": nonmember_sources,
+        }
+        logger.info(
+            "Low-FPR audit candidates selected: members=%d/%d, "
+            "non-members=%d/%d, stratified_seed=%d",
+            int(member_labels.numel()),
+            member_pool_count,
+            int(nonmember_labels.numel()),
+            nonmember_pool_count,
+            self.seed,
+        )
         self.images = torch.cat((member_features, nonmember_features))
         self.labels = torch.cat((member_labels, nonmember_labels))
         self.membership = torch.cat(
@@ -720,9 +849,18 @@ class MembershipAuditor:
                 "mode": "low_fpr_full",
                 "member_count": int(member_labels.numel()),
                 "nonmember_count": int(nonmember_labels.numel()),
-                "member_source_counts": member_sources,
-                "nonmember_source_counts": nonmember_sources,
+                "member_pool_count": member_pool_count,
+                "nonmember_pool_count": nonmember_pool_count,
+                "member_source_counts": selected_member_sources,
+                "nonmember_source_counts": selected_nonmember_sources,
+                "member_pool_source_counts": member_sources,
+                "nonmember_pool_source_counts": nonmember_sources,
                 "minimum_nonmembers": minimum_nonmembers,
+                "maximum_members": self.low_fpr_max_members,
+                "maximum_nonmembers": self.low_fpr_max_nonmembers,
+                "selection_seed": self.seed,
+                "selection_method": "proportional_class_stratified_without_replacement",
+                "selection_artifact": "candidate_selection.pt",
                 "fpr_resolution": 1.0 / int(nonmember_labels.numel()),
             }
         }
@@ -2127,6 +2265,14 @@ class MembershipAuditor:
         if not self.enabled:
             return []
         os.makedirs(self.results_dir, exist_ok=True)
+        low_fpr_candidate_selection = getattr(
+            self, "low_fpr_candidate_selection", None
+        )
+        if low_fpr_candidate_selection is not None:
+            torch.save(
+                low_fpr_candidate_selection,
+                os.path.join(self.results_dir, "candidate_selection.pt"),
+            )
         final_model = copy.deepcopy(final_model).to(self.device)
         final_model.load_state_dict(final_state, strict=False)
         if self.defense_name == "hamp":

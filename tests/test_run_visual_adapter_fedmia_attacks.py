@@ -47,6 +47,12 @@ def test_visual_adapter_attack_sweep_has_five_16shot_jobs_with_projres():
     assert "adapter.net.0.weight" in output
     assert "model_type" in output and "visual_adapter" in output
     assert "visual_adapter.precompute_features" in output
+    assert "data.partition_mode" in output and ": iid" in output
+    assert "privacy_audit.low_fpr_max_members" in output and ": 5000" in output
+    assert (
+        "privacy_audit.low_fpr_max_nonmembers" in output
+        and ": 20000" in output
+    )
     assert "blackbox_loss, loss_series, grad_cosine, avg_cosine" in output
     for dataset in ("caltech101", "oxfordpets", "flowers", "food101", "cifar100"):
         assert dataset in output
@@ -72,7 +78,10 @@ def test_visual_adapter_sweep_builds_valid_fpl_16shot_configs():
         assert job.config["aggregator"] == "fedavg"
         assert job.config["fpl_shots"] == 16
         assert job.config["use_full_dataset"] is False
+        assert job.config["partition_mode"] == "iid"
         assert job.config["audit"]["candidate_sampling"] == "low_fpr_full"
+        assert job.config["audit"]["low_fpr_max_members"] == 5000
+        assert job.config["audit"]["low_fpr_max_nonmembers"] == 20000
         assert job.config["batch_size"] == 128
         assert job.config["eval_batch_size"] == 512
         assert job.config["eval_interval"] == 5
