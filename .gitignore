@@ -5,6 +5,7 @@ checkpoints
 saved_models/
 analysis_reports/
 analysis_scripts/
+tests/
 AGENTS.md
 paper/
 
