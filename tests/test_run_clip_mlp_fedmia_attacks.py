@@ -6,14 +6,18 @@ import shlex
 import subprocess
 import sys
 
+import yaml
+
 from scripts import run_clip_mlp_fedmia_sweep as sweep
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (
-    Path(__file__).resolve().parents[1]
+    REPOSITORY_ROOT
     / "scripts"
     / "run_clip_mlp_fedmia_attacks.sh"
 )
+SPEC = REPOSITORY_ROOT / "configs" / "clip_mlp_fedmia_attacks_sweep.yaml"
 
 
 def _dry_run(*arguments: str) -> tuple[str, list[list[str]]]:
@@ -48,8 +52,13 @@ def test_mlp_attack_sweep_has_five_datasets_and_two_phases_per_dataset():
         assert any(dataset in command[command.index("--config") + 1] for command in commands)
     assert "clip_mlp.precompute_features" in output
     assert "data.partition_mode" in output and ": iid" in output
-    assert "optimization.batch_size" in output and ": 128" in output
+    assert "optimization.batch_size" in output and ": 32" in output
     assert "optimization.learning_rate" in output and ": 0.001" in output
+    assert "optimization.learning_rate_decay" in output and ": 0.99" in output
+    assert (
+        "optimization.learning_rate_decay_interval" in output
+        and ": 5" in output
+    )
     assert "optimization.eval_batch_size" in output and ": 512" in output
     assert "optimization.eval_interval" in output and ": 5" in output
     assert "clip_mlp.precompute_batch_size" in output and ": 64" in output
@@ -61,6 +70,29 @@ def test_mlp_attack_sweep_has_five_datasets_and_two_phases_per_dataset():
         and ": 20000" in output
     )
     assert "blackbox_loss, loss_series, grad_cosine, avg_cosine" in output
+
+
+def test_mlp_dataset_defaults_match_fedmia_training_and_audit_schedule():
+    with SPEC.open("r", encoding="utf-8") as file:
+        spec = yaml.safe_load(file)
+
+    jobs, _ = sweep.build_jobs(spec, SPEC)
+    assert len(jobs) == 5
+    for job in jobs:
+        assert job.config["total_users"] == 10
+        assert job.config["sample_users"] == 10
+        assert job.config["num_global_iters"] == 300
+        assert job.config["local_epochs"] == 1
+        assert job.config["batch_size"] == 32
+        assert job.config["learning_rate_decay"] == 0.99
+        assert job.config["learning_rate_decay_interval"] == 5
+        for attack in (
+            "loss_series",
+            "avg_cosine",
+            "fedmia_loss",
+            "fedmia_cosine",
+        ):
+            assert job.config["audit"]["attack_audit_intervals"][attack] == 10
 
 
 def test_mlp_attack_sweep_supports_filters_overrides_and_prints_parameters():

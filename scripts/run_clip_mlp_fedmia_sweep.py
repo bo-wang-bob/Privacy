@@ -96,6 +96,8 @@ def build_jobs(
     num_global_iters: int | None = None,
     dirichlet_alpha: float | None = None,
     learning_rate: float | None = None,
+    learning_rate_decay: float | None = None,
+    learning_rate_decay_interval: int | None = None,
     started_at: datetime.datetime | None = None,
 ) -> tuple[list[SweepJob], Path]:
     del spec_path
@@ -142,6 +144,16 @@ def build_jobs(
             if learning_rate <= 0:
                 raise ValueError("--learning-rate must be positive.")
             config["learning_rate"] = learning_rate
+        if learning_rate_decay is not None:
+            if not 0 < learning_rate_decay <= 1:
+                raise ValueError("--learning-rate-decay must be in (0, 1].")
+            config["learning_rate_decay"] = learning_rate_decay
+        if learning_rate_decay_interval is not None:
+            if learning_rate_decay_interval <= 0:
+                raise ValueError(
+                    "--learning-rate-decay-interval must be positive."
+                )
+            config["learning_rate_decay_interval"] = learning_rate_decay_interval
         config["seed"] = seed
         config["aggregator"] = "fedavg"
         config["sweep_name"] = sweep_name
@@ -282,6 +294,10 @@ def _job_hyperparameters_block(job: SweepJob) -> str:
         },
         "optimization": {
             "learning_rate": config.get("learning_rate"),
+            "learning_rate_decay": config.get("learning_rate_decay", 1.0),
+            "learning_rate_decay_interval": config.get(
+                "learning_rate_decay_interval", 1
+            ),
             "batch_size": config.get("batch_size"),
             "eval_batch_size": config.get("eval_batch_size"),
             "eval_interval": config.get("eval_interval"),
@@ -675,6 +691,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds", "--num-global-iters", type=int)
     parser.add_argument("--dirichlet-alpha", type=float)
     parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--learning-rate-decay", type=float)
+    parser.add_argument("--learning-rate-decay-interval", type=int)
     parser.add_argument("--projres-threshold", type=float)
     parser.add_argument("--projres-max-candidates", type=int)
     parser.add_argument("--projres-min-out", type=int)
@@ -722,6 +740,8 @@ def main() -> int:
         num_global_iters=args.rounds,
         dirichlet_alpha=args.dirichlet_alpha,
         learning_rate=args.learning_rate,
+        learning_rate_decay=args.learning_rate_decay,
+        learning_rate_decay_interval=args.learning_rate_decay_interval,
     )
     jobs = filter_jobs_by_dataset(jobs, args.datasets)
     if args.max_runs is not None:

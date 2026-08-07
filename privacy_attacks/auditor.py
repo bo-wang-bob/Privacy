@@ -1287,8 +1287,11 @@ class MembershipAuditor:
         is_final_round = (
             self.total_rounds > 0 and round_index == self.total_rounds - 1
         )
+        # ``round_index`` is zero-based but an interval describes completed
+        # communication rounds. For example, interval=10 observes rounds
+        # 10, 20, ... at indices 9, 19, ... rather than indices 0, 10, ....
         return is_final_round or (
-            round_index % self._audit_interval_for_attack(attack) == 0
+            (round_index + 1) % self._audit_interval_for_attack(attack) == 0
         )
 
     def _attacks_for_round(self, round_index: int) -> list[str]:
@@ -1326,6 +1329,7 @@ class MembershipAuditor:
         return {
             "mode": "interval",
             "interval": self._audit_interval_for_attack(attack),
+            "interval_basis": "completed_rounds",
             "include_final_round": self.total_rounds > 0,
         }
 
@@ -2273,6 +2277,7 @@ class MembershipAuditor:
                 low_fpr_candidate_selection,
                 os.path.join(self.results_dir, "candidate_selection.pt"),
             )
+        candidate_clip_features = self._save_candidate_clip_features()
         final_model = copy.deepcopy(final_model).to(self.device)
         final_model.load_state_dict(final_state, strict=False)
         if self.defense_name == "hamp":
@@ -2479,6 +2484,7 @@ class MembershipAuditor:
                         ),
                         "per_client": self.candidate_sampling_by_client,
                     },
+                    "candidate_clip_features": candidate_clip_features,
                     "audit_health": audit_health,
                     "attacks": summaries,
                     "errors": self.errors,
@@ -2535,3 +2541,59 @@ class MembershipAuditor:
                 "Partial diagnostics were saved to privacy_audit/summary.json."
             )
         return summaries
+
+    def _save_candidate_clip_features(self) -> dict:
+        """Optionally persist frozen CLIP vectors aligned to prediction indices."""
+        enabled = bool(self.config.get("save_candidate_clip_features", False))
+        metadata = {
+            "enabled": enabled,
+            "written": False,
+            "file": None,
+            "sample_index_alignment": (
+                "row i equals predictions.csv sample_index i"
+            ),
+        }
+        if not enabled:
+            return metadata
+        if not getattr(self, "candidate_inputs_are_features", False):
+            raise ValueError(
+                "save_candidate_clip_features requires cached frozen-CLIP "
+                "candidate inputs."
+            )
+        features = self.images.detach().cpu()
+        if features.ndim != 2 or features.shape[0] != self.labels.numel():
+            raise ValueError(
+                "Candidate CLIP features must be a two-dimensional tensor "
+                "aligned with candidate labels."
+            )
+        os.makedirs(self.results_dir, exist_ok=True)
+        filename = "candidate_clip_features.pt"
+        torch.save(
+            {
+                "clip_features": features,
+                "sample_indices": torch.arange(features.shape[0]),
+                "candidate_labels": self.labels.detach().cpu().long(),
+                "membership": self.membership.detach().cpu().long(),
+                "candidate_client_ids": (
+                    self.candidate_client_ids.detach().cpu().long()
+                ),
+                "model_type": self.model_type,
+                "feature_space": "frozen_clip_image_encoder_output",
+                "normalized": bool(
+                    getattr(self.model, "normalize_features", False)
+                ),
+            },
+            os.path.join(self.results_dir, filename),
+        )
+        metadata.update(
+            {
+                "written": True,
+                "file": filename,
+                "shape": list(features.shape),
+                "dtype": str(features.dtype),
+                "normalized": bool(
+                    getattr(self.model, "normalize_features", False)
+                ),
+            }
+        )
+        return metadata

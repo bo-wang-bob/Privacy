@@ -76,18 +76,32 @@ def test_visual_adapter_sweep_builds_valid_fpl_16shot_configs():
         assert job.config["sweep_name"] == "visual_adapter_fedmia_attacks"
         assert job.config["model_type"] == "visual_adapter"
         assert job.config["aggregator"] == "fedavg"
+        assert job.config["total_users"] == 10
+        assert job.config["sample_users"] == 10
         assert job.config["fpl_shots"] == 16
         assert job.config["use_full_dataset"] is False
         assert job.config["partition_mode"] == "iid"
         assert job.config["audit"]["candidate_sampling"] == "low_fpr_full"
         assert job.config["audit"]["low_fpr_max_members"] == 5000
         assert job.config["audit"]["low_fpr_max_nonmembers"] == 20000
-        assert job.config["batch_size"] == 128
+        assert job.config["batch_size"] == 32
+        assert job.config["learning_rate"] == 0.001
+        assert job.config["learning_rate_decay"] == 0.99
+        assert job.config["learning_rate_decay_interval"] == 5
         assert job.config["eval_batch_size"] == 512
         assert job.config["eval_interval"] == 5
         assert job.config["visual_adapter"]["precompute_batch_size"] == 64
         assert job.config["audit"]["audit_batch_size"] == 512
         assert job.config["audit"]["audit_interval"] == 5
+        assert job.config["num_global_iters"] == 300
+        assert job.config["local_epochs"] == 1
+        for attack in (
+            "loss_series",
+            "avg_cosine",
+            "fedmia_loss",
+            "fedmia_cosine",
+        ):
+            assert job.config["audit"]["attack_audit_intervals"][attack] == 10
         validate_config(job.config)
 
 

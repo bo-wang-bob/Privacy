@@ -24,6 +24,38 @@ from users.user import UserBase
 logger = logging.getLogger(__name__)
 
 
+def _is_evaluation_round(
+    round_index: int, total_rounds: int, eval_interval: int
+) -> bool:
+    """Schedule evaluation by completed, one-based communication rounds."""
+    completed_round = round_index + 1
+    return completed_round % eval_interval == 0 or completed_round == total_rounds
+
+
+def _scheduled_learning_rate(
+    initial_learning_rate: float,
+    decay: float,
+    round_index: int,
+    decay_interval: int = 1,
+) -> float:
+    """Return the LR for a zero-based communication round.
+
+    Round zero (the first training round) uses the configured initial learning
+    rate.  The rate is reduced only after each complete ``decay_interval``
+    block; a decay of one disables scheduling.
+    """
+    if initial_learning_rate <= 0:
+        raise ValueError("initial_learning_rate must be positive.")
+    if not 0 < decay <= 1:
+        raise ValueError("learning_rate_decay must be in (0, 1].")
+    if round_index < 0:
+        raise ValueError("round_index must be non-negative.")
+    if decay_interval <= 0:
+        raise ValueError("learning_rate_decay_interval must be positive.")
+    decay_steps = round_index // decay_interval
+    return initial_learning_rate * decay**decay_steps
+
+
 def _format_round_progress(
     round_index: int,
     total_rounds: int,
@@ -32,14 +64,18 @@ def _format_round_progress(
     selected_ids: list[int],
     total_users: int,
     audit_snapshots: int,
+    learning_rate: float | None = None,
 ) -> str:
     if sorted(selected_ids) == list(range(total_users)):
         selected = f"all({total_users})"
     else:
         selected = "[" + ",".join(str(user_id) for user_id in selected_ids) + "]"
+    learning_rate_text = (
+        "" if learning_rate is None else f" | lr={learning_rate:.6g}"
+    )
     return (
         f"Progress | round={round_index + 1}/{total_rounds} | loss={loss:.4f} | "
-        f"accuracy={100.0 * accuracy:.2f}% | selected={selected} | "
+        f"accuracy={100.0 * accuracy:.2f}%{learning_rate_text} | selected={selected} | "
         f"audit_snapshots={audit_snapshots}"
     )
 
@@ -64,6 +100,8 @@ class ServerBase:
         results_dir: str,
         user_per_round: int,
         aggregator: BaseAggregator,
+        learning_rate_decay: float = 1.0,
+        learning_rate_decay_interval: int = 1,
         model_load_path=None,
         save_models: bool = False,
         collate_fn=None,
@@ -81,6 +119,12 @@ class ServerBase:
             raise ValueError("user_per_round must be in [1, total_users].")
         if num_glob_iters <= 0 or eval_interval <= 0:
             raise ValueError("Training rounds and eval_interval must be positive.")
+        if learning_rate <= 0:
+            raise ValueError("learning_rate must be positive.")
+        if not 0 < learning_rate_decay <= 1:
+            raise ValueError("learning_rate_decay must be in (0, 1].")
+        if learning_rate_decay_interval <= 0:
+            raise ValueError("learning_rate_decay_interval must be positive.")
         self.train_mode = train_mode
         self.device = device
         self.dataset_name = dataset_name
@@ -95,6 +139,10 @@ class ServerBase:
         self.results_dir = results_dir
         self.save_models_enabled = save_models
         self.eval_interval = eval_interval
+        self.initial_learning_rate = float(learning_rate)
+        self.learning_rate_decay = float(learning_rate_decay)
+        self.learning_rate_decay_interval = int(learning_rate_decay_interval)
+        self.current_learning_rate = float(learning_rate)
         self.audit_config = dict(audit_config or {"enabled": True})
         self.audit_config.setdefault("total_rounds", num_glob_iters)
         self.defense_config = defense_config or {"name": "none"}
@@ -105,7 +153,9 @@ class ServerBase:
         os.makedirs(results_dir, exist_ok=True)
         self.metrics_path = os.path.join(results_dir, "training_metrics.csv")
         with open(self.metrics_path, "w", newline="", encoding="utf-8") as file:
-            csv.writer(file).writerow(("round", "loss", "accuracy", "samples"))
+            csv.writer(file).writerow(
+                ("round", "loss", "accuracy", "samples", "learning_rate")
+            )
         self.training_metrics: list[dict[str, float | int]] = []
 
         self.ctx = Context(
@@ -222,13 +272,20 @@ class ServerBase:
         selected = random.sample(others, self.user_per_round - 1)
         return sorted([self.target_client_id, *selected])
 
-    def _evaluate(self, round_index: int, selected_ids: list[int]) -> None:
+    def _evaluate(
+        self,
+        round_index: int,
+        selected_ids: list[int],
+        learning_rate: float,
+    ) -> None:
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
         for user in self.ctx.users:
             if self.train_mode == "centralized":
-                evaluation_state = self.ctx.new_model_state[0]
+                evaluation_state = self.ctx.new_model_state.get(
+                    0, self.ctx.base_model_state[0]
+                )
             else:
                 evaluation_state = self.ctx.new_model_state.get(
                     user.id, self.ctx.base_model_state[user.id]
@@ -239,10 +296,11 @@ class ServerBase:
             total_correct += correct
             total_samples += samples
         metrics = {
-            "round": int(round_index),
+            "round": int(round_index + 1),
             "loss": total_loss / max(total_samples, 1),
             "accuracy": total_correct / max(total_samples, 1),
             "samples": int(total_samples),
+            "learning_rate": float(learning_rate),
         }
         self.training_metrics.append(metrics)
         with open(self.metrics_path, "a", newline="", encoding="utf-8") as file:
@@ -252,6 +310,7 @@ class ServerBase:
                     metrics["loss"],
                     metrics["accuracy"],
                     metrics["samples"],
+                    metrics["learning_rate"],
                 )
             )
         logger.info(
@@ -264,6 +323,7 @@ class ServerBase:
                 selected_ids=selected_ids,
                 total_users=self.total_users_num,
                 audit_snapshots=len(self.auditor.observations),
+                learning_rate=float(metrics["learning_rate"]),
             ),
         )
 
@@ -378,10 +438,28 @@ class ServerBase:
             self.ctx.get_base_model_state(self.target_client_id), cpu=True
         )
 
+        # Record the true pretrained/random-head baseline before any client
+        # performs a local update.  Auditing still starts only after training
+        # rounds, so this does not add a round-zero attack observation.
+        self._evaluate(
+            round_index=-1,
+            selected_ids=list(range(self.total_users_num)),
+            learning_rate=self.initial_learning_rate,
+        )
+
         for round_index in range(self.num_glob_iters):
             if round_index > 0:
                 self.ctx.continue_to_next_round()
             self.ctx.glob_iter = round_index
+            self.current_learning_rate = _scheduled_learning_rate(
+                self.initial_learning_rate,
+                self.learning_rate_decay,
+                round_index,
+                self.learning_rate_decay_interval,
+            )
+            self.ctx.learning_rate = self.current_learning_rate
+            for user in self.ctx.users:
+                user.learning_rate = self.current_learning_rate
             selected_ids = self._sample_users()
             self.ctx.user_selected = selected_ids
             self.defense.prepare_round(selected_ids, round_index)
@@ -428,11 +506,14 @@ class ServerBase:
                 released_states=self.ctx.new_model_state,
             )
             self._save_round(round_index + 1)
-            if (
-                round_index % self.eval_interval == 0
-                or round_index == self.num_glob_iters - 1
+            if _is_evaluation_round(
+                round_index, self.num_glob_iters, self.eval_interval
             ):
-                self._evaluate(round_index, selected_ids)
+                self._evaluate(
+                    round_index,
+                    selected_ids,
+                    learning_rate=self.current_learning_rate,
+                )
 
         if self.train_mode == "centralized":
             final_state = self.ctx.new_model_state[0]
@@ -463,6 +544,12 @@ class ServerBase:
             "configuration": self.method_config,
             "training_health": training_health,
             "state_scope": "shared_global",
+            "optimization": {
+                "initial_learning_rate": self.initial_learning_rate,
+                "learning_rate_decay": self.learning_rate_decay,
+                "learning_rate_decay_interval": self.learning_rate_decay_interval,
+                "final_round_learning_rate": self.current_learning_rate,
+            },
         }
         if self.federated_method == "promptfl":
             method_summary["paper_alignment"] = (

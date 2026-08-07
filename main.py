@@ -158,6 +158,16 @@ def validate_config(config: dict) -> None:
         raise ValueError("total_users must be greater than one.")
     if not 1 <= config["sample_users"] <= config["total_users"]:
         raise ValueError("sample_users must be in [1, total_users].")
+    if float(config.get("learning_rate", 0.0)) <= 0:
+        raise ValueError("learning_rate must be positive.")
+    learning_rate_decay = float(config.get("learning_rate_decay", 1.0))
+    if not 0 < learning_rate_decay <= 1:
+        raise ValueError("learning_rate_decay must be in (0, 1].")
+    learning_rate_decay_interval = int(
+        config.get("learning_rate_decay_interval", 1)
+    )
+    if learning_rate_decay_interval <= 0:
+        raise ValueError("learning_rate_decay_interval must be positive.")
     partition_mode = str(config.get("partition_mode", "auto")).lower()
     if partition_mode not in {"auto", "dirichlet", "iid", "pathological"}:
         raise ValueError(
@@ -721,6 +731,10 @@ def run(config: dict) -> list[dict]:
         batch_size=config["batch_size"],
         eval_batch_size=config["eval_batch_size"],
         learning_rate=config["learning_rate"],
+        learning_rate_decay=config.get("learning_rate_decay", 1.0),
+        learning_rate_decay_interval=config.get(
+            "learning_rate_decay_interval", 1
+        ),
         num_glob_iters=config["num_global_iters"],
         local_epochs=config["local_epochs"],
         total_users=config["total_users"],
@@ -762,6 +776,8 @@ def default_config() -> dict:
         "batch_size": 16,
         "eval_batch_size": 64,
         "learning_rate": 0.001,
+        "learning_rate_decay": 1.0,
+        "learning_rate_decay_interval": 1,
         "num_global_iters": 20,
         "local_epochs": 2,
         "total_users": 10,
@@ -964,6 +980,18 @@ def parse_args() -> dict:
     )
     parser.add_argument("--learning_rate", type=float)
     parser.add_argument(
+        "--learning_rate_decay",
+        "--learning-rate-decay",
+        type=float,
+        help="Multiply the learning rate by this factor after each communication round.",
+    )
+    parser.add_argument(
+        "--learning_rate_decay_interval",
+        "--learning-rate-decay-interval",
+        type=int,
+        help="Apply one learning-rate decay after this many communication rounds.",
+    )
+    parser.add_argument(
         "--model_type", choices=["prompt", "clip_mlp", "visual_adapter"]
     )
     parser.add_argument("--mlp_hidden_dim", type=int)
@@ -1045,6 +1073,8 @@ def parse_args() -> dict:
         "partition_mode",
         "use_full_dataset",
         "learning_rate",
+        "learning_rate_decay",
+        "learning_rate_decay_interval",
         "model_type",
         "aggregator",
     ):

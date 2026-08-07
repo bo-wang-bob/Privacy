@@ -34,9 +34,20 @@ def test_ultimate_sweep_expands_both_models_all_datasets_and_mlp_projres():
     assert output.count("Expanded 5 jobs") == 2
     assert "model=clip_mlp" in output
     assert "model=visual_adapter" in output
-    assert output.count("optimization.learning_rate") == 10
+    assert len(
+        re.findall(r"optimization\.learning_rate\s+:", output, re.M)
+    ) == 10
     assert len(re.findall(r"optimization\.learning_rate\s+: 0\.1$", output, re.M)) == 5
-    assert len(re.findall(r"optimization\.learning_rate\s+: 0\.01$", output, re.M)) == 5
+    assert len(re.findall(r"optimization\.learning_rate\s+: 0\.001$", output, re.M)) == 5
+    assert len(
+        re.findall(r"optimization\.learning_rate_decay\s+: 0\.99$", output, re.M)
+    ) == 10
+    assert len(
+        re.findall(
+            r"optimization\.learning_rate_decay_interval\s+: 5$", output, re.M
+        )
+    ) == 10
+    assert len(re.findall(r"optimization\.batch_size\s+: 32$", output, re.M)) == 10
     assert len(re.findall(r"data\.partition_mode\s+: iid$", output, re.M)) == 10
     assert output.count("privacy_audit.low_fpr_max_members") == 10
     assert output.count("privacy_audit.low_fpr_max_nonmembers") == 10
@@ -66,11 +77,20 @@ def test_ultimate_sweep_filters_model_dataset_attacks_and_learning_rate():
         "fedmia_loss,fedmia_cosine",
         "--learning-rate",
         "0.0005",
+        "--learning-rate-decay",
+        "0.9",
+        "--learning-rate-decay-interval",
+        "10",
     )
 
     assert "model=visual_adapter" in output
     assert "model=clip_mlp" not in output
     assert "optimization.learning_rate" in output and ": 0.0005" in output
+    assert "optimization.learning_rate_decay" in output and ": 0.9" in output
+    assert (
+        "optimization.learning_rate_decay_interval" in output
+        and ": 10" in output
+    )
     assert "fedmia_loss, fedmia_cosine" in output
     assert len(commands) == 2
     assert commands[0][1].endswith("main.py")

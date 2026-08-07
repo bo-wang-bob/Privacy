@@ -7,33 +7,34 @@ jobs: 1
 seeds: [42]
 target_client_ids: [0]
 
-# Visual Adapter follows the FPL-style system-wide 16-shot protocol.
+# Visual Adapter keeps the FPL-style system-wide 16-shot data protocol while
+# using the same FedMIA training schedule on every dataset.
 datasets:
   - name: caltech101
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 50
+      num_global_iters: 300
   - name: oxfordpets
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 50
+      num_global_iters: 300
   - name: flowers
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 50
+      num_global_iters: 300
   - name: food101
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 50
+      num_global_iters: 300
   - name: cifar100
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 50
+      num_global_iters: 300
 
 common:
   model_type: visual_adapter
@@ -49,9 +50,12 @@ common:
   dirichlet_alpha: 0.1
   use_full_dataset: false
   fpl_shots: 16
-  local_epochs: 5
+  local_epochs: 1
   learning_rate: 0.001
-  batch_size: 128
+  # Step decay: keep LR fixed for five rounds, then multiply it by 0.99.
+  learning_rate_decay: 0.99
+  learning_rate_decay_interval: 5
+  batch_size: 32
   eval_batch_size: 512
   eval_interval: 5
   save_models: false
@@ -84,11 +88,11 @@ common:
     audit_batch_size: 512
     audit_interval: 5
     attack_audit_intervals:
-      loss_series: 1
-      avg_cosine: 1
-      # FedMIA Eq. (12) aggregates t=1..T, so both variants need every round.
-      fedmia_loss: 1
-      fedmia_cosine: 1
+      # Match the released FedMIA code's checkpoints: rounds 10, 20, ..., 300.
+      loss_series: 10
+      avg_cosine: 10
+      fedmia_loss: 10
+      fedmia_cosine: 10
     low_fpr_gradient_batch_size: 16
     signal_storage: compact
     fedmia_tail: upper

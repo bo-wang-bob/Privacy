@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 from types import SimpleNamespace
 
 import pytest
@@ -244,6 +245,7 @@ def test_clip_mlp_runs_complete_fedavg_training_and_saves_only_mlp(tmp_path):
         model=model,
         batch_size=3,
         learning_rate=0.2,
+        learning_rate_decay=0.5,
         num_glob_iters=2,
         local_epochs=1,
         total_users=2,
@@ -277,6 +279,15 @@ def test_clip_mlp_runs_complete_fedavg_training_and_saves_only_mlp(tmp_path):
         torch.equal(model.clip_model.state_dict()[name], tensor)
         for name, tensor in initial_backbone.items()
     )
+    with (tmp_path / "training_metrics.csv").open(
+        newline="", encoding="utf-8"
+    ) as file:
+        training_rows = list(csv.DictReader(file))
+    assert [int(row["round"]) for row in training_rows] == [0, 1, 2]
+    assert [float(row["learning_rate"]) for row in training_rows] == pytest.approx(
+        [0.2, 0.2, 0.1]
+    )
+    assert len(server.auditor.observations) == 0
 
 
 def test_clip_mlp_low_fpr_full_uses_all_candidates_and_caches_clip(tmp_path):
@@ -315,6 +326,7 @@ def test_clip_mlp_low_fpr_full_uses_all_candidates_and_caches_clip(tmp_path):
             "low_fpr_min_nonmembers": 1000,
             "audit_batch_size": 64,
             "low_fpr_gradient_batch_size": 8,
+            "save_candidate_clip_features": True,
         },
         defense_config={"name": "none"},
         federated_method="fedavg",
@@ -326,6 +338,18 @@ def test_clip_mlp_low_fpr_full_uses_all_candidates_and_caches_clip(tmp_path):
     assert int((auditor.membership == 1).sum()) == 7
     assert int((auditor.membership == 0).sum()) == 1020
     assert model.clip_model.encoded_samples == 1027
+    artifact_metadata = auditor._save_candidate_clip_features()
+    assert artifact_metadata["written"]
+    artifact = torch.load(
+        tmp_path / "privacy_audit" / "candidate_clip_features.pt",
+        weights_only=True,
+    )
+    assert torch.equal(artifact["clip_features"], auditor.images)
+    assert torch.equal(
+        artifact["sample_indices"], torch.arange(auditor.images.shape[0])
+    )
+    assert torch.equal(artifact["candidate_labels"], auditor.labels)
+    assert torch.equal(artifact["membership"], auditor.membership)
     encoded_before_outputs = model.clip_model.encoded_samples
     logits, _, losses = auditor._candidate_outputs(
         auditor.model, require_representation=False
@@ -539,6 +563,32 @@ def test_attack_specific_audit_intervals_schedule_only_required_rounds():
     assert auditor._audit_client_ids_for_attacks(
         auditor._attacks_for_round(1), selected_ids
     ) == selected_ids
+
+
+def test_attack_interval_is_counted_in_completed_communication_rounds():
+    auditor = MembershipAuditor.__new__(MembershipAuditor)
+    auditor.enabled = True
+    auditor.total_rounds = 30
+    auditor.audit_interval = 5
+    auditor.config = {}
+    auditor.attacks = ["fedmia_loss", "fedmia_cosine"]
+    auditor.attack_audit_intervals = {
+        "fedmia_loss": 10,
+        "fedmia_cosine": 10,
+    }
+    auditor.observations = [{"round": round_index} for round_index in range(30)]
+
+    for attack in auditor.attacks:
+        assert [
+            observation["round"] + 1
+            for observation in auditor._observations_for_attack(attack)
+        ] == [10, 20, 30]
+        assert auditor._attack_schedule_metadata(attack) == {
+            "mode": "interval",
+            "interval": 10,
+            "interval_basis": "completed_rounds",
+            "include_final_round": True,
+        }
 
 def test_all_attacks_run_in_toy_clip_mlp_fedavg(tmp_path):
     attacks = [

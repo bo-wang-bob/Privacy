@@ -14,7 +14,7 @@ else
 fi
 
 config_path="${VISUAL_ADAPTER_TRAIN_CONFIG:-configs/visual_adapter_privacy.yaml}"
-learning_rate="${VISUAL_ADAPTER_TRAIN_LR:-0.01}"
+learning_rate="${VISUAL_ADAPTER_TRAIN_LR:-0.001}"
 dry_run=false
 forward_args=()
 

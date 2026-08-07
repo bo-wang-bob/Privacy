@@ -32,7 +32,7 @@ def test_visual_adapter_training_script_has_complete_plain_training_defaults():
     assert command[command.index("--config") + 1] == (
         "configs/visual_adapter_privacy.yaml"
     )
-    assert command[command.index("--learning_rate") + 1] == "0.01"
+    assert command[command.index("--learning_rate") + 1] == "0.001"
     assert command[command.index("--dataset_name") + 1] == "caltech101"
     assert command[command.index("--num_global_iters") + 1] == "50"
     assert command[command.index("--local_epochs") + 1] == "5"

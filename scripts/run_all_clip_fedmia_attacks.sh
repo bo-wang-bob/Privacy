@@ -16,7 +16,7 @@ models="${CLIP_MIA_MODELS:-clip_mlp,visual_adapter}"
 gpus="${CLIP_MIA_GPUS:-${CLIP_MIA_GPU:-0}}"
 jobs="${CLIP_MIA_JOBS:-1}"
 clip_mlp_learning_rate="${CLIP_MLP_MIA_LR:-0.1}"
-visual_adapter_learning_rate="${CLIP_ADAPTER_MIA_LR:-0.01}"
+visual_adapter_learning_rate="${CLIP_ADAPTER_MIA_LR:-0.001}"
 forward_args=()
 show_help=false
 
@@ -55,13 +55,16 @@ Unified options:
   --models clip_mlp,visual_adapter   Select one or both models (default: both).
 
 Model-specific learning-rate defaults:
-  clip_mlp=0.1, visual_adapter=0.01
+  clip_mlp=0.1, visual_adapter=0.001
   --learning-rate RATE overrides the default for every selected model.
+  Both model specs default to decay=0.99 once every 5 communication rounds.
 
 All options below are forwarded to each selected sweep, including:
   --datasets CSV        --attacks CSV          --target-client ID
   --seed VALUE          --gpus CSV             --jobs VALUE
-  --learning-rate RATE  --rounds VALUE         --dirichlet-alpha VALUE
+  --learning-rate RATE  --learning-rate-decay RATE
+  --learning-rate-decay-interval ROUNDS
+  --rounds VALUE        --dirichlet-alpha VALUE
   --skip-projres        --force                --dry-run
   --summarize-only      --max-runs VALUE
 

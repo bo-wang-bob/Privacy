@@ -87,9 +87,22 @@ Caltech256、FGVC-Aircraft 和 DTD。不同数据集的目录约定见
 python main.py --config configs/clip_mlp_fedavg.yaml
 ```
 
-当前性能配置使用训练 batch 128、缓存向量评估/审计 batch 512，并每 5 轮评估和
-审计一次（最后一轮始终补做）。原始图片的一次性 CLIP 编码仍单独使用
+当前性能配置使用训练 batch 32、缓存向量评估/审计 batch 512；普通任务会在
+round 0 建立训练前基线，之后每 5 个已完成通信轮评估一次（最后一轮始终补做）。
+原始图片的一次性 CLIP 编码仍单独使用
 `precompute_batch_size: 64`，因此增大向量 batch 不会同步放大视觉主干的显存峰值。
+
+MLP 与 Visual Adapter 的通用实验默认使用每 5 个通信轮下降一次的阶梯学习率：
+
+```text
+decay_step = round_index // learning_rate_decay_interval
+lr(round_index) = initial_learning_rate * learning_rate_decay ** decay_step
+```
+
+其中第 1–5 个训练轮使用初始学习率，默认 `learning_rate_decay: 0.99`、
+`learning_rate_decay_interval: 5`；第 6 轮开始使用 `initial_lr × 0.99`。
+将 decay 设为 `1.0` 可关闭衰减，也可通过 `--learning-rate-decay` 和
+`--learning-rate-decay-interval` 覆盖。
 
 也可以在命令行切换模型；`--model_type clip_mlp` 会自动选择普通集中式
 FedAvg、全量数据，并在未显式指定攻击时关闭隐私审计：

@@ -7,33 +7,33 @@ jobs: 1
 seeds: [42]
 target_client_ids: [0]
 
-# Match the full-data datasets and schedules used by the prompt-method sweep.
+# Use one shared FedMIA training schedule across all full-data datasets.
 datasets:
   - name: caltech101
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 100
+      num_global_iters: 300
   - name: oxfordpets
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 100
+      num_global_iters: 300
   - name: flowers
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 100
+      num_global_iters: 300
   - name: food101
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 100
+      num_global_iters: 300
   - name: cifar100
     overrides:
-      total_users: 50
+      total_users: 10
       sample_users: 10
-      num_global_iters: 400
+      num_global_iters: 300
 
 common:
   model_type: clip_mlp
@@ -49,9 +49,12 @@ common:
   dirichlet_alpha: 0.1
   use_full_dataset: true
   fpl_shots: null
-  local_epochs: 2
+  local_epochs: 1
   learning_rate: 0.001
-  batch_size: 128
+  # Step decay: keep LR fixed for five rounds, then multiply it by 0.99.
+  learning_rate_decay: 0.99
+  learning_rate_decay_interval: 5
+  batch_size: 32
   eval_batch_size: 512
   eval_interval: 5
   save_models: false
@@ -82,13 +85,16 @@ common:
     audit_batch_size: 512
     audit_interval: 5
     attack_audit_intervals:
-      loss_series: 1
-      avg_cosine: 1
-      # FedMIA Eq. (12) aggregates t=1..T, so both variants need every round.
-      fedmia_loss: 1
-      fedmia_cosine: 1
+      # Match the released FedMIA code's checkpoints: rounds 10, 20, ..., 300.
+      loss_series: 10
+      avg_cosine: 10
+      fedmia_loss: 10
+      fedmia_cosine: 10
     low_fpr_gradient_batch_size: 16
     signal_storage: compact
+    # Save one candidate-aligned copy of the frozen CLIP image vectors so
+    # successful/failed membership inferences can be analyzed after training.
+    save_candidate_clip_features: true
     fedmia_tail: upper
     fedmia_tail_calibration_fraction: 0.25
     training_health_check: true

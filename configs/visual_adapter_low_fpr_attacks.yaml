@@ -2,9 +2,11 @@ model_type: visual_adapter
 train_mode: centralized
 dataset_name: caltech101
 data_root: ./data
-batch_size: 128
+batch_size: 32
 eval_batch_size: 512
 learning_rate: 0.001
+learning_rate_decay: 0.99
+learning_rate_decay_interval: 5
 num_global_iters: 50
 local_epochs: 5
 total_users: 10
