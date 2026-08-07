@@ -13,6 +13,7 @@ import torch
 from aggregator.base_aggregator import BaseAggregator
 from context.context import Context
 from privacy_attacks.auditor import MembershipAuditor
+from privacy_attacks.projres_integrated import run_integrated_projres
 from privacy_defenses import (
     FEDMIA_BASELINE_DEFENSES,
     DefenseController,
@@ -85,7 +86,6 @@ class ServerBase:
 
     def __init__(
         self,
-        train_mode,
         device,
         dataset_name,
         train_sets,
@@ -108,11 +108,10 @@ class ServerBase:
         eval_interval: int = 5,
         eval_batch_size: int = 64,
         audit_config: dict | None = None,
+        projres_config: dict | None = None,
         defense_config: dict | None = None,
         method_config: dict | None = None,
     ):
-        if train_mode not in {"centralized", "local"}:
-            raise ValueError("train_mode must be 'centralized' or 'local'.")
         if total_users <= 1:
             raise ValueError("total_users must be greater than one.")
         if not 1 <= user_per_round <= total_users:
@@ -125,7 +124,6 @@ class ServerBase:
             raise ValueError("learning_rate_decay must be in (0, 1].")
         if learning_rate_decay_interval <= 0:
             raise ValueError("learning_rate_decay_interval must be positive.")
-        self.train_mode = train_mode
         self.device = device
         self.dataset_name = dataset_name
         self.num_classes = len(class_names)
@@ -145,6 +143,22 @@ class ServerBase:
         self.current_learning_rate = float(learning_rate)
         self.audit_config = dict(audit_config or {"enabled": True})
         self.audit_config.setdefault("total_rounds", num_glob_iters)
+        self.projres_config = dict(projres_config or {"enabled": False})
+        self.batch_size = int(batch_size)
+        self.eval_batch_size = int(eval_batch_size)
+        self.local_epochs = int(local_epochs)
+        configured_projres_round = self.projres_config.get(
+            "evaluation_round", "last"
+        )
+        if str(configured_projres_round).lower() == "last":
+            self.projres_evaluation_round = self.num_glob_iters
+        else:
+            self.projres_evaluation_round = int(configured_projres_round)
+        if not 1 <= self.projres_evaluation_round <= self.num_glob_iters:
+            raise ValueError(
+                "projres.evaluation_round must be 'last' or a communication "
+                "round in [1, num_global_iters]."
+            )
         self.defense_config = defense_config or {"name": "none"}
         self.target_client_id = int(self.audit_config.get("target_client_id", 0))
         self.ensure_target = bool(self.audit_config.get("enabled", True)) and bool(
@@ -162,7 +176,6 @@ class ServerBase:
             users_num=total_users,
             model=model,
             class_names=class_names,
-            mode=train_mode,
             learning_rate=learning_rate,
             results_dir=results_dir,
         )
@@ -184,15 +197,11 @@ class ServerBase:
         self.defense.method_config = self.method_config
         if (
             self.defense.name in FEDMIA_BASELINE_DEFENSES
-            and (
-                self.federated_method not in {"fedavg", "promptfl"}
-                or self.train_mode != "centralized"
-            )
+            and self.federated_method not in {"fedavg", "promptfl"}
         ):
             raise ValueError(
-                "FedMIA baseline defenses require centralized FedAvg and are "
-                "standalone comparisons; stacking them with personalized or "
-                "private prompt methods would change both mechanisms."
+                "FedMIA baseline defenses require a shared global FedAvg or "
+                "PromptFL model and are standalone comparisons."
             )
         if self.defense.name == "hamp":
             attach_hamp_output_transform(
@@ -243,6 +252,14 @@ class ServerBase:
             federated_method=self.federated_method,
             num_classes=self.num_classes,
         )
+        self.required_audit_client_ids = (
+            list(self.auditor.audit_client_ids) if self.ensure_target else []
+        )
+        if len(self.required_audit_client_ids) > self.user_per_round:
+            raise ValueError(
+                "ensure_target_participation requires sample_users to be at "
+                "least the number of audited clients."
+            )
         self.code_poison_enabled = (
             self.auditor.enabled and "codepoison" in self.auditor.attacks
         )
@@ -264,13 +281,16 @@ class ServerBase:
             return sorted(
                 random.sample(range(self.total_users_num), self.user_per_round)
             )
+        required = set(self.required_audit_client_ids)
         others = [
             user_id
             for user_id in range(self.total_users_num)
-            if user_id != self.target_client_id
+            if user_id not in required
         ]
-        selected = random.sample(others, self.user_per_round - 1)
-        return sorted([self.target_client_id, *selected])
+        selected = random.sample(
+            others, self.user_per_round - len(self.required_audit_client_ids)
+        )
+        return sorted([*self.required_audit_client_ids, *selected])
 
     def _evaluate(
         self,
@@ -282,14 +302,9 @@ class ServerBase:
         total_correct = 0
         total_samples = 0
         for user in self.ctx.users:
-            if self.train_mode == "centralized":
-                evaluation_state = self.ctx.new_model_state.get(
-                    0, self.ctx.base_model_state[0]
-                )
-            else:
-                evaluation_state = self.ctx.new_model_state.get(
-                    user.id, self.ctx.base_model_state[user.id]
-                )
+            evaluation_state = self.ctx.new_model_state.get(
+                0, self.ctx.base_model_state[0]
+            )
             user.set_parameters(evaluation_state)
             loss, correct, samples = user.evaluate()
             total_loss += loss
@@ -413,29 +428,18 @@ class ServerBase:
             return
         path = os.path.join(self.results_dir, "saved_models")
         os.makedirs(path, exist_ok=True)
-        if self.train_mode == "centralized":
-            state = self.ctx.new_model_state.get(0, self.ctx.base_model_state[0])
-            torch.save(
-                self._clone_state(state, cpu=True),
-                os.path.join(path, f"global_round_{round_index}.pt"),
-            )
-        else:
-            for user_id in range(self.total_users_num):
-                state = self.ctx.new_model_state.get(
-                    user_id, self.ctx.base_model_state[user_id]
-                )
-                torch.save(
-                    self._clone_state(state, cpu=True),
-                    os.path.join(path, f"client_{user_id}_round_{round_index}.pt"),
-                )
+        state = self.ctx.new_model_state.get(0, self.ctx.base_model_state[0])
+        torch.save(
+            self._clone_state(state, cpu=True),
+            os.path.join(path, f"global_round_{round_index}.pt"),
+        )
 
     def train(self) -> list[dict]:
-        for user in self.ctx.users:
-            self.ctx.set_base_model_state(
-                user.id, self._clone_state(user.get_parameters())
-            )
+        self.ctx.set_base_model_state(
+            self._clone_state(self.ctx.users[0].get_parameters())
+        )
         initial_target_state = self._clone_state(
-            self.ctx.get_base_model_state(self.target_client_id), cpu=True
+            self.ctx.get_base_model_state(), cpu=True
         )
 
         # Record the true pretrained/random-head baseline before any client
@@ -466,16 +470,16 @@ class ServerBase:
             logger.debug("Round %s selected clients: %s", round_index, selected_ids)
 
             base_states = {
-                user_id: self._clone_state(self.ctx.get_base_model_state(user_id))
+                user_id: self._clone_state(self.ctx.get_base_model_state())
                 for user_id in selected_ids
             }
             base_state = base_states.get(
                 self.target_client_id,
-                self._clone_state(self.ctx.get_base_model_state(self.target_client_id)),
+                self._clone_state(self.ctx.get_base_model_state()),
             )
             for user_id in selected_ids:
                 user = self.ctx.users[user_id]
-                user.set_parameters(self.ctx.get_base_model_state(user_id))
+                user.set_parameters(self.ctx.get_base_model_state())
                 use_code_poison = (
                     self.code_poison_enabled and user_id == self.target_client_id
                 )
@@ -494,6 +498,42 @@ class ServerBase:
                 selected_ids=selected_ids,
                 round_index=round_index,
             )
+
+            if (
+                bool(self.projres_config.get("enabled", False))
+                and round_index + 1 == self.projres_evaluation_round
+            ):
+                projres_client_ids = list(self.auditor.audit_client_ids)
+                missing_clients = sorted(
+                    set(projres_client_ids) - set(selected_ids)
+                )
+                if missing_clients:
+                    raise ValueError(
+                        "ProjRes evaluation round did not include audited clients: "
+                        f"{missing_clients}. Enable ensure_target_participation or "
+                        "increase sample_users."
+                    )
+                run_integrated_projres(
+                    model=self.model,
+                    users=self.ctx.users,
+                    device=self.device,
+                    base_states=base_states,
+                    updated_states=self.ctx.updated_model_state,
+                    learning_rate=self.current_learning_rate,
+                    batch_size=self.batch_size,
+                    eval_batch_size=self.eval_batch_size,
+                    local_epochs=self.local_epochs,
+                    round_index=round_index,
+                    seed=int(self.audit_config.get("seed", 42)),
+                    dataset_name=self.dataset_name,
+                    client_ids=projres_client_ids,
+                    config=self.projres_config,
+                    output_path=os.path.join(
+                        self.results_dir,
+                        "privacy_audit",
+                        "projres_strict.json",
+                    ),
+                )
 
             self.aggregator.aggregate(self.ctx)
             self.auditor.observe_round(
@@ -515,10 +555,7 @@ class ServerBase:
                     learning_rate=self.current_learning_rate,
                 )
 
-        if self.train_mode == "centralized":
-            final_state = self.ctx.new_model_state[0]
-        else:
-            final_state = self.ctx.new_model_state[self.target_client_id]
+        final_state = self.ctx.new_model_state[0]
         training_health = self._validate_training_health(
             initial_target_state, final_state
         )

@@ -1,12 +1,10 @@
 model_type: visual_adapter
-train_mode: centralized
 dataset_name: caltech101
 data_root: ./data
 batch_size: 32
 eval_batch_size: 512
 learning_rate: 0.001
-learning_rate_decay: 0.99
-learning_rate_decay_interval: 5
+learning_rate_decay: 1.0
 num_global_iters: 20
 local_epochs: 2
 total_users: 10
@@ -61,7 +59,6 @@ audit:
     - promptres
   max_samples_per_group: 32
   audit_batch_size: 512
-  audit_interval: 5
   calibration_fraction: 0.5
   auxiliary_fraction: 0.5
   signal_storage: compact

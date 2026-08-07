@@ -143,8 +143,6 @@ def _load_local_clip(
 
 
 def validate_config(config: dict) -> None:
-    if config["train_mode"] not in {"centralized", "local"}:
-        raise ValueError("train_mode must be 'centralized' or 'local'.")
     model_type = str(config.get("model_type", "prompt")).lower()
     if model_type not in {"prompt", "clip_mlp", "visual_adapter"}:
         raise ValueError(
@@ -182,10 +180,8 @@ def validate_config(config: dict) -> None:
         )
     if model_type == "clip_mlp":
         mlp_config = dict(config.get("clip_mlp", {}))
-        if method != "fedavg" or config["train_mode"] != "centralized":
-            raise ValueError(
-                "clip_mlp requires centralized training with aggregator=fedavg."
-            )
+        if method != "fedavg":
+            raise ValueError("clip_mlp requires aggregator=fedavg.")
         if not bool(config.get("use_full_dataset", False)) or fpl_shots is not None:
             raise ValueError(
                 "clip_mlp uses the full dataset and requires "
@@ -199,11 +195,8 @@ def validate_config(config: dict) -> None:
             raise ValueError("clip_mlp.precompute_batch_size must be positive.")
     if model_type == "visual_adapter":
         adapter_config = dict(config.get("visual_adapter", {}))
-        if method != "fedavg" or config["train_mode"] != "centralized":
-            raise ValueError(
-                "visual_adapter requires centralized training with "
-                "aggregator=fedavg."
-            )
+        if method != "fedavg":
+            raise ValueError("visual_adapter requires aggregator=fedavg.")
         if bool(config.get("use_full_dataset", False)) or fpl_shots != 16:
             raise ValueError(
                 "visual_adapter requires the FPL-style 16-shot setting: "
@@ -264,6 +257,19 @@ def validate_config(config: dict) -> None:
     pooled_audit = audit_client_ids == "all" or (
         isinstance(audit_client_ids, list) and len(audit_client_ids) > 1
     )
+    if bool(audit.get("ensure_target_participation", True)):
+        required_audit_clients = (
+            config["total_users"]
+            if audit_client_ids == "all"
+            else len(audit_client_ids)
+            if isinstance(audit_client_ids, list)
+            else 1
+        )
+        if config["sample_users"] < required_audit_clients:
+            raise ValueError(
+                "audit.ensure_target_participation requires sample_users to be "
+                "at least the number of audited clients."
+            )
     candidate_sampling = str(audit.get("candidate_sampling", "legacy")).lower()
     if candidate_sampling not in {"legacy", "fedmia_mix", "low_fpr_full"}:
         raise ValueError(
@@ -295,10 +301,6 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "audit.candidate_sampling=low_fpr_full requires a frozen-CLIP "
                 "feature model."
-            )
-        if pooled_audit:
-            raise ValueError(
-                "audit.candidate_sampling=low_fpr_full supports one target client."
             )
         unsupported_low_fpr = sorted(attacks - low_fpr_attacks)
         if unsupported_low_fpr:
@@ -422,6 +424,49 @@ def validate_config(config: dict) -> None:
             "released_prompt audit view cannot run update-dependent attacks "
             "nasr_passive, fedmia_cosine, grad_cosine, avg_cosine, or promptres."
         )
+    projres = config.get("projres", {})
+    if bool(projres.get("enabled", False)):
+        if model_type not in {"clip_mlp", "visual_adapter"}:
+            raise ValueError(
+                "Integrated ProjRes requires model_type=clip_mlp or "
+                "visual_adapter."
+            )
+        if method != "fedavg":
+            raise ValueError("Integrated ProjRes requires FedAvg training.")
+        if not bool(
+            config.get(model_type, {}).get("precompute_features", True)
+        ):
+            raise ValueError(
+                "Integrated ProjRes requires precompute_features=true."
+            )
+        threshold = float(projres.get("threshold", 0.01))
+        max_candidates = int(projres.get("max_candidates", 32))
+        min_nonmembers = int(projres.get("min_nonmembers", 1000))
+        max_nonmembers = int(projres.get("max_nonmembers", 20000))
+        if threshold < 0 or max_candidates <= 0 or min_nonmembers < 1000:
+            raise ValueError(
+                "ProjRes threshold must be non-negative, max_candidates must "
+                "be positive, and min_nonmembers must be at least 1000."
+            )
+        if max_nonmembers < 0 or (
+            max_nonmembers and max_nonmembers < min_nonmembers
+        ):
+            raise ValueError(
+                "ProjRes max_nonmembers must be 0 or at least min_nonmembers."
+            )
+        evaluation_round = projres.get("evaluation_round", "last")
+        if str(evaluation_round).lower() != "last":
+            try:
+                evaluation_round = int(evaluation_round)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "projres.evaluation_round must be 'last' or an integer."
+                ) from error
+            if not 1 <= evaluation_round <= config["num_global_iters"]:
+                raise ValueError(
+                    "projres.evaluation_round must be in "
+                    "[1, num_global_iters]."
+                )
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in SUPPORTED_DEFENSES:
@@ -430,14 +475,13 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             f"{model_type} attack experiments currently require defense.name=none."
         )
-    if defense_name in FEDMIA_BASELINE_DEFENSES and (
-        method not in {"fedavg", "promptfl"}
-        or config["train_mode"] != "centralized"
+    if (
+        defense_name in FEDMIA_BASELINE_DEFENSES
+        and method not in {"fedavg", "promptfl"}
     ):
         raise ValueError(
-            "FedMIA baseline defenses require centralized FedAvg and must be "
-            "evaluated as standalone comparisons, not stacked with personalized "
-            "or private prompt algorithms."
+            "FedMIA baseline defenses require a shared global FedAvg or PromptFL "
+            "model and must be evaluated as standalone comparisons."
         )
     if defense_name == "mist" and config["sample_users"] < 2:
         raise ValueError("MIST requires at least two selected client submodels.")
@@ -539,16 +583,6 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "Cross-client membership attacks require at least two clients per round."
         )
-    if (
-        audit.get("enabled", True)
-        and attacks & spatial
-        and config["train_mode"] != "centralized"
-    ):
-        raise ValueError(
-            "Cross-client membership attacks require a shared centralized FedAvg model."
-        )
-
-
 def run(config: dict) -> list[dict]:
     from trainmodel.custom_clip import CustomCLIP, get_default_prompt_template
     from trainmodel.clip_mlp import CLIPImageMLP
@@ -582,12 +616,6 @@ def run(config: dict) -> list[dict]:
     method_config = dict(config.get(method, {}))
     method_config.setdefault("seed", seed)
     config[method] = method_config
-    effective_train_mode = (
-        "centralized"
-        if method == "promptfl"
-        else config["train_mode"]
-    )
-    config["effective_train_mode"] = effective_train_mode
 
     # Sweep jobs already have a stable directory; direct runs receive a
     # collision-free timestamped child from this helper.
@@ -721,7 +749,6 @@ def run(config: dict) -> list[dict]:
     )
     audit_config.setdefault("fpl_shots", config.get("fpl_shots"))
     server = ServerBase(
-        train_mode=effective_train_mode,
         device=device,
         dataset_name=config["dataset_name"],
         train_sets=train_sets,
@@ -759,6 +786,7 @@ def run(config: dict) -> list[dict]:
         collate_fn=collate_fn,
         eval_interval=config["eval_interval"],
         audit_config=audit_config,
+        projres_config=config.get("projres", {"enabled": False}),
         defense_config=config.get("defense", {"name": "none"}),
         method_config=method_config,
     )
@@ -770,7 +798,6 @@ def run(config: dict) -> list[dict]:
 def default_config() -> dict:
     return {
         "model_type": "prompt",
-        "train_mode": "centralized",
         "dataset_name": "caltech101",
         "data_root": "./data",
         "batch_size": 16,
@@ -841,7 +868,6 @@ def default_config() -> dict:
                 "promptmia",
             ],
             "max_samples_per_group": 32,
-            "audit_interval": 2,
             "calibration_fraction": 0.5,
             "candidate_sampling": "legacy",
             "nonmember_to_member_ratio": 1.0,
@@ -900,6 +926,14 @@ def default_config() -> dict:
             "promptmia_similarity_span": 0.05,
             "promptres_background_rank": 0,
             "promptres_aggregation": "mean",
+        },
+        "projres": {
+            "enabled": False,
+            "evaluation_round": "last",
+            "threshold": 0.01,
+            "max_candidates": 32,
+            "min_nonmembers": 1000,
+            "max_nonmembers": 20000,
         },
         "defense": {
             "name": "none",
@@ -1090,7 +1124,6 @@ def parse_args() -> dict:
     if args.adapter_alpha is not None:
         config["visual_adapter"]["alpha"] = args.adapter_alpha
     if args.model_type == "clip_mlp":
-        config["train_mode"] = "centralized"
         config["aggregator"] = "fedavg"
         config["fpl_shots"] = None
         config["use_full_dataset"] = True
@@ -1098,7 +1131,6 @@ def parse_args() -> dict:
             config["audit"]["enabled"] = False
             config["audit"]["attacks"] = []
     elif args.model_type == "visual_adapter":
-        config["train_mode"] = "centralized"
         config["aggregator"] = "fedavg"
         config["fpl_shots"] = 16
         config["use_full_dataset"] = False

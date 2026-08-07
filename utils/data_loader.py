@@ -427,7 +427,8 @@ def generate_iid_split(
             logger.warning(
                 f"IID split warning: Class {cls_idx} ('{class_names[cls_idx]}') has only "
                 f"{len(cls_indices)} test samples, but num_users={num_users}. "
-                f"Will distribute one sample per user to the first {len(cls_indices)} users."
+                f"Will distribute one sample to a rotating subset of "
+                f"{len(cls_indices)} users."
             )
 
     # Prepare per-user index containers
@@ -438,7 +439,7 @@ def generate_iid_split(
     def _even_split_indices(
         cls_indices: List[int],
         dest_indices: List[List[int]],
-        allow_partial: bool = False,
+        remainder_offset: int,
     ):
         cls_size = len(cls_indices)
         if cls_size == 0:
@@ -448,18 +449,15 @@ def generate_iid_split(
         shuffled_indices = cls_indices.copy()
         random.shuffle(shuffled_indices)
 
-        # If allow_partial and fewer samples than users, give one to each of the first users
-        if allow_partial and cls_size < num_users:
-            for user_id in range(cls_size):
-                dest_indices[user_id].append(shuffled_indices[user_id])
-            return
-
         base = cls_size // num_users
         remainder = cls_size % num_users
+        counts = [base] * num_users
+        for extra_index in range(remainder):
+            user_id = (remainder_offset + extra_index) % num_users
+            counts[user_id] += 1
 
         start = 0
-        for user_id in range(num_users):
-            add_count = base + (1 if user_id < remainder else 0)
+        for user_id, add_count in enumerate(counts):
             if add_count <= 0:
                 continue
             end = start + add_count
@@ -470,12 +468,12 @@ def generate_iid_split(
         assert start == cls_size, f"Allocation mismatch: {start}!={cls_size}"
 
     # Split training indices evenly per class
-    for cls_indices in train_idx_by_class:
-        _even_split_indices(cls_indices, train_user_indices, allow_partial=False)
+    for cls_idx, cls_indices in enumerate(train_idx_by_class):
+        _even_split_indices(cls_indices, train_user_indices, cls_idx % num_users)
 
-    # Split test indices evenly per class (allow partial distribution if samples < users)
-    for cls_indices in test_idx_by_class:
-        _even_split_indices(cls_indices, test_user_indices, allow_partial=True)
+    # Rotate class remainders so the same clients do not receive every extra sample.
+    for cls_idx, cls_indices in enumerate(test_idx_by_class):
+        _even_split_indices(cls_indices, test_user_indices, cls_idx % num_users)
 
     # Create Subset objects for each user
     train_subsets = [Subset(trainset, indices) for indices in train_user_indices]

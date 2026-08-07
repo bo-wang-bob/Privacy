@@ -38,7 +38,7 @@ class FedAvgAggregator(BaseAggregator):
                 "tensors": {
                     name: (
                         ctx.updated_model_state[user_id][name]
-                        - ctx.get_base_model_state(user_id)[name]
+                        - ctx.get_base_model_state()[name]
                     )
                     .detach()
                     .clone()
@@ -47,14 +47,6 @@ class FedAvgAggregator(BaseAggregator):
             }
             for user_id in selected_ids
         }
-        if ctx.mode == "local":
-            ctx.new_model_state = {
-                user_id: ctx.updated_model_state.get(
-                    user_id, ctx.base_model_state[user_id]
-                )
-                for user_id in range(ctx.users_num)
-            }
-            return
         aggregate_fedavg_model_states(ctx, selected_ids)
 
 

@@ -560,7 +560,7 @@ def main() -> int:
     parser.add_argument(
         "--max-nonmembers",
         type=int,
-        default=0,
+        default=20000,
         help="Maximum non-members, or 0 to use the complete disjoint pool.",
     )
     parser.add_argument("--output", type=Path)

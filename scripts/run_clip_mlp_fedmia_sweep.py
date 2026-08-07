@@ -67,11 +67,24 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _audit_client_label(config: dict[str, Any]) -> str:
+    """Return a stable human-readable label for the clients audited in one run."""
+    audit = config.get("audit", {})
+    configured = audit.get("audit_client_ids")
+    if isinstance(configured, str) and configured.lower() == "all":
+        return "all"
+    if isinstance(configured, list) and len(configured) > 1:
+        return "clients" + "-".join(str(int(value)) for value in configured)
+    if isinstance(configured, list) and configured:
+        return str(int(configured[0]))
+    return str(int(audit.get("target_client_id", 0)))
+
+
 def _timestamped_run_id(
     config: dict[str, Any],
     dataset: str,
     seed: int,
-    target: int,
+    target: int | str,
     started_at: datetime.datetime,
 ) -> str:
     canonical = copy.deepcopy(config)
@@ -105,6 +118,9 @@ def build_jobs(
         spec.get("base_config", "configs/clip_mlp_low_fpr_attacks.yaml")
     )
     base = _deep_merge(_load_yaml(base_path), spec.get("common", {}))
+    base["projres"] = _deep_merge(
+        base.get("projres", {}), spec.get("projres", {})
+    )
     results_root = _resolve_path(spec.get("results_root", "results"))
     sweep_name = str(spec.get("name", "clip_mlp_fedmia_attacks"))
     datasets = spec.get("datasets", [])
@@ -114,6 +130,19 @@ def build_jobs(
     targets = [int(value) for value in spec.get("target_client_ids", [0])]
     if not seeds or not targets:
         raise ValueError("sweep seeds and target_client_ids must be non-empty.")
+    configured_audit_clients = base.get("audit", {}).get("audit_client_ids")
+    pooled_audit = (
+        isinstance(configured_audit_clients, str)
+        and configured_audit_clients.lower() == "all"
+    ) or (
+        isinstance(configured_audit_clients, list)
+        and len(configured_audit_clients) > 1
+    )
+    if pooled_audit and len(targets) != 1:
+        raise ValueError(
+            "A pooled audit uses one training job; target_client_ids must contain "
+            "only one compatibility anchor."
+        )
     defenses = spec.get("defenses", [{"name": "none"}])
     if len(defenses) != 1 or str(defenses[0].get("name", "none")).lower() != "none":
         raise ValueError("The frozen-CLIP attack sweep supports defense=none only.")
@@ -161,7 +190,7 @@ def build_jobs(
         config.setdefault("audit", {})["target_client_id"] = target
         dataset = str(config["dataset_name"])
         run_id = _timestamped_run_id(
-            config, dataset, seed, target, invocation_time
+            config, dataset, seed, _audit_client_label(config), invocation_time
         )
         run_root = results_root / run_id
         config["results_dir"] = str(run_root)
@@ -249,7 +278,16 @@ def _completed_result(job: SweepJob) -> Path | None:
         return None
     completed = {row.get("attack") for row in audit.get("attacks", [])}
     expected = set(job.config.get("audit", {}).get("attacks", []))
-    return job.run_root if not audit.get("errors") and completed == expected else None
+    projres_complete = not bool(
+        job.config.get("projres", {}).get("enabled", False)
+    ) or _projres_path(job).is_file()
+    return (
+        job.run_root
+        if not audit.get("errors")
+        and completed == expected
+        and projres_complete
+        else None
+    )
 
 
 def _display(value: Any) -> str:
@@ -316,6 +354,7 @@ def summarize(
     jobs: list[SweepJob], results_root: Path, summary_prefix: str
 ) -> tuple[int, int]:
     rows = []
+    client_rows = []
     complete = 0
     for job in jobs:
         result_dir = _completed_result(job)
@@ -333,12 +372,19 @@ def summarize(
         accuracy = float(training_rows[-1]["accuracy"]) if training_rows else None
         for attack in audit.get("attacks", []):
             reportable = attack.get("reportable_metrics", attack)
+            metadata = attack.get("metadata", {})
+            macro = metadata.get("macro_metrics", {})
+            macro_value = lambda key: (
+                macro.get(key, {}).get("mean")
+                if isinstance(macro.get(key), dict)
+                else None
+            )
             rows.append(
                 {
                     "run_id": job.run_id,
                     "dataset": job.dataset,
                     "seed": job.seed,
-                    "target_client_id": job.target_client_id,
+                    "target_client_id": _audit_client_label(job.config),
                     "attack": attack["attack"],
                     "final_accuracy": accuracy,
                     "auc": attack.get("auc"),
@@ -348,15 +394,60 @@ def summarize(
                     "member_count": attack.get("member_count"),
                     "nonmember_count": attack.get("nonmember_count"),
                     "fpr_resolution": attack.get("fpr_resolution"),
+                    "client_macro_auc": macro_value("auc"),
+                    "client_macro_tpr_at_fpr_0.1": macro_value(
+                        "tpr_at_fpr_0.1"
+                    ),
+                    "client_macro_tpr_at_fpr_0.01": macro_value(
+                        "tpr_at_fpr_0.01"
+                    ),
+                    "client_macro_tpr_at_fpr_0.001": macro_value(
+                        "tpr_at_fpr_0.001"
+                    ),
                     "result_dir": str(result_dir),
                 }
             )
+            for client_id, client in metadata.get(
+                "per_client_metrics", {}
+            ).items():
+                client_reportable = client.get("reportable_metrics", client)
+                nonmember_count = client.get("nonmember_count")
+                client_rows.append(
+                    {
+                        "run_id": job.run_id,
+                        "dataset": job.dataset,
+                        "seed": job.seed,
+                        "target_client_id": client_id,
+                        "attack": attack["attack"],
+                        "final_accuracy": accuracy,
+                        "auc": client.get("auc"),
+                        "tpr_at_fpr_0.1": client_reportable.get(
+                            "tpr_at_fpr_0.1"
+                        ),
+                        "tpr_at_fpr_0.01": client_reportable.get(
+                            "tpr_at_fpr_0.01"
+                        ),
+                        "tpr_at_fpr_0.001": client_reportable.get(
+                            "tpr_at_fpr_0.001"
+                        ),
+                        "member_count": client.get("member_count"),
+                        "nonmember_count": nonmember_count,
+                        "fpr_resolution": (
+                            1.0 / int(nonmember_count)
+                            if nonmember_count
+                            else None
+                        ),
+                        "result_dir": str(result_dir),
+                    }
+                )
     results_root.mkdir(parents=True, exist_ok=True)
     fields = [
         "run_id", "dataset", "seed", "target_client_id", "attack",
         "final_accuracy", "auc", "tpr_at_fpr_0.1", "tpr_at_fpr_0.01",
         "tpr_at_fpr_0.001", "member_count", "nonmember_count",
-        "fpr_resolution", "result_dir",
+        "fpr_resolution", "client_macro_auc",
+        "client_macro_tpr_at_fpr_0.1", "client_macro_tpr_at_fpr_0.01",
+        "client_macro_tpr_at_fpr_0.001", "result_dir",
     ]
     with (results_root / f"{summary_prefix}_summary_by_run.csv").open(
         "w", encoding="utf-8", newline=""
@@ -365,13 +456,32 @@ def summarize(
         writer.writeheader()
         writer.writerows(rows)
 
+    client_fields = [
+        "run_id", "dataset", "seed", "target_client_id", "attack",
+        "final_accuracy", "auc", "tpr_at_fpr_0.1", "tpr_at_fpr_0.01",
+        "tpr_at_fpr_0.001", "member_count", "nonmember_count",
+        "fpr_resolution", "result_dir",
+    ]
+    with (results_root / f"{summary_prefix}_summary_by_client.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=client_fields)
+        writer.writeheader()
+        writer.writerows(client_rows)
+
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault((row["dataset"], row["attack"]), []).append(row)
     aggregate_rows = []
     for (dataset, attack), group in sorted(grouped.items()):
         result = {"dataset": dataset, "attack": attack, "runs": len(group)}
-        for metric in ("final_accuracy", "auc", "tpr_at_fpr_0.001"):
+        for metric in (
+            "final_accuracy",
+            "auc",
+            "tpr_at_fpr_0.001",
+            "client_macro_auc",
+            "client_macro_tpr_at_fpr_0.001",
+        ):
             values = [float(row[metric]) for row in group if row[metric] is not None]
             result[f"{metric}_mean"] = statistics.fmean(values) if values else None
             result[f"{metric}_std"] = statistics.stdev(values) if len(values) > 1 else 0.0 if values else None
@@ -379,6 +489,9 @@ def summarize(
     aggregate_fields = [
         "dataset", "attack", "runs", "final_accuracy_mean", "final_accuracy_std",
         "auc_mean", "auc_std", "tpr_at_fpr_0.001_mean", "tpr_at_fpr_0.001_std",
+        "client_macro_auc_mean", "client_macro_auc_std",
+        "client_macro_tpr_at_fpr_0.001_mean",
+        "client_macro_tpr_at_fpr_0.001_std",
     ]
     with (results_root / f"{summary_prefix}_summary_aggregate.csv").open(
         "w", encoding="utf-8", newline=""
@@ -406,7 +519,7 @@ def _projres_path(job) -> Path:
     return job.run_root / "privacy_audit" / "projres_strict.json"
 
 
-def _commands(job, gpu: int, projres: dict[str, Any], skip_projres: bool):
+def _commands(job, gpu: int) -> list[list[str]]:
     main_command = [
         sys.executable,
         str(REPOSITORY_ROOT / "main.py"),
@@ -415,29 +528,7 @@ def _commands(job, gpu: int, projres: dict[str, Any], skip_projres: bool):
         "--gpu",
         str(gpu),
     ]
-    projres_command = None
-    if not skip_projres and bool(projres.get("enabled", True)):
-        projres_command = [
-            sys.executable,
-            str(REPOSITORY_ROOT / "scripts/validate_projres_mlp_real.py"),
-            "--config",
-            str(job.config_path),
-            "--gpu",
-            str(gpu),
-            "--target-client",
-            str(job.target_client_id),
-            "--threshold",
-            str(projres.get("threshold", 0.01)),
-            "--max-candidates",
-            str(projres.get("max_candidates", 32)),
-            "--min-nonmembers",
-            str(projres.get("min_nonmembers", 1000)),
-            "--max-nonmembers",
-            str(projres.get("max_nonmembers", 0)),
-            "--output",
-            str(_projres_path(job)),
-        ]
-    return main_command, projres_command
+    return [main_command]
 
 
 def _command_text(command: list[str]) -> str:
@@ -483,14 +574,15 @@ def _projres_parameters_block(job, projres: dict[str, Any]) -> str:
     return "\n".join(
         (
             divider,
-            f"STRICT PROJRES | {job.run_id}",
+            f"PROJRES ON OBSERVED CLIENT UPDATE | {job.run_id}",
             divider,
+            f"  evaluation_round   : {projres.get('evaluation_round', 'last')}",
             f"  threshold          : {projres.get('threshold', 0.01)}",
             f"  max_candidates     : {projres.get('max_candidates', 32)}",
             f"  min_nonmembers     : {projres.get('min_nonmembers', 1000)}",
-            f"  max_nonmembers     : {projres.get('max_nonmembers', 0)}",
+            f"  max_nonmembers     : {projres.get('max_nonmembers', 20000)}",
             f"  attacked_layer     : {attacked_layer}",
-            "  threat_model       : one batch, one vanilla FedSGD step",
+            "  update_source      : observed client upload from that real round",
             divider,
         )
     )
@@ -557,7 +649,7 @@ def _announce_job_start(
     blocks = [
         (
             f"STARTING JOB | {_log_context(job, 'all', gpu)} | "
-            f"seed={job.seed} | target_client={job.target_client_id}"
+            f"seed={job.seed} | audit_clients={_audit_client_label(job.config)}"
         ),
         _job_hyperparameters_block(job),
     ]
@@ -589,7 +681,7 @@ def _run_job(
 ):
     _announce_job_start(job, gpu, projres, skip_projres)
     _write_job_config(job)
-    main_command, projres_command = _commands(job, gpu, projres, skip_projres)
+    main_command = _commands(job, gpu)[0]
     main_complete = _completed_result(job) is not None
     if force or not main_complete:
         if force:
@@ -607,18 +699,6 @@ def _run_job(
         )
         if return_code != 0 or _completed_result(job) is None:
             return job.run_id, False, "main.py failed"
-    if projres_command is not None and (force or not _projres_path(job).is_file()):
-        projres_log = job.run_root / "projres_strict.log"
-        projres_phase = "projres_strict"
-        _announce_phase(job, "STRICT PROJRES", projres_phase, gpu, projres_log)
-        return_code = _run_logged(
-            projres_command,
-            projres_log,
-            stream_output=stream_output,
-            context=_log_context(job, projres_phase, gpu),
-        )
-        if return_code != 0 or not _projres_path(job).is_file():
-            return job.run_id, False, "strict ProjRes failed"
     return job.run_id, True, "complete"
 
 
@@ -643,7 +723,7 @@ def summarize_projres(jobs, results_root: Path, summary_prefix: str) -> int:
                 "run_id": job.run_id,
                 "dataset": job.dataset,
                 "seed": job.seed,
-                "target_client_id": job.target_client_id,
+                "target_client_id": _audit_client_label(job.config),
                 "attack": "projres",
                 "auc": metrics.get("auc"),
                 "tpr_at_fpr_0.1": reportable.get("tpr_at_fpr_0.1"),
@@ -682,7 +762,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--datasets", help="Comma-separated dataset names.")
     parser.add_argument("--attacks", default=None, help="Generic attack CSV.")
-    parser.add_argument("--target-client", type=int)
+    parser.add_argument(
+        "--target-client",
+        help="Audit one client ID, or use 'all' for every client in one training run.",
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument("--gpus", help="Comma-separated GPU indices.")
     parser.add_argument("--jobs", type=int)
@@ -694,6 +777,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate-decay", type=float)
     parser.add_argument("--learning-rate-decay-interval", type=int)
     parser.add_argument("--projres-threshold", type=float)
+    parser.add_argument(
+        "--projres-round",
+        help="One-based communication round for ProjRes, or 'last'.",
+    )
     parser.add_argument("--projres-max-candidates", type=int)
     parser.add_argument("--projres-min-out", type=int)
     parser.add_argument("--projres-max-out", type=int)
@@ -715,12 +802,32 @@ def main() -> int:
             _parse_csv(args.attacks)
         )
     if args.target_client is not None:
-        spec["target_client_ids"] = [args.target_client]
+        target_text = str(args.target_client).strip().lower()
+        audit_override = spec.setdefault("common", {}).setdefault("audit", {})
+        if target_text == "all":
+            spec["target_client_ids"] = [0]
+            audit_override["target_client_id"] = 0
+            audit_override["audit_client_ids"] = "all"
+        else:
+            try:
+                target_client_id = int(target_text)
+            except ValueError as error:
+                raise ValueError(
+                    "--target-client must be a non-negative integer or 'all'."
+                ) from error
+            if target_client_id < 0:
+                raise ValueError(
+                    "--target-client must be a non-negative integer or 'all'."
+                )
+            spec["target_client_ids"] = [target_client_id]
+            audit_override["target_client_id"] = target_client_id
+            audit_override["audit_client_ids"] = [target_client_id]
     if args.seed is not None:
         spec["seeds"] = [args.seed]
     projres = dict(spec.get("projres", {}))
     projres_enabled = bool(projres.get("enabled", True)) and not args.skip_projres
     overrides = {
+        "evaluation_round": args.projres_round,
         "threshold": args.projres_threshold,
         "max_candidates": args.projres_max_candidates,
         "min_nonmembers": args.projres_min_out,
@@ -731,6 +838,9 @@ def main() -> int:
         raise ValueError("ProjRes threshold must be non-negative.")
     if int(projres.get("min_nonmembers", 1000)) < 1000:
         raise ValueError("ProjRes needs at least 1000 non-members for 0.1% FPR.")
+    projres.setdefault("max_nonmembers", 20000)
+    projres["enabled"] = projres_enabled
+    spec["projres"] = projres
 
     jobs, results_root = build_jobs(
         spec,
@@ -758,11 +868,8 @@ def main() -> int:
             print(_job_hyperparameters_block(job))
             if projres_enabled:
                 print(_projres_parameters_block(job, projres))
-            for command in _commands(
-                job, gpus[index % len(gpus)], projres, args.skip_projres
-            ):
-                if command is not None:
-                    print("COMMAND " + _command_text(command))
+            for command in _commands(job, gpus[index % len(gpus)]):
+                print("COMMAND " + _command_text(command))
         print(f"Expanded {len(jobs)} jobs; results_root={results_root}")
         return 0
     if args.summarize_only:

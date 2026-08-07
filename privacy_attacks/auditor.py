@@ -65,6 +65,7 @@ SUPPORTED_ATTACKS = {
 # evidence. Active/query attacks remain single-client because their probes must
 # be scheduled and accounted for separately for every target user.
 POOLED_CLIENT_ATTACKS = {
+    "blackbox_loss",
     "loss_series",
     "grad_cosine",
     "avg_cosine",
@@ -736,7 +737,7 @@ class MembershipAuditor:
     def _initialize_low_fpr_full_candidates(
         self, users: list, target_client_id: int
     ) -> None:
-        """Build the full low-FPR pool, then apply reproducible optional caps."""
+        """Build reproducible low-FPR pools for one or more audit clients."""
         supported = {
             "blackbox_loss",
             "loss_series",
@@ -750,102 +751,137 @@ class MembershipAuditor:
             raise ValueError(
                 "low_fpr_full currently requires a frozen-CLIP feature model."
             )
-        if self.pooled_client_audit:
-            raise ValueError("low_fpr_full currently supports one target client.")
         if unsupported:
             raise ValueError(
                 "low_fpr_full does not support: " + ", ".join(unsupported)
             )
-        target = users[target_client_id]
-        member_features, member_labels, member_sources = (
-            self._collect_encoded_candidates(
-                [target.train_data], [f"target_train:{target_client_id}"]
+        image_parts = []
+        label_parts = []
+        membership_parts = []
+        client_parts = []
+        candidate_sampling_by_client = {}
+        selection_by_client = {}
+        overlap_by_client = {}
+        source_priority = []
+        eligible_client_ids = []
+
+        for client_id in self.audit_client_ids:
+            try:
+                target = users[client_id]
+                member_features, member_labels, member_sources = (
+                    self._collect_encoded_candidates(
+                        [target.train_data], [f"target_train:{client_id}"]
+                    )
+                )
+                nonmember_datasets = []
+                nonmember_source_names = []
+                for user in users:
+                    if len(user.test_data):
+                        nonmember_datasets.append(user.test_data)
+                        nonmember_source_names.append(
+                            f"independent_test:{user.id}"
+                        )
+                for user in users:
+                    if user.id != client_id and len(user.train_data):
+                        nonmember_datasets.append(user.train_data)
+                        nonmember_source_names.append(
+                            f"other_client_train:{user.id}"
+                        )
+                nonmember_features, nonmember_labels, nonmember_sources = (
+                    self._collect_encoded_candidates(
+                        nonmember_datasets, nonmember_source_names
+                    )
+                )
+                minimum_nonmembers = self.low_fpr_min_nonmembers
+                if nonmember_labels.numel() < minimum_nonmembers:
+                    raise ValueError(
+                        "low_fpr_full needs at least "
+                        f"{minimum_nonmembers} non-members, but only found "
+                        f"{nonmember_labels.numel()}."
+                    )
+            except ValueError as error:
+                if not self.allow_partial_client_audit:
+                    raise
+                self.skipped_audit_clients[str(client_id)] = str(error)
+                logger.warning(
+                    "Skipping client %d in low-FPR audit: %s",
+                    client_id,
+                    error,
+                )
+                continue
+
+            member_pool_count = int(member_labels.numel())
+            nonmember_pool_count = int(nonmember_labels.numel())
+            client_seed_offset = 1000003 * int(client_id)
+            member_sampling_seed = self.seed + 104729 + client_seed_offset
+            nonmember_sampling_seed = self.seed + 130363 + client_seed_offset
+            member_pool_indices = self._stratified_subsample_indices(
+                member_labels,
+                self.low_fpr_max_members,
+                member_sampling_seed,
             )
-        )
-        nonmember_datasets = []
-        nonmember_source_names = []
-        for user in users:
-            if len(user.test_data):
-                nonmember_datasets.append(user.test_data)
-                nonmember_source_names.append(f"independent_test:{user.id}")
-        for user in users:
-            if user.id != target_client_id and len(user.train_data):
-                nonmember_datasets.append(user.train_data)
-                nonmember_source_names.append(f"other_client_train:{user.id}")
-        nonmember_features, nonmember_labels, nonmember_sources = (
-            self._collect_encoded_candidates(
-                nonmember_datasets, nonmember_source_names
+            nonmember_pool_indices = self._stratified_subsample_indices(
+                nonmember_labels,
+                self.low_fpr_max_nonmembers,
+                nonmember_sampling_seed,
             )
-        )
-        minimum_nonmembers = self.low_fpr_min_nonmembers
-        if nonmember_labels.numel() < minimum_nonmembers:
-            raise ValueError(
-                "low_fpr_full needs at least "
-                f"{minimum_nonmembers} non-members, but only found "
-                f"{nonmember_labels.numel()}."
+            selected_member_sources = self._selected_source_counts(
+                member_pool_indices, member_sources
             )
-        member_pool_count = int(member_labels.numel())
-        nonmember_pool_count = int(nonmember_labels.numel())
-        member_pool_indices = self._stratified_subsample_indices(
-            member_labels,
-            self.low_fpr_max_members,
-            self.seed + 104729,
-        )
-        nonmember_pool_indices = self._stratified_subsample_indices(
-            nonmember_labels,
-            self.low_fpr_max_nonmembers,
-            self.seed + 130363,
-        )
-        selected_member_sources = self._selected_source_counts(
-            member_pool_indices, member_sources
-        )
-        selected_nonmember_sources = self._selected_source_counts(
-            nonmember_pool_indices, nonmember_sources
-        )
-        member_features = member_features.index_select(0, member_pool_indices)
-        member_labels = member_labels.index_select(0, member_pool_indices)
-        nonmember_features = nonmember_features.index_select(
-            0, nonmember_pool_indices
-        )
-        nonmember_labels = nonmember_labels.index_select(
-            0, nonmember_pool_indices
-        )
-        self.low_fpr_candidate_selection = {
-            "seed": self.seed,
-            "member_sampling_seed": self.seed + 104729,
-            "nonmember_sampling_seed": self.seed + 130363,
-            "index_convention": (
-                "zero-based positions in each complete concatenated candidate "
-                "pool; source boundaries follow the ordered pool_source_counts"
-            ),
-            "member_pool_indices": member_pool_indices,
-            "nonmember_pool_indices": nonmember_pool_indices,
-            "member_pool_source_counts": member_sources,
-            "nonmember_pool_source_counts": nonmember_sources,
-        }
-        logger.info(
-            "Low-FPR audit candidates selected: members=%d/%d, "
-            "non-members=%d/%d, stratified_seed=%d",
-            int(member_labels.numel()),
-            member_pool_count,
-            int(nonmember_labels.numel()),
-            nonmember_pool_count,
-            self.seed,
-        )
-        self.images = torch.cat((member_features, nonmember_features))
-        self.labels = torch.cat((member_labels, nonmember_labels))
-        self.membership = torch.cat(
-            (
-                torch.ones(member_labels.numel(), dtype=torch.long),
-                torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+            selected_nonmember_sources = self._selected_source_counts(
+                nonmember_pool_indices, nonmember_sources
             )
-        )
-        self.candidate_client_ids = torch.full(
-            (self.labels.numel(),), target_client_id, dtype=torch.long
-        )
-        self.candidate_inputs_are_features = True
-        self.candidate_sampling_by_client = {
-            str(target_client_id): {
+            member_features = member_features.index_select(
+                0, member_pool_indices
+            )
+            member_labels = member_labels.index_select(0, member_pool_indices)
+            nonmember_features = nonmember_features.index_select(
+                0, nonmember_pool_indices
+            )
+            nonmember_labels = nonmember_labels.index_select(
+                0, nonmember_pool_indices
+            )
+            selection = {
+                "seed": self.seed,
+                "member_sampling_seed": member_sampling_seed,
+                "nonmember_sampling_seed": nonmember_sampling_seed,
+                "index_convention": (
+                    "zero-based positions in this client's complete concatenated "
+                    "candidate pool; source boundaries follow the ordered "
+                    "pool_source_counts"
+                ),
+                "member_pool_indices": member_pool_indices,
+                "nonmember_pool_indices": nonmember_pool_indices,
+                "member_pool_source_counts": member_sources,
+                "nonmember_pool_source_counts": nonmember_sources,
+            }
+            selection_by_client[str(client_id)] = selection
+            logger.info(
+                "Low-FPR client %d candidates selected: members=%d/%d, "
+                "non-members=%d/%d, seed=%d",
+                client_id,
+                int(member_labels.numel()),
+                member_pool_count,
+                int(nonmember_labels.numel()),
+                nonmember_pool_count,
+                self.seed,
+            )
+            images = torch.cat((member_features, nonmember_features))
+            labels = torch.cat((member_labels, nonmember_labels))
+            memberships = torch.cat(
+                (
+                    torch.ones(member_labels.numel(), dtype=torch.long),
+                    torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+                )
+            )
+            image_parts.append(images)
+            label_parts.append(labels)
+            membership_parts.append(memberships)
+            client_parts.append(
+                torch.full((labels.numel(),), client_id, dtype=torch.long)
+            )
+            eligible_client_ids.append(client_id)
+            candidate_sampling_by_client[str(client_id)] = {
                 "mode": "low_fpr_full",
                 "member_count": int(member_labels.numel()),
                 "nonmember_count": int(nonmember_labels.numel()),
@@ -859,23 +895,55 @@ class MembershipAuditor:
                 "maximum_members": self.low_fpr_max_members,
                 "maximum_nonmembers": self.low_fpr_max_nonmembers,
                 "selection_seed": self.seed,
-                "selection_method": "proportional_class_stratified_without_replacement",
+                "selection_method": (
+                    "proportional_class_stratified_without_replacement"
+                ),
                 "selection_artifact": "candidate_selection.pt",
                 "fpr_resolution": 1.0 / int(nonmember_labels.numel()),
             }
-        }
+            overlap_by_client[str(client_id)] = sorted(
+                set(member_labels.unique().tolist())
+                & set(nonmember_labels.unique().tolist())
+            )
+            source_priority.extend(nonmember_source_names)
+
+        if not eligible_client_ids:
+            raise ValueError(
+                "Low-FPR audit found no client with enough member and "
+                "non-member candidates."
+            )
+        self.audit_client_ids = eligible_client_ids
+        self.pooled_client_audit = len(eligible_client_ids) > 1
+        if not self.pooled_client_audit:
+            self.target_client_id = eligible_client_ids[0]
+        self.low_fpr_candidate_selection = (
+            {
+                "scope": "pooled_clients",
+                "seed": self.seed,
+                "audit_client_ids": eligible_client_ids,
+                "per_client": selection_by_client,
+            }
+            if self.pooled_client_audit
+            else selection_by_client[str(eligible_client_ids[0])]
+        )
+        self.images = torch.cat(image_parts)
+        self.labels = torch.cat(label_parts)
+        self.membership = torch.cat(membership_parts)
+        self.candidate_client_ids = torch.cat(client_parts)
+        self.candidate_inputs_are_features = True
+        self.candidate_sampling_by_client = candidate_sampling_by_client
         self.candidate_label_support = sorted(
             set(self.labels.detach().cpu().unique().tolist())
         )
-        member_support = set(member_labels.unique().tolist())
-        nonmember_support = set(nonmember_labels.unique().tolist())
         self.null_client_candidate_label_overlap = sorted(
-            member_support & nonmember_support
+            {
+                class_id
+                for overlap in overlap_by_client.values()
+                for class_id in overlap
+            }
         )
-        self.null_client_candidate_label_overlap_by_client = {
-            str(target_client_id): self.null_client_candidate_label_overlap
-        }
-        self.nonmember_source_priority = nonmember_source_names
+        self.null_client_candidate_label_overlap_by_client = overlap_by_client
+        self.nonmember_source_priority = list(dict.fromkeys(source_priority))
 
     @staticmethod
     def _unused_few_shot_training_pool(users) -> Subset | None:
@@ -1915,7 +1983,12 @@ class MembershipAuditor:
         membership = self.membership[indices]
         labels = self.labels[indices]
         seed = self.seed + 1009 * client_id
-        if attack in {"loss_series", "grad_cosine", "avg_cosine"}:
+        if attack in {
+            "blackbox_loss",
+            "loss_series",
+            "grad_cosine",
+            "avg_cosine",
+        }:
             return run_fedmia_baseline(
                 observations,
                 membership,
@@ -2277,7 +2350,6 @@ class MembershipAuditor:
                 low_fpr_candidate_selection,
                 os.path.join(self.results_dir, "candidate_selection.pt"),
             )
-        candidate_clip_features = self._save_candidate_clip_features()
         final_model = copy.deepcopy(final_model).to(self.device)
         final_model.load_state_dict(final_state, strict=False)
         if self.defense_name == "hamp":
@@ -2437,7 +2509,6 @@ class MembershipAuditor:
                             self.match_candidate_labels
                             and distributions_exactly_matched
                         ),
-                        "personalized_public_model_projection": None,
                         "null_clients_share_candidate_training_labels": bool(
                             self.null_client_candidate_label_overlap
                         ),
@@ -2484,7 +2555,6 @@ class MembershipAuditor:
                         ),
                         "per_client": self.candidate_sampling_by_client,
                     },
-                    "candidate_clip_features": candidate_clip_features,
                     "audit_health": audit_health,
                     "attacks": summaries,
                     "errors": self.errors,
@@ -2541,59 +2611,3 @@ class MembershipAuditor:
                 "Partial diagnostics were saved to privacy_audit/summary.json."
             )
         return summaries
-
-    def _save_candidate_clip_features(self) -> dict:
-        """Optionally persist frozen CLIP vectors aligned to prediction indices."""
-        enabled = bool(self.config.get("save_candidate_clip_features", False))
-        metadata = {
-            "enabled": enabled,
-            "written": False,
-            "file": None,
-            "sample_index_alignment": (
-                "row i equals predictions.csv sample_index i"
-            ),
-        }
-        if not enabled:
-            return metadata
-        if not getattr(self, "candidate_inputs_are_features", False):
-            raise ValueError(
-                "save_candidate_clip_features requires cached frozen-CLIP "
-                "candidate inputs."
-            )
-        features = self.images.detach().cpu()
-        if features.ndim != 2 or features.shape[0] != self.labels.numel():
-            raise ValueError(
-                "Candidate CLIP features must be a two-dimensional tensor "
-                "aligned with candidate labels."
-            )
-        os.makedirs(self.results_dir, exist_ok=True)
-        filename = "candidate_clip_features.pt"
-        torch.save(
-            {
-                "clip_features": features,
-                "sample_indices": torch.arange(features.shape[0]),
-                "candidate_labels": self.labels.detach().cpu().long(),
-                "membership": self.membership.detach().cpu().long(),
-                "candidate_client_ids": (
-                    self.candidate_client_ids.detach().cpu().long()
-                ),
-                "model_type": self.model_type,
-                "feature_space": "frozen_clip_image_encoder_output",
-                "normalized": bool(
-                    getattr(self.model, "normalize_features", False)
-                ),
-            },
-            os.path.join(self.results_dir, filename),
-        )
-        metadata.update(
-            {
-                "written": True,
-                "file": filename,
-                "shape": list(features.shape),
-                "dtype": str(features.dtype),
-                "normalized": bool(
-                    getattr(self.model, "normalize_features", False)
-                ),
-            }
-        )
-        return metadata

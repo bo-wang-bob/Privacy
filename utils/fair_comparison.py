@@ -13,7 +13,6 @@ import yaml
 
 
 FAIR_CONFIG_PATHS = (
-    "train_mode",
     "dataset_name",
     "batch_size",
     "eval_batch_size",
@@ -36,7 +35,6 @@ FAIR_CONFIG_PATHS = (
     "audit.ensure_target_participation",
     "audit.attacks",
     "audit.max_samples_per_group",
-    "audit.audit_interval",
     "audit.calibration_fraction",
     "audit.match_candidate_labels",
     "audit.auxiliary_fraction",

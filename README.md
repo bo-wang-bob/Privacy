@@ -92,15 +92,16 @@ round 0 建立训练前基线，之后每 5 个已完成通信轮评估一次（
 原始图片的一次性 CLIP 编码仍单独使用
 `precompute_batch_size: 64`，因此增大向量 batch 不会同步放大视觉主干的显存峰值。
 
-MLP 与 Visual Adapter 的通用实验默认使用每 5 个通信轮下降一次的阶梯学习率：
+训练器仍支持按通信轮进行阶梯学习率调度：
 
 ```text
 decay_step = round_index // learning_rate_decay_interval
 lr(round_index) = initial_learning_rate * learning_rate_decay ** decay_step
 ```
 
-其中第 1–5 个训练轮使用初始学习率，默认 `learning_rate_decay: 0.99`、
-`learning_rate_decay_interval: 5`；第 6 轮开始使用 `initial_lr × 0.99`。
+当前 MLP 与 Visual Adapter 的通用实验设置 `learning_rate_decay: 1.0`，因此全部
+300 个通信轮保持初始客户端学习率不变。只有显式设置小于 1 的衰减系数时，
+`learning_rate_decay_interval` 才会影响训练。
 将 decay 设为 `1.0` 可关闭衰减，也可通过 `--learning-rate-decay` 和
 `--learning-rate-decay-interval` 覆盖。
 
@@ -159,7 +160,7 @@ bash scripts/run_projres_mlp_real.sh
 `promptres` 不是同一种算法。
 
 在 MLP FedAvg 上运行损失、时序损失、单轮/时序梯度余弦、FedMIA-I/II，
-并在随后使用相同配置执行严格单批次 ProjRes：
+并在同一主进程中对指定通信轮的真实客户端上传更新执行 ProjRes：
 
 ```bash
 bash scripts/run_clip_mlp_fedmia_attacks.sh
@@ -175,28 +176,35 @@ bash scripts/run_clip_mlp_fedmia_attacks.sh \
 ```
 
 每个训练任务都会创建一个新的时间戳目录，例如
-`results/2026-08-05_14-30-52-123456_clip_mlp_caltech101_fedavg_seed42_target0_<hash>/`。
-目录名同时标明任务启动时间、模型实现、数据集、联邦方法、随机种子和目标客户端；
+`results/2026-08-05_14-30-52-123456_clip_mlp_caltech101_fedavg_seed42_targetall_<hash>/`。
+目录名同时标明任务启动时间、模型实现、数据集、联邦方法、随机种子和审计范围；
 重新运行不会复用或覆盖之前的任务目录。可复现配置保存在该目录的
 `run_config.yaml`，默认攻击列表可通过 `--attacks` 覆盖。
 
-严格 ProjRes 结果写入每个作业的
+ProjRes 直接复用主任务已缓存的 CLIP 向量，并观察实际通信轮的客户端上传更新，
+不再启动第二个 Python 进程或重新加载数据；默认评估最后一轮，也可通过
+`--projres-round 50` 对齐论文通常使用的第 50 轮。结果写入每个作业的
 `privacy_audit/projres_strict.json`。可使用 `--projres-threshold` 调整阈值；仅运行
 通用审计攻击时传入 `--skip-projres`。普通攻击汇总以实验组为文件名前缀写入
-`results/<实验组>_summary_by_run.csv` / `<实验组>_summary_aggregate.csv`，
+`results/<实验组>_summary_by_run.csv`、`<实验组>_summary_by_client.csv` 与
+`<实验组>_summary_aggregate.csv`，
 ProjRes 汇总写入 `<实验组>_summary_projres.csv`；不会生成 HTML 文件。
 
 该脚本默认加载 `configs/clip_mlp_fedmia_attacks_sweep.yaml`，其基础配置是
-`configs/clip_mlp_low_fpr_attacks.yaml`：通用攻击使用目标客户端
-完整训练集作为成员，并使用所有客户端测试集及其他客户端训练集作为互斥非成员；
+`configs/clip_mlp_low_fpr_attacks.yaml`：默认只训练一次，并依次把每个客户端的
+完整训练集作为该客户端的成员，使用所有客户端测试集及其他客户端训练集作为
+相对于该客户端的互斥非成员；
 全部联邦训练集和测试集在训练开始前只编码一次，后续 FedAvg、测试及攻击均复用
-向量。协议强制至少 1000 个非成员，因此
+向量。每个客户端独立构建候选池和计算指标，再报告客户端宏平均；协议强制每个
+客户端至少 1000 个非成员，因此
 `TPR@0.1%FPR` 的经验分辨率达到要求；实际成员数、非成员数和
-`fpr_resolution` 会写入 `privacy_audit/summary.json`。严格 ProjRes 的成员仍只能
-来自产生上传梯度的实际 batch，但它也使用完整非成员池计算低 FPR 指标。
+`fpr_resolution` 会写入 `privacy_audit/summary.json`。ProjRes 的成员定义与被观察
+轮次的本地训练协议一致：FedSGD 时是当前 batch；当前默认 `local_epochs: 1` 的
+FedAvg 实验中则是该轮被客户端遍历的本地训练集。它使用完整非成员池计算低 FPR
+指标。
 
-Visual Adapter 对应的 16-shot 五数据集 sweep 使用相同参数接口，但不会运行
-MLP 专用的严格 ProjRes：
+Visual Adapter 对应的 16-shot 五数据集 sweep 使用相同参数接口；严格 ProjRes
+攻击 Adapter 的第一层下采样参数：
 
 ```bash
 bash scripts/run_visual_adapter_fedmia_attacks.sh
@@ -211,7 +219,7 @@ bash scripts/run_all_clip_fedmia_attacks.sh
 
 该入口默认运行两个模型和五个数据集。可通过 `--models clip_mlp` 或
 `--models visual_adapter` 只运行一个模型，并可用 `--learning-rate` 临时覆盖
-学习率。MLP 会额外运行严格 ProjRes，Adapter 会自动跳过这一架构专属攻击。
+学习率。MLP 与 Adapter 都会在各自主任务内执行对应第一层的严格 ProjRes。
 
 常用筛选、覆盖和并行命令：
 
@@ -287,7 +295,9 @@ python analysis_scripts/verify_promptres_toy.py
 
 非 FedMIA 分数使用客户端内、无成员标签的经验 CDF 秩校准后再合并；FedMIA
 保留自身的零假设 CDF。汇总文件同时包含总体指标、客户端宏平均指标和逐客户
-端指标。使用混合来源的 `fedmia_mix` 测评时可配置为：
+端指标。低 FPR 完整候选池与混合来源的 `fedmia_mix` 均支持一次训练审计所有
+客户端；只审计单个客户端时可传 `--target-client 3`，恢复全部客户端时传
+`--target-client all`。使用 `fedmia_mix` 测评时可配置为：
 
 ```yaml
 audit:
@@ -349,8 +359,9 @@ Adapter 的单次运行、低 FPR sweep，以及 MLP 严格 ProjRes 配置。
 通过 sweep 脚本启动时，每个训练任务只使用一个
 `results/<时间>_<模型>_<数据集>_<方法>_seed<种子>_target<客户端>_<hash>/`
 目录。展开后的实际配置保存为其中的 `run_config.yaml`，标准输出和错误保存为
-其中的 `run.log`，训练指标、健康检查、隐私审计结果和 `projres_strict.log`
-也直接写入该任务目录，不再创建独立的 `configs/` 或 `launcher_logs/`。
+其中的 `run.log`，训练指标、健康检查和隐私审计结果也直接写入该任务目录；
+ProjRes 日志并入 `run.log`，不再创建独立的 `projres_strict.log`、`configs/` 或
+`launcher_logs/`。
 进度日志按 `eval_interval` 输出；逐轮详情仅在 DEBUG 级别记录。
 
 ## 测试

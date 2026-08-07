@@ -57,18 +57,20 @@ Unified options:
 Model-specific learning-rate defaults:
   clip_mlp=0.1, visual_adapter=0.001
   --learning-rate RATE overrides the default for every selected model.
-  Both model specs default to decay=0.99 once every 5 communication rounds.
+  Both model specs keep the client learning rate constant (decay=1.0).
 
 All options below are forwarded to each selected sweep, including:
-  --datasets CSV        --attacks CSV          --target-client ID
+  --datasets CSV        --attacks CSV          --target-client ID|all
   --seed VALUE          --gpus CSV             --jobs VALUE
   --learning-rate RATE  --learning-rate-decay RATE
   --learning-rate-decay-interval ROUNDS
   --rounds VALUE        --dirichlet-alpha VALUE
+  --projres-round N|last
   --skip-projres        --force                --dry-run
   --summarize-only      --max-runs VALUE
 
-Strict ProjRes runs on the first trainable MLP/Adapter downsampling layer.
+ProjRes runs inside each main task on the selected real communication-round
+upload and attacks the first trainable MLP/Adapter downsampling layer.
 EOF
   "$python_bin" scripts/run_clip_mlp_fedmia_sweep.py --help
   exit 0

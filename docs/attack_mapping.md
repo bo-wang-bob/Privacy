@@ -162,3 +162,8 @@ batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。�
 `scripts/validate_projres_mlp_real.py`，配置是 `configs/clip_mlp_projres.yaml`；完整
 边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
 余弦相似度的 `promptres`。
+
+统一 sweep 还提供进程内 ProjRes：它在配置的真实通信轮（默认最后一轮）读取
+`base_state - uploaded_client_state`，不重新构造训练前更新。若该轮每个客户端只
+执行一个 batch，它与论文 FedSGD 观测一致；若包含多个本地 batch，则明确作为
+ProjRes 在实际 FedAvg 上传上的扩展实验报告。
