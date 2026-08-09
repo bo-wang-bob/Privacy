@@ -111,6 +111,7 @@ def build_jobs(
     learning_rate: float | None = None,
     learning_rate_decay: float | None = None,
     learning_rate_decay_interval: int | None = None,
+    partition_mode: str | None = None,
     started_at: datetime.datetime | None = None,
 ) -> tuple[list[SweepJob], Path]:
     del spec_path
@@ -169,6 +170,11 @@ def build_jobs(
                 raise ValueError("--dirichlet-alpha must be positive.")
             config["dirichlet_alpha"] = dirichlet_alpha
             config["partition_mode"] = "dirichlet"
+        if partition_mode is not None:
+            normalized_partition = str(partition_mode).lower()
+            if normalized_partition not in {"iid", "dirichlet"}:
+                raise ValueError("--partition-mode must be iid or dirichlet.")
+            config["partition_mode"] = normalized_partition
         if learning_rate is not None:
             if learning_rate <= 0:
                 raise ValueError("--learning-rate must be positive.")
@@ -184,7 +190,17 @@ def build_jobs(
                 )
             config["learning_rate_decay_interval"] = learning_rate_decay_interval
         config["seed"] = seed
-        config["aggregator"] = "fedavg"
+        config["aggregator"] = (
+            "fedsgd"
+            if str(config.get("model_type", "clip_mlp")).lower()
+            == "visual_adapter"
+            else "fedavg"
+        )
+        if str(config.get("model_type", "clip_mlp")).lower() in {
+            "clip_mlp",
+            "visual_adapter",
+        }:
+            config["aggregation_weighting"] = "uniform"
         config["sweep_name"] = sweep_name
         config["defense"] = _deep_merge(config.get("defense", {}), {"name": "none"})
         config.setdefault("audit", {})["target_client_id"] = target
@@ -200,7 +216,7 @@ def build_jobs(
                 run_id=run_id,
                 config=config,
                 dataset=dataset,
-                method="fedavg",
+                method=str(config["aggregator"]),
                 seed=seed,
                 target_client_id=target,
                 defense="none",
@@ -325,6 +341,8 @@ def _job_hyperparameters_block(job: SweepJob) -> str:
             "data_root": config.get("data_root"),
         },
         "federated": {
+            "aggregator": config.get("aggregator"),
+            "aggregation_weighting": config.get("aggregation_weighting"),
             "total_users": config.get("total_users"),
             "sample_users": config.get("sample_users"),
             "num_global_iters": config.get("num_global_iters"),
@@ -690,7 +708,14 @@ def _run_job(
                 stale.unlink()
         main_log = job.run_root / "run.log"
         main_phase = "training+membership_audit"
-        _announce_phase(job, "FEDAVG + GENERIC AUDIT", main_phase, gpu, main_log)
+        protocol = str(job.config.get("aggregator", "fedavg")).upper()
+        _announce_phase(
+            job,
+            f"{protocol} + GENERIC AUDIT",
+            main_phase,
+            gpu,
+            main_log,
+        )
         return_code = _run_logged(
             main_command,
             main_log,
@@ -773,6 +798,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cache-dir")
     parser.add_argument("--rounds", "--num-global-iters", type=int)
     parser.add_argument("--dirichlet-alpha", type=float)
+    parser.add_argument(
+        "--partition-mode",
+        choices=["iid", "dirichlet"],
+        help="Explicit client partition mode; defaults to the sweep specification.",
+    )
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--learning-rate-decay", type=float)
     parser.add_argument("--learning-rate-decay-interval", type=int)
@@ -852,6 +882,7 @@ def main() -> int:
         learning_rate=args.learning_rate,
         learning_rate_decay=args.learning_rate_decay,
         learning_rate_decay_interval=args.learning_rate_decay_interval,
+        partition_mode=args.partition_mode,
     )
     jobs = filter_jobs_by_dataset(jobs, args.datasets)
     if args.max_runs is not None:

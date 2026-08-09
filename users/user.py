@@ -48,12 +48,18 @@ class UserBase:
         self.defense_controller = defense_controller
         self.federated_method = str(federated_method).lower()
         self.method_config = dict(method_config or {})
+        train_generator = None
+        if self.federated_method == "fedsgd":
+            train_generator = torch.Generator().manual_seed(
+                int(self.method_config.get("seed", 42)) + 1000003 * int(self.id)
+            )
         self.trainloader = DataLoader(
             train_data,
             batch_size=batch_size,
             shuffle=True,
             collate_fn=collate_fn,
             drop_last=False,
+            generator=train_generator,
         )
         self.testloader = DataLoader(
             test_data,
@@ -62,6 +68,50 @@ class UserBase:
             collate_fn=collate_fn,
         )
         self.model = copy.deepcopy(model)
+        self._train_iterator = None
+        self.last_update_sample_count = 0
+        self.last_train_batch: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def begin_local_update(self) -> None:
+        self.last_update_sample_count = 0
+        self.last_train_batch = None
+
+    def _record_train_batch(
+        self, images: torch.Tensor, labels: torch.Tensor
+    ) -> None:
+        self.last_update_sample_count += int(labels.numel())
+        self.last_train_batch = (
+            images.detach().cpu().clone(),
+            labels.detach().cpu().long().clone(),
+        )
+
+    def next_train_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the next shuffled local mini-batch, cycling across rounds."""
+        if self._train_iterator is None:
+            self._train_iterator = iter(self.trainloader)
+        try:
+            batch = next(self._train_iterator)
+        except StopIteration:
+            self._train_iterator = iter(self.trainloader)
+            try:
+                batch = next(self._train_iterator)
+            except StopIteration as error:
+                raise ValueError(
+                    f"Client {self.id} has no local training batch."
+                ) from error
+        images, labels = batch
+        self._record_train_batch(images, labels)
+        return images, labels
+
+    def iter_local_batches(self):
+        """Yield the batches used by one local update under the active protocol."""
+        if self.federated_method == "fedsgd":
+            yield self.next_train_batch()
+            return
+        for _ in range(self.local_epochs):
+            for images, labels in self.trainloader:
+                self._record_train_batch(images, labels)
+                yield images, labels
 
     def set_parameters(self, state: dict[str, torch.Tensor]) -> None:
         self.model.load_state_dict(state, strict=False)
@@ -85,6 +135,7 @@ class UserBase:
         round_index: int = 0,
         privacy_probe: bool = False,
     ) -> None:
+        self.begin_local_update()
         if self.defense_controller is not None:
             effective_round = round_index
             if privacy_probe and round_index == 0:
@@ -112,24 +163,23 @@ class UserBase:
             parameter for parameter in model.parameters() if parameter.requires_grad
         ]
         optimizer = torch.optim.SGD(trainable, lr=self.learning_rate)
-        for _ in range(self.local_epochs):
-            for images, labels in self.trainloader:
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-                optimizer.zero_grad()
-                if code_poison:
-                    loss = compromised_prompt_loss(
-                        model,
-                        images,
-                        labels,
-                        weight=float(self.code_poison_config.get("weight", 1.0)),
-                        mean=float(self.code_poison_config.get("synthetic_mean", 0.0)),
-                        std=float(self.code_poison_config.get("synthetic_std", 0.1)),
-                    )
-                else:
-                    loss = F.cross_entropy(model(images), labels)
-                loss.backward()
-                optimizer.step()
+        for images, labels in self.iter_local_batches():
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+            optimizer.zero_grad()
+            if code_poison:
+                loss = compromised_prompt_loss(
+                    model,
+                    images,
+                    labels,
+                    weight=float(self.code_poison_config.get("weight", 1.0)),
+                    mean=float(self.code_poison_config.get("synthetic_mean", 0.0)),
+                    std=float(self.code_poison_config.get("synthetic_std", 0.1)),
+                )
+            else:
+                loss = F.cross_entropy(model(images), labels)
+            loss.backward()
+            optimizer.step()
 
     def train(self, code_poison: bool = False, round_index: int = 0) -> None:
         self.train_model(

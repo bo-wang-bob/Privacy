@@ -373,25 +373,24 @@ class DefenseController:
     def _standard_training(
         self, user, model, optimizer, round_index: int, code_poison: bool = False
     ) -> None:
-        for _ in range(user.local_epochs):
-            for images, labels in user.trainloader:
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
-                if code_poison:
-                    loss = compromised_prompt_loss(
-                        model,
-                        images,
-                        labels,
-                        weight=float(user.code_poison_config.get("weight", 1.0)),
-                        mean=float(user.code_poison_config.get("synthetic_mean", 0.0)),
-                        std=float(user.code_poison_config.get("synthetic_std", 0.1)),
-                    )
-                else:
-                    loss = F.cross_entropy(model(images), labels)
-                loss.backward()
-                optimizer.step()
-                self.steps[user.id] += 1
+        for images, labels in user.iter_local_batches():
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+            optimizer.zero_grad(set_to_none=True)
+            if code_poison:
+                loss = compromised_prompt_loss(
+                    model,
+                    images,
+                    labels,
+                    weight=float(user.code_poison_config.get("weight", 1.0)),
+                    mean=float(user.code_poison_config.get("synthetic_mean", 0.0)),
+                    std=float(user.code_poison_config.get("synthetic_std", 0.1)),
+                )
+            else:
+                loss = F.cross_entropy(model(images), labels)
+            loss.backward()
+            optimizer.step()
+            self.steps[user.id] += 1
 
     @staticmethod
     def _sample_beta(

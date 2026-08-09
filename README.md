@@ -126,9 +126,11 @@ python main.py --model_type clip_mlp --attack fedmia_cosine
 
 ### 16-shot 视觉 CLIP Adapter
 
-该模式冻结 CLIP 图像和文本编码器，只用 FedAvg 训练
+该模式冻结 CLIP 图像和文本编码器，只用 FedSGD 训练
 `Linear -> ReLU -> Linear -> ReLU` 视觉瓶颈，并按 `alpha` 将适配特征与原始
-图像特征残差混合。它固定复用 FPL 的每类 16-shot 划分：
+图像特征残差混合。每个通信轮中，每个参与客户端只使用一个 mini-batch 做一次
+SGD 更新，服务器对参与客户端的更新直接等权平均，不按 batch 或本地数据量加权。
+它固定复用 FPL 的每类 16-shot 划分：
 
 ```bash
 python main.py --config configs/visual_adapter_privacy.yaml
@@ -144,8 +146,10 @@ CIFAR-100 与 Caltech101 默认使用 `a photo of a {class}.`；OxfordPets 使�
 
 `PromptFL` 是针对可训练 `prompt_learner` 定义的算法，不能直接应用到 MLP
 分类头或视觉 Adapter。两种
-冻结 CLIP 微调模型当前都使用普通集中式 FedAvg；它们之间可比较的是相同训练
-协议下的成员推理攻击，而不是把 prompt 专用的本地参数化强行替换到分类头上。
+冻结 CLIP 微调模型使用共享全局模型：CLIP-MLP 使用 FedAvg，Visual Adapter
+使用每客户端每轮一个 mini-batch 的 FedSGD。两者训练协议不同，比较攻击结果时
+需要同时报告这一差异；两者的服务器聚合均对参与客户端直接等权平均，而不是按
+客户端样本数加权。
 
 论文 ProjRes 在第一层 MLP 参数上的严格单轮 FedSGD 实现使用独立入口。它只取
 `classifier.0.weight` 的一个真实 batch 更新，并以该层输入的 CLIP 表示计算
@@ -159,8 +163,8 @@ bash scripts/run_projres_mlp_real.sh
 `docs/projres_mlp_strict.md`。这里的严格 ProjRes 与通用审计器中的余弦
 `promptres` 不是同一种算法。
 
-在 MLP FedAvg 上运行损失、时序损失、单轮/时序梯度余弦、FedMIA-I/II，
-并在同一主进程中对指定通信轮的真实客户端上传更新执行 ProjRes：
+在 MLP FedAvg 上运行损失、时序损失、单轮/时序梯度余弦和 FedMIA-I/II；统一
+sweep 不再对 MLP 执行 ProjRes：
 
 ```bash
 bash scripts/run_clip_mlp_fedmia_attacks.sh
@@ -181,7 +185,7 @@ bash scripts/run_clip_mlp_fedmia_attacks.sh \
 重新运行不会复用或覆盖之前的任务目录。可复现配置保存在该目录的
 `run_config.yaml`，默认攻击列表可通过 `--attacks` 覆盖。
 
-ProjRes 直接复用主任务已缓存的 CLIP 向量，并观察实际通信轮的客户端上传更新，
+Visual Adapter 的 ProjRes 直接复用主任务已缓存的 CLIP 向量，并观察实际通信轮的客户端上传更新，
 不再启动第二个 Python 进程或重新加载数据；默认评估最后一轮，也可通过
 `--projres-round 50` 对齐论文通常使用的第 50 轮。结果写入每个作业的
 `privacy_audit/projres_strict.json`。可使用 `--projres-threshold` 调整阈值；仅运行
@@ -198,10 +202,9 @@ ProjRes 汇总写入 `<实验组>_summary_projres.csv`；不会生成 HTML 文�
 向量。每个客户端独立构建候选池和计算指标，再报告客户端宏平均；协议强制每个
 客户端至少 1000 个非成员，因此
 `TPR@0.1%FPR` 的经验分辨率达到要求；实际成员数、非成员数和
-`fpr_resolution` 会写入 `privacy_audit/summary.json`。ProjRes 的成员定义与被观察
-轮次的本地训练协议一致：FedSGD 时是当前 batch；当前默认 `local_epochs: 1` 的
-FedAvg 实验中则是该轮被客户端遍历的本地训练集。它使用完整非成员池计算低 FPR
-指标。
+`fpr_resolution` 会写入 `privacy_audit/summary.json`。Adapter ProjRes 的成员
+定义与被观察轮次的 FedSGD 协议一致，即当前实际 batch；它使用完整非成员池计算
+低 FPR 指标。CLIP-MLP 的统一 sweep 不生成 ProjRes 结果。
 
 Visual Adapter 对应的 16-shot 五数据集 sweep 使用相同参数接口；严格 ProjRes
 攻击 Adapter 的第一层下采样参数：
@@ -219,7 +222,8 @@ bash scripts/run_all_clip_fedmia_attacks.sh
 
 该入口默认运行两个模型和五个数据集。可通过 `--models clip_mlp` 或
 `--models visual_adapter` 只运行一个模型，并可用 `--learning-rate` 临时覆盖
-学习率。MLP 与 Adapter 都会在各自主任务内执行对应第一层的严格 ProjRes。
+学习率。ProjRes 只在 Adapter 主任务内执行；MLP 只执行六种通用攻击。独立的
+MLP ProjRes 验证入口仍保留用于单独复现实验。
 
 常用筛选、覆盖和并行命令：
 

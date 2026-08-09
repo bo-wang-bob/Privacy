@@ -40,7 +40,7 @@ command=(
   --dataset_name caltech101
   --learning_rate "$learning_rate"
   --num_global_iters 50
-  --local_epochs 5
+  --local_epochs 1
   --dirichlet_alpha 0.1
   --gpu 0
   "${forward_args[@]}"

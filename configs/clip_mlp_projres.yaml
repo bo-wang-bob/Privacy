@@ -10,6 +10,7 @@ local_epochs: 1
 total_users: 10
 sample_users: 10
 aggregator: fedavg
+aggregation_weighting: uniform
 
 clip_mlp:
   # CLIP ViT-B/32 projects to 512 dimensions, so this is a downsampling layer.

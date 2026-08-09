@@ -39,6 +39,7 @@ datasets:
 common:
   model_type: clip_mlp
   aggregator: fedavg
+  aggregation_weighting: uniform
   data_root: ./data
   cache_dir: ./checkpoints/clip-vit-base-patch32
   require_cuda: true
@@ -95,11 +96,10 @@ common:
     fedmia_tail_calibration_fraction: 0.25
     training_health_check: true
 
-# Run ProjRes on each target client's real upload at the selected round.
-# With multiple local batches this is a FedAvg extension, not exact FedSGD.
+# ProjRes is reserved for the Visual Adapter FedSGD sweep. CLIP-MLP runs only
+# the six generic attacks in this unified experiment.
 projres:
-  enabled: true
-  # Observe the real uploaded client updates from the final communication round.
+  enabled: false
   evaluation_round: last
   threshold: 0.01
   max_candidates: 32

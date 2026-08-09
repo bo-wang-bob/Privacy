@@ -6,10 +6,11 @@ eval_batch_size: 512
 learning_rate: 0.001
 learning_rate_decay: 1.0
 num_global_iters: 20
-local_epochs: 2
+local_epochs: 1
 total_users: 10
 sample_users: 10
-aggregator: fedavg
+aggregator: fedsgd
+aggregation_weighting: uniform
 
 visual_adapter:
   feature_dim: 512

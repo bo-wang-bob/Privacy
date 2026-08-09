@@ -122,7 +122,7 @@ FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的�
 ## CLIP 图像编码器 + 两层 MLP 场景
 
 `model_type: clip_mlp` 冻结 CLIP，只训练两层 MLP 分类头。普通 FedAvg 上传并
-按样本数聚合 `classifier.0.{weight,bias}` 和
+对参与客户端等权聚合 `classifier.0.{weight,bias}` 和
 `classifier.3.{weight,bias}`。攻击适配遵循以下映射：
 
 `clip_mlp.precompute_features: true`（默认）会在训练开始前把各客户端训练集和
@@ -144,8 +144,9 @@ FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的�
 
 ## 16-shot 视觉 CLIP Adapter 场景
 
-`model_type: visual_adapter` 冻结 CLIP，只通过 FedAvg 训练视觉残差瓶颈，且配置
-强制 `fpl_shots: 16` 与 `use_full_dataset: false`。损失、概率、表示、更新余弦、
+`model_type: visual_adapter` 冻结 CLIP，只通过每客户端每轮一个 mini-batch 的
+FedSGD 训练视觉残差瓶颈，且配置强制 `fpl_shots: 16` 与
+`use_full_dataset: false`；服务器对参与客户端更新直接等权平均。损失、概率、表示、更新余弦、
 Nasr、PromptRes、PIPRA、RMIA、IMIA、YOQO、Canary 和 CodePoison 均复用其原有
 观测协议，但影子模型与 probe 只重置或更新 adapter 参数。
 
@@ -163,7 +164,7 @@ batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。�
 边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
 余弦相似度的 `promptres`。
 
-统一 sweep 还提供进程内 ProjRes：它在配置的真实通信轮（默认最后一轮）读取
-`base_state - uploaded_client_state`，不重新构造训练前更新。若该轮每个客户端只
-执行一个 batch，它与论文 FedSGD 观测一致；若包含多个本地 batch，则明确作为
-ProjRes 在实际 FedAvg 上传上的扩展实验报告。
+统一 sweep 只对 Visual Adapter 提供进程内 ProjRes：它在配置的真实通信轮
+（默认最后一轮）读取 `base_state - uploaded_client_state`，不重新构造训练前
+更新。Adapter 的真实上传严格来自一个 batch，因此与论文 FedSGD 观测一致。
+CLIP-MLP 的统一攻击任务不执行 ProjRes；其独立严格验证入口仍然保留。

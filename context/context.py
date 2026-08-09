@@ -25,6 +25,7 @@ class Context:
         self.protocol_messages: dict[int, dict] = {}
         self.user_selected: list[int] = []
         self.samples_num: list[int] = []
+        self.update_sample_counts: dict[int, int] = {}
         self.trainable_param_names = [
             name
             for name, parameter in model.named_parameters()
@@ -49,3 +50,4 @@ class Context:
         self.updated_model_state = {}
         self.user_selected = []
         self.protocol_messages = {}
+        self.update_sample_counts = {}

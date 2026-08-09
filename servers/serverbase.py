@@ -132,6 +132,11 @@ class ServerBase:
         self.num_glob_iters = num_glob_iters
         self.user_per_round = user_per_round
         self.aggregator = aggregator
+        if str(getattr(model, "model_type", "")).lower() in {
+            "clip_mlp",
+            "visual_adapter",
+        } and hasattr(self.aggregator, "aggregation_weighting"):
+            self.aggregator.aggregation_weighting = "uniform"
         self.federated_method = aggregator.name
         self.method_config = dict(method_config or {})
         self.results_dir = results_dir
@@ -147,6 +152,11 @@ class ServerBase:
         self.batch_size = int(batch_size)
         self.eval_batch_size = int(eval_batch_size)
         self.local_epochs = int(local_epochs)
+        if self.federated_method == "fedsgd" and self.local_epochs != 1:
+            raise ValueError(
+                "FedSGD uses exactly one mini-batch per client and requires "
+                "local_epochs=1."
+            )
         configured_projres_round = self.projres_config.get(
             "evaluation_round", "last"
         )
@@ -265,8 +275,13 @@ class ServerBase:
         )
         self.private_probe_steps = planned_private_probe_steps(self.audit_config)
         target_user = self.ctx.users[self.target_client_id]
-        self.defense.additional_private_steps = self.private_probe_steps * (
-            target_user.local_epochs * len(target_user.trainloader)
+        local_steps_per_probe = (
+            1
+            if self.federated_method == "fedsgd"
+            else target_user.local_epochs * len(target_user.trainloader)
+        )
+        self.defense.additional_private_steps = (
+            self.private_probe_steps * local_steps_per_probe
         )
 
     @staticmethod
@@ -487,6 +502,14 @@ class ServerBase:
                     code_poison=use_code_poison,
                     round_index=round_index,
                 )
+                if self.federated_method == "fedsgd":
+                    if user.last_update_sample_count <= 0:
+                        raise RuntimeError(
+                            f"FedSGD client {user_id} did not consume a mini-batch."
+                        )
+                    self.ctx.update_sample_counts[user_id] = (
+                        user.last_update_sample_count
+                    )
                 self.ctx.set_updated_model_state(
                     user_id, self._clone_state(user.get_parameters())
                 )
@@ -523,6 +546,7 @@ class ServerBase:
                     batch_size=self.batch_size,
                     eval_batch_size=self.eval_batch_size,
                     local_epochs=self.local_epochs,
+                    federated_method=self.federated_method,
                     round_index=round_index,
                     seed=int(self.audit_config.get("seed", 42)),
                     dataset_name=self.dataset_name,

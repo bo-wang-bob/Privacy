@@ -125,6 +125,7 @@ def _run_client(
     batch_size: int,
     eval_batch_size: int,
     local_epochs: int,
+    federated_method: str,
     round_index: int,
     seed: int,
     threshold: float,
@@ -133,18 +134,25 @@ def _run_client(
     max_nonmembers: int | None,
 ) -> dict[str, object]:
     target = users[client_id]
-    loader = DataLoader(
-        target.train_data,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=target.collate_fn,
-        generator=torch.Generator().manual_seed(seed + client_id),
-        drop_last=False,
-    )
-    try:
-        member_features, member_labels = next(iter(loader))
-    except StopIteration as error:
-        raise ValueError(f"Client {client_id} has no training batch.") from error
+    if federated_method == "fedsgd":
+        if target.last_train_batch is None:
+            raise ValueError(
+                f"FedSGD client {client_id} did not retain its observed batch."
+            )
+        member_features, member_labels = target.last_train_batch
+    else:
+        loader = DataLoader(
+            target.train_data,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=target.collate_fn,
+            generator=torch.Generator().manual_seed(seed + client_id),
+            drop_last=False,
+        )
+        try:
+            member_features, member_labels = next(iter(loader))
+        except StopIteration as error:
+            raise ValueError(f"Client {client_id} has no training batch.") from error
     if member_features.ndim != 2:
         raise ValueError(
             "Integrated ProjRes requires precomputed CLIP feature datasets."
@@ -214,12 +222,15 @@ def _run_client(
         labels, attack.scores, attack.l1_residuals, attack.predictions
     )
     actual_batch_size = int(member_labels.numel())
-    batches_per_epoch = (
-        len(target.trainloader)
-        if hasattr(target, "trainloader")
-        else math.ceil(len(target.train_data) / batch_size)
-    )
-    local_batches = int(local_epochs * batches_per_epoch)
+    if federated_method == "fedsgd":
+        local_batches = 1
+    else:
+        batches_per_epoch = (
+            len(target.trainloader)
+            if hasattr(target, "trainloader")
+            else math.ceil(len(target.train_data) / batch_size)
+        )
+        local_batches = int(local_epochs * batches_per_epoch)
     logger.info(
         "Integrated ProjRes | round=%d | client=%d | local_batches=%d | "
         "rank=%d | auc=%.4f",
@@ -238,10 +249,13 @@ def _run_client(
             "rounds_observed": 1,
             "local_batches": local_batches,
             "local_epochs": int(local_epochs),
+            "federated_method": federated_method,
             "optimizer": "actual_client_optimizer",
             "attacked_parameter": attacked_parameter,
             "member_definition": (
-                "present_in_the_target_client_local_training_data_for_the_"
+                "present_in_the_observed_target_client_fedsgd_batch"
+                if federated_method == "fedsgd"
+                else "present_in_the_target_client_local_training_data_for_the_"
                 "observed_round"
             ),
             "execution": "integrated_from_observed_client_update",
@@ -339,6 +353,7 @@ def run_integrated_projres(
     client_ids: list[int],
     config: dict,
     output_path: str | Path,
+    federated_method: str = "fedavg",
 ) -> dict[str, object]:
     """Run ProjRes on client updates observed in one real training round."""
     if not client_ids:
@@ -365,6 +380,7 @@ def run_integrated_projres(
                 batch_size,
                 eval_batch_size,
                 local_epochs,
+                federated_method,
                 round_index,
                 seed,
                 threshold,

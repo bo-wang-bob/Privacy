@@ -149,9 +149,9 @@ def validate_config(config: dict) -> None:
             "model_type must be prompt, clip_mlp, or visual_adapter."
         )
     method = config["aggregator"].lower()
-    supported_methods = {"fedavg", "promptfl"}
+    supported_methods = {"fedavg", "fedsgd", "promptfl"}
     if method not in supported_methods:
-        raise ValueError("aggregator must be fedavg or promptfl.")
+        raise ValueError("aggregator must be fedavg, fedsgd, or promptfl.")
     if config["total_users"] <= 1:
         raise ValueError("total_users must be greater than one.")
     if not 1 <= config["sample_users"] <= config["total_users"]:
@@ -166,6 +166,13 @@ def validate_config(config: dict) -> None:
     )
     if learning_rate_decay_interval <= 0:
         raise ValueError("learning_rate_decay_interval must be positive.")
+    aggregation_weighting = str(
+        config.get("aggregation_weighting", "sample_count")
+    ).lower()
+    if aggregation_weighting not in {"sample_count", "uniform"}:
+        raise ValueError(
+            "aggregation_weighting must be sample_count or uniform."
+        )
     partition_mode = str(config.get("partition_mode", "auto")).lower()
     if partition_mode not in {"auto", "dirichlet", "iid", "pathological"}:
         raise ValueError(
@@ -195,8 +202,15 @@ def validate_config(config: dict) -> None:
             raise ValueError("clip_mlp.precompute_batch_size must be positive.")
     if model_type == "visual_adapter":
         adapter_config = dict(config.get("visual_adapter", {}))
-        if method != "fedavg":
-            raise ValueError("visual_adapter requires aggregator=fedavg.")
+        if method not in {"fedavg", "fedsgd"}:
+            raise ValueError(
+                "visual_adapter requires aggregator=fedavg or fedsgd."
+            )
+        if method == "fedsgd" and int(config.get("local_epochs", 1)) != 1:
+            raise ValueError(
+                "visual_adapter FedSGD requires local_epochs=1 because each "
+                "client performs exactly one mini-batch step per round."
+            )
         if bool(config.get("use_full_dataset", False)) or fpl_shots != 16:
             raise ValueError(
                 "visual_adapter requires the FPL-style 16-shot setting: "
@@ -431,8 +445,10 @@ def validate_config(config: dict) -> None:
                 "Integrated ProjRes requires model_type=clip_mlp or "
                 "visual_adapter."
             )
-        if method != "fedavg":
-            raise ValueError("Integrated ProjRes requires FedAvg training.")
+        if method not in {"fedavg", "fedsgd"}:
+            raise ValueError(
+                "Integrated ProjRes requires FedAvg or FedSGD training."
+            )
         if not bool(
             config.get(model_type, {}).get("precompute_features", True)
         ):
@@ -595,8 +611,13 @@ def run(config: dict) -> list[dict]:
         precompute_federated_clip_features,
     )
 
-    validate_config(config)
     config = copy.deepcopy(config)
+    if str(config.get("model_type", "prompt")).lower() in {
+        "clip_mlp",
+        "visual_adapter",
+    }:
+        config["aggregation_weighting"] = "uniform"
+    validate_config(config)
     seed = int(config["seed"])
     random.seed(seed)
     np.random.seed(seed)
@@ -770,6 +791,9 @@ def run(config: dict) -> list[dict]:
         aggregator=build_aggregator(
             method,
             device=device,
+            aggregation_weighting=config.get(
+                "aggregation_weighting", "sample_count"
+            ),
             seed=seed,
             rank=int(method_config.get("rank", 4)),
             oversampling=int(method_config.get("oversampling", 2)),
@@ -810,6 +834,7 @@ def default_config() -> dict:
         "total_users": 10,
         "sample_users": 10,
         "aggregator": "fedavg",
+        "aggregation_weighting": "sample_count",
         "clip_mlp": {
             "hidden_dim": 512,
             "dropout": 0.0,
@@ -1034,7 +1059,12 @@ def parse_args() -> dict:
     parser.add_argument("--adapter_alpha", type=float)
     parser.add_argument(
         "--aggregator",
-        choices=["fedavg", "promptfl"],
+        choices=["fedavg", "fedsgd", "promptfl"],
+    )
+    parser.add_argument(
+        "--aggregation_weighting",
+        "--aggregation-weighting",
+        choices=["sample_count", "uniform"],
     )
     parser.add_argument("--target_client_id", type=int)
     parser.add_argument("--audit_attacks", help="Comma-separated attack names")
@@ -1111,6 +1141,7 @@ def parse_args() -> dict:
         "learning_rate_decay_interval",
         "model_type",
         "aggregator",
+        "aggregation_weighting",
     ):
         value = getattr(args, key)
         if value is not None:
@@ -1125,13 +1156,16 @@ def parse_args() -> dict:
         config["visual_adapter"]["alpha"] = args.adapter_alpha
     if args.model_type == "clip_mlp":
         config["aggregator"] = "fedavg"
+        config["aggregation_weighting"] = "uniform"
         config["fpl_shots"] = None
         config["use_full_dataset"] = True
         if args.attack is None and args.audit_attacks is None:
             config["audit"]["enabled"] = False
             config["audit"]["attacks"] = []
     elif args.model_type == "visual_adapter":
-        config["aggregator"] = "fedavg"
+        config["aggregator"] = "fedsgd"
+        config["aggregation_weighting"] = "uniform"
+        config["local_epochs"] = 1
         config["fpl_shots"] = 16
         config["use_full_dataset"] = False
     # A direct few-shot/alpha override denotes the Dirichlet experiment

@@ -9,7 +9,7 @@ seeds: [42]
 target_client_ids: [0]
 
 # Visual Adapter keeps the FPL-style system-wide 16-shot data protocol while
-# using the same FedMIA training schedule on every dataset.
+# using one mini-batch FedSGD update per client and communication round.
 datasets:
   - name: caltech101
     overrides:
@@ -39,7 +39,8 @@ datasets:
 
 common:
   model_type: visual_adapter
-  aggregator: fedavg
+  aggregator: fedsgd
+  aggregation_weighting: uniform
   data_root: ./data
   cache_dir: ./checkpoints/clip-vit-base-patch32
   require_cuda: true
@@ -99,7 +100,7 @@ common:
     training_health_check: true
 
 # ProjRes attacks the visual Adapter's first downsampling layer using the real
-# upload at the selected round. Multiple local batches extend beyond FedSGD.
+# one-batch FedSGD upload at the selected round.
 projres:
   enabled: true
   # Observe the real uploaded client updates from the final communication round.
