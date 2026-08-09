@@ -4,9 +4,22 @@ import copy
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, default_collate
 
 from privacy_attacks.code_poison import compromised_prompt_loss
+
+
+class _IndexedDataset(Dataset):
+    """Expose stable local positions without changing the wrapped samples."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        return self.dataset[index], int(index)
 
 
 class UserBase:
@@ -53,13 +66,29 @@ class UserBase:
             train_generator = torch.Generator().manual_seed(
                 int(self.method_config.get("seed", 42)) + 1000003 * int(self.id)
             )
+        self._iclr_enabled = (
+            str(getattr(self.defense_controller, "name", "none")).lower()
+            == "iclr"
+        )
         self.trainloader = DataLoader(
             train_data,
             batch_size=batch_size,
             shuffle=True,
             collate_fn=collate_fn,
             drop_last=False,
-            generator=train_generator,
+            generator=None if self._iclr_enabled else train_generator,
+        )
+        self.iclr_trainloader = (
+            DataLoader(
+                _IndexedDataset(train_data),
+                batch_size=batch_size,
+                shuffle=True,
+                collate_fn=self._collate_indexed_batch,
+                drop_last=False,
+                generator=train_generator,
+            )
+            if self._iclr_enabled
+            else None
         )
         self.testloader = DataLoader(
             test_data,
@@ -69,12 +98,41 @@ class UserBase:
         )
         self.model = copy.deepcopy(model)
         self._train_iterator = None
+        self._iclr_train_iterator = None
         self.last_update_sample_count = 0
         self.last_train_batch: tuple[torch.Tensor, torch.Tensor] | None = None
+        self.last_train_indices: torch.Tensor | None = None
+        self.iclr_source_round: int | None = None
+        self.iclr_aggregation_weight: float | None = None
+        self.iclr_ranking_round: int | None = None
+        self.iclr_own_losses: torch.Tensor | None = None
+        self.iclr_other_losses: torch.Tensor | None = None
+        self.iclr_scores: torch.Tensor | None = None
+        self.iclr_ranked_positions: torch.Tensor | None = None
+        self.iclr_ranked_scores: torch.Tensor | None = None
+        self.iclr_ranked_labels: torch.Tensor | None = None
+        self.iclr_local_indices: torch.Tensor | None = None
+        self.iclr_ranked_local_indices: torch.Tensor | None = None
+        self.iclr_score_count: torch.Tensor | None = None
+        self.iclr_score_sum: torch.Tensor | None = None
+        self.iclr_score_sum_sq: torch.Tensor | None = None
+        self.iclr_score_min: torch.Tensor | None = None
+        self.iclr_score_max: torch.Tensor | None = None
+        self.iclr_score_last: torch.Tensor | None = None
+        self.iclr_score_last_round: torch.Tensor | None = None
+
+    def _collate_indexed_batch(self, batch):
+        samples, indices = zip(*batch)
+        if self.collate_fn is None:
+            images, labels = default_collate(list(samples))
+        else:
+            images, labels = self.collate_fn(list(samples))
+        return images, labels, torch.tensor(indices, dtype=torch.long)
 
     def begin_local_update(self) -> None:
         self.last_update_sample_count = 0
         self.last_train_batch = None
+        self.last_train_indices = None
 
     def _record_train_batch(
         self, images: torch.Tensor, labels: torch.Tensor
@@ -102,6 +160,42 @@ class UserBase:
         images, labels = batch
         self._record_train_batch(images, labels)
         return images, labels
+
+    def next_iclr_train_batch(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return the next indexed FedSGD batch, cycling across rounds."""
+        if self.iclr_trainloader is None:
+            raise RuntimeError("Indexed ICLR training is not enabled for this client.")
+        if self._iclr_train_iterator is None:
+            self._iclr_train_iterator = iter(self.iclr_trainloader)
+        try:
+            batch = next(self._iclr_train_iterator)
+        except StopIteration:
+            self._iclr_train_iterator = iter(self.iclr_trainloader)
+            try:
+                batch = next(self._iclr_train_iterator)
+            except StopIteration as error:
+                raise ValueError(
+                    f"Client {self.id} has no indexed local training batch."
+                ) from error
+        images, labels, indices = batch
+        self._record_train_batch(images, labels)
+        self.last_train_indices = indices.detach().cpu().long().clone()
+        return images, labels, indices
+
+    def iter_iclr_local_batches(self):
+        """Yield exact local-update batches together with stable local indices."""
+        if self.iclr_trainloader is None:
+            raise RuntimeError("Indexed ICLR training is not enabled for this client.")
+        if self.federated_method == "fedsgd":
+            yield self.next_iclr_train_batch()
+            return
+        for _ in range(self.local_epochs):
+            for images, labels, indices in self.iclr_trainloader:
+                self._record_train_batch(images, labels)
+                self.last_train_indices = indices.detach().cpu().long().clone()
+                yield images, labels, indices
 
     def iter_local_batches(self):
         """Yield the batches used by one local update under the active protocol."""
@@ -148,6 +242,7 @@ class UserBase:
                 model,
                 round_index=effective_round,
                 code_poison=code_poison,
+                privacy_probe=privacy_probe,
             )
             if privacy_probe:
                 self.defense_controller.after_probe_training(

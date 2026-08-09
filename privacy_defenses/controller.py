@@ -22,6 +22,10 @@ from privacy_attacks.code_poison import (
     compromised_prompt_loss,
     generate_membership_encoding_samples,
 )
+from privacy_defenses.iclr import (
+    infer_other_clients_state,
+    rank_loss_differences,
+)
 
 
 SUPPORTED_DEFENSES = {
@@ -40,6 +44,7 @@ SUPPORTED_DEFENSES = {
     "local_ggeur",
     "mirage",
     "veil",
+    "iclr",
 }
 
 FEDMIA_BASELINE_DEFENSES = {
@@ -234,6 +239,11 @@ class DefenseController:
         self._class_assignments: dict[tuple[int, int], set[int]] = {}
         self._generator_calls = defaultdict(int)
         self._selected_by_round: dict[int, list[int]] = {}
+        self._iclr_client_stats: dict[int, dict[str, int | float]] = {}
+        self._iclr_pending_states: dict[
+            int,
+            tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]],
+        ] = {}
         self.federated_method = "fedavg"
         self.method_config: dict = {}
         self.additional_private_steps = 0
@@ -333,12 +343,17 @@ class DefenseController:
         model: torch.nn.Module,
         round_index: int = 0,
         code_poison: bool = False,
+        privacy_probe: bool = False,
     ) -> None:
         model.to(self.device)
         model.train()
         parameters = _trainable_parameters(model)
         optimizer = torch.optim.SGD(parameters, lr=user.learning_rate)
-        if self.name == "prompt_dp":
+        if self.name == "iclr" and not privacy_probe:
+            self._iclr_training(
+                user, model, optimizer, round_index, code_poison
+            )
+        elif self.name == "prompt_dp":
             self._prompt_dp_training(
                 user, model, optimizer, parameters, round_index, code_poison
             )
@@ -358,6 +373,144 @@ class DefenseController:
             self._standard_training(
                 user, model, optimizer, round_index, code_poison=code_poison
             )
+
+    def _iclr_training(
+        self,
+        user,
+        model: torch.nn.Module,
+        optimizer,
+        round_index: int,
+        code_poison: bool,
+    ) -> None:
+        """Rank the exact upcoming sample stream, then train without filtering it."""
+        indexed_batches = list(user.iter_iclr_local_batches())
+        batches = [(images, labels) for images, labels, _ in indexed_batches]
+        local_indices = torch.cat(
+            [indices.detach().cpu().long() for _, _, indices in indexed_batches]
+        )
+        reference_states = self._iclr_pending_states.pop(user.id, None)
+        if reference_states is not None:
+            own_state, other_state = reference_states
+            restore_state = user.get_parameters()
+            ranking = rank_loss_differences(
+                model=model,
+                batches=batches,
+                own_state=own_state,
+                other_state=other_state,
+                restore_state=restore_state,
+                device=self.device,
+                sample_indices=local_indices,
+            )
+            user.iclr_ranking_round = int(round_index)
+            user.iclr_own_losses = ranking.own_losses
+            user.iclr_other_losses = ranking.other_losses
+            user.iclr_scores = ranking.scores
+            user.iclr_ranked_positions = ranking.ranked_positions
+            user.iclr_ranked_scores = ranking.scores[ranking.ranked_positions]
+            user.iclr_ranked_labels = ranking.labels[ranking.ranked_positions]
+            user.iclr_local_indices = ranking.sample_indices
+            user.iclr_ranked_local_indices = ranking.sample_indices[
+                ranking.ranked_positions
+            ]
+            self._update_iclr_score_statistics(user, ranking, round_index)
+            self._iclr_client_stats.setdefault(user.id, {}).update(
+                {
+                    "latest_ranking_round": int(round_index),
+                    "latest_ranking_source_round": int(user.iclr_source_round),
+                    "latest_ranked_samples": int(ranking.scores.numel()),
+                    "latest_ranking_weight": float(
+                        user.iclr_aggregation_weight
+                    ),
+                }
+            )
+            self._record("iclr_score_mean", float(ranking.scores.mean()))
+            self._record("iclr_score_min", float(ranking.scores.min()))
+            self._record("iclr_score_max", float(ranking.scores.max()))
+            self._record(
+                "iclr_positive_score_fraction",
+                float((ranking.scores > 0).float().mean()),
+            )
+
+        for images, labels in batches:
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+            optimizer.zero_grad(set_to_none=True)
+            if code_poison:
+                loss = compromised_prompt_loss(
+                    model,
+                    images,
+                    labels,
+                    weight=float(user.code_poison_config.get("weight", 1.0)),
+                    mean=float(user.code_poison_config.get("synthetic_mean", 0.0)),
+                    std=float(user.code_poison_config.get("synthetic_std", 0.1)),
+                )
+            else:
+                loss = F.cross_entropy(model(images), labels)
+            loss.backward()
+            optimizer.step()
+            self.steps[user.id] += 1
+
+    @staticmethod
+    def _update_iclr_score_statistics(user, ranking, round_index: int) -> None:
+        """Maintain compact per-local-sample statistics across communication rounds."""
+        sample_count = int(user.train_samples)
+        if user.iclr_score_count is None:
+            user.iclr_score_count = torch.zeros(sample_count, dtype=torch.long)
+            user.iclr_score_sum = torch.zeros(sample_count, dtype=torch.float64)
+            user.iclr_score_sum_sq = torch.zeros(sample_count, dtype=torch.float64)
+            user.iclr_score_min = torch.full(
+                (sample_count,), float("inf"), dtype=torch.float64
+            )
+            user.iclr_score_max = torch.full(
+                (sample_count,), float("-inf"), dtype=torch.float64
+            )
+            user.iclr_score_last = torch.full(
+                (sample_count,), float("nan"), dtype=torch.float64
+            )
+            user.iclr_score_last_round = torch.full(
+                (sample_count,), -1, dtype=torch.long
+            )
+
+        indices = ranking.sample_indices.detach().cpu().long()
+        scores = ranking.scores.detach().cpu().to(torch.float64)
+        if indices.numel() == 0:
+            return
+        if int(indices.min()) < 0 or int(indices.max()) >= sample_count:
+            raise IndexError("ICLR local sample index is outside the client dataset.")
+        ones = torch.ones(indices.numel(), dtype=torch.long)
+        user.iclr_score_count.index_add_(0, indices, ones)
+        user.iclr_score_sum.index_add_(0, indices, scores)
+        user.iclr_score_sum_sq.index_add_(0, indices, scores.square())
+        user.iclr_score_min.scatter_reduce_(
+            0, indices, scores, reduce="amin", include_self=True
+        )
+        user.iclr_score_max.scatter_reduce_(
+            0, indices, scores, reduce="amax", include_self=True
+        )
+        if torch.unique(indices).numel() == indices.numel():
+            user.iclr_score_last[indices] = scores
+            user.iclr_score_last_round[indices] = int(round_index)
+        else:
+            for index, score in zip(indices.tolist(), scores.tolist()):
+                user.iclr_score_last[index] = score
+                user.iclr_score_last_round[index] = int(round_index)
+
+    def prepare_client_training(
+        self,
+        user,
+        global_state: dict[str, torch.Tensor],
+        own_weight: float,
+        source_round: int,
+    ) -> None:
+        """Build the two ICLR references immediately before global overwrite."""
+        if self.name != "iclr":
+            return
+        own_state = user.get_parameters()
+        weight = float(own_weight)
+        other_state = infer_other_clients_state(global_state, own_state, weight)
+        self._iclr_pending_states[user.id] = (own_state, other_state)
+        user.iclr_source_round = int(source_round)
+        user.iclr_aggregation_weight = weight
 
     @staticmethod
     def _secret_losses(user, model, images, labels) -> torch.Tensor:
@@ -1493,6 +1646,18 @@ class DefenseController:
             "steps_per_client": {str(key): value for key, value in self.steps.items()},
             "metrics": averaged,
         }
+        if self.name == "iclr":
+            summary["iclr"] = {
+                "score": "L(x; theta_-k) - L(x; theta_k)",
+                "ranking": "descending",
+                "training_action": "rank_only",
+                "client_state": {
+                    str(client_id): values
+                    for client_id, values in sorted(
+                        self._iclr_client_stats.items()
+                    )
+                },
+            }
         epsilon = self.conservative_dp_epsilon()
         if epsilon is not None:
             summary["privacy_accounting"] = {

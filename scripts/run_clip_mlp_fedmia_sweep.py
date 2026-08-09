@@ -145,8 +145,15 @@ def build_jobs(
             "only one compatibility anchor."
         )
     defenses = spec.get("defenses", [{"name": "none"}])
-    if len(defenses) != 1 or str(defenses[0].get("name", "none")).lower() != "none":
-        raise ValueError("The frozen-CLIP attack sweep supports defense=none only.")
+    if len(defenses) != 1 or not isinstance(defenses[0], dict):
+        raise ValueError("The frozen-CLIP attack sweep requires one defense entry.")
+    defense_config = dict(defenses[0])
+    defense_name = str(defense_config.get("name", "none")).lower()
+    if defense_name not in {"none", "iclr"}:
+        raise ValueError(
+            "The frozen-CLIP attack sweep supports defense=none or iclr."
+        )
+    defense_config["name"] = defense_name
 
     jobs = []
     invocation_time = started_at or datetime.datetime.now()
@@ -202,7 +209,9 @@ def build_jobs(
         }:
             config["aggregation_weighting"] = "uniform"
         config["sweep_name"] = sweep_name
-        config["defense"] = _deep_merge(config.get("defense", {}), {"name": "none"})
+        config["defense"] = _deep_merge(
+            config.get("defense", {}), defense_config
+        )
         config.setdefault("audit", {})["target_client_id"] = target
         dataset = str(config["dataset_name"])
         run_id = _timestamped_run_id(
@@ -219,7 +228,7 @@ def build_jobs(
                 method=str(config["aggregator"]),
                 seed=seed,
                 target_client_id=target,
-                defense="none",
+                defense=defense_name,
                 run_root=run_root,
                 config_path=run_root / "run_config.yaml",
             )
@@ -297,11 +306,22 @@ def _completed_result(job: SweepJob) -> Path | None:
     projres_complete = not bool(
         job.config.get("projres", {}).get("enabled", False)
     ) or _projres_path(job).is_file()
+    iclr_complete = True
+    if str(job.defense).lower() == "iclr":
+        validation = audit.get("iclr_validation") or {}
+        privacy_audit = job.run_root / "privacy_audit"
+        iclr_complete = (
+            validation.get("status") == "ok"
+            and (privacy_audit / "iclr_attack_samples.csv").is_file()
+            and (privacy_audit / "iclr_attack_relationship.csv").is_file()
+            and (privacy_audit / "iclr_attack_relationship.json").is_file()
+        )
     return (
         job.run_root
         if not audit.get("errors")
         and completed == expected
         and projres_complete
+        and iclr_complete
         else None
     )
 
@@ -360,6 +380,7 @@ def _job_hyperparameters_block(job: SweepJob) -> str:
         },
         model_type: config.get(model_type, {}),
         "privacy_audit": config.get("audit", {}),
+        "privacy_defense": config.get("defense", {}),
     }
     rows = _flatten(selected)
     width = max(len(key) for key, _ in rows)
@@ -788,6 +809,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--datasets", help="Comma-separated dataset names.")
     parser.add_argument("--attacks", default=None, help="Generic attack CSV.")
     parser.add_argument(
+        "--defense",
+        choices=["none", "iclr"],
+        help="Run the plain baseline or ICLR specificity validation.",
+    )
+    parser.add_argument(
         "--target-client",
         help="Audit one client ID, or use 'all' for every client in one training run.",
     )
@@ -831,6 +857,8 @@ def main() -> int:
         spec.setdefault("common", {}).setdefault("audit", {})["attacks"] = (
             _parse_csv(args.attacks)
         )
+    if args.defense is not None:
+        spec["defenses"] = [{"name": args.defense}]
     if args.target_client is not None:
         target_text = str(args.target_client).strip().lower()
         audit_override = spec.setdefault("common", {}).setdefault("audit", {})
@@ -907,6 +935,8 @@ def main() -> int:
         jobs = filter_jobs_by_dataset(
             discover_existing_jobs(results_root, sweep_name), args.datasets
         )
+        if args.defense is not None:
+            jobs = [job for job in jobs if job.defense == args.defense]
         if args.max_runs is not None:
             jobs = jobs[-args.max_runs :]
         complete, attack_rows = summarize(jobs, results_root, sweep_name)

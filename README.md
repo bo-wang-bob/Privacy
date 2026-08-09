@@ -100,7 +100,7 @@ lr(round_index) = initial_learning_rate * learning_rate_decay ** decay_step
 ```
 
 当前 MLP 与 Visual Adapter 的通用实验设置 `learning_rate_decay: 1.0`，因此全部
-300 个通信轮保持初始客户端学习率不变。只有显式设置小于 1 的衰减系数时，
+150 个通信轮保持初始客户端学习率不变。只有显式设置小于 1 的衰减系数时，
 `learning_rate_decay_interval` 才会影响训练。
 将 decay 设为 `1.0` 可关闭衰减，也可通过 `--learning-rate-decay` 和
 `--learning-rate-decay-interval` 覆盖。

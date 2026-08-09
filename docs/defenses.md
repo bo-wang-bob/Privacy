@@ -1,6 +1,6 @@
 # 联邦 soft-prompt 成员隐私防御
 
-仓库支持十二种彼此独立的防御。一次实验只能选择一个 `defense.name`，不会在后台组合其他防御。
+仓库支持多种彼此独立的防御。一次实验只能选择一个 `defense.name`，不会在后台组合其他防御。
 
 | 运行名 | 方法 | 当前联邦 prompt 适配 |
 |---|---|---|
@@ -16,12 +16,46 @@
 | `sampling` | FedMIA Data Sampling 基线 | 每个本地 batch 无放回抽取固定比例样本参与训练 |
 | `data_aug` | FedMIA Data Aug 基线 | 对已经预处理的 CLIP 张量做翻转、平移和颜色扰动 |
 | `data_aug_sampling` | FedMIA Data Aug + Sampling 基线 | 在同一本地训练分支中先抽样再增强 |
+| `iclr` | ICLR（暂定名，第一阶段） | 从上一轮全局模型、客户端本地上传和真实聚合权重反演其他客户端聚合模型，并按逐样本损失差降序排名 |
 
 这些实现是针对“冻结 CLIP、只训练共享 CoOp prompt”的场景适配。SOFT 原论文处理文本，因此本仓库使用保持图像语义的视觉混淆；HAMP 原论文测试阶段使用随机低置信度分数重排，本仓库使用可微温度映射，使主动梯度攻击仍能正常运行并得到分数，而不是因输出不可导而失败。
 
 ## 常用防御参数
 
 参数放在 YAML 的 `defense:` 节点中；命令行 `--defense` 只覆盖方法名。
+
+### ICLR（第一阶段）
+
+当前实现使用服务器实际记录的线性聚合权重。客户端对象自然保留上一轮本地模型；下一轮用新全局模型覆盖它之前，客户端即时读取该模型并计算：
+
+```text
+theta_-k^t = (theta_global^(t+1) - w_k^t * theta_k^t) / (1 - w_k^t)
+```
+
+客户端下一次参与训练时，对该次本地更新实际消费的 batch 流计算：
+
+```text
+s_i = L(x_i; theta_-k^t) - L(x_i; theta_k^t)
+```
+
+两套参考参数只在当前客户端打分期间临时存在，打分完成后立即释放，不在聚合后为每个客户端保存模型副本。`iclr_ranked_positions` 是上述 batch 流拼接后的降序位置，而不是原始数据集的永久索引；`iclr_ranked_scores` 和 `iclr_ranked_labels` 分别保存对应的有序分数与标签。首轮没有历史模型对，因此不打分。若采用部分客户端参与，只有连续两轮均被选中的客户端能够执行这种精确反演。现阶段只生成排名并保存在客户端运行态，同时将汇总统计写入 `defense_summary.json`；不会根据排名筛样本、改变损失或改变原有训练顺序。该实现目前只允许使用预计算 CLIP 特征的 CLIP-MLP 和 Visual Adapter，并要求每轮至少聚合两个客户端。
+
+为了验证该分数能否衡量样本特异性，ICLR 会为训练 batch 携带相对于客户端训练集的稳定本地索引，并在训练期间为每个样本累计 `mean`、`last`、`max`、标准差和观测次数。审计完成后，这些索引会与 `low_fpr_full` 候选池中的成员索引严格连接，并针对每种攻击分别计算：
+
+- Pearson 和 Spearman 相关性；
+- 类别内秩中心化 Spearman 及逐类别宏平均 Spearman，用于控制类别分布泄漏；
+- ICLR 最高/最低分位组的平均攻击分数差；
+- ICLR Top-K 与攻击 Top-K 的重合率和相对随机期望的富集倍数；
+- 在 `FPR=0.1/0.01/0.001` 下，全部成员、ICLR 高分组和低分组被攻击命中的比例及其差值。
+
+`defense.iclr_validation_top_fraction` 控制高分组和低分组比例，默认 `0.2`。验证只比较能够严格对齐且至少获得一次 ICLR 观测的成员样本；它衡量的是 ICLR 分数与“成员样本被攻击识别的难易程度”之间的关联，不能单独证明因果关系或防御有效性。当前只有 `candidate_sampling: low_fpr_full` 能提供所需的稳定候选索引；其他采样方式会在验证 JSON 中标记为不可用。
+
+验证产物位于任务的 `privacy_audit/`：
+
+- `iclr_attack_samples.csv`：攻击、候选索引、客户端本地索引、类别、攻击分数及 ICLR 聚合分数；
+- `iclr_attack_relationship.csv`：每个攻击、客户端和 ICLR 聚合方式的关联指标；
+- `iclr_attack_relationship.json`：方法定义、覆盖范围和完整指标；
+- `summary.json` 中的 `iclr_validation`：状态、覆盖规模和产物入口。
 
 ### FedMIA 比较基线
 

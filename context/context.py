@@ -26,6 +26,7 @@ class Context:
         self.user_selected: list[int] = []
         self.samples_num: list[int] = []
         self.update_sample_counts: dict[int, int] = {}
+        self.aggregation_weights: dict[int, float] = {}
         self.trainable_param_names = [
             name
             for name, parameter in model.named_parameters()
@@ -51,3 +52,4 @@ class Context:
         self.user_selected = []
         self.protocol_messages = {}
         self.update_sample_counts = {}
+        self.aggregation_weights = {}

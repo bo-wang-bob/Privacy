@@ -317,11 +317,20 @@ class ServerBase:
         total_correct = 0
         total_samples = 0
         for user in self.ctx.users:
+            local_state = (
+                self._clone_state(user.get_parameters())
+                if self.defense.name == "iclr"
+                else None
+            )
             evaluation_state = self.ctx.new_model_state.get(
                 0, self.ctx.base_model_state[0]
             )
-            user.set_parameters(evaluation_state)
-            loss, correct, samples = user.evaluate()
+            try:
+                user.set_parameters(evaluation_state)
+                loss, correct, samples = user.evaluate()
+            finally:
+                if local_state is not None:
+                    user.set_parameters(local_state)
             total_loss += loss
             total_correct += correct
             total_samples += samples
@@ -466,6 +475,8 @@ class ServerBase:
             learning_rate=self.initial_learning_rate,
         )
 
+        previous_selected_ids: set[int] = set()
+        previous_aggregation_weights: dict[int, float] = {}
         for round_index in range(self.num_glob_iters):
             if round_index > 0:
                 self.ctx.continue_to_next_round()
@@ -494,6 +505,13 @@ class ServerBase:
             )
             for user_id in selected_ids:
                 user = self.ctx.users[user_id]
+                if user_id in previous_selected_ids:
+                    self.defense.prepare_client_training(
+                        user=user,
+                        global_state=self.ctx.get_base_model_state(),
+                        own_weight=previous_aggregation_weights[user_id],
+                        source_round=round_index - 1,
+                    )
                 user.set_parameters(self.ctx.get_base_model_state())
                 use_code_poison = (
                     self.code_poison_enabled and user_id == self.target_client_id
@@ -560,6 +578,8 @@ class ServerBase:
                 )
 
             self.aggregator.aggregate(self.ctx)
+            previous_selected_ids = set(selected_ids)
+            previous_aggregation_weights = dict(self.ctx.aggregation_weights)
             self.auditor.observe_round(
                 round_index=round_index,
                 base_state=base_state,

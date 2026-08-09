@@ -23,13 +23,19 @@ def aggregate_fedavg_model_states(
     total_samples = sum(counts.values())
     if total_samples <= 0:
         raise ValueError("FedAvg cannot aggregate zero training samples.")
+    if any(count < 0 for count in counts.values()):
+        raise ValueError("FedAvg client sample counts must be non-negative.")
+
+    ctx.aggregation_weights = {
+        user_id: counts[user_id] / total_samples for user_id in aggregation_ids
+    }
 
     first_state = ctx.updated_model_state[aggregation_ids[0]]
     aggregated = {
         name: torch.zeros_like(first_state[name]) for name in ctx.trainable_param_names
     }
     for user_id in aggregation_ids:
-        weight = counts[user_id] / total_samples
+        weight = ctx.aggregation_weights[user_id]
         state = ctx.updated_model_state[user_id]
         for name in ctx.trainable_param_names:
             aggregated[name].add_(state[name], alpha=weight)

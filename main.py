@@ -487,10 +487,34 @@ def validate_config(config: dict) -> None:
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
-    if model_type in {"clip_mlp", "visual_adapter"} and defense_name != "none":
+    if model_type in {"clip_mlp", "visual_adapter"} and defense_name not in {
+        "none",
+        "iclr",
+    }:
         raise ValueError(
-            f"{model_type} attack experiments currently require defense.name=none."
+            f"{model_type} attack experiments currently require defense.name "
+            "to be none or iclr."
         )
+    if defense_name == "iclr":
+        if model_type not in {"clip_mlp", "visual_adapter"}:
+            raise ValueError(
+                "ICLR currently requires model_type=clip_mlp or visual_adapter."
+            )
+        if method not in {"fedavg", "fedsgd"}:
+            raise ValueError("ICLR requires linear FedAvg or FedSGD aggregation.")
+        if config["sample_users"] < 2:
+            raise ValueError("ICLR requires at least two selected clients per round.")
+        model_config = dict(config.get(model_type, {}))
+        if not bool(model_config.get("precompute_features", True)):
+            raise ValueError(
+                "ICLR currently requires precomputed CLIP features so the exact "
+                "local-update batch stream can be ranked without retaining raw images."
+            )
+        top_fraction = float(defense.get("iclr_validation_top_fraction", 0.2))
+        if not 0.0 < top_fraction <= 0.5:
+            raise ValueError(
+                "defense.iclr_validation_top_fraction must be in (0, 0.5]."
+            )
     if (
         defense_name in FEDMIA_BASELINE_DEFENSES
         and method not in {"fedavg", "promptfl"}
@@ -1005,6 +1029,7 @@ def default_config() -> dict:
             "local_ggeur_class_balanced": False,
             "local_ggeur_upload_clip_norm": 0.5,
             "local_ggeur_upload_noise_std": 0.07,
+            "iclr_validation_top_fraction": 0.2,
         },
     }
 

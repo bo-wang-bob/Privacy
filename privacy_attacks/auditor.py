@@ -35,6 +35,9 @@ from privacy_defenses import (
     attach_hamp_output_transform,
     attach_output_temperature_transform,
 )
+from privacy_defenses.iclr_validation import (
+    validate_iclr_attack_relationships,
+)
 from utils.data_loader import group_idx_by_class
 
 logger = logging.getLogger(__name__)
@@ -367,6 +370,7 @@ class MembershipAuditor:
         self.errors: dict[str, str] = {}
         self.candidate_inputs_are_features = False
         self.low_fpr_candidate_selection: dict | None = None
+        self.candidate_local_indices: torch.Tensor | None = None
 
         if self.enabled:
             if self.candidate_sampling_mode == "low_fpr_full":
@@ -759,6 +763,7 @@ class MembershipAuditor:
         label_parts = []
         membership_parts = []
         client_parts = []
+        local_index_parts = []
         candidate_sampling_by_client = {}
         selection_by_client = {}
         overlap_by_client = {}
@@ -880,6 +885,16 @@ class MembershipAuditor:
             client_parts.append(
                 torch.full((labels.numel(),), client_id, dtype=torch.long)
             )
+            local_index_parts.append(
+                torch.cat(
+                    (
+                        member_pool_indices.detach().cpu().long(),
+                        torch.full(
+                            (nonmember_labels.numel(),), -1, dtype=torch.long
+                        ),
+                    )
+                )
+            )
             eligible_client_ids.append(client_id)
             candidate_sampling_by_client[str(client_id)] = {
                 "mode": "low_fpr_full",
@@ -930,6 +945,7 @@ class MembershipAuditor:
         self.labels = torch.cat(label_parts)
         self.membership = torch.cat(membership_parts)
         self.candidate_client_ids = torch.cat(client_parts)
+        self.candidate_local_indices = torch.cat(local_index_parts)
         self.candidate_inputs_are_features = True
         self.candidate_sampling_by_client = candidate_sampling_by_client
         self.candidate_label_support = sorted(
@@ -2437,6 +2453,37 @@ class MembershipAuditor:
             abs(member / member_count - nonmember / nonmember_count)
             for member, nonmember in zip(member_histogram, nonmember_histogram)
         )
+        iclr_validation = None
+        if self.defense_name == "iclr":
+            try:
+                validation = validate_iclr_attack_relationships(
+                    results=self.results,
+                    users=self.users,
+                    candidate_labels=candidate_labels,
+                    candidate_membership=candidate_membership,
+                    candidate_client_ids=self.candidate_client_ids,
+                    candidate_local_indices=self.candidate_local_indices,
+                    output_dir=self.results_dir,
+                    top_fraction=float(
+                        self.defense_config.get(
+                            "iclr_validation_top_fraction", 0.2
+                        )
+                    ),
+                )
+                iclr_validation = {
+                    key: value
+                    for key, value in validation.items()
+                    if key != "relationships"
+                }
+            except Exception as error:
+                logger.exception("ICLR specificity validation failed")
+                self.errors["iclr_validation"] = (
+                    f"{type(error).__name__}: {error}"
+                )
+                iclr_validation = {
+                    "status": "error",
+                    "error": self.errors["iclr_validation"],
+                }
         with open(
             os.path.join(self.results_dir, "summary.json"), "w", encoding="utf-8"
         ) as file:
@@ -2556,6 +2603,7 @@ class MembershipAuditor:
                         "per_client": self.candidate_sampling_by_client,
                     },
                     "audit_health": audit_health,
+                    "iclr_validation": iclr_validation,
                     "attacks": summaries,
                     "errors": self.errors,
                 },

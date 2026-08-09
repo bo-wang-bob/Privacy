@@ -109,6 +109,7 @@ Model-specific learning-rate defaults:
 
 All options below are forwarded to each selected sweep, including:
   --datasets CSV        --attacks CSV          --target-client ID|all
+  --defense none|iclr   Enable ICLR specificity validation (default: none).
   --seed VALUE          --gpus CSV             --jobs VALUE
   --learning-rate RATE  --learning-rate-decay RATE
   --learning-rate-decay-interval ROUNDS

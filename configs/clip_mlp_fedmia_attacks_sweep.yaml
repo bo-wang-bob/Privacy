@@ -14,27 +14,27 @@ datasets:
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 300
+      num_global_iters: 150
   - name: oxfordpets
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 300
+      num_global_iters: 150
   - name: flowers
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 300
+      num_global_iters: 150
   - name: food101
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 300
+      num_global_iters: 150
   - name: cifar100
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 300
+      num_global_iters: 150
 
 common:
   model_type: clip_mlp
@@ -85,7 +85,7 @@ common:
     match_candidate_labels: false
     audit_batch_size: 512
     attack_audit_intervals:
-      # Match the released FedMIA code's checkpoints: rounds 10, 20, ..., 300.
+      # Measure every 10 completed rounds: rounds 10, 20, ..., 150.
       loss_series: 10
       avg_cosine: 10
       fedmia_loss: 10

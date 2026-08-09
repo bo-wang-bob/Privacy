@@ -7,6 +7,14 @@ from privacy_defenses.controller import (
     attach_hamp_output_transform,
     attach_output_temperature_transform,
 )
+from privacy_defenses.iclr import (
+    ICLRRanking,
+    infer_other_clients_state,
+    rank_loss_differences,
+)
+from privacy_defenses.iclr_validation import (
+    validate_iclr_attack_relationships,
+)
 
 __all__ = [
     "SUPPORTED_DEFENSES",
@@ -14,4 +22,8 @@ __all__ = [
     "DefenseController",
     "attach_hamp_output_transform",
     "attach_output_temperature_transform",
+    "ICLRRanking",
+    "infer_other_clients_state",
+    "rank_loss_differences",
+    "validate_iclr_attack_relationships",
 ]
