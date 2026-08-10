@@ -54,7 +54,7 @@ def build_visual_adapter_text_features(
 
 
 class VisualAdapter(nn.Module):
-    """CLIP-Adapter bottleneck applied to frozen visual features."""
+    """CLIP-Adapter bottleneck applied to frozen CLIP features."""
 
     def __init__(
         self,
@@ -85,7 +85,7 @@ class VisualAdapter(nn.Module):
 
 
 class VisualCLIPAdapter(nn.Module):
-    """Frozen CLIP with a trainable residual bottleneck on image features."""
+    """Frozen CLIP with trainable residual adapters on both modalities."""
 
     model_type = "visual_adapter"
     trainable_state_filename = "final_visual_adapter.pt"
@@ -99,11 +99,18 @@ class VisualCLIPAdapter(nn.Module):
         reduction: int = 4,
         alpha: float = 0.2,
         output_relu: bool = True,
+        text_adapter_enabled: bool = True,
+        text_reduction: int | None = None,
+        text_alpha: float | None = None,
+        text_output_relu: bool | None = None,
         device: torch.device = torch.device("cpu"),
     ) -> None:
         super().__init__()
         if not 0.0 <= alpha <= 1.0:
             raise ValueError("alpha must be between 0 and 1")
+        resolved_text_alpha = alpha if text_alpha is None else float(text_alpha)
+        if not 0.0 <= resolved_text_alpha <= 1.0:
+            raise ValueError("text_alpha must be between 0 and 1")
         if text_features.ndim != 2 or text_features.shape[0] <= 0:
             raise ValueError("text_features must have shape (classes, feature_dim)")
 
@@ -138,12 +145,31 @@ class VisualCLIPAdapter(nn.Module):
         self.reduction = int(reduction)
         self.alpha = float(alpha)
         self.output_relu = bool(output_relu)
+        self.text_adapter_enabled = bool(text_adapter_enabled)
+        self.text_reduction = int(
+            self.reduction if text_reduction is None else text_reduction
+        )
+        self.text_alpha = resolved_text_alpha
+        self.text_output_relu = bool(
+            self.output_relu
+            if text_output_relu is None
+            else text_output_relu
+        )
         self.device = device
         self.adapter = VisualAdapter(
             feature_dim=self.projection_dim,
             reduction=self.reduction,
             output_relu=self.output_relu,
         ).to(device)
+        self.text_adapter = (
+            VisualAdapter(
+                feature_dim=self.projection_dim,
+                reduction=self.text_reduction,
+                output_relu=self.text_output_relu,
+            ).to(device)
+            if self.text_adapter_enabled
+            else None
+        )
         self.register_buffer(
             "text_features",
             F.normalize(text_features.detach().float(), dim=-1).to(device),
@@ -187,6 +213,17 @@ class VisualCLIPAdapter(nn.Module):
         )
         return F.normalize(mixed_features, dim=-1)
 
+    def mixed_text_features(self) -> torch.Tensor:
+        """Return normalized class vectors after the trainable text adapter."""
+        if self.text_adapter is None:
+            return self.text_features
+        adapted_features = self.text_adapter(self.text_features)
+        mixed_features = (
+            self.text_alpha * adapted_features
+            + (1.0 - self.text_alpha) * self.text_features
+        )
+        return F.normalize(mixed_features, dim=-1)
+
     def forward_from_image_features(
         self,
         image_features: torch.Tensor,
@@ -195,10 +232,11 @@ class VisualCLIPAdapter(nn.Module):
         mixed_features = self.mixed_image_features_from_image_features(
             image_features
         )
+        mixed_text_features = self.mixed_text_features()
         logit_scale = self.clip_model.logit_scale.exp().detach()
-        logits = logit_scale * mixed_features @ self.text_features.t()
+        logits = logit_scale * mixed_features @ mixed_text_features.t()
         if return_intermediate:
-            return logits, mixed_features, self.text_features
+            return logits, mixed_features, mixed_text_features
         return logits
 
     def forward(self, images: torch.Tensor, return_intermediate: bool = False):
@@ -225,12 +263,13 @@ class VisualCLIPAdapter(nn.Module):
             self.alpha * adapted + (1.0 - self.alpha) * raw,
             dim=-1,
         )
+        text_features = self.mixed_text_features()
         logits = (
             self.clip_model.logit_scale.exp().detach()
             * mixed
-            @ self.text_features.t()
+            @ text_features.t()
         )
-        class_features = self.text_features[labels.to(self.text_features.device)]
+        class_features = text_features[labels.to(text_features.device)]
         representation = torch.cat(
             (logits, raw, adapted, mixed, mixed * class_features), dim=1
         )
@@ -242,7 +281,8 @@ class VisualCLIPAdapter(nn.Module):
         mixed = self.mixed_image_features_from_image_features(
             self.encode_images(images)
         )
-        return mixed, self.text_features[labels.to(self.text_features.device)]
+        text_features = self.mixed_text_features()
+        return mixed, text_features[labels.to(text_features.device)]
 
     def get_audit_key_parameter(self) -> torch.nn.Parameter:
         first_layer = cast(nn.Linear, self.adapter.net[0])
@@ -257,9 +297,17 @@ class VisualCLIPAdapter(nn.Module):
             reduction=self.reduction,
             alpha=self.alpha,
             output_relu=self.output_relu,
+            text_adapter_enabled=self.text_adapter_enabled,
+            text_reduction=self.text_reduction,
+            text_alpha=self.text_alpha,
+            text_output_relu=self.text_output_relu,
             device=self.device,
         )
         clone.adapter.load_state_dict(self.adapter.state_dict(), strict=True)
+        if self.text_adapter is not None and clone.text_adapter is not None:
+            clone.text_adapter.load_state_dict(
+                self.text_adapter.state_dict(), strict=True
+            )
         clone.text_features.copy_(self.text_features)
         clone.train(self.training)
         return clone

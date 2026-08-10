@@ -17,6 +17,10 @@ visual_adapter:
   reduction: 4
   alpha: 0.2
   output_relu: true
+  text_adapter_enabled: true
+  text_reduction: 4
+  text_alpha: 0.2
+  text_output_relu: true
   precompute_features: true
   precompute_batch_size: 64
   template: null

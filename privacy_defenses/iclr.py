@@ -24,6 +24,46 @@ class ICLRRanking:
     sample_indices: torch.Tensor
 
 
+def encode_training_batches(
+    model: torch.nn.Module,
+    batches: list[TrainingBatch],
+    device: torch.device,
+) -> torch.Tensor:
+    """Return frozen image-encoder features aligned with a local batch stream.
+
+    Frozen-CLIP runs normally pass precomputed two-dimensional features through
+    ``encode_images``.  The same path also supports ordinary image tensors when
+    feature precomputation is disabled.  No additional normalization is
+    applied, so the statistics use the exact representation returned by the
+    model's frozen image-encoding path.
+    """
+    if not batches:
+        raise ValueError("ICLR feature statistics require at least one batch.")
+    encoder = getattr(model, "encode_images", None)
+    if not callable(encoder):
+        raise TypeError("ICLR feature statistics require model.encode_images().")
+
+    was_training = model.training
+    feature_parts = []
+    model.eval()
+    try:
+        with torch.no_grad():
+            for images, labels in batches:
+                features = encoder(images.to(device))
+                if not isinstance(features, torch.Tensor) or features.ndim != 2:
+                    raise ValueError(
+                        "ICLR encoded features must have shape [samples, dimension]."
+                    )
+                if features.shape[0] != labels.numel():
+                    raise ValueError(
+                        "ICLR encoded features must align one-to-one with labels."
+                    )
+                feature_parts.append(features.detach().to(device="cpu"))
+    finally:
+        model.train(was_training)
+    return torch.cat(feature_parts, dim=0)
+
+
 def infer_other_clients_state(
     global_state: ModelState,
     own_state: ModelState,

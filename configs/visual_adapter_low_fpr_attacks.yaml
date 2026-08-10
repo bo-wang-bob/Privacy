@@ -17,6 +17,10 @@ visual_adapter:
   reduction: 4
   alpha: 0.2
   output_relu: true
+  text_adapter_enabled: true
+  text_reduction: 4
+  text_alpha: 0.2
+  text_output_relu: true
   precompute_features: true
   # Keep raw-image CLIP encoding separate from the larger cached-vector batches.
   precompute_batch_size: 64
@@ -52,11 +56,10 @@ audit:
     - avg_cosine
     - fedmia_loss
     - fedmia_cosine
-  candidate_sampling: low_fpr_full
-  low_fpr_min_nonmembers: 1000
+  candidate_sampling: balanced_holdout
   low_fpr_max_members: 5000
-  low_fpr_max_nonmembers: 20000
-  match_candidate_labels: false
+  low_fpr_max_nonmembers: 5000
+  match_candidate_labels: true
   audit_batch_size: 512
   low_fpr_gradient_batch_size: 16
   signal_storage: compact

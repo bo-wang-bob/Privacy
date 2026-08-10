@@ -9,6 +9,7 @@ from privacy_defenses.controller import (
 )
 from privacy_defenses.iclr import (
     ICLRRanking,
+    encode_training_batches,
     infer_other_clients_state,
     rank_loss_differences,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "attach_hamp_output_transform",
     "attach_output_temperature_transform",
     "ICLRRanking",
+    "encode_training_batches",
     "infer_other_clients_state",
     "rank_loss_differences",
     "validate_iclr_attack_relationships",

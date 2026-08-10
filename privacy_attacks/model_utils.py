@@ -10,6 +10,8 @@ def trainable_scope_name(model: torch.nn.Module) -> str:
     if model_type == "clip_mlp":
         return "mlp_only"
     if model_type == "visual_adapter":
+        if bool(getattr(model, "text_adapter_enabled", False)):
+            return "visual_and_text_adapters"
         return "visual_adapter_only"
     return "prompt_only"
 

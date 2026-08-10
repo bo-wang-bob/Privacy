@@ -77,12 +77,12 @@ common:
       - avg_cosine
       - fedmia_loss
       - fedmia_cosine
-    candidate_sampling: low_fpr_full
-    low_fpr_min_nonmembers: 1000
-    # Deterministic class-stratified caps. Smaller datasets still use all data.
+    candidate_sampling: balanced_holdout
+    # Per client, pair target-train members with never-trained target-test
+    # non-members using identical class counts and a strict 1:1 ratio.
     low_fpr_max_members: 5000
-    low_fpr_max_nonmembers: 20000
-    match_candidate_labels: false
+    low_fpr_max_nonmembers: 5000
+    match_candidate_labels: true
     audit_batch_size: 512
     attack_audit_intervals:
       # Measure every 10 completed rounds: rounds 10, 20, ..., 150.

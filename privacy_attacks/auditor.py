@@ -22,7 +22,7 @@ from privacy_attacks.features import (
 from privacy_attacks.fedmia import FEDMIA_MEASUREMENT_NAMES, run_fedmia
 from privacy_attacks.fedmia_baselines import run_fedmia_baseline
 from privacy_attacks.imia import run_imia
-from privacy_attacks.model_utils import last_client_states
+from privacy_attacks.model_utils import last_client_states, trainable_scope_name
 from privacy_attacks.pipra import run_pipra
 from privacy_attacks.promptmia import run_promptmia
 from privacy_attacks.promptres import promptres_round_scores, run_promptres
@@ -317,11 +317,14 @@ class MembershipAuditor:
             "legacy",
             "fedmia_mix",
             "low_fpr_full",
+            "balanced_holdout",
         }:
             raise ValueError(
-                "audit.candidate_sampling must be legacy, fedmia_mix, or "
-                "low_fpr_full."
+                "audit.candidate_sampling must be legacy, fedmia_mix, "
+                "low_fpr_full, or balanced_holdout."
             )
+        if self.candidate_sampling_mode == "balanced_holdout":
+            self.match_candidate_labels = True
         self.nonmember_to_member_ratio = float(
             self.config.get("nonmember_to_member_ratio", 1.0)
         )
@@ -343,19 +346,29 @@ class MembershipAuditor:
         self.low_fpr_max_nonmembers = int(
             self.config.get("low_fpr_max_nonmembers", 0)
         )
-        if self.candidate_sampling_mode == "low_fpr_full":
-            if self.low_fpr_min_nonmembers < 1000:
-                raise ValueError(
-                    "low_fpr_min_nonmembers must be at least 1000 to resolve "
-                    "0.1% FPR."
-                )
+        if self.candidate_sampling_mode in {
+            "low_fpr_full",
+            "balanced_holdout",
+        }:
             if self.low_fpr_max_members < 0 or self.low_fpr_max_members == 1:
                 raise ValueError(
                     "low_fpr_max_members must be 0 (unlimited) or at least 2."
                 )
             if (
                 self.low_fpr_max_nonmembers < 0
-                or 0
+                or self.low_fpr_max_nonmembers == 1
+            ):
+                raise ValueError(
+                    "low_fpr_max_nonmembers must be 0 (unlimited) or at least 2."
+                )
+        if self.candidate_sampling_mode == "low_fpr_full":
+            if self.low_fpr_min_nonmembers < 1000:
+                raise ValueError(
+                    "low_fpr_min_nonmembers must be at least 1000 to resolve "
+                    "0.1% FPR."
+                )
+            if (
+                0
                 < self.low_fpr_max_nonmembers
                 < self.low_fpr_min_nonmembers
             ):
@@ -373,6 +386,11 @@ class MembershipAuditor:
         self.candidate_local_indices: torch.Tensor | None = None
 
         if self.enabled:
+            if self.candidate_sampling_mode == "balanced_holdout":
+                self._initialize_balanced_holdout_candidates(
+                    users, target_client_id
+                )
+                return
             if self.candidate_sampling_mode == "low_fpr_full":
                 self._initialize_low_fpr_full_candidates(users, target_client_id)
                 return
@@ -961,6 +979,217 @@ class MembershipAuditor:
         self.null_client_candidate_label_overlap_by_client = overlap_by_client
         self.nonmember_source_priority = list(dict.fromkeys(source_priority))
 
+    def _initialize_balanced_holdout_candidates(
+        self, users: list, target_client_id: int
+    ) -> None:
+        """Build per-client 1:1 train/test pools with identical label counts.
+
+        Members come only from the target client's local training data.  Every
+        non-member comes from that client's independently partitioned test data,
+        which is never used by any federated client for training.  Exact
+        per-class pairing prevents client label skew from becoming a membership
+        shortcut.
+        """
+        supported = {
+            "blackbox_loss",
+            "loss_series",
+            "grad_cosine",
+            "avg_cosine",
+            "fedmia_loss",
+            "fedmia_cosine",
+        }
+        unsupported = sorted(set(self.attacks) - supported)
+        if self.model_type not in {"clip_mlp", "visual_adapter"}:
+            raise ValueError(
+                "balanced_holdout currently requires a frozen-CLIP feature model."
+            )
+        if unsupported:
+            raise ValueError(
+                "balanced_holdout does not support: " + ", ".join(unsupported)
+            )
+
+        image_parts = []
+        label_parts = []
+        membership_parts = []
+        client_parts = []
+        local_index_parts = []
+        candidate_sampling_by_client = {}
+        selection_by_client = {}
+        overlap_by_client = {}
+        eligible_client_ids = []
+
+        for client_id in self.audit_client_ids:
+            target = users[client_id]
+            member_limit = (
+                self.low_fpr_max_members
+                if self.low_fpr_max_members > 0
+                else len(target.train_data)
+            )
+            nonmember_limit = (
+                self.low_fpr_max_nonmembers
+                if self.low_fpr_max_nonmembers > 0
+                else len(target.test_data)
+            )
+            try:
+                (
+                    member_images,
+                    member_labels,
+                    nonmember_images,
+                    nonmember_labels,
+                    sampling,
+                ) = self._collect_exact_paired_candidates(
+                    target.train_data,
+                    target.test_data,
+                    member_limit,
+                    nonmember_limit,
+                    client_id,
+                )
+            except ValueError as error:
+                if not self.allow_partial_client_audit:
+                    raise
+                self.skipped_audit_clients[str(client_id)] = str(error)
+                logger.warning(
+                    "Skipping client %d in balanced holdout audit: %s",
+                    client_id,
+                    error,
+                )
+                continue
+
+            member_indices = torch.as_tensor(
+                sampling.pop("member_indices"), dtype=torch.long
+            )
+            nonmember_indices = torch.as_tensor(
+                sampling.pop("nonmember_indices"), dtype=torch.long
+            )
+            member_count = int(member_labels.numel())
+            nonmember_count = int(nonmember_labels.numel())
+            if member_count != nonmember_count:
+                raise AssertionError(
+                    "Balanced holdout membership groups must have equal size."
+                )
+
+            images = torch.cat((member_images, nonmember_images))
+            labels = torch.cat((member_labels, nonmember_labels))
+            memberships = torch.cat(
+                (
+                    torch.ones(member_count, dtype=torch.long),
+                    torch.zeros(nonmember_count, dtype=torch.long),
+                )
+            )
+            image_parts.append(images)
+            label_parts.append(labels)
+            membership_parts.append(memberships)
+            client_parts.append(
+                torch.full((labels.numel(),), client_id, dtype=torch.long)
+            )
+            local_index_parts.append(
+                torch.cat(
+                    (
+                        member_indices,
+                        torch.full((nonmember_count,), -1, dtype=torch.long),
+                    )
+                )
+            )
+            eligible_client_ids.append(client_id)
+            paired_histogram = torch.bincount(
+                member_labels, minlength=self.num_classes
+            ).tolist()
+            selection_by_client[str(client_id)] = {
+                "seed": self.seed,
+                "member_pool_indices": member_indices,
+                "nonmember_pool_indices": nonmember_indices,
+                "member_pool_source_counts": {
+                    f"target_train:{client_id}": len(target.train_data)
+                },
+                "nonmember_pool_source_counts": {
+                    f"target_independent_test:{client_id}": len(target.test_data)
+                },
+                "index_convention": (
+                    "zero-based local positions in the target client's train "
+                    "or independent test dataset"
+                ),
+            }
+            candidate_sampling_by_client[str(client_id)] = {
+                **sampling,
+                "mode": "balanced_holdout",
+                "member_count": member_count,
+                "nonmember_count": nonmember_count,
+                "member_pool_count": len(target.train_data),
+                "nonmember_pool_count": len(target.test_data),
+                "member_source_counts": {
+                    f"target_train:{client_id}": member_count
+                },
+                "nonmember_source_counts": {
+                    f"target_independent_test:{client_id}": nonmember_count
+                },
+                "maximum_members": self.low_fpr_max_members,
+                "maximum_nonmembers": self.low_fpr_max_nonmembers,
+                "selection_method": "exact_per_class_paired_without_replacement",
+                "selection_artifact": "candidate_selection.pt",
+                "membership_definition": "global_model_record_membership",
+                "nonmember_training_exposure": "never_trained",
+                "actual_nonmember_to_member_ratio": 1.0,
+                "paired_label_histogram": paired_histogram,
+                "fpr_resolution": 1.0 / nonmember_count,
+            }
+            overlap_by_client[str(client_id)] = [
+                class_id
+                for class_id, count in enumerate(paired_histogram)
+                if count > 0
+            ]
+            logger.info(
+                "Balanced holdout client %d candidates selected: "
+                "members=%d/%d, non-members=%d/%d, ratio=1:1",
+                client_id,
+                member_count,
+                len(target.train_data),
+                nonmember_count,
+                len(target.test_data),
+            )
+
+        if not eligible_client_ids:
+            raise ValueError(
+                "Balanced holdout audit found no client with at least two "
+                "same-label train/test pairs."
+            )
+        self.audit_client_ids = eligible_client_ids
+        self.pooled_client_audit = len(eligible_client_ids) > 1
+        if not self.pooled_client_audit:
+            self.target_client_id = eligible_client_ids[0]
+        self.low_fpr_candidate_selection = (
+            {
+                "scope": "pooled_clients",
+                "seed": self.seed,
+                "audit_client_ids": eligible_client_ids,
+                "per_client": selection_by_client,
+            }
+            if self.pooled_client_audit
+            else selection_by_client[str(eligible_client_ids[0])]
+        )
+        self.images = torch.cat(image_parts)
+        self.labels = torch.cat(label_parts)
+        self.membership = torch.cat(membership_parts)
+        self.candidate_client_ids = torch.cat(client_parts)
+        self.candidate_local_indices = torch.cat(local_index_parts)
+        self.candidate_inputs_are_features = bool(
+            self.images.ndim == 2
+            and self.images.shape[1]
+            == int(getattr(self.model, "projection_dim", -1))
+        )
+        self.candidate_sampling_by_client = candidate_sampling_by_client
+        self.candidate_label_support = sorted(
+            set(self.labels.detach().cpu().unique().tolist())
+        )
+        self.null_client_candidate_label_overlap = sorted(
+            {
+                class_id
+                for overlap in overlap_by_client.values()
+                for class_id in overlap
+            }
+        )
+        self.null_client_candidate_label_overlap_by_client = overlap_by_client
+        self.nonmember_source_priority = ["target_client_independent_test"]
+
     @staticmethod
     def _unused_few_shot_training_pool(users) -> Subset | None:
         """Recover examples excluded before the federated few-shot split.
@@ -1253,6 +1482,8 @@ class MembershipAuditor:
                 if member_groups[class_id] and not nonmember_groups[class_id]
             ],
             "sampling_seed": int(self.seed + 65537 * (client_id + 1)),
+            "member_indices": member_indices,
+            "nonmember_indices": nonmember_indices,
         }
         return (
             member_images,
@@ -2394,7 +2625,7 @@ class MembershipAuditor:
                         )
                 elif self.model_type == "visual_adapter":
                     result.metadata.setdefault(
-                        "trainable_scope", "visual_adapter_only"
+                        "trainable_scope", trainable_scope_name(final_model)
                     )
                     if attack == "promptmia":
                         result.metadata.setdefault(
@@ -2565,6 +2796,18 @@ class MembershipAuditor:
                     },
                     "candidate_sampling": {
                         "mode": self.candidate_sampling_mode,
+                        "membership_definition": (
+                            "global_model_record_membership"
+                            if self.candidate_sampling_mode
+                            == "balanced_holdout"
+                            else "target_client_membership"
+                        ),
+                        "nonmember_training_exposure": (
+                            "never_trained"
+                            if self.candidate_sampling_mode
+                            == "balanced_holdout"
+                            else "source_dependent"
+                        ),
                         "requested_nonmember_to_member_ratio": (
                             self.nonmember_to_member_ratio
                             if self.candidate_sampling_mode == "fedmia_mix"
@@ -2578,7 +2821,10 @@ class MembershipAuditor:
                             and histograms_exactly_matched
                         ),
                         "label_matching_mode": (
-                            "fedmia_mix_unmatched"
+                            "balanced_target_train_test_per_class"
+                            if self.candidate_sampling_mode
+                            == "balanced_holdout"
+                            else "fedmia_mix_unmatched"
                             if self.candidate_sampling_mode == "fedmia_mix"
                             else "exact_paired_per_client"
                             if self.pooled_client_audit

@@ -15,27 +15,27 @@ datasets:
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 150
+      num_global_iters: 300
   - name: oxfordpets
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 150
+      num_global_iters: 300
   - name: flowers
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 150
+      num_global_iters: 300
   - name: food101
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 150
+      num_global_iters: 300
   - name: cifar100
     overrides:
       total_users: 10
       sample_users: 10
-      num_global_iters: 150
+      num_global_iters: 300
 
 common:
   model_type: visual_adapter
@@ -64,6 +64,10 @@ common:
     reduction: 4
     alpha: 0.2
     output_relu: true
+    text_adapter_enabled: true
+    text_reduction: 4
+    text_alpha: 0.2
+    text_output_relu: true
     precompute_features: true
     precompute_batch_size: 64
     template: null
@@ -80,15 +84,15 @@ common:
       - avg_cosine
       - fedmia_loss
       - fedmia_cosine
-    candidate_sampling: low_fpr_full
-    low_fpr_min_nonmembers: 1000
-    # Match the CLIP-MLP audit budget and deterministic stratified sampling.
+    candidate_sampling: balanced_holdout
+    # Per client, pair target-train members with never-trained target-test
+    # non-members using identical class counts and a strict 1:1 ratio.
     low_fpr_max_members: 5000
-    low_fpr_max_nonmembers: 20000
-    match_candidate_labels: false
+    low_fpr_max_nonmembers: 5000
+    match_candidate_labels: true
     audit_batch_size: 512
     attack_audit_intervals:
-      # Measure every 10 completed rounds: rounds 10, 20, ..., 150.
+      # Measure every 10 completed rounds: rounds 10, 20, ..., 300.
       loss_series: 10
       avg_cosine: 10
       fedmia_loss: 10

@@ -90,6 +90,17 @@ class UserBase:
             if self._iclr_enabled
             else None
         )
+        self.iclr_statistics_loader = (
+            DataLoader(
+                _IndexedDataset(train_data),
+                batch_size=eval_batch_size,
+                shuffle=False,
+                collate_fn=self._collate_indexed_batch,
+                drop_last=False,
+            )
+            if self._iclr_enabled
+            else None
+        )
         self.testloader = DataLoader(
             test_data,
             batch_size=eval_batch_size,
@@ -120,6 +131,12 @@ class UserBase:
         self.iclr_score_max: torch.Tensor | None = None
         self.iclr_score_last: torch.Tensor | None = None
         self.iclr_score_last_round: torch.Tensor | None = None
+        self.iclr_feature_seen: torch.Tensor | None = None
+        self.iclr_class_feature_counts: torch.Tensor | None = None
+        self.iclr_class_feature_means: torch.Tensor | None = None
+        self.iclr_within_class_scatter: torch.Tensor | None = None
+        self.iclr_within_class_covariance: torch.Tensor | None = None
+        self.iclr_within_class_covariance_dof: int = 0
 
     def _collate_indexed_batch(self, batch):
         samples, indices = zip(*batch)
@@ -196,6 +213,12 @@ class UserBase:
                 self._record_train_batch(images, labels)
                 self.last_train_indices = indices.detach().cpu().long().clone()
                 yield images, labels, indices
+
+    def iter_iclr_statistics_batches(self):
+        """Yield the complete local training set once in stable index order."""
+        if self.iclr_statistics_loader is None:
+            raise RuntimeError("ICLR statistics are not enabled for this client.")
+        yield from self.iclr_statistics_loader
 
     def iter_local_batches(self):
         """Yield the batches used by one local update under the active protocol."""

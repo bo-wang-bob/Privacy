@@ -250,6 +250,8 @@ class ServerBase:
             for user in self.ctx.users:
                 user.set_parameters(state)
 
+        self.defense.initialize_iclr_feature_statistics(self.ctx.users)
+
         self.auditor = MembershipAuditor(
             model=model,
             users=self.ctx.users,

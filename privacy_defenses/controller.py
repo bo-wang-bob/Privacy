@@ -23,6 +23,7 @@ from privacy_attacks.code_poison import (
     generate_membership_encoding_samples,
 )
 from privacy_defenses.iclr import (
+    encode_training_batches,
     infer_other_clients_state,
     rank_loss_differences,
 )
@@ -450,6 +451,57 @@ class DefenseController:
             optimizer.step()
             self.steps[user.id] += 1
 
+    def initialize_iclr_feature_statistics(self, users) -> None:
+        """Compute fixed feature statistics from every complete local dataset."""
+        if self.name != "iclr":
+            return
+        for user in users:
+            user.iclr_feature_seen = None
+            user.iclr_class_feature_counts = None
+            user.iclr_class_feature_means = None
+            user.iclr_within_class_scatter = None
+            user.iclr_within_class_covariance = None
+            user.iclr_within_class_covariance_dof = 0
+            for images, labels, local_indices in (
+                user.iter_iclr_statistics_batches()
+            ):
+                encoded_features = encode_training_batches(
+                    model=user.model,
+                    batches=[(images, labels)],
+                    device=self.device,
+                )
+                self._update_iclr_feature_statistics(
+                    user=user,
+                    encoded_features=encoded_features,
+                    labels=labels,
+                    sample_indices=local_indices,
+                    num_classes=self.num_classes,
+                )
+            if user.iclr_class_feature_counts is None:
+                raise ValueError(
+                    f"Client {user.id} has no samples for ICLR feature statistics."
+                )
+            encoded_samples = int(user.iclr_class_feature_counts.sum())
+            if encoded_samples != int(user.train_samples):
+                raise RuntimeError(
+                    f"Client {user.id} ICLR feature statistics cover "
+                    f"{encoded_samples}/{user.train_samples} local samples."
+                )
+            self._iclr_client_stats.setdefault(user.id, {}).update(
+                {
+                    "encoded_feature_samples": encoded_samples,
+                    "encoded_feature_classes": int(
+                        (user.iclr_class_feature_counts > 0).sum()
+                    ),
+                    "encoded_feature_dimension": int(
+                        user.iclr_class_feature_means.shape[1]
+                    ),
+                    "within_class_covariance_dof": int(
+                        user.iclr_within_class_covariance_dof
+                    ),
+                }
+            )
+
     @staticmethod
     def _update_iclr_score_statistics(user, ranking, round_index: int) -> None:
         """Maintain compact per-local-sample statistics across communication rounds."""
@@ -494,6 +546,106 @@ class DefenseController:
             for index, score in zip(indices.tolist(), scores.tolist()):
                 user.iclr_score_last[index] = score
                 user.iclr_score_last_round[index] = int(round_index)
+
+    @staticmethod
+    def _update_iclr_feature_statistics(
+        user,
+        encoded_features: torch.Tensor,
+        labels: torch.Tensor,
+        sample_indices: torch.Tensor,
+        num_classes: int,
+    ) -> None:
+        """Update unique-sample class means and pooled within-class covariance."""
+        features = encoded_features.detach().cpu().to(torch.float64)
+        labels = labels.detach().cpu().long().flatten()
+        indices = sample_indices.detach().cpu().long().flatten()
+        if features.ndim != 2:
+            raise ValueError("ICLR encoded features must be a matrix.")
+        if features.shape[0] != labels.numel() or labels.numel() != indices.numel():
+            raise ValueError(
+                "ICLR features, labels, and local indices must be sample-aligned."
+            )
+        if indices.numel() == 0:
+            return
+        sample_count = int(user.train_samples)
+        if int(indices.min()) < 0 or int(indices.max()) >= sample_count:
+            raise IndexError("ICLR feature local index is outside the client dataset.")
+        if int(labels.min()) < 0 or int(labels.max()) >= int(num_classes):
+            raise ValueError("ICLR feature label is outside the configured classes.")
+
+        dimension = int(features.shape[1])
+        if user.iclr_feature_seen is None:
+            user.iclr_feature_seen = torch.zeros(sample_count, dtype=torch.bool)
+            user.iclr_class_feature_counts = torch.zeros(
+                num_classes, dtype=torch.long
+            )
+            user.iclr_class_feature_means = torch.zeros(
+                (num_classes, dimension), dtype=torch.float64
+            )
+            user.iclr_within_class_scatter = torch.zeros(
+                (dimension, dimension), dtype=torch.float64
+            )
+            user.iclr_within_class_covariance = torch.zeros(
+                (dimension, dimension), dtype=torch.float64
+            )
+        elif user.iclr_class_feature_means.shape != (num_classes, dimension):
+            raise ValueError(
+                "ICLR encoded feature dimension or class count changed during training."
+            )
+
+        new_positions = []
+        batch_indices = set()
+        for position, local_index in enumerate(indices.tolist()):
+            if user.iclr_feature_seen[local_index] or local_index in batch_indices:
+                continue
+            batch_indices.add(local_index)
+            new_positions.append(position)
+        if not new_positions:
+            return
+
+        positions = torch.tensor(new_positions, dtype=torch.long)
+        new_features = features[positions]
+        new_labels = labels[positions]
+        new_indices = indices[positions]
+        for class_id in torch.unique(new_labels, sorted=True).tolist():
+            class_mask = new_labels == int(class_id)
+            class_features = new_features[class_mask]
+            batch_count = int(class_features.shape[0])
+            batch_mean = class_features.mean(dim=0)
+            centered = class_features - batch_mean
+            batch_scatter = centered.t().matmul(centered)
+
+            previous_count = int(user.iclr_class_feature_counts[class_id])
+            previous_mean = user.iclr_class_feature_means[class_id]
+            combined_count = previous_count + batch_count
+            if previous_count == 0:
+                combined_mean = batch_mean
+                merge_scatter = batch_scatter
+            else:
+                delta = batch_mean - previous_mean
+                combined_mean = previous_mean + delta * (
+                    batch_count / combined_count
+                )
+                correction = torch.outer(delta, delta) * (
+                    previous_count * batch_count / combined_count
+                )
+                merge_scatter = batch_scatter + correction
+            user.iclr_class_feature_counts[class_id] = combined_count
+            user.iclr_class_feature_means[class_id] = combined_mean
+            user.iclr_within_class_scatter.add_(merge_scatter)
+
+        user.iclr_feature_seen[new_indices] = True
+        populated_classes = int((user.iclr_class_feature_counts > 0).sum())
+        total_samples = int(user.iclr_class_feature_counts.sum())
+        degrees_of_freedom = total_samples - populated_classes
+        user.iclr_within_class_covariance_dof = degrees_of_freedom
+        if degrees_of_freedom > 0:
+            covariance = user.iclr_within_class_scatter / degrees_of_freedom
+            user.iclr_within_class_covariance.copy_(
+                (covariance + covariance.t()) * 0.5
+            )
+        else:
+            user.iclr_within_class_covariance.zero_()
 
     def prepare_client_training(
         self,
@@ -1651,6 +1803,13 @@ class DefenseController:
                 "score": "L(x; theta_-k) - L(x; theta_k)",
                 "ranking": "descending",
                 "training_action": "rank_only",
+                "feature_statistics": {
+                    "feature_space": "frozen_clip_image_encoder_output",
+                    "sample_weighting": "full_local_training_set_once",
+                    "computation_stage": "before_federated_training",
+                    "class_means": "per_client_per_class",
+                    "within_class_covariance": "per_client_pooled_unbiased",
+                },
                 "client_state": {
                     str(client_id): values
                     for client_id, values in sorted(

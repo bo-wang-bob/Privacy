@@ -53,11 +53,10 @@ audit:
     - fedmia_cosine
   # Build the candidate pool from every target-client member and every disjoint
   # non-member, then apply deterministic class-stratified caps when needed.
-  candidate_sampling: low_fpr_full
-  low_fpr_min_nonmembers: 1000
+  candidate_sampling: balanced_holdout
   low_fpr_max_members: 5000
-  low_fpr_max_nonmembers: 20000
-  match_candidate_labels: false
+  low_fpr_max_nonmembers: 5000
+  match_candidate_labels: true
   audit_batch_size: 512
   low_fpr_gradient_batch_size: 16
   signal_storage: compact

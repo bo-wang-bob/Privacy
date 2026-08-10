@@ -490,6 +490,25 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             reduction=int(adapter_config.get("reduction", 4)),
             alpha=float(adapter_config.get("alpha", 0.2)),
             output_relu=bool(adapter_config.get("output_relu", True)),
+            text_adapter_enabled=bool(
+                adapter_config.get("text_adapter_enabled", False)
+            ),
+            text_reduction=int(
+                adapter_config.get(
+                    "text_reduction", adapter_config.get("reduction", 4)
+                )
+            ),
+            text_alpha=float(
+                adapter_config.get(
+                    "text_alpha", adapter_config.get("alpha", 0.2)
+                )
+            ),
+            text_output_relu=bool(
+                adapter_config.get(
+                    "text_output_relu",
+                    adapter_config.get("output_relu", True),
+                )
+            ),
             device=device,
         ).to(device)
     selected = (

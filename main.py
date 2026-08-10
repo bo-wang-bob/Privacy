@@ -228,6 +228,15 @@ def validate_config(config: dict) -> None:
         alpha = float(adapter_config.get("alpha", 0.2))
         if not 0 <= alpha <= 1:
             raise ValueError("visual_adapter.alpha must be in [0, 1].")
+        text_reduction = int(adapter_config.get("text_reduction", reduction))
+        if text_reduction <= 0 or feature_dim % text_reduction != 0:
+            raise ValueError(
+                "visual_adapter.feature_dim must be divisible by "
+                "visual_adapter.text_reduction."
+            )
+        text_alpha = float(adapter_config.get("text_alpha", alpha))
+        if not 0 <= text_alpha <= 1:
+            raise ValueError("visual_adapter.text_alpha must be in [0, 1].")
         if int(adapter_config.get("precompute_batch_size", 64)) <= 0:
             raise ValueError(
                 "visual_adapter.precompute_batch_size must be positive."
@@ -285,10 +294,15 @@ def validate_config(config: dict) -> None:
                 "at least the number of audited clients."
             )
     candidate_sampling = str(audit.get("candidate_sampling", "legacy")).lower()
-    if candidate_sampling not in {"legacy", "fedmia_mix", "low_fpr_full"}:
+    if candidate_sampling not in {
+        "legacy",
+        "fedmia_mix",
+        "low_fpr_full",
+        "balanced_holdout",
+    }:
         raise ValueError(
-            "audit.candidate_sampling must be legacy, fedmia_mix, or "
-            "low_fpr_full."
+            "audit.candidate_sampling must be legacy, fedmia_mix, "
+            "low_fpr_full, or balanced_holdout."
         )
     nonmember_ratio = float(audit.get("nonmember_to_member_ratio", 1.0))
     if nonmember_ratio <= 0:
@@ -302,7 +316,7 @@ def validate_config(config: dict) -> None:
             "audit.candidate_sampling=fedmia_mix requires "
             "match_candidate_labels=false to reproduce the reference protocol."
         )
-    if candidate_sampling == "low_fpr_full":
+    if candidate_sampling in {"low_fpr_full", "balanced_holdout"}:
         low_fpr_attacks = {
             "blackbox_loss",
             "loss_series",
@@ -313,15 +327,16 @@ def validate_config(config: dict) -> None:
         }
         if model_type not in {"clip_mlp", "visual_adapter"}:
             raise ValueError(
-                "audit.candidate_sampling=low_fpr_full requires a frozen-CLIP "
-                "feature model."
+                f"audit.candidate_sampling={candidate_sampling} requires a "
+                "frozen-CLIP feature model."
             )
         unsupported_low_fpr = sorted(attacks - low_fpr_attacks)
         if unsupported_low_fpr:
             raise ValueError(
-                "low_fpr_full does not support: "
+                f"{candidate_sampling} does not support: "
                 + ", ".join(unsupported_low_fpr)
             )
+    if candidate_sampling == "low_fpr_full":
         if int(audit.get("low_fpr_min_nonmembers", 1000)) < 1000:
             raise ValueError(
                 "audit.low_fpr_min_nonmembers must be at least 1000."
@@ -344,6 +359,17 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "audit.low_fpr_max_nonmembers must be 0 (unlimited) or at "
                 "least audit.low_fpr_min_nonmembers."
+            )
+    if candidate_sampling == "balanced_holdout":
+        low_fpr_max_members = int(audit.get("low_fpr_max_members", 0))
+        low_fpr_max_nonmembers = int(audit.get("low_fpr_max_nonmembers", 0))
+        if low_fpr_max_members < 0 or low_fpr_max_members == 1:
+            raise ValueError(
+                "audit.low_fpr_max_members must be 0 (unlimited) or at least 2."
+            )
+        if low_fpr_max_nonmembers < 0 or low_fpr_max_nonmembers == 1:
+            raise ValueError(
+                "audit.low_fpr_max_nonmembers must be 0 (unlimited) or at least 2."
             )
     if pooled_audit and attacks - POOLED_CLIENT_ATTACKS:
         raise ValueError(
@@ -742,6 +768,25 @@ def run(config: dict) -> list[dict]:
             reduction=int(adapter_config.get("reduction", 4)),
             alpha=float(adapter_config.get("alpha", 0.2)),
             output_relu=bool(adapter_config.get("output_relu", True)),
+            text_adapter_enabled=bool(
+                adapter_config.get("text_adapter_enabled", False)
+            ),
+            text_reduction=int(
+                adapter_config.get(
+                    "text_reduction", adapter_config.get("reduction", 4)
+                )
+            ),
+            text_alpha=float(
+                adapter_config.get(
+                    "text_alpha", adapter_config.get("alpha", 0.2)
+                )
+            ),
+            text_output_relu=bool(
+                adapter_config.get(
+                    "text_output_relu",
+                    adapter_config.get("output_relu", True),
+                )
+            ),
             device=device,
         )
     else:
@@ -871,6 +916,10 @@ def default_config() -> dict:
             "reduction": 4,
             "alpha": 0.2,
             "output_relu": True,
+            "text_adapter_enabled": True,
+            "text_reduction": 4,
+            "text_alpha": 0.2,
+            "text_output_relu": True,
             "precompute_features": True,
             "precompute_batch_size": 64,
             "template": None,

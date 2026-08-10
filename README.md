@@ -99,8 +99,9 @@ decay_step = round_index // learning_rate_decay_interval
 lr(round_index) = initial_learning_rate * learning_rate_decay ** decay_step
 ```
 
-当前 MLP 与 Visual Adapter 的通用实验设置 `learning_rate_decay: 1.0`，因此全部
-150 个通信轮保持初始客户端学习率不变。只有显式设置小于 1 的衰减系数时，
+当前 MLP 与 Visual Adapter 的通用实验设置 `learning_rate_decay: 1.0`；MLP 的
+150 轮和 Adapter 的 300 轮均保持初始客户端学习率不变。只有显式设置小于 1
+的衰减系数时，
 `learning_rate_decay_interval` 才会影响训练。
 将 decay 设为 `1.0` 可关闭衰减，也可通过 `--learning-rate-decay` 和
 `--learning-rate-decay-interval` 覆盖。
@@ -124,13 +125,13 @@ python main.py --config configs/clip_mlp_privacy.yaml
 python main.py --model_type clip_mlp --attack fedmia_cosine
 ```
 
-### 16-shot 视觉 CLIP Adapter
+### 16-shot 双侧 CLIP Adapter
 
-该模式冻结 CLIP 图像和文本编码器，只用 FedSGD 训练
-`Linear -> ReLU -> Linear -> ReLU` 视觉瓶颈，并按 `alpha` 将适配特征与原始
-图像特征残差混合。每个通信轮中，每个参与客户端只使用一个 mini-batch 做一次
-SGD 更新，服务器对参与客户端的更新直接等权平均，不按 batch 或本地数据量加权。
-它固定复用 FPL 的每类 16-shot 划分：
+该模式冻结 CLIP 图像和文本编码器，在图像特征与类别文本特征两侧分别训练
+`Linear -> ReLU -> Linear -> ReLU` 瓶颈。视觉侧按 `alpha` 做残差混合，文本侧
+按 `text_alpha` 做残差混合，之后分别归一化并计算相似度。每个通信轮中，每个参与
+客户端只使用一个 mini-batch 做一次 SGD 更新，服务器对两侧 Adapter 的更新直接
+等权平均，不按 batch 或本地数据量加权。它固定复用 FPL 的每类 16-shot 划分：
 
 ```bash
 python main.py --config configs/visual_adapter_privacy.yaml
@@ -142,7 +143,8 @@ Visual Adapter 使用同一套预计算与缓存策略：CLIP 图像特征在启
 
 CIFAR-100 与 Caltech101 默认使用 `a photo of a {class}.`；OxfordPets 使用
 `a photo of a {class}, a type of pet.`。可通过 `visual_adapter.template` 覆盖。
-命令行可使用 `--adapter_reduction` 和 `--adapter_alpha` 调整瓶颈与混合比例。
+`text_reduction`、`text_alpha` 和 `text_output_relu` 控制文本侧 Adapter；省略时
+分别继承视觉侧设置。历史配置若没有 `text_adapter_enabled`，仍按仅视觉侧运行。
 
 `PromptFL` 是针对可训练 `prompt_learner` 定义的算法，不能直接应用到 MLP
 分类头或视觉 Adapter。两种
@@ -318,6 +320,10 @@ audit:
 `match_candidate_labels: true` 使用。两种协议的结果不应直接混合比较；
 `privacy_audit/summary.json` 会记录实际成员/非成员数量、比例和各非成员来源。
 
+统一 CLIP 实验默认使用更严格的 `balanced_holdout`：对客户端 `k`，成员仅来自
+该客户端训练集，非成员仅来自该客户端从未参与任何训练的独立测试集；两组按类别
+无放回精确配对并保持 1:1。其他客户端训练样本不会被错误标记为全局模型非成员。
+
 完整攻击定义和威胁模型见 [`docs/attack_mapping.md`](docs/attack_mapping.md)。
 
 ## 配置说明
@@ -327,8 +333,8 @@ audit:
 - `model_type`：`prompt`、冻结 CLIP 图像编码器的 `clip_mlp`，或
   16-shot `visual_adapter`；
 - `clip_mlp`：两层 MLP 的隐藏维度、dropout 与特征归一化设置；
-- `visual_adapter`：视觉特征维度、瓶颈 reduction、残差混合系数 `alpha`、输出
-  ReLU、特征缓存和可选文本模板；该模式固定使用 `fpl_shots: 16`；
+- `visual_adapter`：双侧特征维度、视觉/文本瓶颈 reduction、两侧残差混合系数、
+  输出 ReLU、图像特征缓存和可选文本模板；该模式固定使用 `fpl_shots: 16`；
 - `aggregator`：联邦训练方法；
 - `total_users`、`sample_users`：客户端总数和每轮参与数；
 - `partition_mode`：`iid`、`dirichlet`、`pathological` 或 `auto`；
@@ -350,7 +356,7 @@ Adapter 的单次运行、低 FPR sweep，以及 MLP 严格 ProjRes 配置。
 - `training_health.json`：训练状态健康检查；
 - `final_prompt.pt`：最终可训练提示参数；
 - `final_mlp.pt`：`clip_mlp` 基线最终可训练的两层 MLP 参数；
-- `final_visual_adapter.pt`：视觉 CLIP Adapter 最终可训练的瓶颈参数；
+- `final_visual_adapter.pt`：图像侧和文本侧 CLIP Adapter 的最终可训练参数；
 - `federated_method_summary.json`：联邦方法配置与诊断；
 - `defense_summary.json`：防御配置、统计与隐私会计；
 - `privacy_audit/summary.json`：攻击指标和逐客户端元数据；
@@ -370,11 +376,18 @@ ProjRes 日志并入 `run.log`，不再创建独立的 `projres_strict.log`、`c
 
 ## 测试
 
-轻量测试不需要数据集、GPU 或 CLIP 检查点：
+日常修改默认运行快速核心回归，不需要数据集、GPU 或 CLIP 检查点：
 
 ```bash
 python -m pytest -q
 ```
 
-测试覆盖联邦聚合、few-shot 数据划分、攻击与防御接口、审计池化、信号压缩
-和 sweep 配置。
+默认测试覆盖 few-shot 数据划分、实验入口与配置、轮次调度、信号压缩和
+ProjRes 基本不变量。只有修改共享审计器、聚合核心或准备完整回归时，才显式运行
+完整本地测试：
+
+```bash
+python -m pytest -q tests
+```
+
+小范围修改应优先直接指定相关测试文件，避免无关测试消耗时间和资源。
