@@ -240,12 +240,28 @@ class MembershipAuditor:
         )
         if self.num_classes <= 0:
             raise ValueError("Membership auditing requires a positive class count.")
-        self.model = copy.deepcopy(model).to(device)
-        self.initial_prompt_state = {
-            name: parameter.detach().clone()
-            for name, parameter in self.model.named_parameters()
-            if parameter.requires_grad
-        }
+        # Plain training runs do not need an auditor-side model clone. This is
+        # especially important for multi-billion-byte frozen language-model
+        # backbones used with parameter-efficient fine-tuning.
+        # Client-scoped PEFT models already share one immutable multi-GB
+        # backbone. Auditing is serialized between local-training rounds, so
+        # reuse that model and only load released trainable states into it.
+        self.model = (
+            model
+            if getattr(model, "client_scoped_parameters", False)
+            else copy.deepcopy(model).to(device)
+            if self.enabled
+            else model
+        )
+        self.initial_prompt_state = (
+            {}
+            if getattr(model, "client_scoped_parameters", False)
+            else {
+                name: parameter.detach().clone()
+                for name, parameter in self.model.named_parameters()
+                if parameter.requires_grad
+            }
+        )
         if self.defense_name == "hamp":
             attach_hamp_output_transform(
                 self.model,
@@ -1006,10 +1022,12 @@ class MembershipAuditor:
             "clip_mlp",
             "visual_adapter",
             "clip_lora",
+            "bert_adapter",
+            "gpt2_adapter",
         }:
             raise ValueError(
-                "balanced_holdout requires a supported CLIP "
-                "parameter-efficient model."
+                "balanced_holdout requires a supported parameter-efficient "
+                "model."
             )
         if unsupported:
             raise ValueError(
@@ -1076,7 +1094,9 @@ class MembershipAuditor:
                     "Balanced holdout membership groups must have equal size."
                 )
 
-            images = torch.cat((member_images, nonmember_images))
+            images = self._cat_candidate_inputs(
+                (member_images, nonmember_images)
+            )
             labels = torch.cat((member_labels, nonmember_labels))
             memberships = torch.cat(
                 (
@@ -1174,7 +1194,7 @@ class MembershipAuditor:
             if self.pooled_client_audit
             else selection_by_client[str(eligible_client_ids[0])]
         )
-        self.images = torch.cat(image_parts)
+        self.images = self._cat_candidate_inputs(image_parts)
         self.labels = torch.cat(label_parts)
         self.membership = torch.cat(membership_parts)
         self.candidate_client_ids = torch.cat(client_parts)
@@ -1251,7 +1271,23 @@ class MembershipAuditor:
             raise ValueError("Cannot audit an empty candidate dataset.")
         if limit - remaining < 2:
             raise ValueError("Each membership group needs at least two candidates.")
-        return torch.cat(image_parts), torch.cat(label_parts)
+        return self._cat_candidate_inputs(image_parts), torch.cat(label_parts)
+
+    @staticmethod
+    def _cat_candidate_inputs(parts) -> torch.Tensor:
+        """Concatenate images/features or dynamically padded text batches."""
+        tensors = list(parts)
+        if not tensors:
+            raise ValueError("Cannot concatenate an empty candidate pool.")
+        if all(tensor.ndim == 3 and tensor.shape[1] == 2 for tensor in tensors):
+            maximum_length = max(int(tensor.shape[-1]) for tensor in tensors)
+            tensors = [
+                F.pad(tensor, (0, maximum_length - int(tensor.shape[-1])))
+                if tensor.shape[-1] != maximum_length
+                else tensor
+                for tensor in tensors
+            ]
+        return torch.cat(tensors)
 
     def _collect_source_balanced(
         self,
@@ -1807,6 +1843,68 @@ class MembershipAuditor:
             )
         return torch.cat(score_parts).t().contiguous()
 
+    def _raw_input_gradient_cosines(
+        self,
+        model: torch.nn.Module,
+        parameter_names: list[str],
+        updates: list[tuple[dict[str, torch.Tensor], float]],
+    ) -> torch.Tensor:
+        """Stream exact text-sample gradients without retaining the full pool."""
+        if not updates:
+            raise ValueError("At least one client update is required.")
+        allowed = set(parameter_names)
+        named_parameters = [
+            (name, parameter)
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and name in allowed
+        ]
+        parameters = [parameter for _, parameter in named_parameters]
+        if not parameters or any(
+            set(update) != allowed for update, _ in updates
+        ):
+            raise ValueError(
+                "Text gradient observations and uploaded PEFT updates must "
+                "have identical parameter scopes."
+            )
+        update_norms = []
+        for update, _ in updates:
+            norm_sq = torch.zeros((), dtype=torch.float64)
+            for name in parameter_names:
+                values = update[name].detach().cpu().to(torch.float64)
+                norm_sq += values.square().sum()
+            update_norms.append(norm_sq.sqrt().clamp_min(1e-12))
+        rows = []
+        model.eval()
+        for candidate_input, candidate_label in zip(self.images, self.labels):
+            model.zero_grad(set_to_none=True)
+            logits = model(candidate_input.unsqueeze(0).to(self.device))
+            loss = F.cross_entropy(
+                logits, candidate_label.view(1).to(self.device)
+            )
+            gradients = torch.autograd.grad(loss, parameters, retain_graph=False)
+            gradient_norm_sq = torch.zeros((), dtype=torch.float64)
+            dots = [torch.zeros((), dtype=torch.float64) for _ in updates]
+            for (name, _), gradient in zip(named_parameters, gradients):
+                flat = gradient.detach().flatten().cpu()
+                gradient_norm_sq += flat.to(torch.float64).square().sum()
+                for index, (update, sign) in enumerate(updates):
+                    dots[index] += (
+                        flat.to(torch.float64)
+                        * update[name].detach().flatten().cpu().to(torch.float64)
+                    ).sum() * float(sign)
+                del flat
+            gradient_norm = gradient_norm_sq.sqrt().clamp_min(1e-12)
+            rows.append(
+                torch.stack(
+                    [
+                        dot / (gradient_norm * norm.to(torch.float64))
+                        for dot, norm in zip(dots, update_norms)
+                    ]
+                ).to(torch.float32)
+            )
+            del gradients
+        return torch.stack(rows).t().contiguous()
+
     @staticmethod
     def _clone_prompt_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {name: tensor.detach().clone() for name, tensor in state.items()}
@@ -1866,8 +1964,18 @@ class MembershipAuditor:
         )
         sample_gradients = None
         signatures = None
+        streaming_text_cosines = bool(
+            self.model_type in {"bert_adapter", "gpt2_adapter"}
+            and needs["cosine"]
+            and not needs["whitebox_features"]
+            and not needs["promptres"]
+        )
         observable_base_state = self._observable_base_state(base_state)
-        if needs_gradients and not self.candidate_inputs_are_features:
+        if (
+            needs_gradients
+            and not self.candidate_inputs_are_features
+            and not streaming_text_cosines
+        ):
             self.model.load_state_dict(
                 observable_base_state, strict=False
             )
@@ -1884,6 +1992,7 @@ class MembershipAuditor:
         promptres_updates = []
         promptres_gradients = []
         cached_feature_updates = []
+        streaming_text_updates = []
         observable_states = {}
         for user_id in selected_ids:
             state = self._observable_client_state(
@@ -1895,7 +2004,38 @@ class MembershipAuditor:
                 client_base = (
                     base_state if base_states is None else base_states[user_id]
                 )
-                if self.audit_view == "released_prompt":
+                if streaming_text_cosines and (
+                    self.audit_view == "protocol_plus_released_prompts"
+                    and protocol_messages is not None
+                    and user_id in protocol_messages
+                ):
+                    message = protocol_messages[user_id]
+                    tensors = message.get("tensors", {})
+                    sign = (
+                        -1.0
+                        if message.get("kind")
+                        in {"model_update", "global_prompt_update"}
+                        else 1.0
+                    )
+                    streaming_text_updates.append((tensors, sign))
+                    update = None
+                elif streaming_text_cosines:
+                    if self.audit_view == "released_prompt":
+                        raise ValueError(
+                            "Text gradient-cosine attacks require an observable "
+                            "client update."
+                        )
+                    streaming_text_updates.append(
+                        (
+                            {
+                                name: client_base[name] - state[name]
+                                for name in observable_names
+                            },
+                            1.0,
+                        )
+                    )
+                    update = None
+                elif self.audit_view == "released_prompt":
                     update = torch.ones(1)
                 elif (
                     self.audit_view == "protocol_plus_released_prompts"
@@ -1921,7 +2061,9 @@ class MembershipAuditor:
                     update = flatten_state_delta(
                         client_base, state, observable_names
                     )
-                if self.candidate_inputs_are_features:
+                if streaming_text_cosines:
+                    pass
+                elif self.candidate_inputs_are_features:
                     cached_feature_updates.append(update)
                 else:
                     if sample_gradients is None:
@@ -1991,6 +2133,14 @@ class MembershipAuditor:
                     self.model,
                     observable_names,
                     cached_feature_updates,
+                )
+            elif streaming_text_cosines:
+                self.model.load_state_dict(observable_base_state, strict=False)
+                self.model.eval()
+                observation["cosine"] = self._raw_input_gradient_cosines(
+                    self.model,
+                    observable_names,
+                    streaming_text_updates,
                 )
             else:
                 observation["cosine"] = torch.stack(cosine)
@@ -2605,7 +2755,11 @@ class MembershipAuditor:
                 low_fpr_candidate_selection,
                 os.path.join(self.results_dir, "candidate_selection.pt"),
             )
-        final_model = copy.deepcopy(final_model).to(self.device)
+        final_model = (
+            final_model
+            if getattr(final_model, "client_scoped_parameters", False)
+            else copy.deepcopy(final_model).to(self.device)
+        )
         final_model.load_state_dict(final_state, strict=False)
         if self.defense_name == "hamp":
             attach_hamp_output_transform(
@@ -2646,6 +2800,13 @@ class MembershipAuditor:
                     result.metadata.setdefault(
                         "lora_aggregation",
                         f"factor_wise_{self.federated_method}",
+                    )
+                elif self.model_type in {"bert_adapter", "gpt2_adapter"}:
+                    result.metadata.setdefault(
+                        "trainable_scope", trainable_scope_name(final_model)
+                    )
+                    result.metadata.setdefault(
+                        "gradient_evaluation", "streamed_exact_full_peft_update"
                     )
                 self.results.append(result)
                 if self.device.type == "cuda":

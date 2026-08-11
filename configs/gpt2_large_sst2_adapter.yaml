@@ -1,0 +1,64 @@
+model_type: gpt2_adapter
+architecture: gpt2
+model_path: ./checkpoints/gpt2-large
+dataset_path: ./data/huggingface/sst2
+dataset_name: sst2
+
+# The protocol is identical to BERT: synchronous one-batch FedSGD.
+total_users: 30
+sample_users: 30
+num_global_iters: 50
+batch_size: 16
+eval_batch_size: 8
+learning_rate: 0.0001
+learning_rate_decay: 1.0
+eval_interval: 5
+aggregation_weighting: uniform
+
+max_length: 128
+adapter:
+  reduction: 2
+  activation: relu
+  classifier_dropout: 0.0
+  gradient_checkpointing: true
+
+gpu: 0
+require_cuda: true
+seed: 42
+save_models: false
+results_dir: ./results
+
+audit:
+  enabled: true
+  strict: true
+  attacks:
+    - blackbox_loss
+    - loss_series
+    - grad_cosine
+    - avg_cosine
+    - fedmia_loss
+    - fedmia_cosine
+  target_client_id: 0
+  audit_client_ids: [0]
+  candidate_sampling: balanced_holdout
+  # Keep output inference bounded; cosine gradients are always streamed one
+  # sample at a time and are never retained as a candidate-by-parameter matrix.
+  audit_batch_size: 4
+  audit_interval: 10
+  attack_audit_intervals:
+    loss_series: 10
+    avg_cosine: 10
+    fedmia_loss: 10
+    fedmia_cosine: 10
+  signal_storage: compact
+  low_fpr_max_members: 0
+  low_fpr_max_nonmembers: 0
+
+projres:
+  enabled: true
+  evaluation_round: last
+  threshold: 0.01
+  max_candidates: 16
+  min_nonmembers: 100
+  max_nonmembers: 872
+  token_reduction: auto

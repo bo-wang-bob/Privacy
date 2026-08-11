@@ -325,6 +325,9 @@ class ServerBase:
                 self._clone_state(user.get_parameters())
                 if self.defense.name == "iclr"
                 or bool(getattr(user.model, "client_scoped_lora", False))
+                or bool(
+                    getattr(user.model, "client_scoped_parameters", False)
+                )
                 else None
             )
             evaluation_state = self.ctx.new_model_state.get(
@@ -500,10 +503,24 @@ class ServerBase:
             self.defense.prepare_round(selected_ids, round_index)
             logger.debug("Round %s selected clients: %s", round_index, selected_ids)
 
-            base_states = {
-                user_id: self._clone_state(self.ctx.get_base_model_state())
-                for user_id in selected_ids
-            }
+            if str(getattr(self.model, "model_type", "")).lower() in {
+                "bert_adapter",
+                "gpt2_adapter",
+            }:
+                # Every synchronous client starts from the same global PEFT
+                # state. Sharing this immutable snapshot avoids 30 redundant
+                # copies of a large ratio-2 Adapter state.
+                shared_base_state = self._clone_state(
+                    self.ctx.get_base_model_state()
+                )
+                base_states = {
+                    user_id: shared_base_state for user_id in selected_ids
+                }
+            else:
+                base_states = {
+                    user_id: self._clone_state(self.ctx.get_base_model_state())
+                    for user_id in selected_ids
+                }
             base_state = base_states.get(
                 self.target_client_id,
                 self._clone_state(self.ctx.get_base_model_state()),
@@ -659,6 +676,19 @@ class ServerBase:
                     getattr(self.aggregator, "aggregation_weighting", "uniform")
                 ),
                 "frozen_backbone": True,
+            }
+        if str(getattr(self.model, "model_type", "")).lower() in {
+            "bert_adapter",
+            "gpt2_adapter",
+        }:
+            method_summary["transformer_adapter"] = {
+                "architecture": str(self.model.architecture),
+                "adapter_layers": int(self.model.num_adapter_layers),
+                "down_projection_ratio": int(self.model.reduction),
+                "trainable_scope": "all_block_adapters_and_classification_head",
+                "client_storage": "independent_peft_parameters_on_cpu",
+                "shared_frozen_backbone": True,
+                "aggregation": "uniform_fedsgd",
             }
         with open(
             os.path.join(self.results_dir, "federated_method_summary.json"),

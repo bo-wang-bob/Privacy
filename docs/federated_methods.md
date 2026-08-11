@@ -31,6 +31,34 @@ CLIP 主干和服务器全局 LoRA 工作槽位；每个客户端模型类只注
 该客户端参数；执行结束后恢复全局槽位。服务器收到和聚合的状态字典因此只含
 同名的 `lora_A/lora_B`，不会包含冻结 CLIP 权重。
 
+## FedLLM Adapter 的同步 FedSGD
+
+`bert_adapter` 和 `gpt2_adapter` 按 Deng 等人的实验协议，在每个 Transformer
+block 输出后插入残差瓶颈：
+
+```text
+h(x) = x + W_up ReLU(W_down x + b_down) + b_up
+```
+
+down-projection ratio 为 2，即瓶颈宽度等于主干隐藏宽度的一半。预训练主干冻结，
+新增 Adapter 和 SST-2 二分类头可训练。默认使用 30 个 IID 客户端、batch size 16、
+所有客户端同步参与；每个客户端每轮执行一次无 momentum、无 weight decay 的 SGD，
+服务器对客户端上传等权平均，构成 one-batch FedSGD。
+
+内存中只保留一个共享预训练主干。客户端持有独立的 Adapter/分类头状态并常驻 CPU，
+训练或评估时临时移动到主干设备并绑定，结束后立即卸载回 CPU；客户端上传和最终
+checkpoint 均不包含冻结的 BERT/GPT2 参数。
+
+这两个文本模型复用通用审计器的 Blackbox/Fed-loss、Loss-Series、Grad-Cosine、
+Avg-Cosine 和两种 FedMIA 信号。默认只审计客户端 0，成员来自该客户端训练分区，
+非成员来自该客户端独立 validation 分区，并按标签精确配成 1:1。余弦攻击比较候选
+样本对全部可训练 Adapter/分类头参数的精确梯度与服务器收到的真实 FedSGD 上传；
+GPT2-Large 使用逐样本流式点积控制内存。
+
+严格 ProjRes 在最终通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
+down-projection 权重更新构造子空间，并在同一全局模型下提取进入该层的样本级隐藏
+表示。成员只取该轮保留的真实 batch，非成员只取从未训练的 validation 样本。
+
 ## 攻击可见性
 
 `audit.audit_view` 支持：

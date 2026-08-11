@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Federated Adapter fine-tuning for BERT-Base or GPT2-Large on SST-2."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import logging
+import os
+from pathlib import Path
+import random
+import sys
+
+import numpy as np
+import torch
+import yaml
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from aggregator.aggregator_builder import build_aggregator
+from servers.serverbase import ServerBase
+from trainmodel.transformer_adapter import TransformerAdapterClassifier
+from utils.text_data_loader import load_federated_sst2
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fine-tune BERT-Base or GPT2-Large on federated SST-2 using "
+            "a ratio-2 Adapter after every Transformer layer."
+        )
+    )
+    parser.add_argument(
+        "--config",
+        default="configs/bert_base_sst2_adapter.yaml",
+        help="YAML experiment configuration.",
+    )
+    parser.add_argument("--gpu", type=int)
+    parser.add_argument("--rounds", type=int)
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--results-dir")
+    parser.add_argument(
+        "--attacks",
+        help=(
+            "Comma-separated common attacks. Defaults to the six attacks in "
+            "the YAML configuration."
+        ),
+    )
+    parser.add_argument("--target-client-id", type=int)
+    parser.add_argument(
+        "--projres",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable strict observed-batch ProjRes.",
+    )
+    parser.add_argument(
+        "--require-cuda",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    return parser.parse_args()
+
+
+def load_config(args: argparse.Namespace) -> dict:
+    config_path = (REPOSITORY_ROOT / args.config).resolve()
+    with config_path.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file) or {}
+    config["config_path"] = str(config_path)
+    if args.gpu is not None:
+        config["gpu"] = args.gpu
+    if args.rounds is not None:
+        config["num_global_iters"] = args.rounds
+    if args.seed is not None:
+        config["seed"] = args.seed
+    if args.results_dir is not None:
+        config["results_dir"] = args.results_dir
+    if args.attacks is not None:
+        config.setdefault("audit", {})["attacks"] = [
+            attack.strip() for attack in args.attacks.split(",") if attack.strip()
+        ]
+    if args.target_client_id is not None:
+        config.setdefault("audit", {})["target_client_id"] = (
+            args.target_client_id
+        )
+        config["audit"]["audit_client_ids"] = [args.target_client_id]
+    if args.projres is not None:
+        config.setdefault("projres", {})["enabled"] = args.projres
+    if args.require_cuda is not None:
+        config["require_cuda"] = args.require_cuda
+    validate_config(config)
+    return config
+
+
+def validate_config(config: dict) -> None:
+    architecture = str(config.get("architecture", "")).lower()
+    expected_type = f"{architecture}_adapter"
+    if architecture not in {"bert", "gpt2"}:
+        raise ValueError("architecture must be bert or gpt2.")
+    if str(config.get("model_type", "")).lower() != expected_type:
+        raise ValueError(f"model_type must be {expected_type}.")
+    if str(config.get("dataset_name", "")).lower() not in {"sst2", "sst-2"}:
+        raise ValueError("This entry currently supports SST-2 only.")
+    if int(config.get("batch_size", 0)) != 16:
+        raise ValueError("The Deng et al. protocol requires batch_size=16.")
+    if int(config.get("total_users", 0)) <= 1:
+        raise ValueError("total_users must be greater than one.")
+    if int(config.get("sample_users", 0)) != int(config["total_users"]):
+        raise ValueError("Synchronous paper mode requires all clients each round.")
+    for key in ("num_global_iters", "eval_batch_size", "eval_interval"):
+        if int(config.get(key, 0)) <= 0:
+            raise ValueError(f"{key} must be positive.")
+    if float(config.get("learning_rate", 0.0)) <= 0:
+        raise ValueError("learning_rate must be positive.")
+    if not 0 < float(config.get("learning_rate_decay", 1.0)) <= 1:
+        raise ValueError("learning_rate_decay must be in (0, 1].")
+    adapter = dict(config.get("adapter", {}))
+    if int(adapter.get("reduction", 0)) != 2:
+        raise ValueError("The paper Adapter requires reduction=2.")
+    if str(config.get("aggregation_weighting", "uniform")) != "uniform":
+        raise ValueError("Paper FedSGD aggregates client updates uniformly.")
+    supported_attacks = {
+        "blackbox_loss",
+        "loss_series",
+        "grad_cosine",
+        "avg_cosine",
+        "fedmia_loss",
+        "fedmia_cosine",
+    }
+    audit = dict(config.get("audit", {}))
+    unknown_attacks = sorted(set(audit.get("attacks", [])) - supported_attacks)
+    if unknown_attacks:
+        raise ValueError(
+            "Text Adapter experiments currently support these common attacks: "
+            + ", ".join(sorted(supported_attacks))
+            + ". Unsupported: "
+            + ", ".join(unknown_attacks)
+        )
+    target_client_id = int(audit.get("target_client_id", 0))
+    if not 0 <= target_client_id < int(config["total_users"]):
+        raise ValueError("audit.target_client_id is outside the client range.")
+
+
+def resolve_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = REPOSITORY_ROOT / path
+    return path.resolve()
+
+
+def make_result_dir(config: dict) -> Path:
+    root = resolve_path(str(config.get("results_dir", "./results")))
+    timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    run_name = (
+        f"{timestamp}_{config['model_type']}_sst2_fedsgd_"
+        f"seed{int(config['seed'])}"
+    )
+    result_dir = root / run_name
+    result_dir.mkdir(parents=True, exist_ok=False)
+    return result_dir
+
+
+def configure_logging(result_dir: Path) -> None:
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    stream = logging.StreamHandler()
+    stream.setFormatter(formatter)
+    file_handler = logging.FileHandler(result_dir / "run.log", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[stream, file_handler],
+        force=True,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args)
+    seed = int(config.get("seed", 42))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    if bool(config.get("require_cuda", False)) and not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required by the selected configuration.")
+    device = torch.device(
+        f"cuda:{int(config.get('gpu', 0))}"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    result_dir = make_result_dir(config)
+    configure_logging(result_dir)
+    logger = logging.getLogger(__name__)
+    resolved_config = copy.deepcopy(config)
+    resolved_config["model_path"] = str(resolve_path(config["model_path"]))
+    resolved_config["dataset_path"] = str(resolve_path(config["dataset_path"]))
+    resolved_config["device"] = str(device)
+    with (result_dir / "run_config.yaml").open("w", encoding="utf-8") as file:
+        yaml.safe_dump(resolved_config, file, sort_keys=False, allow_unicode=True)
+
+    logger.info(
+        "Loading %s on %s | clients=%d | batch=%d | rounds=%d",
+        config["model_type"],
+        device,
+        int(config["total_users"]),
+        int(config["batch_size"]),
+        int(config["num_global_iters"]),
+    )
+    data = load_federated_sst2(
+        dataset_path=resolved_config["dataset_path"],
+        model_path=resolved_config["model_path"],
+        num_users=int(config["total_users"]),
+        seed=seed,
+        max_length=int(config.get("max_length", 128)),
+    )
+    adapter = dict(config.get("adapter", {}))
+    model = TransformerAdapterClassifier(
+        model_path=resolved_config["model_path"],
+        architecture=str(config["architecture"]),
+        num_classes=len(data.class_names),
+        reduction=int(adapter.get("reduction", 2)),
+        activation=str(adapter.get("activation", "relu")),
+        classifier_dropout=float(adapter.get("classifier_dropout", 0.0)),
+        gradient_checkpointing=bool(
+            adapter.get("gradient_checkpointing", False)
+        ),
+        device=device,
+    )
+    model.classnames = list(data.class_names)
+    trainable_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    frozen_parameters = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if not parameter.requires_grad
+    )
+    logger.info(
+        "Adapter ready | layers=%d | reduction=%d | trainable=%d | frozen=%d",
+        model.num_adapter_layers,
+        model.reduction,
+        trainable_parameters,
+        frozen_parameters,
+    )
+
+    method_config = {
+        "client_optimizer": "sgd",
+        "momentum": 0.0,
+        "weight_decay": 0.0,
+        "seed": seed,
+    }
+    audit_config = copy.deepcopy(config.get("audit", {}))
+    audit_config.setdefault("enabled", True)
+    audit_config.setdefault("target_client_id", 0)
+    audit_config.setdefault("audit_client_ids", [audit_config["target_client_id"]])
+    audit_config["seed"] = seed
+    audit_config["training_health_check"] = True
+    projres_config = copy.deepcopy(config.get("projres", {}))
+    projres_config.setdefault("enabled", True)
+    server = ServerBase(
+        device=device,
+        dataset_name="sst2",
+        train_sets=data.train_sets,
+        test_sets=data.test_sets,
+        class_names=data.class_names,
+        model=model,
+        batch_size=int(config["batch_size"]),
+        eval_batch_size=int(config["eval_batch_size"]),
+        learning_rate=float(config["learning_rate"]),
+        learning_rate_decay=float(config.get("learning_rate_decay", 1.0)),
+        learning_rate_decay_interval=1,
+        num_glob_iters=int(config["num_global_iters"]),
+        local_epochs=1,
+        total_users=int(config["total_users"]),
+        results_dir=str(result_dir),
+        user_per_round=int(config["sample_users"]),
+        aggregator=build_aggregator(
+            "fedsgd",
+            device=device,
+            aggregation_weighting="uniform",
+        ),
+        save_models=bool(config.get("save_models", False)),
+        collate_fn=data.collate_fn,
+        eval_interval=int(config["eval_interval"]),
+        audit_config=audit_config,
+        projres_config=projres_config,
+        defense_config={"name": "none"},
+        method_config=method_config,
+    )
+    server.train()
+    logger.info("Training complete: %s", result_dir)
+
+
+if __name__ == "__main__":
+    main()

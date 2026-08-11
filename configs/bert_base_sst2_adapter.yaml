@@ -1,0 +1,65 @@
+model_type: bert_adapter
+architecture: bert
+model_path: ./checkpoints/bert-base-uncased
+dataset_path: ./data/huggingface/sst2
+dataset_name: sst2
+
+# Deng et al. use synchronous FedSGD with 30 IID clients and one local batch
+# of 16 examples per communication round.
+total_users: 30
+sample_users: 30
+num_global_iters: 50
+batch_size: 16
+eval_batch_size: 32
+learning_rate: 0.0001
+learning_rate_decay: 1.0
+eval_interval: 5
+aggregation_weighting: uniform
+
+max_length: 128
+adapter:
+  reduction: 2
+  activation: relu
+  classifier_dropout: 0.0
+  gradient_checkpointing: false
+
+gpu: 0
+require_cuda: false
+seed: 42
+save_models: false
+results_dir: ./results
+
+# All candidates for a client are 1:1 exact class-matched train/validation
+# pairs. Validation examples are never used by any federated client.
+audit:
+  enabled: true
+  strict: true
+  attacks:
+    - blackbox_loss
+    - loss_series
+    - grad_cosine
+    - avg_cosine
+    - fedmia_loss
+    - fedmia_cosine
+  target_client_id: 0
+  audit_client_ids: [0]
+  candidate_sampling: balanced_holdout
+  audit_batch_size: 16
+  audit_interval: 10
+  attack_audit_intervals:
+    loss_series: 10
+    avg_cosine: 10
+    fedmia_loss: 10
+    fedmia_cosine: 10
+  signal_storage: compact
+  low_fpr_max_members: 0
+  low_fpr_max_nonmembers: 0
+
+projres:
+  enabled: true
+  evaluation_round: last
+  threshold: 0.01
+  max_candidates: 16
+  min_nonmembers: 100
+  max_nonmembers: 872
+  token_reduction: auto

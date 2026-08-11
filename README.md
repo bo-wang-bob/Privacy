@@ -175,6 +175,45 @@ FedSGD。
 LoRA 工作槽位，结束后恢复全局槽位；客户端上传也只导出自己的 A/B，不复制或
 上传完整 CLIP。
 
+### BERT-Base / GPT2-Large 的联邦 Adapter 微调
+
+文本入口复现 Deng 等人的 Adapter-based PEFT 协议：SST-2 训练集以固定种子
+IID 随机划分给 30 个客户端，每轮所有客户端各使用一个大小为 16 的本地 batch，
+服务器执行同步等权 FedSGD。BERT 和 GPT2 的每个 Transformer block 后均插入
+`down -> ReLU -> up + residual`，down-projection ratio 为 2；预训练主干全部冻结，
+只训练各层 Adapter 与新增的二分类任务头。一个全局主干由所有客户端共享，每个
+客户端只在 CPU 保存自己的 PEFT 参数，轮到该客户端时才绑定到主干所在设备。
+
+先下载并验证模型与 SST-2：
+
+```bash
+python scripts/download_hf_sst2_models.py
+```
+
+分别运行两种模型：
+
+```bash
+python scripts/run_fedllm_adapter.py \
+  --config configs/bert_base_sst2_adapter.yaml
+
+python scripts/run_fedllm_adapter.py \
+  --config configs/gpt2_large_sst2_adapter.yaml
+```
+
+默认训练 50 个通信轮、学习率 `1e-4`，BERT 配置允许 CPU 调试；GPT2-Large
+默认要求 CUDA。SST-2 的官方 test 标签不可见，因此联邦训练使用 train split，
+独立评估使用 validation split。两个配置默认同时运行六种通用攻击：
+`blackbox_loss`、`loss_series`、`grad_cosine`、`avg_cosine`、`fedmia_loss` 和
+`fedmia_cosine`，并在最后一轮运行严格 ProjRes。通用攻击对目标客户端构建
+train/validation 严格 1:1、逐类别同数量的候选池；非成员只来自从未参与任何客户端
+训练的 validation 数据。可用 `--attacks` 覆盖通用攻击列表，用 `--no-projres`
+只关闭 ProjRes。
+
+GPT2-Large 的逐样本梯度不会组成“候选数 × 全部 PEFT 参数”的常驻矩阵，而是逐样本
+计算与真实上传的精确余弦后立即释放。ProjRes 观察目标客户端最后一轮真实 FedSGD
+batch，攻击首个 Transformer block 后 Adapter 的 `down.weight`；成员定义严格等于
+该 batch，非成员使用完整的独立 validation 分区。
+
 `PromptFL` 是针对可训练 `prompt_learner` 定义的算法，不能直接应用到 MLP
 分类头、Adapter 或 LoRA。三种参数高效微调模型使用共享全局状态：CLIP-MLP
 使用 FedAvg，Visual Adapter 使用每客户端每轮一个 mini-batch 的 FedSGD；

@@ -15,6 +15,8 @@ def trainable_scope_name(model: torch.nn.Module) -> str:
         return "visual_adapter_only"
     if model_type == "clip_lora":
         return "clip_attention_lora_only"
+    if model_type in {"bert_adapter", "gpt2_adapter"}:
+        return "all_transformer_adapters_and_classification_head"
     return "prompt_only"
 
 
