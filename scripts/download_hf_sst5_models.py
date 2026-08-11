@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download SST-2, BERT-Base, and GPT2-Large and verify local inference.
+"""Download SST-5, BERT-Base, and GPT2-Large and verify local inference.
 
 The script deliberately downloads only Transformers configuration, tokenizer,
 and Safetensors files for the two models. Hugging Face progress bars remain
@@ -21,8 +21,7 @@ from typing import Any
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 BERT_REPO_ID = "google-bert/bert-base-uncased"
 GPT2_REPO_ID = "openai-community/gpt2-large"
-SST2_REPO_ID = "nyu-mll/glue"
-SST2_CONFIG = "sst2"
+SST5_REPO_ID = "SetFit/sst5"
 MODEL_ALLOW_PATTERNS = (
     "*.json",
     "*.model",
@@ -38,7 +37,7 @@ def log(message: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Download SST-2, BERT-Base, and GPT2-Large from Hugging Face, "
+            "Download SST-5, BERT-Base, and GPT2-Large from Hugging Face, "
             "then validate the local artifacts without network access."
         )
     )
@@ -75,7 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-download",
         action="store_true",
-        help="Redownload remote files and replace the saved SST-2 dataset.",
+        help="Redownload remote files and replace the saved SST-5 dataset.",
     )
     args = parser.parse_args()
     if args.max_workers <= 0:
@@ -140,19 +139,19 @@ def _save_dataset_atomically(dataset: Any, destination: Path) -> None:
         shutil.rmtree(temporary_root, ignore_errors=True)
 
 
-def download_sst2(
+def download_sst5(
     destination: Path,
     cache_dir: Path,
     force_download: bool,
 ) -> Path:
     from datasets import DownloadMode, load_dataset, load_from_disk
 
-    log(f"\n[下载数据集] {SST2_REPO_ID}/{SST2_CONFIG}")
+    log(f"\n[下载数据集] {SST5_REPO_ID}")
     log(f"  保存目录: {destination}")
     if destination.exists() and not force_download:
         try:
             load_from_disk(str(destination))
-            log("  已存在有效的本地 SST-2，跳过重复下载。")
+            log("  已存在有效的本地 SST-5，跳过重复下载。")
             return destination
         except Exception:
             log("  已有目录无法加载，将重新下载并替换。")
@@ -163,13 +162,12 @@ def download_sst2(
         else DownloadMode.REUSE_DATASET_IF_EXISTS
     )
     dataset = load_dataset(
-        SST2_REPO_ID,
-        SST2_CONFIG,
+        SST5_REPO_ID,
         cache_dir=str(cache_dir / "datasets"),
         download_mode=download_mode,
     )
     _save_dataset_atomically(dataset, destination)
-    log("  SST-2 下载和本地序列化完成。")
+    log("  SST-5 下载和本地序列化完成。")
     return destination
 
 
@@ -192,29 +190,29 @@ def release_model(model: Any) -> None:
         torch.cuda.empty_cache()
 
 
-def validate_sst2(dataset_path: Path) -> str:
+def validate_sst5(dataset_path: Path) -> str:
     from datasets import load_from_disk
 
-    log("\n[验证数据集] 使用 load_from_disk 离线加载 SST-2")
+    log("\n[验证数据集] 使用 load_from_disk 离线加载 SST-5")
     dataset = load_from_disk(str(dataset_path))
     required_splits = {"train", "validation", "test"}
     if not required_splits.issubset(dataset.keys()):
         raise RuntimeError(
-            f"SST-2 splits are incomplete: expected {required_splits}, "
+            f"SST-5 splits are incomplete: expected {required_splits}, "
             f"found {set(dataset.keys())}."
         )
     for split in sorted(required_splits):
-        if not {"sentence", "label"}.issubset(dataset[split].column_names):
-            raise RuntimeError(f"SST-2 {split} is missing sentence/label columns.")
+        if not {"text", "label"}.issubset(dataset[split].column_names):
+            raise RuntimeError(f"SST-5 {split} is missing text/label columns.")
         if len(dataset[split]) == 0:
-            raise RuntimeError(f"SST-2 {split} is empty.")
+            raise RuntimeError(f"SST-5 {split} is empty.")
 
     example = dataset["validation"][0]
-    if not isinstance(example["sentence"], str) or int(example["label"]) not in {0, 1}:
-        raise RuntimeError("SST-2 validation example has an invalid schema or label.")
+    if not isinstance(example["text"], str) or int(example["label"]) not in range(5):
+        raise RuntimeError("SST-5 validation example has an invalid schema or label.")
     sizes = ", ".join(f"{name}={len(dataset[name])}" for name in dataset.keys())
     log(f"  验证通过: {sizes}")
-    return example["sentence"]
+    return example["text"]
 
 
 def validate_bert(model_path: Path, sentence: str, device: str) -> None:
@@ -298,14 +296,14 @@ def main() -> None:
 
     bert_path = models_dir / "bert-base-uncased"
     gpt2_path = models_dir / "gpt2-large"
-    sst2_path = datasets_dir / "sst2"
+    sst5_path = datasets_dir / "sst5"
 
     log("Hugging Face 下载与验证任务")
     log(f"  模型根目录: {models_dir}")
     log(f"  数据根目录: {datasets_dir}")
     log(f"  缓存根目录: {cache_dir}")
 
-    download_sst2(sst2_path, cache_dir, args.force_download)
+    download_sst5(sst5_path, cache_dir, args.force_download)
     download_model(
         BERT_REPO_ID,
         bert_path,
@@ -322,11 +320,11 @@ def main() -> None:
     )
 
     device = resolve_device(args.device)
-    sentence = validate_sst2(sst2_path)
+    sentence = validate_sst5(sst5_path)
     validate_bert(bert_path, sentence, device)
     validate_gpt2(gpt2_path, sentence, device)
 
-    log("\n全部下载完成，SST-2、BERT-Base 和 GPT2-Large 均验证通过。")
+    log("\n全部下载完成，SST-5、BERT-Base 和 GPT2-Large 均验证通过。")
 
 
 if __name__ == "__main__":

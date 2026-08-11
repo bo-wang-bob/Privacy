@@ -18,6 +18,7 @@ class BottleneckAdapter(nn.Module):
         reduction: int = 2,
         activation: str = "relu",
         initializer_std: float = 0.02,
+        zero_init_up: bool = True,
     ) -> None:
         super().__init__()
         if hidden_size <= 0 or reduction <= 0:
@@ -43,7 +44,16 @@ class BottleneckAdapter(nn.Module):
         self.up = nn.Linear(bottleneck_size, hidden_size)
         nn.init.normal_(self.down.weight, mean=0.0, std=initializer_std)
         nn.init.zeros_(self.down.bias)
-        nn.init.normal_(self.up.weight, mean=0.0, std=initializer_std)
+        if zero_init_up:
+            # Start as an exact identity residual branch.  Randomly
+            # initializing both projections perturbs the pretrained
+            # representation at every Transformer block before the task head
+            # has learned anything, which is especially harmful in one-batch
+            # FedSGD.  The down projection still receives gradients as soon as
+            # the up projection moves away from zero.
+            nn.init.zeros_(self.up.weight)
+        else:
+            nn.init.normal_(self.up.weight, mean=0.0, std=initializer_std)
         nn.init.zeros_(self.up.bias)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -60,6 +70,7 @@ class TransformerBlockWithAdapter(nn.Module):
         reduction: int,
         activation: str,
         initializer_std: float,
+        zero_init_up: bool,
     ) -> None:
         super().__init__()
         self.base_layer = base_layer
@@ -68,6 +79,7 @@ class TransformerBlockWithAdapter(nn.Module):
             reduction=reduction,
             activation=activation,
             initializer_std=initializer_std,
+            zero_init_up=zero_init_up,
         )
 
     def forward(self, *args, **kwargs):
@@ -98,6 +110,7 @@ class TransformerAdapterClassifier(nn.Module):
         activation: str = "relu",
         classifier_dropout: float = 0.0,
         gradient_checkpointing: bool = False,
+        zero_init_up: bool = True,
         device: torch.device = torch.device("cpu"),
     ) -> None:
         super().__init__()
@@ -118,6 +131,7 @@ class TransformerAdapterClassifier(nn.Module):
         self.activation_name = str(activation).lower()
         self.classifier_dropout_probability = float(classifier_dropout)
         self.gradient_checkpointing = bool(gradient_checkpointing)
+        self.zero_init_up = bool(zero_init_up)
         self.device = device
 
         self.backbone = AutoModel.from_pretrained(
@@ -167,6 +181,7 @@ class TransformerAdapterClassifier(nn.Module):
                 reduction=self.reduction,
                 activation=self.activation_name,
                 initializer_std=initializer_std,
+                zero_init_up=self.zero_init_up,
             )
         self.num_adapter_layers = len(blocks)
         if self.num_adapter_layers <= 0:
@@ -297,6 +312,14 @@ class TransformerAdapterClassifier(nn.Module):
         )
         hidden_states = outputs.last_hidden_state
         if self.architecture == "bert":
+            # BertForSequenceClassification uses the pretrained pooler rather
+            # than the raw final-layer CLS vector.  Retaining that frozen
+            # dense+tanh projection gives the randomly initialized task head a
+            # substantially better-conditioned input while Adapter gradients
+            # still flow through the complete encoder.
+            pooler_output = getattr(outputs, "pooler_output", None)
+            if isinstance(pooler_output, torch.Tensor):
+                return pooler_output
             return hidden_states[:, 0]
         positions = attention_mask.to(hidden_states.device).sum(dim=1) - 1
         positions = positions.clamp_min(0)

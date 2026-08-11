@@ -41,23 +41,42 @@ h(x) = x + W_up ReLU(W_down x + b_down) + b_up
 ```
 
 down-projection ratio 为 2，即瓶颈宽度等于主干隐藏宽度的一半。预训练主干冻结，
-新增 Adapter 和 SST-2 二分类头可训练。默认使用 30 个 IID 客户端、batch size 16、
-所有客户端同步参与；每个客户端每轮执行一次无 momentum、无 weight decay 的 SGD，
+新增 Adapter 和任务分类头可训练，其中 SST-5 为五分类，CoLA 和 IMDB 为二分类。
+数据入口支持 SST-5、CoLA 和 IMDB；前两者
+使用 `train/validation`，IMDB 使用 `train/test`，评估 split 从不参与训练。
+默认使用 30 个 IID 客户端，BERT 与 GPT2-Large 均使用 batch size 32 和 300 轮，
+客户端学习率恒定为 `0.001`。Adapter 的 up-projection
+零初始化，使每层残差分支从恒等映射开始；全部可训练参数使用同一个标量学习率，
+客户端梯度的全局 norm 裁剪阈值为 1.0。
+两者均由所有客户端同步参与；每个客户端每轮执行一次无 momentum、无 weight decay 的 SGD，
 服务器对客户端上传等权平均，构成 one-batch FedSGD。
+这些普通任务优化不关闭或绕过审计：上传仍是攻击器观察到的真实 one-batch 更新，
+六种通用攻击与最终轮 ProjRes 均保持启用。
+普通任务评估中，SST-5 与 IMDB 以 accuracy 为主；CoLA 以 MCC 为主，并继续记录
+accuracy 以兼容已有结果分析。
 
 内存中只保留一个共享预训练主干。客户端持有独立的 Adapter/分类头状态并常驻 CPU，
 训练或评估时临时移动到主干设备并绑定，结束后立即卸载回 CPU；客户端上传和最终
 checkpoint 均不包含冻结的 BERT/GPT2 参数。
 
+`scripts/run_all_fedllm_attacks.sh` 是统一 sweep 入口，不带参数时按
+`BERT/GPT2 × SST-5/CoLA/IMDB` 展开 6 个独立进程；
+`scripts/run_fedllm_adapter.py` 只执行 Shell 入口传入的单个任务。统一 Shell 模式
+支持 `--models`、`--datasets`、`--gpus`、`--jobs`、`--dry-run`、
+`--max-runs` 和 `--skip-projres`，默认单 GPU 串行调度。dry-run 只打印命令；
+完整解析配置仅在对应任务实际启动后写入终端和该任务的 `run.log`。
+
 这两个文本模型复用通用审计器的 Blackbox/Fed-loss、Loss-Series、Grad-Cosine、
 Avg-Cosine 和两种 FedMIA 信号。默认只审计客户端 0，成员来自该客户端训练分区，
-非成员来自该客户端独立 validation 分区，并按标签精确配成 1:1。余弦攻击比较候选
+非成员来自该客户端独立 evaluation 分区，并按标签精确配成 1:1。余弦攻击比较候选
 样本对全部可训练 Adapter/分类头参数的精确梯度与服务器收到的真实 FedSGD 上传；
 GPT2-Large 使用逐样本流式点积控制内存。
 
 严格 ProjRes 在最终通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
 down-projection 权重更新构造子空间，并在同一全局模型下提取进入该层的样本级隐藏
-表示。成员只取该轮保留的真实 batch，非成员只取从未训练的 validation 样本。
+表示。成员只取该轮保留的真实 batch，非成员只取从未训练的 evaluation 样本。
+两种模型的 `projres.max_candidates: 32` 都会审计完整的 32 条上传 batch；由于原论文
+训练协议使用 batch size 16，结果元数据会将 `paper_fedsgd_exact` 记为 `false`。
 
 ## 攻击可见性
 

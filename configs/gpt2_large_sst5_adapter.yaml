@@ -1,17 +1,20 @@
 model_type: gpt2_adapter
 architecture: gpt2
 model_path: ./checkpoints/gpt2-large
-dataset_path: ./data/huggingface/sst2
-dataset_name: sst2
+dataset_path: ./data/huggingface/sst5
+dataset_name: sst5
 
-# The protocol is identical to BERT: synchronous one-batch FedSGD.
+# Match the BERT large-batch variant: synchronous one-batch FedSGD with 32
+# examples per client and communication round.
 total_users: 30
 sample_users: 30
-num_global_iters: 50
-batch_size: 16
+num_global_iters: 300
+batch_size: 32
 eval_batch_size: 8
-learning_rate: 0.0001
+# Use the same constant client learning rate as BERT for all 300 rounds.
+learning_rate: 0.001
 learning_rate_decay: 1.0
+learning_rate_decay_interval: 50
 eval_interval: 5
 aggregation_weighting: uniform
 
@@ -21,6 +24,13 @@ adapter:
   activation: relu
   classifier_dropout: 0.0
   gradient_checkpointing: true
+  zero_init_up: true
+
+optimization:
+  client_optimizer: sgd
+  momentum: 0.0
+  weight_decay: 0.0
+  max_grad_norm: 1.0
 
 gpu: 0
 require_cuda: true
@@ -51,14 +61,15 @@ audit:
     fedmia_loss: 10
     fedmia_cosine: 10
   signal_storage: compact
-  low_fpr_max_members: 0
-  low_fpr_max_nonmembers: 0
+  low_fpr_max_members: 100
+  low_fpr_max_nonmembers: 100
 
 projres:
   enabled: true
   evaluation_round: last
   threshold: 0.01
-  max_candidates: 16
+  # Audit the complete observed FedSGD batch.
+  max_candidates: 32
   min_nonmembers: 100
-  max_nonmembers: 872
+  max_nonmembers: 1000
   token_reduction: auto

@@ -57,6 +57,30 @@ def _scheduled_learning_rate(
     return initial_learning_rate * decay**decay_steps
 
 
+def _matthews_correlation(confusion: torch.Tensor) -> float:
+    """Compute multiclass MCC from a true-label by predicted-label matrix."""
+    if confusion.ndim != 2 or confusion.shape[0] != confusion.shape[1]:
+        raise ValueError("confusion must be a square matrix.")
+    if confusion.numel() == 0 or torch.any(confusion < 0):
+        raise ValueError("confusion must be non-empty and non-negative.")
+    matrix = confusion.detach().cpu().to(torch.float64)
+    samples = float(matrix.sum())
+    if samples <= 0:
+        raise ValueError("confusion must contain at least one sample.")
+    true_totals = matrix.sum(dim=1)
+    predicted_totals = matrix.sum(dim=0)
+    correct = float(torch.trace(matrix))
+    covariance = correct * samples - float(
+        torch.dot(true_totals, predicted_totals)
+    )
+    predicted_variance = samples**2 - float(
+        torch.dot(predicted_totals, predicted_totals)
+    )
+    true_variance = samples**2 - float(torch.dot(true_totals, true_totals))
+    denominator = math.sqrt(max(predicted_variance * true_variance, 0.0))
+    return covariance / denominator if denominator > 0 else 0.0
+
+
 def _format_round_progress(
     round_index: int,
     total_rounds: int,
@@ -66,6 +90,7 @@ def _format_round_progress(
     total_users: int,
     audit_snapshots: int,
     learning_rate: float | None = None,
+    mcc: float | None = None,
 ) -> str:
     if sorted(selected_ids) == list(range(total_users)):
         selected = f"all({total_users})"
@@ -74,9 +99,14 @@ def _format_round_progress(
     learning_rate_text = (
         "" if learning_rate is None else f" | lr={learning_rate:.6g}"
     )
+    metric_text = (
+        f"accuracy={100.0 * accuracy:.2f}%"
+        if mcc is None
+        else f"mcc={mcc:.4f} | accuracy={100.0 * accuracy:.2f}%"
+    )
     return (
         f"Progress | round={round_index + 1}/{total_rounds} | loss={loss:.4f} | "
-        f"accuracy={100.0 * accuracy:.2f}%{learning_rate_text} | selected={selected} | "
+        f"{metric_text}{learning_rate_text} | selected={selected} | "
         f"audit_snapshots={audit_snapshots}"
     )
 
@@ -126,6 +156,9 @@ class ServerBase:
             raise ValueError("learning_rate_decay_interval must be positive.")
         self.device = device
         self.dataset_name = dataset_name
+        self.primary_metric_name = (
+            "mcc" if str(dataset_name).lower() == "cola" else "accuracy"
+        )
         self.num_classes = len(class_names)
         self.model = model
         self.total_users_num = total_users
@@ -179,9 +212,16 @@ class ServerBase:
         self.metrics_path = os.path.join(results_dir, "training_metrics.csv")
         with open(self.metrics_path, "w", newline="", encoding="utf-8") as file:
             csv.writer(file).writerow(
-                ("round", "loss", "accuracy", "samples", "learning_rate")
+                (
+                    "round",
+                    "loss",
+                    "accuracy",
+                    "mcc",
+                    "samples",
+                    "learning_rate",
+                )
             )
-        self.training_metrics: list[dict[str, float | int]] = []
+        self.training_metrics: list[dict[str, float | int | None]] = []
 
         self.ctx = Context(
             users_num=total_users,
@@ -320,6 +360,11 @@ class ServerBase:
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
+        total_confusion = (
+            torch.zeros((self.num_classes, self.num_classes), dtype=torch.long)
+            if self.primary_metric_name == "mcc"
+            else None
+        )
         for user in self.ctx.users:
             local_state = (
                 self._clone_state(user.get_parameters())
@@ -335,17 +380,34 @@ class ServerBase:
             )
             try:
                 user.set_parameters(evaluation_state)
-                loss, correct, samples = user.evaluate()
+                if total_confusion is None:
+                    loss, correct, samples = user.evaluate()
+                else:
+                    loss, correct, samples, confusion = (
+                        user.evaluate_with_confusion()
+                    )
+                    if confusion.shape != total_confusion.shape:
+                        raise ValueError(
+                            "Evaluation confusion matrix does not match the "
+                            "configured number of classes."
+                        )
+                    total_confusion += confusion
             finally:
                 if local_state is not None:
                     user.set_parameters(local_state)
             total_loss += loss
             total_correct += correct
             total_samples += samples
+        mcc = (
+            _matthews_correlation(total_confusion)
+            if total_confusion is not None
+            else None
+        )
         metrics = {
             "round": int(round_index + 1),
             "loss": total_loss / max(total_samples, 1),
             "accuracy": total_correct / max(total_samples, 1),
+            "mcc": mcc,
             "samples": int(total_samples),
             "learning_rate": float(learning_rate),
         }
@@ -356,6 +418,7 @@ class ServerBase:
                     metrics["round"],
                     metrics["loss"],
                     metrics["accuracy"],
+                    "" if metrics["mcc"] is None else metrics["mcc"],
                     metrics["samples"],
                     metrics["learning_rate"],
                 )
@@ -371,6 +434,7 @@ class ServerBase:
                 total_users=self.total_users_num,
                 audit_snapshots=len(self.auditor.observations),
                 learning_rate=float(metrics["learning_rate"]),
+                mcc=None if metrics["mcc"] is None else float(metrics["mcc"]),
             ),
         )
 
@@ -411,8 +475,18 @@ class ServerBase:
             compared += final.numel()
         update_norm = math.sqrt(squared_delta)
         losses = [float(item["loss"]) for item in self.training_metrics]
-        finite_metrics = bool(losses) and all(
-            math.isfinite(value) for value in losses
+        primary_metric_name = getattr(
+            self, "primary_metric_name", "accuracy"
+        )
+        primary_values = [
+            float(item[primary_metric_name])
+            for item in self.training_metrics
+            if item.get(primary_metric_name) is not None
+        ]
+        finite_metrics = (
+            bool(losses)
+            and len(primary_values) == len(losses)
+            and all(math.isfinite(value) for value in (*losses, *primary_values))
         )
         loss_range = max(losses) - min(losses) if losses else None
         uniform_loss = math.log(max(self.num_classes, 1))
@@ -442,6 +516,14 @@ class ServerBase:
             "final_loss": losses[-1] if losses else None,
             "loss_range": loss_range,
             "uniform_classifier_loss": uniform_loss,
+            "primary_metric": primary_metric_name,
+            "initial_primary_metric": (
+                primary_values[0] if primary_values else None
+            ),
+            "final_primary_metric": (
+                primary_values[-1] if primary_values else None
+            ),
+            "best_primary_metric": max(primary_values) if primary_values else None,
         }
         with open(
             os.path.join(self.results_dir, "training_health.json"),

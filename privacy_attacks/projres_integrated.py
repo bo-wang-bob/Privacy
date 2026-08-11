@@ -497,7 +497,10 @@ def _run_text_adapter_client(
                 "present_in_the_observed_target_client_fedsgd_batch"
             ),
             "execution": "integrated_from_observed_client_update",
-            "paper_fedsgd_exact": True,
+            # The paper training protocol uses one batch of 16 examples. A
+            # larger one-batch run remains a valid observed-update ProjRes
+            # experiment, but must not be labeled as the exact paper setup.
+            "paper_fedsgd_exact": actual_batch_size == 16,
             "paper_reference": (
                 "Deng et al. (2026), Toward Efficient Membership Inference "
                 "Attacks against Federated Large Language Models"

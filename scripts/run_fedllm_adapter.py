@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Federated Adapter fine-tuning for BERT-Base or GPT2-Large on SST-2."""
+"""Federated text Adapter fine-tuning for BERT-Base or GPT2-Large."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import argparse
 import copy
 import datetime as dt
 import logging
-import os
 from pathlib import Path
 import random
 import sys
@@ -24,25 +23,36 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from aggregator.aggregator_builder import build_aggregator
 from servers.serverbase import ServerBase
 from trainmodel.transformer_adapter import TransformerAdapterClassifier
-from utils.text_data_loader import load_federated_sst2
+from utils.text_data_loader import (
+    load_federated_text_classification,
+    normalize_text_dataset_name,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Fine-tune BERT-Base or GPT2-Large on federated SST-2 using "
-            "a ratio-2 Adapter after every Transformer layer."
+            "Fine-tune BERT-Base or GPT2-Large on federated SST-5, CoLA, "
+            "or IMDB using a ratio-2 Adapter after every Transformer layer."
         )
     )
     parser.add_argument(
         "--config",
-        default="configs/bert_base_sst2_adapter.yaml",
-        help="YAML experiment configuration.",
+        default="configs/bert_base_sst5_adapter.yaml",
+        help="YAML configuration for this single training task.",
     )
     parser.add_argument("--gpu", type=int)
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--results-dir")
+    parser.add_argument(
+        "--dataset",
+        choices=("sst5", "cola", "imdb"),
+        help=(
+            "Dataset preset. The local path is resolved as a sibling of the "
+            "configured dataset_path."
+        ),
+    )
     parser.add_argument(
         "--attacks",
         help=(
@@ -56,6 +66,13 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Enable or disable strict observed-batch ProjRes.",
+    )
+    parser.add_argument(
+        "--skip-projres",
+        action="store_false",
+        dest="projres",
+        default=None,
+        help="Alias matching the CLIP sweep: disable strict ProjRes.",
     )
     parser.add_argument(
         "--require-cuda",
@@ -78,6 +95,10 @@ def load_config(args: argparse.Namespace) -> dict:
         config["seed"] = args.seed
     if args.results_dir is not None:
         config["results_dir"] = args.results_dir
+    if args.dataset is not None:
+        configured_path = Path(str(config["dataset_path"]))
+        config["dataset_name"] = args.dataset
+        config["dataset_path"] = str(configured_path.parent / args.dataset)
     if args.attacks is not None:
         config.setdefault("audit", {})["attacks"] = [
             attack.strip() for attack in args.attacks.split(",") if attack.strip()
@@ -102,10 +123,11 @@ def validate_config(config: dict) -> None:
         raise ValueError("architecture must be bert or gpt2.")
     if str(config.get("model_type", "")).lower() != expected_type:
         raise ValueError(f"model_type must be {expected_type}.")
-    if str(config.get("dataset_name", "")).lower() not in {"sst2", "sst-2"}:
-        raise ValueError("This entry currently supports SST-2 only.")
-    if int(config.get("batch_size", 0)) != 16:
-        raise ValueError("The Deng et al. protocol requires batch_size=16.")
+    dataset_name = normalize_text_dataset_name(config.get("dataset_name", ""))
+    config["dataset_name"] = dataset_name
+    config["primary_metric"] = "mcc" if dataset_name == "cola" else "accuracy"
+    if int(config.get("batch_size", 0)) <= 0:
+        raise ValueError("batch_size must be positive.")
     if int(config.get("total_users", 0)) <= 1:
         raise ValueError("total_users must be greater than one.")
     if int(config.get("sample_users", 0)) != int(config["total_users"]):
@@ -113,6 +135,8 @@ def validate_config(config: dict) -> None:
     for key in ("num_global_iters", "eval_batch_size", "eval_interval"):
         if int(config.get(key, 0)) <= 0:
             raise ValueError(f"{key} must be positive.")
+    if int(config.get("learning_rate_decay_interval", 1)) <= 0:
+        raise ValueError("learning_rate_decay_interval must be positive.")
     if float(config.get("learning_rate", 0.0)) <= 0:
         raise ValueError("learning_rate must be positive.")
     if not 0 < float(config.get("learning_rate_decay", 1.0)) <= 1:
@@ -122,6 +146,11 @@ def validate_config(config: dict) -> None:
         raise ValueError("The paper Adapter requires reduction=2.")
     if str(config.get("aggregation_weighting", "uniform")) != "uniform":
         raise ValueError("Paper FedSGD aggregates client updates uniformly.")
+    optimization = dict(config.get("optimization", {}))
+    if str(optimization.get("client_optimizer", "sgd")).lower() != "sgd":
+        raise ValueError("FedLLM privacy runs require one-batch SGD uploads.")
+    if float(optimization.get("max_grad_norm", 0.0)) < 0:
+        raise ValueError("max_grad_norm must be non-negative.")
     supported_attacks = {
         "blackbox_loss",
         "loss_series",
@@ -155,7 +184,7 @@ def make_result_dir(config: dict) -> Path:
     root = resolve_path(str(config.get("results_dir", "./results")))
     timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     run_name = (
-        f"{timestamp}_{config['model_type']}_sst2_fedsgd_"
+        f"{timestamp}_{config['model_type']}_{config['dataset_name']}_fedsgd_"
         f"seed{int(config['seed'])}"
     )
     result_dir = root / run_name
@@ -176,6 +205,52 @@ def configure_logging(result_dir: Path) -> None:
         handlers=[stream, file_handler],
         force=True,
     )
+
+
+def log_task_configuration(logger: logging.Logger, config: dict) -> None:
+    """Emit one task's resolved settings only after that task has started."""
+    audit = dict(config.get("audit", {}))
+    projres = dict(config.get("projres", {}))
+    rows = (
+        ("model_type", config["model_type"]),
+        ("dataset", config["dataset_name"]),
+        ("evaluation.primary_metric", config["primary_metric"]),
+        ("device", config["device"]),
+        ("model_path", config["model_path"]),
+        ("dataset_path", config["dataset_path"]),
+        ("federated.aggregator", "fedsgd"),
+        ("federated.aggregation_weighting", config["aggregation_weighting"]),
+        ("federated.total_users", config["total_users"]),
+        ("federated.sample_users", config["sample_users"]),
+        ("federated.num_global_iters", config["num_global_iters"]),
+        ("optimization.batch_size", config["batch_size"]),
+        ("optimization.learning_rate", config["learning_rate"]),
+        (
+            "optimization.learning_rate_decay",
+            config.get("learning_rate_decay", 1.0),
+        ),
+        (
+            "optimization.learning_rate_decay_interval",
+            config.get("learning_rate_decay_interval", 1),
+        ),
+        ("adapter.reduction", config["adapter"]["reduction"]),
+        (
+            "adapter.zero_init_up",
+            config["adapter"].get("zero_init_up", True),
+        ),
+        (
+            "optimization.max_grad_norm",
+            config.get("optimization", {}).get("max_grad_norm", 0.0),
+        ),
+        ("privacy_audit.attacks", ", ".join(audit.get("attacks", []))),
+        ("privacy_audit.target_client_id", audit.get("target_client_id", 0)),
+        ("privacy_audit.candidate_sampling", audit.get("candidate_sampling")),
+        ("projres.enabled", projres.get("enabled", True)),
+        ("projres.evaluation_round", projres.get("evaluation_round", "last")),
+    )
+    logger.info("Resolved FedLLM task configuration")
+    for key, value in rows:
+        logger.info("  %-42s: %s", key, value)
 
 
 def main() -> None:
@@ -204,16 +279,19 @@ def main() -> None:
     resolved_config["device"] = str(device)
     with (result_dir / "run_config.yaml").open("w", encoding="utf-8") as file:
         yaml.safe_dump(resolved_config, file, sort_keys=False, allow_unicode=True)
+    log_task_configuration(logger, resolved_config)
 
     logger.info(
-        "Loading %s on %s | clients=%d | batch=%d | rounds=%d",
+        "Loading %s/%s on %s | clients=%d | batch=%d | rounds=%d",
         config["model_type"],
+        config["dataset_name"],
         device,
         int(config["total_users"]),
         int(config["batch_size"]),
         int(config["num_global_iters"]),
     )
-    data = load_federated_sst2(
+    data = load_federated_text_classification(
+        dataset_name=str(config["dataset_name"]),
         dataset_path=resolved_config["dataset_path"],
         model_path=resolved_config["model_path"],
         num_users=int(config["total_users"]),
@@ -231,6 +309,7 @@ def main() -> None:
         gradient_checkpointing=bool(
             adapter.get("gradient_checkpointing", False)
         ),
+        zero_init_up=bool(adapter.get("zero_init_up", True)),
         device=device,
     )
     model.classnames = list(data.class_names)
@@ -252,10 +331,14 @@ def main() -> None:
         frozen_parameters,
     )
 
+    optimization = dict(config.get("optimization", {}))
     method_config = {
-        "client_optimizer": "sgd",
-        "momentum": 0.0,
-        "weight_decay": 0.0,
+        "client_optimizer": str(
+            optimization.get("client_optimizer", "sgd")
+        ).lower(),
+        "momentum": float(optimization.get("momentum", 0.0)),
+        "weight_decay": float(optimization.get("weight_decay", 0.0)),
+        "max_grad_norm": float(optimization.get("max_grad_norm", 0.0)),
         "seed": seed,
     }
     audit_config = copy.deepcopy(config.get("audit", {}))
@@ -268,7 +351,7 @@ def main() -> None:
     projres_config.setdefault("enabled", True)
     server = ServerBase(
         device=device,
-        dataset_name="sst2",
+        dataset_name=str(config["dataset_name"]),
         train_sets=data.train_sets,
         test_sets=data.test_sets,
         class_names=data.class_names,
@@ -277,7 +360,9 @@ def main() -> None:
         eval_batch_size=int(config["eval_batch_size"]),
         learning_rate=float(config["learning_rate"]),
         learning_rate_decay=float(config.get("learning_rate_decay", 1.0)),
-        learning_rate_decay_interval=1,
+        learning_rate_decay_interval=int(
+            config.get("learning_rate_decay_interval", 1)
+        ),
         num_glob_iters=int(config["num_global_iters"]),
         local_epochs=1,
         total_users=int(config["total_users"]),

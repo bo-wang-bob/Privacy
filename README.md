@@ -177,42 +177,113 @@ LoRA 工作槽位，结束后恢复全局槽位；客户端上传也只导出自
 
 ### BERT-Base / GPT2-Large 的联邦 Adapter 微调
 
-文本入口复现 Deng 等人的 Adapter-based PEFT 协议：SST-2 训练集以固定种子
-IID 随机划分给 30 个客户端，每轮所有客户端各使用一个大小为 16 的本地 batch，
+文本入口复现 Deng 等人的 Adapter-based PEFT 协议，支持 SST-5、CoLA 和 IMDB。
+所选训练集以固定种子 IID 随机划分给 30 个客户端。BERT 与 GPT2-Large 每轮每客户端
+均使用一个大小为 32 的本地 batch。
 服务器执行同步等权 FedSGD。BERT 和 GPT2 的每个 Transformer block 后均插入
 `down -> ReLU -> up + residual`，down-projection ratio 为 2；预训练主干全部冻结，
-只训练各层 Adapter 与新增的二分类任务头。一个全局主干由所有客户端共享，每个
+只训练各层 Adapter 与新增的任务分类头。SST-5 使用五分类头，CoLA 和 IMDB 使用
+二分类头。一个全局主干由所有客户端共享，每个
 客户端只在 CPU 保存自己的 PEFT 参数，轮到该客户端时才绑定到主干所在设备。
 
-先下载并验证模型与 SST-2：
+先下载并验证模型与 SST-5：
 
 ```bash
-python scripts/download_hf_sst2_models.py
+python scripts/download_hf_sst5_models.py
 ```
 
-分别运行两种模型：
+与 CLIP 统一入口相同，直接运行脚本会展开完整模型/数据集矩阵：
+
+```bash
+bash scripts/run_all_fedllm_attacks.sh
+```
+
+默认依次运行 BERT-Base、GPT2-Large 在 SST-5、CoLA、IMDB 上的 6 个独立任务；
+每个任务均启用六种通用成员推理攻击和最终轮严格 ProjRes。每个一级结果目录仍只
+对应一次训练任务。正式运行前可检查完整展开参数：
+
+```bash
+bash scripts/run_all_fedllm_attacks.sh --dry-run
+```
+
+统一入口支持与 `run_all_clip_fedmia_attacks.sh` 对齐的筛选和调度参数：
+
+```bash
+# 只运行 BERT 的 CoLA、IMDB 任务
+bash scripts/run_all_fedllm_attacks.sh \
+  --models bert \
+  --datasets cola,imdb
+
+# 两张 GPU 同时运行两个任务
+bash scripts/run_all_fedllm_attacks.sh \
+  --gpus 0,1 \
+  --jobs 2
+
+# 只运行一种攻击并关闭 ProjRes
+bash scripts/run_all_fedllm_attacks.sh \
+  --attacks blackbox_loss \
+  --skip-projres
+```
+
+`--models` 支持 `bert,gpt2,all`，`--datasets` 支持
+`sst5,cola,imdb,all`；另有 `--max-runs`、`--rounds` 和 `--seed`。默认单 GPU、
+串行执行，避免 BERT 与 GPT2-Large 同时占用同一张 GPU。
+
+底层 Python 文件只执行一个任务。需要直接运行单任务时显式提供模型配置和数据集：
 
 ```bash
 python scripts/run_fedllm_adapter.py \
-  --config configs/bert_base_sst2_adapter.yaml
+  --config configs/bert_base_sst5_adapter.yaml \
+  --dataset sst5
 
 python scripts/run_fedllm_adapter.py \
-  --config configs/gpt2_large_sst2_adapter.yaml
+  --config configs/gpt2_large_sst5_adapter.yaml \
+  --dataset sst5
 ```
 
-默认训练 50 个通信轮、学习率 `1e-4`，BERT 配置允许 CPU 调试；GPT2-Large
-默认要求 CUDA。SST-2 的官方 test 标签不可见，因此联邦训练使用 train split，
-独立评估使用 validation split。两个配置默认同时运行六种通用攻击：
+CoLA 和 IMDB 使用相同模型配置作为数据集预设，无需复制 YAML。例如：
+
+```bash
+python scripts/run_fedllm_adapter.py \
+  --config configs/bert_base_sst5_adapter.yaml \
+  --dataset cola
+
+python scripts/run_fedllm_adapter.py \
+  --config configs/gpt2_large_sst5_adapter.yaml \
+  --dataset imdb
+```
+
+将 `--dataset` 分别替换为 `cola` 或 `imdb`，即可运行四种模型/数据集组合。
+入口会在配置中 `dataset_path` 的同级目录解析数据，例如
+`data/huggingface/cola` 和 `data/huggingface/imdb`。SST-5、CoLA 分别使用各自
+`train/validation`；IMDB 使用官方 `train/test`。
+所有 evaluation 样本都不会参与联邦训练，因此仍可作为有效全局非成员。
+
+BERT 与 GPT2-Large 默认均训练 300 轮，客户端学习率恒定为 `0.001`；BERT 允许
+CPU 调试，GPT2-Large 要求 CUDA。Adapter 的 up-projection 零初始化，使残差分支
+从恒等映射开始；全部可训练
+参数使用同一个标量学习率，并对每个真实 one-batch 客户端梯度执行 norm 1.0 裁剪。
+两个配置默认同时运行六种通用攻击。SST-5 与 IMDB 以 accuracy 为主任务指标；
+CoLA 以 MCC 为主，同时保留 accuracy 作为辅助指标。六种通用攻击包括：
 `blackbox_loss`、`loss_series`、`grad_cosine`、`avg_cosine`、`fedmia_loss` 和
 `fedmia_cosine`，并在最后一轮运行严格 ProjRes。通用攻击对目标客户端构建
-train/validation 严格 1:1、逐类别同数量的候选池；非成员只来自从未参与任何客户端
-训练的 validation 数据。可用 `--attacks` 覆盖通用攻击列表，用 `--no-projres`
+train/evaluation 严格 1:1、逐类别同数量的候选池；非成员只来自从未参与任何客户端
+训练的独立 evaluation split。可用 `--attacks` 覆盖通用攻击列表，用 `--no-projres`
 只关闭 ProjRes。
+
+通用攻击每个成员状态最多使用 100 个候选，符合论文的 100 次重复评估规模，并避免
+IMDB/GPT2-Large 对 800 余个客户端测试样本逐一计算完整 PEFT 梯度；成员和非成员
+仍保持严格 1:1。SST-5 和 CoLA 的单客户端 evaluation 分区少于 100，因此默认使用
+其全部可配对样本。
 
 GPT2-Large 的逐样本梯度不会组成“候选数 × 全部 PEFT 参数”的常驻矩阵，而是逐样本
 计算与真实上传的精确余弦后立即释放。ProjRes 观察目标客户端最后一轮真实 FedSGD
 batch，攻击首个 Transformer block 后 Adapter 的 `down.weight`；成员定义严格等于
-该 batch，非成员使用完整的独立 validation 分区。
+该 batch，非成员来自独立 evaluation 分区，最多使用 1,000 个。
+BERT 与 GPT2-Large 的 batch-size-32 设置是相对论文 batch-size-16 协议的较大
+batch 变体，因此两者的 ProjRes 元数据都会记录 `paper_fedsgd_exact: false`。
+上述优化仍保留同步 vanilla SGD、真实客户端上传、六种通用攻击和最终轮 ProjRes；
+没有通过关闭隐私评估提高普通任务准确率。
 
 `PromptFL` 是针对可训练 `prompt_learner` 定义的算法，不能直接应用到 MLP
 分类头、Adapter 或 LoRA。三种参数高效微调模型使用共享全局状态：CLIP-MLP

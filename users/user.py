@@ -293,8 +293,12 @@ class UserBase:
             model.to(self.device)
             model.train()
             trainable = [
-                parameter for parameter in model.parameters() if parameter.requires_grad
+                parameter
+                for parameter in model.parameters()
+                if parameter.requires_grad
             ]
+            if not trainable:
+                raise ValueError("The client model has no trainable parameters.")
             optimizer_name = str(
                 self.method_config.get("client_optimizer", "sgd")
             ).lower()
@@ -329,6 +333,13 @@ class UserBase:
                 else:
                     loss = F.cross_entropy(model(images), labels)
                 loss.backward()
+                max_grad_norm = float(
+                    self.method_config.get("max_grad_norm", 0.0)
+                )
+                if max_grad_norm < 0:
+                    raise ValueError("max_grad_norm must be non-negative.")
+                if max_grad_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
                 optimizer.step()
 
     def train(self, code_poison: bool = False, round_index: int = 0) -> None:
@@ -339,7 +350,9 @@ class UserBase:
         )
 
     @torch.no_grad()
-    def evaluate(self) -> tuple[float, int, int]:
+    def evaluate_with_confusion(
+        self,
+    ) -> tuple[float, int, int, torch.Tensor]:
         shared_session = getattr(self.model, "use_shared_model", None)
         session = shared_session() if callable(shared_session) else nullcontext()
         with session:
@@ -347,11 +360,35 @@ class UserBase:
             total_loss = 0.0
             total_correct = 0
             total_samples = 0
+            confusion: torch.Tensor | None = None
             for images, labels in self.testloader:
                 images = images.to(self.device)
                 labels = labels.to(self.device)
                 logits = self.model(images)
+                predictions = logits.argmax(dim=1)
                 total_loss += float(F.cross_entropy(logits, labels, reduction="sum"))
-                total_correct += int((logits.argmax(dim=1) == labels).sum())
+                total_correct += int((predictions == labels).sum())
                 total_samples += labels.numel()
+                num_classes = int(logits.shape[-1])
+                if confusion is None:
+                    confusion = torch.zeros(
+                        (num_classes, num_classes), dtype=torch.long
+                    )
+                flat_indices = (
+                    labels.detach().cpu().long() * num_classes
+                    + predictions.detach().cpu().long()
+                )
+                confusion += torch.bincount(
+                    flat_indices,
+                    minlength=num_classes * num_classes,
+                ).reshape(num_classes, num_classes)
+        if confusion is None:
+            confusion = torch.zeros((0, 0), dtype=torch.long)
+        return total_loss, total_correct, total_samples, confusion
+
+    @torch.no_grad()
+    def evaluate(self) -> tuple[float, int, int]:
+        total_loss, total_correct, total_samples, _ = (
+            self.evaluate_with_confusion()
+        )
         return total_loss, total_correct, total_samples
