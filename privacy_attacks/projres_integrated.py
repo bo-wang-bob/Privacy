@@ -1,4 +1,4 @@
-"""In-process ProjRes on real client uploads and cached CLIP features."""
+"""In-process ProjRes on real client uploads and CLIP representations."""
 
 from __future__ import annotations
 
@@ -113,6 +113,223 @@ def _collect_cached_features(
     if not label_parts:
         raise ValueError("The integrated ProjRes candidate pool is empty.")
     return torch.cat(feature_parts), torch.cat(label_parts), source_counts
+
+
+def _collect_lora_representations(
+    datasets: list,
+    source_names: list[str],
+    model: torch.nn.Module,
+    collate_fn,
+    batch_size: int,
+    maximum: int | None,
+    attacked_parameter: str,
+    token_reduction: str,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, int], int]:
+    """Encode raw candidates at the input of the attacked vision LoRA layer."""
+    if len(datasets) != len(source_names) or not datasets:
+        raise ValueError("LoRA ProjRes candidate sources must be non-empty and named.")
+    extractor = getattr(model, "get_projres_representations", None)
+    if not callable(extractor):
+        raise TypeError("CLIP-LoRA must expose get_projres_representations().")
+    remaining = maximum
+    representation_parts = []
+    label_parts = []
+    source_counts = {}
+    tokens_per_sample = None
+    for dataset, source in zip(datasets, source_names):
+        count = 0
+        loader = DataLoader(
+            dataset,
+            batch_size=min(int(batch_size), 64),
+            shuffle=False,
+            collate_fn=collate_fn,
+            drop_last=False,
+        )
+        for images, labels in loader:
+            if images.ndim != 4:
+                raise ValueError(
+                    "CLIP-LoRA ProjRes requires raw preprocessed image tensors."
+                )
+            take = int(labels.numel())
+            if remaining is not None:
+                take = min(remaining, take)
+                images = images[:take]
+                labels = labels[:take]
+            representations, observed_tokens = extractor(
+                images,
+                parameter_name=attacked_parameter,
+                token_reduction=token_reduction,
+            )
+            if representations.ndim != 2 or representations.shape[0] != take:
+                raise ValueError(
+                    "LoRA ProjRes representations must be [samples, hidden]."
+                )
+            if tokens_per_sample is None:
+                tokens_per_sample = int(observed_tokens)
+            elif tokens_per_sample != int(observed_tokens):
+                raise ValueError("LoRA ProjRes token counts changed across batches.")
+            representation_parts.append(representations.detach().cpu().float())
+            label_parts.append(labels.detach().cpu().long())
+            count += take
+            if remaining is not None:
+                remaining -= take
+                if remaining == 0:
+                    break
+        source_counts[source] = count
+        if remaining == 0:
+            break
+    if not label_parts or tokens_per_sample is None:
+        raise ValueError("The CLIP-LoRA ProjRes candidate pool is empty.")
+    return (
+        torch.cat(representation_parts),
+        torch.cat(label_parts),
+        source_counts,
+        tokens_per_sample,
+    )
+
+
+def _run_lora_client(
+    client_id: int,
+    users: list,
+    global_model: torch.nn.Module,
+    base_state: dict[str, torch.Tensor],
+    updated_state: dict[str, torch.Tensor],
+    nonmember_representations: torch.Tensor,
+    nonmember_labels: torch.Tensor,
+    nonmember_source_counts: dict[str, int],
+    nonmember_tokens_per_sample: int,
+    learning_rate: float,
+    round_index: int,
+    threshold: float,
+    max_candidates: int,
+    attacked_parameter: str,
+    token_reduction: str,
+) -> dict[str, object]:
+    """Run Deng et al.'s ProjRes on a real one-batch LoRA-A upload."""
+    target = users[client_id]
+    if target.last_train_batch is None:
+        raise ValueError(
+            f"FedSGD client {client_id} did not retain its observed batch."
+        )
+    member_images, member_labels = target.last_train_batch
+    if member_images.ndim != 4:
+        raise ValueError("CLIP-LoRA ProjRes members must be raw image tensors.")
+    extractor = getattr(global_model, "get_projres_representations")
+    member_representations, member_tokens_per_sample = extractor(
+        member_images,
+        parameter_name=attacked_parameter,
+        token_reduction=token_reduction,
+    )
+    member_representations = member_representations.detach().cpu().float()
+    member_labels = member_labels.detach().cpu().long()
+    if int(member_tokens_per_sample) != int(nonmember_tokens_per_sample):
+        raise ValueError("Member and non-member CLIP token counts must match.")
+    actual_batch_size = int(member_labels.numel())
+    member_count = min(actual_batch_size, int(max_candidates))
+
+    if attacked_parameter not in base_state or attacked_parameter not in updated_state:
+        raise ValueError(
+            f"Observed client update does not contain {attacked_parameter}."
+        )
+    observed_update = (
+        base_state[attacked_parameter].detach().cpu().float()
+        - updated_state[attacked_parameter].detach().cpu().float()
+    )
+    candidate_representations = torch.cat(
+        (member_representations[:member_count], nonmember_representations)
+    )
+    hidden_vector_count = actual_batch_size * int(member_tokens_per_sample)
+    attack = strict_mlp_projres(
+        observed_update,
+        candidate_representations,
+        threshold=threshold,
+        max_rank=hidden_vector_count,
+    )
+    attack.metadata["attacked_parameter"] = attacked_parameter
+    attack.metadata["sample_representation"] = (
+        f"{token_reduction}_token_input_to_attacked_vision_lora"
+    )
+    attack.metadata["lora_factor"] = "A_down_projection"
+    labels = torch.cat(
+        (
+            torch.ones(member_count, dtype=torch.long),
+            torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+        )
+    )
+    metrics = _metric_payload(
+        labels, attack.scores, attack.l1_residuals, attack.predictions
+    )
+    surface_getter = getattr(global_model, "get_projres_attack_surface")
+    _, attacked_module = surface_getter(attacked_parameter)
+    input_dimension = int(attacked_module.in_features)
+    output_dimension = int(attacked_module.rank)
+    logger.info(
+        "Integrated LoRA ProjRes | round=%d | client=%d | hidden_vectors=%d | "
+        "rank=%d | auc=%.4f",
+        round_index + 1,
+        client_id,
+        hidden_vector_count,
+        int(attack.metadata["subspace"]["numerical_rank"]),
+        float(metrics["auc"]),
+    )
+    return {
+        "client_id": client_id,
+        "model_type": "clip_lora",
+        "threat_model": {
+            "server": "honest-but-curious",
+            "communication_round": round_index + 1,
+            "rounds_observed": 1,
+            "local_batches": 1,
+            "local_epochs": 1,
+            "federated_method": "fedsgd",
+            "optimizer": "vanilla_sgd",
+            "attacked_parameter": attacked_parameter,
+            "attacked_lora_factor": "A_down_projection",
+            "member_definition": (
+                "present_in_the_observed_target_client_fedsgd_batch"
+            ),
+            "execution": "integrated_from_observed_client_update",
+            "paper_fedsgd_exact": True,
+            "paper_reference": (
+                "Deng et al. (2026), Toward Efficient Membership Inference "
+                "Attacks against Federated Large Language Models"
+            ),
+        },
+        "dimensions": {
+            "candidate_sampling_batch_size": actual_batch_size,
+            "member_candidate_count": member_count,
+            "nonmember_candidate_count": int(nonmember_labels.numel()),
+            "observed_local_batches": 1,
+            "input_dimension": input_dimension,
+            "first_layer_output_dimension": output_dimension,
+            "tokens_per_sample": int(member_tokens_per_sample),
+            "observed_hidden_vector_count": hidden_vector_count,
+            "sample_representation": f"{token_reduction}_token_layer_input",
+            "paper_favorable_rank_condition": bool(
+                hidden_vector_count <= output_dimension
+                and hidden_vector_count < input_dimension
+            ),
+        },
+        "optimization": {
+            "learning_rate": learning_rate,
+            "observed_update_norm": float(observed_update.norm()),
+            "update_source": "base_lora_A_minus_uploaded_client_lora_A",
+        },
+        "attack": {"metrics": metrics, "metadata": attack.metadata},
+        "raw": {
+            "labels": labels.tolist(),
+            "scores": attack.scores.detach().cpu().tolist(),
+            "l1_residuals": attack.l1_residuals.detach().cpu().tolist(),
+            "predictions": attack.predictions.detach().cpu().tolist(),
+        },
+        "candidate_controls": {
+            "label_matched_nonmembers": False,
+            "member_labels": member_labels[:member_count].tolist(),
+            "nonmember_labels": nonmember_labels.tolist(),
+            "nonmember_source_counts": nonmember_source_counts,
+            "nonmember_training_exposure": "never_trained",
+        },
+    }
 
 
 def _run_client(
@@ -361,42 +578,112 @@ def run_integrated_projres(
     if str(getattr(model, "model_type", "")) not in {
         "clip_mlp",
         "visual_adapter",
+        "clip_lora",
     }:
-        raise ValueError("Integrated ProjRes requires CLIP-MLP or Visual Adapter.")
+        raise ValueError(
+            "Integrated ProjRes requires CLIP-MLP, Visual Adapter, or CLIP-LoRA."
+        )
     threshold = float(config.get("threshold", 0.01))
     max_candidates = int(config.get("max_candidates", 32))
     min_nonmembers = int(config.get("min_nonmembers", 1000))
     configured_max_nonmembers = int(config.get("max_nonmembers", 20000))
     results = []
-    for client_id in client_ids:
-        results.append(
-            _run_client(
-                client_id,
-                users,
-                model,
-                base_states[client_id],
-                updated_states[client_id],
-                learning_rate,
-                batch_size,
-                eval_batch_size,
-                local_epochs,
-                federated_method,
-                round_index,
-                seed,
-                threshold,
-                max_candidates,
-                min_nonmembers,
-                (
-                    None
-                    if configured_max_nonmembers == 0
-                    else configured_max_nonmembers
-                ),
-            )
-        )
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
     model_type = str(getattr(model, "model_type", ""))
+    if model_type == "clip_lora":
+        if federated_method != "fedsgd" or int(local_epochs) != 1:
+            raise ValueError(
+                "Paper-faithful CLIP-LoRA ProjRes requires one-batch FedSGD."
+            )
+        attacked_parameter, _ = model.get_projres_attack_surface(
+            config.get("attacked_parameter")
+        )
+        token_reduction = str(config.get("token_reduction", "cls")).lower()
+        # Candidate representations must be computed under the released global
+        # state that preceded the observed client update. All clients share it.
+        model.load_state_dict(base_states[client_ids[0]], strict=False)
+        nonmember_datasets = [
+            user.test_data for user in users if len(user.test_data)
+        ]
+        nonmember_source_names = [
+            f"independent_test:{user.id}" for user in users if len(user.test_data)
+        ]
+        (
+            nonmember_representations,
+            nonmember_labels,
+            nonmember_source_counts,
+            nonmember_tokens_per_sample,
+        ) = _collect_lora_representations(
+            nonmember_datasets,
+            nonmember_source_names,
+            model,
+            users[client_ids[0]].collate_fn,
+            eval_batch_size,
+            (
+                None
+                if configured_max_nonmembers == 0
+                else configured_max_nonmembers
+            ),
+            attacked_parameter,
+            token_reduction,
+        )
+        if nonmember_labels.numel() < min_nonmembers:
+            raise ValueError(
+                "Strict CLIP-LoRA ProjRes needs at least "
+                f"{min_nonmembers} never-trained non-members; found "
+                f"{nonmember_labels.numel()}."
+            )
+        for client_id in client_ids:
+            results.append(
+                _run_lora_client(
+                    client_id,
+                    users,
+                    model,
+                    base_states[client_id],
+                    updated_states[client_id],
+                    nonmember_representations,
+                    nonmember_labels,
+                    nonmember_source_counts,
+                    nonmember_tokens_per_sample,
+                    learning_rate,
+                    round_index,
+                    threshold,
+                    max_candidates,
+                    attacked_parameter,
+                    token_reduction,
+                )
+            )
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    else:
+        for client_id in client_ids:
+            results.append(
+                _run_client(
+                    client_id,
+                    users,
+                    model,
+                    base_states[client_id],
+                    updated_states[client_id],
+                    learning_rate,
+                    batch_size,
+                    eval_batch_size,
+                    local_epochs,
+                    federated_method,
+                    round_index,
+                    seed,
+                    threshold,
+                    max_candidates,
+                    min_nonmembers,
+                    (
+                        None
+                        if configured_max_nonmembers == 0
+                        else configured_max_nonmembers
+                    ),
+                )
+            )
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     if len(results) == 1:
         payload = {
             "experiment": f"observed_update_{model_type}_projres_single_client",

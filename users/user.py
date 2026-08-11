@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -107,7 +108,11 @@ class UserBase:
             shuffle=False,
             collate_fn=collate_fn,
         )
-        self.model = copy.deepcopy(model)
+        client_model_factory = getattr(model, "create_client_model", None)
+        if callable(client_model_factory):
+            self.model = client_model_factory(client_id=self.id)
+        else:
+            self.model = copy.deepcopy(model)
         self._train_iterator = None
         self._iclr_train_iterator = None
         self.last_update_sample_count = 0
@@ -231,9 +236,16 @@ class UserBase:
                 yield images, labels
 
     def set_parameters(self, state: dict[str, torch.Tensor]) -> None:
-        self.model.load_state_dict(state, strict=False)
+        loader = getattr(self.model, "load_trainable_state", None)
+        if callable(loader):
+            loader(state, strict=True)
+        else:
+            self.model.load_state_dict(state, strict=False)
 
     def get_parameters(self) -> dict[str, torch.Tensor]:
+        exporter = getattr(self.model, "export_trainable_state", None)
+        if callable(exporter):
+            return exporter()
         names = {
             name
             for name, parameter in self.model.named_parameters()
@@ -253,51 +265,71 @@ class UserBase:
         privacy_probe: bool = False,
     ) -> None:
         self.begin_local_update()
-        if self.defense_controller is not None:
-            effective_round = round_index
-            if privacy_probe and round_index == 0:
-                effective_round = max(
-                    0,
-                    int(self.defense_controller.total_rounds) - 1,
-                )
-            self.defense_controller.train_client(
-                self,
-                model,
-                round_index=effective_round,
-                code_poison=code_poison,
-                privacy_probe=privacy_probe,
-            )
-            if privacy_probe:
-                self.defense_controller.after_probe_training(
+        shared_session = getattr(model, "use_shared_model", None)
+        session = shared_session() if callable(shared_session) else nullcontext()
+        with session:
+            if self.defense_controller is not None:
+                effective_round = round_index
+                if privacy_probe and round_index == 0:
+                    effective_round = max(
+                        0,
+                        int(self.defense_controller.total_rounds) - 1,
+                    )
+                self.defense_controller.train_client(
+                    self,
                     model,
-                    client_id=self.id,
                     round_index=effective_round,
+                    code_poison=code_poison,
+                    privacy_probe=privacy_probe,
                 )
-            return
+                if privacy_probe:
+                    self.defense_controller.after_probe_training(
+                        model,
+                        client_id=self.id,
+                        round_index=effective_round,
+                    )
+                return
 
-        model.to(self.device)
-        model.train()
-        trainable = [
-            parameter for parameter in model.parameters() if parameter.requires_grad
-        ]
-        optimizer = torch.optim.SGD(trainable, lr=self.learning_rate)
-        for images, labels in self.iter_local_batches():
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            optimizer.zero_grad()
-            if code_poison:
-                loss = compromised_prompt_loss(
-                    model,
-                    images,
-                    labels,
-                    weight=float(self.code_poison_config.get("weight", 1.0)),
-                    mean=float(self.code_poison_config.get("synthetic_mean", 0.0)),
-                    std=float(self.code_poison_config.get("synthetic_std", 0.1)),
+            model.to(self.device)
+            model.train()
+            trainable = [
+                parameter for parameter in model.parameters() if parameter.requires_grad
+            ]
+            optimizer_name = str(
+                self.method_config.get("client_optimizer", "sgd")
+            ).lower()
+            if optimizer_name == "sgd":
+                optimizer = torch.optim.SGD(
+                    trainable,
+                    lr=self.learning_rate,
+                    momentum=float(self.method_config.get("momentum", 0.0)),
+                    weight_decay=float(self.method_config.get("weight_decay", 0.0)),
+                )
+            elif optimizer_name == "adamw":
+                optimizer = torch.optim.AdamW(
+                    trainable,
+                    lr=self.learning_rate,
+                    weight_decay=float(self.method_config.get("weight_decay", 0.01)),
                 )
             else:
-                loss = F.cross_entropy(model(images), labels)
-            loss.backward()
-            optimizer.step()
+                raise ValueError("client_optimizer must be sgd or adamw.")
+            for images, labels in self.iter_local_batches():
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                optimizer.zero_grad()
+                if code_poison:
+                    loss = compromised_prompt_loss(
+                        model,
+                        images,
+                        labels,
+                        weight=float(self.code_poison_config.get("weight", 1.0)),
+                        mean=float(self.code_poison_config.get("synthetic_mean", 0.0)),
+                        std=float(self.code_poison_config.get("synthetic_std", 0.1)),
+                    )
+                else:
+                    loss = F.cross_entropy(model(images), labels)
+                loss.backward()
+                optimizer.step()
 
     def train(self, code_poison: bool = False, round_index: int = 0) -> None:
         self.train_model(
@@ -308,15 +340,18 @@ class UserBase:
 
     @torch.no_grad()
     def evaluate(self) -> tuple[float, int, int]:
-        self.model.eval()
-        total_loss = 0.0
-        total_correct = 0
-        total_samples = 0
-        for images, labels in self.testloader:
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            logits = self.model(images)
-            total_loss += float(F.cross_entropy(logits, labels, reduction="sum"))
-            total_correct += int((logits.argmax(dim=1) == labels).sum())
-            total_samples += labels.numel()
+        shared_session = getattr(self.model, "use_shared_model", None)
+        session = shared_session() if callable(shared_session) else nullcontext()
+        with session:
+            self.model.eval()
+            total_loss = 0.0
+            total_correct = 0
+            total_samples = 0
+            for images, labels in self.testloader:
+                images = images.to(self.device)
+                labels = labels.to(self.device)
+                logits = self.model(images)
+                total_loss += float(F.cross_entropy(logits, labels, reduction="sum"))
+                total_correct += int((logits.argmax(dim=1) == labels).sum())
+                total_samples += labels.numel()
         return total_loss, total_correct, total_samples

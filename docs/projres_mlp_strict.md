@@ -1,10 +1,11 @@
-# CLIP-MLP 与 Visual Adapter 上的严格 ProjRes 实现
+# CLIP-MLP、Visual Adapter 与 CLIP-LoRA 上的 ProjRes 实现
 
 本实现对应论文 *Toward Efficient Membership Inference Attacks against
 Federated Large Language Models: A Projection Residual Approach* 的 Algorithm
 1。论文中的 adapter down-projection 层在 Visual Adapter 中直接对应
 `adapter.net.0.weight`；在 CLIP-MLP 对照模型中对应第一层分类 MLP
-`classifier.0.weight`。
+`classifier.0.weight`。CLIP-LoRA 对应视觉编码器首个 Q 投影中的下投影因子
+`clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A`。
 
 ## 数学映射
 
@@ -31,6 +32,22 @@ member iff r(x) < tau
 实现使用论文的原始 L1 残差，默认 `tau=0.01`。为了使用统一的 ROC/AUC
 接口，报告中的 `score=-r(x)`；这只是单调变换，不改变攻击排序。
 
+### LoRA 映射
+
+仓库的 LoRA 前向为 `W_eff = W_0 + scale * B A`，其中 `A` 的形状为
+`(rank, hidden)`。对视觉注意力 Q 投影，客户端单步 SGD 上传满足：
+
+```text
+Delta_A = learning_rate * dL/dA
+rowspan(dL/dA) is a subspace of the attacked-layer token inputs
+```
+
+实现从产生该上传之前的全局模型注册 forward hook，捕获进入 Q-LoRA 的
+`[batch, tokens, hidden]` 表示。论文子空间由全部 token 共同形成；当前样本级
+候选使用 CLIP class token 作为 `f(x)`，并将完整的
+`batch_size * tokens_per_sample` 记入论文秩条件。服务端只读取真实上传的
+`lora_A` 参数差，不构造代理梯度或合并后的稠密 `BA` 更新。
+
 ### 数值稳定性
 
 实际 float32 SGD 上传通过 `W_before - W_after` 得到，参数相减可能产生理论梯度
@@ -54,8 +71,9 @@ member iff r(x) < tau
   客户端的数据集”；
 - 不使用其他客户端更新、代理梯度、shadow model、学习型攻击头或成员标签
   来构造攻击子空间；
-- CLIP 全冻结；Visual Adapter 只读取首个 down-projection 权重更新，
-  CLIP-MLP 对照模型只读取第一层分类 MLP 权重更新；
+- CLIP 主干冻结；Visual Adapter 只读取首个 down-projection 权重更新，
+  CLIP-MLP 对照模型只读取第一层分类 MLP 权重更新，CLIP-LoRA 只读取首个
+  视觉 Q 投影的 `lora_A` 更新；
 - 数据协议与对应正常训练保持一致：CLIP-MLP 使用完整数据集，Visual
   Adapter 使用系统级 16-shot FPL 设置。
 
@@ -68,7 +86,7 @@ member iff r(x) < tau
 第 3.1 节要求的是目标客户端单个通信轮的上传梯度，而不是训练初始化时额外构造
 一次更新。论文第 4.1 节的默认实验通常在第 50 个通信轮评估。
 
-统一 MLP/Adapter sweep 因此直接观察实际客户端上传，并默认在最后一个通信轮执行
+统一 Adapter/LoRA sweep 因此直接观察实际客户端上传，并默认在最后一个通信轮执行
 ProjRes；设置 `--projres-round 50` 可选择第 50 轮。该路径与上述独立严格入口有一
 个重要区别：若一次本地训练包含多个 batch，实际 FedAvg 参数差是多步更新的累积，
 不再与论文的单 batch FedSGD 梯度完全等价。此时成员定义为该轮参与本地训练的
@@ -118,3 +136,8 @@ python scripts/validate_projres_mlp_real.py \
 down-projection 为 `n=512, m=128`，实际 `p` 是目标客户端首个 batch 的大小。
 若改成多 batch、本地多步、动量、裁剪、噪声或安全聚合，上传更新不再是单个
 batch 梯度的常数倍，就不再属于本入口声明的严格实验设置。
+
+CLIP-LoRA 中 `p` 是 `batch_size * tokens_per_sample`，`m` 是 LoRA rank，
+`n` 是被攻击注意力层的 hidden size。默认结果会明确写入
+`paper_favorable_rank_condition`；当 rank 较小导致该条件不成立时，仍可计算
+投影残差和 AUC，但不能宣称获得论文定理保证。

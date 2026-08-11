@@ -1,0 +1,108 @@
+name: clip_lora_fedmia_attacks
+base_config: configs/clip_lora_low_fpr_attacks.yaml
+results_root: results
+
+gpus: [0]
+jobs: 1
+seeds: [42]
+target_client_ids: [0]
+
+datasets:
+  - name: caltech101
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 300
+  - name: oxfordpets
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 300
+  - name: flowers
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 300
+  - name: food101
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 300
+  - name: cifar100
+    overrides:
+      total_users: 10
+      sample_users: 10
+      num_global_iters: 300
+
+common:
+  model_type: clip_lora
+  aggregator: fedsgd
+  aggregation_weighting: uniform
+  data_root: ./data
+  cache_dir: ./checkpoints/clip-vit-base-patch32
+  require_cuda: true
+  partition_mode: iid
+  dirichlet_alpha: 0.1
+  use_full_dataset: false
+  fpl_shots: 16
+  local_epochs: 1
+  learning_rate: 0.0002
+  learning_rate_decay: 1.0
+  batch_size: 32
+  eval_batch_size: 128
+  eval_interval: 5
+  save_models: false
+  fedsgd:
+    client_optimizer: sgd
+    momentum: 0.0
+    weight_decay: 0.0
+  clip_lora:
+    encoder: both
+    target_modules: [q, k, v]
+    layers: all
+    rank: 2
+    alpha: 1.0
+    dropout: 0.0
+    scaling: sqrt_rank
+    template: null
+  audit:
+    enabled: true
+    strict: true
+    audit_client_ids: all
+    target_client_id: 0
+    ensure_target_participation: true
+    attacks:
+      - blackbox_loss
+      - loss_series
+      - grad_cosine
+      - avg_cosine
+      - fedmia_loss
+      - fedmia_cosine
+    candidate_sampling: balanced_holdout
+    low_fpr_max_members: 5000
+    low_fpr_max_nonmembers: 5000
+    match_candidate_labels: true
+    audit_batch_size: 64
+    attack_audit_intervals:
+      loss_series: 10
+      avg_cosine: 10
+      fedmia_loss: 10
+      fedmia_cosine: 10
+    low_fpr_gradient_batch_size: 1
+    signal_storage: compact
+    fedmia_tail: upper
+    fedmia_tail_calibration_fraction: 0.25
+    training_health_check: true
+
+projres:
+  enabled: true
+  evaluation_round: last
+  threshold: 0.01
+  max_candidates: 32
+  min_nonmembers: 1000
+  max_nonmembers: 20000
+  attacked_parameter: clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A
+  token_reduction: cls
+
+defenses:
+  - name: none

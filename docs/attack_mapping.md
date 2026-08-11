@@ -164,7 +164,9 @@ batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。�
 边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
 余弦相似度的 `promptres`。
 
-统一 sweep 只对 Visual Adapter 提供进程内 ProjRes：它在配置的真实通信轮
-（默认最后一轮）读取 `base_state - uploaded_client_state`，不重新构造训练前
-更新。Adapter 的真实上传严格来自一个 batch，因此与论文 FedSGD 观测一致。
-CLIP-MLP 的统一攻击任务不执行 ProjRes；其独立严格验证入口仍然保留。
+统一 sweep 对 Visual Adapter 和 CLIP-LoRA 提供进程内 ProjRes：它在配置的
+真实通信轮（默认最后一轮）读取 `base_state - uploaded_client_state`，不重新
+构造训练前更新。Adapter 攻击第一层 down-projection；LoRA 攻击视觉 Q 投影的
+`lora_A` 下投影因子，并使用该层输入的 CLIP class-token 隐藏表示。两者真实
+上传均只来自一个 batch，因此与论文 FedSGD 观测一致。CLIP-MLP 的统一攻击任务
+不执行 ProjRes；其独立严格验证入口仍然保留。

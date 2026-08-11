@@ -146,12 +146,40 @@ CIFAR-100 与 Caltech101 默认使用 `a photo of a {class}.`；OxfordPets 使�
 `text_reduction`、`text_alpha` 和 `text_output_relu` 控制文本侧 Adapter；省略时
 分别继承视觉侧设置。历史配置若没有 `text_adapter_enabled`，仍按仅视觉侧运行。
 
+### 16-shot CLIP-LoRA
+
+`clip_lora` 冻结原始 CLIP，只在图像与文本 Transformer 每层自注意力的
+Q/K/V 投影上训练 LoRA。基础配置使用 rank 2、`alpha=1`、dropout 0.25 和
+`alpha/sqrt(rank)` 缩放；图像侧 LoRA 会改变编码结果，因此训练和审计直接使用
+原始图像，不复用冻结特征缓存：
+
+```bash
+python main.py --config configs/clip_lora_privacy.yaml
+```
+
+基础联邦聚合直接分别平均各客户端的低秩因子：
+
+```text
+A^(t+1) = sum_k w_k A_k^t
+B^(t+1) = sum_k w_k B_k^t
+```
+
+当前统一协议令参与客户端 `w_k=1/|S_t|`。冻结的 CLIP 主干不上传、不聚合；
+这种逐因子线性聚合不做 SVD 重分解、稀疏化或异构 rank 对齐。普通 LoRA 配置
+使用 FedAvg；带严格 ProjRes 的攻击 sweep 使用论文威胁模型要求的 one-batch
+FedSGD。
+
+实现上只有一个全局共享的冻结 CLIP 主干，每个客户端模型只持有自己的
+`lora_A/lora_B`。轮到某客户端训练或推理时，其因子会临时绑定到共享主干的
+LoRA 工作槽位，结束后恢复全局槽位；客户端上传也只导出自己的 A/B，不复制或
+上传完整 CLIP。
+
 `PromptFL` 是针对可训练 `prompt_learner` 定义的算法，不能直接应用到 MLP
-分类头或视觉 Adapter。两种
-冻结 CLIP 微调模型使用共享全局模型：CLIP-MLP 使用 FedAvg，Visual Adapter
-使用每客户端每轮一个 mini-batch 的 FedSGD。两者训练协议不同，比较攻击结果时
-需要同时报告这一差异；两者的服务器聚合均对参与客户端直接等权平均，而不是按
-客户端样本数加权。
+分类头、Adapter 或 LoRA。三种参数高效微调模型使用共享全局状态：CLIP-MLP
+使用 FedAvg，Visual Adapter 使用每客户端每轮一个 mini-batch 的 FedSGD；
+CLIP-LoRA 普通训练使用 FedAvg，带论文严格 ProjRes 的统一攻击任务使用
+one-batch FedSGD。训练协议不同，比较攻击结果时需要同时报告这一差异；服务器
+聚合均对参与客户端直接等权平均，而不是按客户端样本数加权。
 
 论文 ProjRes 在第一层 MLP 参数上的严格单轮 FedSGD 实现使用独立入口。它只取
 `classifier.0.weight` 的一个真实 batch 更新，并以该层输入的 CLIP 表示计算
@@ -215,22 +243,23 @@ Visual Adapter 对应的 16-shot 五数据集 sweep 使用相同参数接口；�
 bash scripts/run_visual_adapter_fedmia_attacks.sh
 ```
 
-推荐使用统一的终极入口，一条命令依次完成 CLIP+MLP 和 CLIP+Adapter 的全部
-数据集 sweep；默认学习率统一为 `0.001`：
+推荐使用统一入口。无参数调用会依次完成 CLIP+MLP、CLIP+Adapter 和
+CLIP-LoRA 的全部数据集 sweep：
 
 ```bash
 bash scripts/run_all_clip_fedmia_attacks.sh
 ```
 
-该入口默认运行两个模型和五个数据集。可通过 `--models clip_mlp` 或
-`--models visual_adapter` 只运行一个模型，并可用 `--learning-rate` 临时覆盖
-学习率。ProjRes 只在 Adapter 主任务内执行；MLP 只执行六种通用攻击。独立的
-MLP ProjRes 验证入口仍保留用于单独复现实验。
+该入口默认运行三种模型和五个数据集。可通过 `--models clip_mlp`、
+`--models visual_adapter` 或 `--models clip_lora` 只运行一个模型，并可用
+`--learning-rate` 临时覆盖学习率。`--models all` 同样表示三种模型。ProjRes
+在 Adapter 与 LoRA 主任务内执行；MLP 运行六种通用攻击。独立的 MLP ProjRes
+验证入口仍保留用于单独复现实验。
 
 常用筛选、覆盖和并行命令：
 
 ```bash
-# 只打印两个模型的完整作业命令
+# 只打印三种模型的完整作业命令
 bash scripts/run_all_clip_fedmia_attacks.sh --dry-run
 
 # 只跑指定数据集与 FedMIA-I/II
@@ -246,12 +275,15 @@ bash scripts/run_all_clip_fedmia_attacks.sh \
   --models visual_adapter \
   --rounds 50 \
   --learning-rate 0.0005
+
+# 只打印 CLIP-LoRA 作业（等价入口：run_clip_lora_fedmia_attacks.sh）
+bash scripts/run_all_clip_fedmia_attacks.sh --models clip_lora --dry-run
 ```
 
-两个 sweep 默认运行 `blackbox_loss`、`loss_series`、`grad_cosine`、
-`avg_cosine`、`fedmia_loss` 和 `fedmia_cosine`，并使用至少 1000 个非成员的
-`low_fpr_full` 协议。完整攻击集合仍分别使用
-`configs/clip_mlp_privacy.yaml` 和 `configs/visual_adapter_privacy.yaml`。
+三种模型的攻击 sweep 默认运行 `blackbox_loss`、`loss_series`、`grad_cosine`、
+`avg_cosine`、`fedmia_loss` 和 `fedmia_cosine`，并使用每客户端成员/非成员
+1:1、类别精确配对的 `balanced_holdout` 协议。LoRA 因图像编码器可训练而不能
+使用预计算特征的 `low_fpr_full` 候选池。
 
 审计信号按攻击需求调度：`blackbox_loss` 和 `grad_cosine` 默认只使用最终轮，
 `loss_series`、`avg_cosine`、`fedmia_loss` 和 `fedmia_cosine` 按论文定义逐轮
@@ -335,6 +367,8 @@ audit:
 - `clip_mlp`：两层 MLP 的隐藏维度、dropout 与特征归一化设置；
 - `visual_adapter`：双侧特征维度、视觉/文本瓶颈 reduction、两侧残差混合系数、
   输出 ReLU、图像特征缓存和可选文本模板；该模式固定使用 `fpl_shots: 16`；
+- `clip_lora`：编码器侧、注意力目标投影、层范围、rank、alpha、dropout、缩放
+  方式和可选文本模板；该模式固定使用 `fpl_shots: 16`；
 - `aggregator`：联邦训练方法；
 - `total_users`、`sample_users`：客户端总数和每轮参与数；
 - `partition_mode`：`iid`、`dirichlet`、`pathological` 或 `auto`；
@@ -343,8 +377,8 @@ audit:
 - `defense`：独立防御名称和参数；
 - `results_dir`：运行输出根目录。
 
-命令行参数会覆盖 YAML 中对应字段。`configs/` 只保留 CLIP-MLP 与 Visual
-Adapter 的单次运行、低 FPR sweep，以及 MLP 严格 ProjRes 配置。
+命令行参数会覆盖 YAML 中对应字段。`configs/` 提供 CLIP-MLP、Visual Adapter
+与 CLIP-LoRA 的单次运行和攻击 sweep，以及 MLP 严格 ProjRes 配置。
 
 ## 输出文件
 

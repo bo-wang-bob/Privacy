@@ -653,11 +653,12 @@ class DefenseController:
         global_state: dict[str, torch.Tensor],
         own_weight: float,
         source_round: int,
+        own_state: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Build the two ICLR references immediately before global overwrite."""
         if self.name != "iclr":
             return
-        own_state = user.get_parameters()
+        own_state = user.get_parameters() if own_state is None else own_state
         weight = float(own_weight)
         other_state = infer_other_clients_state(global_state, own_state, weight)
         self._iclr_pending_states[user.id] = (own_state, other_state)

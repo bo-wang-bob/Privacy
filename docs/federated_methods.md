@@ -10,6 +10,27 @@
 
 严格的 `promptfl` 入口使用论文式 `[SOS] [learned context] [class] [EOS]` 构造。论文：[arXiv](https://arxiv.org/abs/2208.11625)。
 
+## CLIP-LoRA 的基础 FedAvg
+
+`model_type: clip_lora` 冻结 CLIP 主干，在图像与文本编码器注意力投影中插入
+`W_eff = W_0 + (alpha/sqrt(r)) B A`。客户端只优化并上传 `lora_A`、`lora_B`，
+服务器分别线性聚合同名因子。普通配置使用 FedAvg；严格 ProjRes 配置使用
+one-batch FedSGD。两者默认均对本轮参与客户端等权：
+
+```text
+A_global = (1 / |S|) sum_k A_k
+B_global = (1 / |S|) sum_k B_k
+```
+
+该基础方案不聚合冻结主干，也不先把 `B_k A_k` 合成稠密更新；后者与分别平均
+因子并不数学等价，属于需要另行实现和对照的聚合变体。
+
+内存模型采用“一个共享 CLIP + 每客户端独立 LoRA”的结构。共享模型保存冻结
+CLIP 主干和服务器全局 LoRA 工作槽位；每个客户端模型类只注册该客户端的 A/B
+参数。客户端执行时临时把自己的 Parameter 绑定到工作槽位，使优化器直接更新
+该客户端参数；执行结束后恢复全局槽位。服务器收到和聚合的状态字典因此只含
+同名的 `lora_A/lora_B`，不会包含冻结 CLIP 权重。
+
 ## 攻击可见性
 
 `audit.audit_view` 支持：

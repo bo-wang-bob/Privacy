@@ -12,11 +12,12 @@ else
   python_bin="python3"
 fi
 
-models="${CLIP_MIA_MODELS:-clip_mlp,visual_adapter}"
+models="${CLIP_MIA_MODELS:-clip_mlp,visual_adapter,clip_lora}"
 gpus="${CLIP_MIA_GPUS:-${CLIP_MIA_GPU:-0}}"
 jobs="${CLIP_MIA_JOBS:-1}"
 clip_mlp_learning_rate="${CLIP_MLP_MIA_LR:-0.1}"
 visual_adapter_learning_rate="${CLIP_ADAPTER_MIA_LR:-0.001}"
+clip_lora_learning_rate="${CLIP_LORA_MIA_LR:-0.0002}"
 partition_mode="${CLIP_MIA_PARTITION_MODE:-iid}"
 partition_mode_explicit=false
 if [[ -n "${CLIP_MIA_PARTITION_MODE:-}" ]]; then
@@ -99,13 +100,14 @@ if [[ "$show_help" == true ]]; then
 Run all frozen-CLIP membership-inference sweeps.
 
 Unified options:
-  --models clip_mlp,visual_adapter   Select one or both models (default: both).
+  --models clip_mlp,visual_adapter,clip_lora
+                                    Select models (default: all three).
   --partition-mode iid|dirichlet    Data partition (default: iid).
 
 Model-specific learning-rate defaults:
-  clip_mlp=0.1, visual_adapter=0.001
+  clip_mlp=0.1, visual_adapter=0.001, clip_lora=0.0002
   --learning-rate RATE overrides the default for every selected model.
-  Both model specs keep the client learning rate constant (decay=1.0).
+  All model specs keep the client learning rate constant (decay=1.0).
 
 All options below are forwarded to each selected sweep, including:
   --datasets CSV        --attacks CSV          --target-client ID|all
@@ -119,9 +121,9 @@ All options below are forwarded to each selected sweep, including:
   --skip-projres        --force                --dry-run
   --summarize-only      --max-runs VALUE
 
-ProjRes runs only for Visual Adapter, using its selected real one-batch FedSGD
-upload and attacking the first Adapter downsampling layer. CLIP-MLP runs only
-the six generic attacks in this unified entry point.
+ProjRes runs for Visual Adapter and CLIP-LoRA from a selected real one-batch
+FedSGD upload. It attacks the first Adapter downsampling layer or the first
+vision Q-projection LoRA-A matrix. CLIP-MLP runs the six generic attacks only.
 EOF
   "$python_bin" scripts/run_clip_mlp_fedmia_sweep.py --help
   exit 0
@@ -133,7 +135,7 @@ for requested in "${requested_models[@]}"; do
   requested="${requested//[[:space:]]/}"
   case "${requested,,}" in
     all)
-      normalized_models=(clip_mlp visual_adapter)
+      normalized_models=(clip_mlp visual_adapter clip_lora)
       break
       ;;
     clip_mlp|clip-mlp|mlp)
@@ -142,10 +144,13 @@ for requested in "${requested_models[@]}"; do
     visual_adapter|visual-adapter|clip_adapter|clip-adapter|adapter)
       normalized_models+=(visual_adapter)
       ;;
+    clip_lora|clip-lora|lora)
+      normalized_models+=(clip_lora)
+      ;;
     "")
       ;;
     *)
-      echo "Unknown model '$requested'; use clip_mlp, visual_adapter, or all." >&2
+      echo "Unknown model '$requested'; use clip_mlp, visual_adapter, clip_lora, or all." >&2
       exit 2
       ;;
   esac
@@ -168,6 +173,10 @@ run_model() {
     visual_adapter)
       spec="${CLIP_ADAPTER_MIA_SPEC:-configs/visual_adapter_fedmia_attacks_sweep.yaml}"
       learning_rate="$visual_adapter_learning_rate"
+      ;;
+    clip_lora)
+      spec="${CLIP_LORA_MIA_SPEC:-configs/clip_lora_fedmia_attacks_sweep.yaml}"
+      learning_rate="$clip_lora_learning_rate"
       ;;
   esac
   echo "================================================================================"

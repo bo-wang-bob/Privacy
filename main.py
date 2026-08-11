@@ -144,9 +144,14 @@ def _load_local_clip(
 
 def validate_config(config: dict) -> None:
     model_type = str(config.get("model_type", "prompt")).lower()
-    if model_type not in {"prompt", "clip_mlp", "visual_adapter"}:
+    if model_type not in {
+        "prompt",
+        "clip_mlp",
+        "visual_adapter",
+        "clip_lora",
+    }:
         raise ValueError(
-            "model_type must be prompt, clip_mlp, or visual_adapter."
+            "model_type must be prompt, clip_mlp, visual_adapter, or clip_lora."
         )
     method = config["aggregator"].lower()
     supported_methods = {"fedavg", "fedsgd", "promptfl"}
@@ -241,6 +246,54 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "visual_adapter.precompute_batch_size must be positive."
             )
+    if model_type == "clip_lora":
+        lora_config = dict(config.get("clip_lora", {}))
+        if method not in {"fedavg", "fedsgd"}:
+            raise ValueError("clip_lora requires factor-wise FedAvg or FedSGD.")
+        if method == "fedsgd" and int(config["local_epochs"]) != 1:
+            raise ValueError("clip_lora FedSGD requires local_epochs=1.")
+        if bool(config.get("use_full_dataset", False)) or fpl_shots != 16:
+            raise ValueError(
+                "clip_lora requires the 16-shot setting: "
+                "use_full_dataset=false and fpl_shots=16."
+            )
+        if str(lora_config.get("encoder", "both")).lower() not in {
+            "vision",
+            "text",
+            "both",
+        }:
+            raise ValueError("clip_lora.encoder must be vision, text, or both.")
+        targets = list(lora_config.get("target_modules", ["q", "k", "v"]))
+        if not targets or set(targets) - {
+            "q",
+            "k",
+            "v",
+            "o",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "out_proj",
+        }:
+            raise ValueError(
+                "clip_lora.target_modules must contain q, k, v, or o."
+            )
+        if int(lora_config.get("rank", 2)) <= 0:
+            raise ValueError("clip_lora.rank must be positive.")
+        if float(lora_config.get("alpha", 1.0)) <= 0:
+            raise ValueError("clip_lora.alpha must be positive.")
+        if not 0 <= float(lora_config.get("dropout", 0.25)) < 1:
+            raise ValueError("clip_lora.dropout must be in [0, 1).")
+        if str(lora_config.get("scaling", "sqrt_rank")).lower() not in {
+            "rank",
+            "sqrt_rank",
+        }:
+            raise ValueError("clip_lora.scaling must be rank or sqrt_rank.")
+        layers = lora_config.get("layers", "all")
+        if isinstance(layers, str) and layers.lower() not in {
+            "all",
+            "last_half",
+        }:
+            raise ValueError("clip_lora.layers must be all, last_half, or a list.")
     if float(config.get("dirichlet_alpha", 0.1)) <= 0:
         raise ValueError("dirichlet_alpha must be positive.")
     audit = config.get("audit", {})
@@ -316,6 +369,11 @@ def validate_config(config: dict) -> None:
             "audit.candidate_sampling=fedmia_mix requires "
             "match_candidate_labels=false to reproduce the reference protocol."
         )
+    if model_type == "clip_lora" and candidate_sampling == "low_fpr_full":
+        raise ValueError(
+            "clip_lora cannot use low_fpr_full because vision LoRA makes "
+            "precomputed image features stale; use balanced_holdout."
+        )
     if candidate_sampling in {"low_fpr_full", "balanced_holdout"}:
         low_fpr_attacks = {
             "blackbox_loss",
@@ -325,10 +383,10 @@ def validate_config(config: dict) -> None:
             "fedmia_loss",
             "fedmia_cosine",
         }
-        if model_type not in {"clip_mlp", "visual_adapter"}:
+        if model_type not in {"clip_mlp", "visual_adapter", "clip_lora"}:
             raise ValueError(
                 f"audit.candidate_sampling={candidate_sampling} requires a "
-                "frozen-CLIP feature model."
+                "supported CLIP parameter-efficient model."
             )
         unsupported_low_fpr = sorted(attacks - low_fpr_attacks)
         if unsupported_low_fpr:
@@ -466,21 +524,60 @@ def validate_config(config: dict) -> None:
         )
     projres = config.get("projres", {})
     if bool(projres.get("enabled", False)):
-        if model_type not in {"clip_mlp", "visual_adapter"}:
+        if model_type not in {"clip_mlp", "visual_adapter", "clip_lora"}:
             raise ValueError(
-                "Integrated ProjRes requires model_type=clip_mlp or "
-                "visual_adapter."
+                "Integrated ProjRes requires CLIP-MLP, Visual Adapter, or "
+                "CLIP-LoRA."
             )
         if method not in {"fedavg", "fedsgd"}:
             raise ValueError(
                 "Integrated ProjRes requires FedAvg or FedSGD training."
             )
-        if not bool(
+        if model_type != "clip_lora" and not bool(
             config.get(model_type, {}).get("precompute_features", True)
         ):
             raise ValueError(
                 "Integrated ProjRes requires precompute_features=true."
             )
+        if model_type == "clip_lora":
+            if method != "fedsgd":
+                raise ValueError(
+                    "Paper-faithful CLIP-LoRA ProjRes requires one-batch FedSGD."
+                )
+            optimizer_config = dict(config.get("fedsgd", {}))
+            if str(optimizer_config.get("client_optimizer", "sgd")).lower() != "sgd":
+                raise ValueError("CLIP-LoRA ProjRes requires vanilla client SGD.")
+            if float(optimizer_config.get("momentum", 0.0)) != 0.0 or float(
+                optimizer_config.get("weight_decay", 0.0)
+            ) != 0.0:
+                raise ValueError(
+                    "CLIP-LoRA ProjRes requires zero momentum and weight decay."
+                )
+            if float(config.get("clip_lora", {}).get("dropout", 0.25)) != 0.0:
+                raise ValueError(
+                    "CLIP-LoRA ProjRes requires clip_lora.dropout=0 so the "
+                    "observed LoRA input matches the projected representation."
+                )
+            if str(config.get("clip_lora", {}).get("encoder", "both")).lower() not in {
+                "vision",
+                "both",
+            }:
+                raise ValueError(
+                    "CLIP-LoRA ProjRes requires LoRA in the vision encoder."
+                )
+            attacked_parameter = projres.get("attacked_parameter")
+            if attacked_parameter is not None and (
+                "vision_model" not in str(attacked_parameter)
+                or not str(attacked_parameter).endswith(".lora_A")
+            ):
+                raise ValueError(
+                    "projres.attacked_parameter must name a vision lora_A matrix."
+                )
+            if str(projres.get("token_reduction", "cls")).lower() not in {
+                "cls",
+                "mean",
+            }:
+                raise ValueError("projres.token_reduction must be cls or mean.")
         threshold = float(projres.get("threshold", 0.01))
         max_candidates = int(projres.get("max_candidates", 32))
         min_nonmembers = int(projres.get("min_nonmembers", 1000))
@@ -513,7 +610,11 @@ def validate_config(config: dict) -> None:
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
-    if model_type in {"clip_mlp", "visual_adapter"} and defense_name not in {
+    if model_type in {
+        "clip_mlp",
+        "visual_adapter",
+        "clip_lora",
+    } and defense_name not in {
         "none",
         "iclr",
     }:
@@ -522,16 +623,18 @@ def validate_config(config: dict) -> None:
             "to be none or iclr."
         )
     if defense_name == "iclr":
-        if model_type not in {"clip_mlp", "visual_adapter"}:
+        if model_type not in {"clip_mlp", "visual_adapter", "clip_lora"}:
             raise ValueError(
-                "ICLR currently requires model_type=clip_mlp or visual_adapter."
+                "ICLR requires CLIP-MLP, Visual Adapter, or CLIP-LoRA."
             )
         if method not in {"fedavg", "fedsgd"}:
             raise ValueError("ICLR requires linear FedAvg or FedSGD aggregation.")
         if config["sample_users"] < 2:
             raise ValueError("ICLR requires at least two selected clients per round.")
         model_config = dict(config.get(model_type, {}))
-        if not bool(model_config.get("precompute_features", True)):
+        if model_type != "clip_lora" and not bool(
+            model_config.get("precompute_features", True)
+        ):
             raise ValueError(
                 "ICLR currently requires precomputed CLIP features so the exact "
                 "local-update batch stream can be ranked without retaining raw images."
@@ -652,6 +755,10 @@ def validate_config(config: dict) -> None:
 def run(config: dict) -> list[dict]:
     from trainmodel.custom_clip import CustomCLIP, get_default_prompt_template
     from trainmodel.clip_mlp import CLIPImageMLP
+    from trainmodel.clip_lora import (
+        CLIPLoRA,
+        build_clip_lora_text_inputs,
+    )
     from trainmodel.visual_adapter import (
         VisualCLIPAdapter,
         build_visual_adapter_text_features,
@@ -665,6 +772,7 @@ def run(config: dict) -> list[dict]:
     if str(config.get("model_type", "prompt")).lower() in {
         "clip_mlp",
         "visual_adapter",
+        "clip_lora",
     }:
         config["aggregation_weighting"] = "uniform"
     validate_config(config)
@@ -787,6 +895,28 @@ def run(config: dict) -> list[dict]:
                     adapter_config.get("output_relu", True),
                 )
             ),
+            device=device,
+        )
+    elif model_type == "clip_lora":
+        lora_config = dict(config.get("clip_lora", {}))
+        model = CLIPLoRA(
+            clip_model=clip_model,
+            text_inputs=build_clip_lora_text_inputs(
+                processor=processor,
+                classnames=class_names,
+                dataset_name=config["dataset_name"],
+                template=lora_config.get("template"),
+            ),
+            classnames=class_names,
+            encoder=str(lora_config.get("encoder", "both")),
+            target_modules=lora_config.get(
+                "target_modules", ["q", "k", "v"]
+            ),
+            layers=lora_config.get("layers", "all"),
+            rank=int(lora_config.get("rank", 2)),
+            alpha=float(lora_config.get("alpha", 1.0)),
+            dropout=float(lora_config.get("dropout", 0.25)),
+            scaling=str(lora_config.get("scaling", "sqrt_rank")),
             device=device,
         )
     else:
@@ -924,6 +1054,16 @@ def default_config() -> dict:
             "precompute_batch_size": 64,
             "template": None,
         },
+        "clip_lora": {
+            "encoder": "both",
+            "target_modules": ["q", "k", "v"],
+            "layers": "all",
+            "rank": 2,
+            "alpha": 1.0,
+            "dropout": 0.25,
+            "scaling": "sqrt_rank",
+            "template": None,
+        },
         "promptfl": {},
         "dirichlet_alpha": 0.1,
         "partition_mode": "auto",
@@ -1032,6 +1172,8 @@ def default_config() -> dict:
             "max_candidates": 32,
             "min_nonmembers": 1000,
             "max_nonmembers": 20000,
+            "attacked_parameter": None,
+            "token_reduction": "cls",
         },
         "defense": {
             "name": "none",
@@ -1125,7 +1267,8 @@ def parse_args() -> dict:
         help="Apply one learning-rate decay after this many communication rounds.",
     )
     parser.add_argument(
-        "--model_type", choices=["prompt", "clip_mlp", "visual_adapter"]
+        "--model_type",
+        choices=["prompt", "clip_mlp", "visual_adapter", "clip_lora"],
     )
     parser.add_argument("--mlp_hidden_dim", type=int)
     parser.add_argument("--mlp_dropout", type=float)
@@ -1240,6 +1383,11 @@ def parse_args() -> dict:
         config["aggregator"] = "fedsgd"
         config["aggregation_weighting"] = "uniform"
         config["local_epochs"] = 1
+        config["fpl_shots"] = 16
+        config["use_full_dataset"] = False
+    elif args.model_type == "clip_lora":
+        config["aggregator"] = "fedavg"
+        config["aggregation_weighting"] = "uniform"
         config["fpl_shots"] = 16
         config["use_full_dataset"] = False
     # A direct few-shot/alpha override denotes the Dirichlet experiment

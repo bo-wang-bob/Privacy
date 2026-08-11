@@ -135,6 +135,7 @@ class ServerBase:
         if str(getattr(model, "model_type", "")).lower() in {
             "clip_mlp",
             "visual_adapter",
+            "clip_lora",
         } and hasattr(self.aggregator, "aggregation_weighting"):
             self.aggregator.aggregation_weighting = "uniform"
         self.federated_method = aggregator.name
@@ -247,6 +248,7 @@ class ServerBase:
 
         if model_load_path:
             state = torch.load(model_load_path, map_location=device)
+            self.model.load_state_dict(state, strict=False)
             for user in self.ctx.users:
                 user.set_parameters(state)
 
@@ -322,6 +324,7 @@ class ServerBase:
             local_state = (
                 self._clone_state(user.get_parameters())
                 if self.defense.name == "iclr"
+                or bool(getattr(user.model, "client_scoped_lora", False))
                 else None
             )
             evaluation_state = self.ctx.new_model_state.get(
@@ -542,6 +545,12 @@ class ServerBase:
                 round_index=round_index,
             )
 
+            if str(getattr(self.model, "model_type", "")).lower() == "clip_lora":
+                for user_id in selected_ids:
+                    self.ctx.users[user_id].set_parameters(
+                        self.ctx.updated_model_state[user_id]
+                    )
+
             if (
                 bool(self.projres_config.get("enabled", False))
                 and round_index + 1 == self.projres_evaluation_round
@@ -638,6 +647,19 @@ class ServerBase:
             method_summary["paper_alignment"] = (
                 "CoOp-style shared soft text prompt with sample-weighted FedAvg"
             )
+        if str(getattr(self.model, "model_type", "")).lower() == "clip_lora":
+            method_summary["lora"] = {
+                "trainable_scope": "attention_lora_A_and_lora_B_only",
+                "client_storage": "independent_lora_factors_only",
+                "shared_clip_backbone": True,
+                "aggregation": str(
+                    f"factor_wise_{self.federated_method}"
+                ),
+                "aggregation_weighting": str(
+                    getattr(self.aggregator, "aggregation_weighting", "uniform")
+                ),
+                "frozen_backbone": True,
+            }
         with open(
             os.path.join(self.results_dir, "federated_method_summary.json"),
             "w",

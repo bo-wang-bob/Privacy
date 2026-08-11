@@ -769,7 +769,10 @@ class MembershipAuditor:
             "fedmia_cosine",
         }
         unsupported = sorted(set(self.attacks) - supported)
-        if self.model_type not in {"clip_mlp", "visual_adapter"}:
+        if self.model_type not in {
+            "clip_mlp",
+            "visual_adapter",
+        }:
             raise ValueError(
                 "low_fpr_full currently requires a frozen-CLIP feature model."
             )
@@ -999,9 +1002,14 @@ class MembershipAuditor:
             "fedmia_cosine",
         }
         unsupported = sorted(set(self.attacks) - supported)
-        if self.model_type not in {"clip_mlp", "visual_adapter"}:
+        if self.model_type not in {
+            "clip_mlp",
+            "visual_adapter",
+            "clip_lora",
+        }:
             raise ValueError(
-                "balanced_holdout currently requires a frozen-CLIP feature model."
+                "balanced_holdout requires a supported CLIP "
+                "parameter-efficient model."
             )
         if unsupported:
             raise ValueError(
@@ -2631,6 +2639,14 @@ class MembershipAuditor:
                         result.metadata.setdefault(
                             "signal_space", "adapter_input_projection_vectors"
                         )
+                elif self.model_type == "clip_lora":
+                    result.metadata.setdefault(
+                        "trainable_scope", trainable_scope_name(final_model)
+                    )
+                    result.metadata.setdefault(
+                        "lora_aggregation",
+                        f"factor_wise_{self.federated_method}",
+                    )
                 self.results.append(result)
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()

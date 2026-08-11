@@ -13,6 +13,8 @@ def trainable_scope_name(model: torch.nn.Module) -> str:
         if bool(getattr(model, "text_adapter_enabled", False)):
             return "visual_and_text_adapters"
         return "visual_adapter_only"
+    if model_type == "clip_lora":
+        return "clip_attention_lora_only"
     return "prompt_only"
 
 

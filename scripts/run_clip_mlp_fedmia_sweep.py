@@ -200,12 +200,13 @@ def build_jobs(
         config["aggregator"] = (
             "fedsgd"
             if str(config.get("model_type", "clip_mlp")).lower()
-            == "visual_adapter"
+            in {"visual_adapter", "clip_lora"}
             else "fedavg"
         )
         if str(config.get("model_type", "clip_mlp")).lower() in {
             "clip_mlp",
             "visual_adapter",
+            "clip_lora",
         }:
             config["aggregation_weighting"] = "uniform"
         config["sweep_name"] = sweep_name
@@ -609,6 +610,10 @@ def _projres_parameters_block(job, projres: dict[str, Any]) -> str:
     attacked_layer = {
         "clip_mlp": "classifier.0.weight",
         "visual_adapter": "adapter.net.0.weight",
+        "clip_lora": (
+            "clip_model.vision_model.encoder.layers.0.self_attn."
+            "q_proj.lora_A"
+        ),
     }.get(model_type, "first_trainable_linear_weight")
     return "\n".join(
         (
