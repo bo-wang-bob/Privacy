@@ -8,8 +8,8 @@ seeds: [42]
 # One anchor job per dataset/seed; the audit itself targets every client.
 target_client_ids: [0]
 
-# Visual Adapter keeps the FPL-style system-wide 16-shot data protocol while
-# using one mini-batch FedSGD update per client and communication round.
+# Visual Adapter uses the complete training split while retaining one
+# mini-batch FedSGD update per client and communication round.
 datasets:
   - name: caltech101
     overrides:
@@ -49,8 +49,8 @@ common:
   partition_mode: iid
   # Retained for config/CLI compatibility; ignored when partition_mode=iid.
   dirichlet_alpha: 0.1
-  use_full_dataset: false
-  fpl_shots: 16
+  use_full_dataset: true
+  fpl_shots: null
   local_epochs: 1
   learning_rate: 0.001
   # Keep the client learning rate constant for all communication rounds.

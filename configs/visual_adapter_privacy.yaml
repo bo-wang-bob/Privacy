@@ -27,8 +27,8 @@ visual_adapter:
 
 partition_mode: dirichlet
 dirichlet_alpha: 0.1
-use_full_dataset: false
-fpl_shots: 16
+use_full_dataset: true
+fpl_shots: null
 gpu: 0
 seed: 42
 cache_dir: ./checkpoints/clip-vit-base-patch32

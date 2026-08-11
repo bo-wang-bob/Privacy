@@ -125,13 +125,14 @@ python main.py --config configs/clip_mlp_privacy.yaml
 python main.py --model_type clip_mlp --attack fedmia_cosine
 ```
 
-### 16-shot 双侧 CLIP Adapter
+### 全数据双侧 CLIP Adapter
 
 该模式冻结 CLIP 图像和文本编码器，在图像特征与类别文本特征两侧分别训练
 `Linear -> ReLU -> Linear -> ReLU` 瓶颈。视觉侧按 `alpha` 做残差混合，文本侧
 按 `text_alpha` 做残差混合，之后分别归一化并计算相似度。每个通信轮中，每个参与
 客户端只使用一个 mini-batch 做一次 SGD 更新，服务器对两侧 Adapter 的更新直接
-等权平均，不按 batch 或本地数据量加权。它固定复用 FPL 的每类 16-shot 划分：
+等权平均，不按 batch 或本地数据量加权。它与 CLIP-MLP 一样使用完整训练集，
+不再执行按类别 few-shot 截断：
 
 ```bash
 python main.py --config configs/visual_adapter_privacy.yaml
@@ -146,12 +147,12 @@ CIFAR-100 与 Caltech101 默认使用 `a photo of a {class}.`；OxfordPets 使�
 `text_reduction`、`text_alpha` 和 `text_output_relu` 控制文本侧 Adapter；省略时
 分别继承视觉侧设置。历史配置若没有 `text_adapter_enabled`，仍按仅视觉侧运行。
 
-### 16-shot CLIP-LoRA
+### 全数据 CLIP-LoRA
 
 `clip_lora` 冻结原始 CLIP，只在图像与文本 Transformer 每层自注意力的
 Q/K/V 投影上训练 LoRA。基础配置使用 rank 2、`alpha=1`、dropout 0.25 和
 `alpha/sqrt(rank)` 缩放；图像侧 LoRA 会改变编码结果，因此训练和审计直接使用
-原始图像，不复用冻结特征缓存：
+原始图像，不复用冻结特征缓存。数据协议使用完整训练集：
 
 ```bash
 python main.py --config configs/clip_lora_privacy.yaml
@@ -236,7 +237,7 @@ ProjRes 汇总写入 `<实验组>_summary_projres.csv`；不会生成 HTML 文�
 定义与被观察轮次的 FedSGD 协议一致，即当前实际 batch；它使用完整非成员池计算
 低 FPR 指标。CLIP-MLP 的统一 sweep 不生成 ProjRes 结果。
 
-Visual Adapter 对应的 16-shot 五数据集 sweep 使用相同参数接口；严格 ProjRes
+Visual Adapter 对应的全数据五数据集 sweep 使用相同参数接口；严格 ProjRes
 攻击 Adapter 的第一层下采样参数：
 
 ```bash
@@ -362,13 +363,13 @@ audit:
 
 实验主要通过 YAML 管理，常用字段包括：
 
-- `model_type`：`prompt`、冻结 CLIP 图像编码器的 `clip_mlp`，或
-  16-shot `visual_adapter`；
+- `model_type`：`prompt`、冻结 CLIP 图像编码器的 `clip_mlp`、
+  `visual_adapter` 或 `clip_lora`；
 - `clip_mlp`：两层 MLP 的隐藏维度、dropout 与特征归一化设置；
 - `visual_adapter`：双侧特征维度、视觉/文本瓶颈 reduction、两侧残差混合系数、
-  输出 ReLU、图像特征缓存和可选文本模板；该模式固定使用 `fpl_shots: 16`；
+  输出 ReLU、图像特征缓存和可选文本模板；该模式使用完整训练集；
 - `clip_lora`：编码器侧、注意力目标投影、层范围、rank、alpha、dropout、缩放
-  方式和可选文本模板；该模式固定使用 `fpl_shots: 16`；
+  方式和可选文本模板；该模式使用完整训练集；
 - `aggregator`：联邦训练方法；
 - `total_users`、`sample_users`：客户端总数和每轮参与数；
 - `partition_mode`：`iid`、`dirichlet`、`pathological` 或 `auto`；

@@ -216,10 +216,10 @@ def validate_config(config: dict) -> None:
                 "visual_adapter FedSGD requires local_epochs=1 because each "
                 "client performs exactly one mini-batch step per round."
             )
-        if bool(config.get("use_full_dataset", False)) or fpl_shots != 16:
+        if not bool(config.get("use_full_dataset", False)) or fpl_shots is not None:
             raise ValueError(
-                "visual_adapter requires the FPL-style 16-shot setting: "
-                "use_full_dataset=false and fpl_shots=16."
+                "visual_adapter uses the full dataset and requires "
+                "use_full_dataset=true and fpl_shots=null."
             )
         reduction = int(adapter_config.get("reduction", 4))
         if reduction <= 0:
@@ -252,10 +252,10 @@ def validate_config(config: dict) -> None:
             raise ValueError("clip_lora requires factor-wise FedAvg or FedSGD.")
         if method == "fedsgd" and int(config["local_epochs"]) != 1:
             raise ValueError("clip_lora FedSGD requires local_epochs=1.")
-        if bool(config.get("use_full_dataset", False)) or fpl_shots != 16:
+        if not bool(config.get("use_full_dataset", False)) or fpl_shots is not None:
             raise ValueError(
-                "clip_lora requires the 16-shot setting: "
-                "use_full_dataset=false and fpl_shots=16."
+                "clip_lora uses the full dataset and requires "
+                "use_full_dataset=true and fpl_shots=null."
             )
         if str(lora_config.get("encoder", "both")).lower() not in {
             "vision",
@@ -1383,13 +1383,13 @@ def parse_args() -> dict:
         config["aggregator"] = "fedsgd"
         config["aggregation_weighting"] = "uniform"
         config["local_epochs"] = 1
-        config["fpl_shots"] = 16
-        config["use_full_dataset"] = False
+        config["fpl_shots"] = None
+        config["use_full_dataset"] = True
     elif args.model_type == "clip_lora":
         config["aggregator"] = "fedavg"
         config["aggregation_weighting"] = "uniform"
-        config["fpl_shots"] = 16
-        config["use_full_dataset"] = False
+        config["fpl_shots"] = None
+        config["use_full_dataset"] = True
     # A direct few-shot/alpha override denotes the Dirichlet experiment
     # family unless the caller explicitly selected another partition mode.
     if args.fpl_shots is not None and args.use_full_dataset is None:

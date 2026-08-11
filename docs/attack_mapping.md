@@ -142,11 +142,11 @@ FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的�
 这些映射保留每种攻击的观测权限和 FedAvg 协议边界，但不把 MLP 类别向量称为
 文本 prompt。完整入口见 `configs/clip_mlp_privacy.yaml`。
 
-## 16-shot 视觉 CLIP Adapter 场景
+## 全数据视觉 CLIP Adapter 场景
 
 `model_type: visual_adapter` 冻结 CLIP，只通过每客户端每轮一个 mini-batch 的
-FedSGD 训练视觉残差瓶颈，且配置强制 `fpl_shots: 16` 与
-`use_full_dataset: false`；服务器对参与客户端更新直接等权平均。损失、概率、表示、更新余弦、
+FedSGD 训练视觉残差瓶颈，并与 CLIP-MLP 一样使用完整训练集，即
+`fpl_shots: null` 与 `use_full_dataset: true`；服务器对参与客户端更新直接等权平均。损失、概率、表示、更新余弦、
 Nasr、PromptRes、PIPRA、RMIA、IMIA、YOQO、Canary 和 CodePoison 均复用其原有
 观测协议，但影子模型与 probe 只重置或更新 adapter 参数。
 
