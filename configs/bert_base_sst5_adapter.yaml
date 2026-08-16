@@ -4,18 +4,19 @@ model_path: ./checkpoints/bert-base-uncased
 dataset_path: ./data/huggingface/sst5
 dataset_name: sst5
 
-# Use synchronous FedSGD with 30 IID clients and one local batch of 32 examples
-# per communication round. This keeps the one-batch threat model but is a
-# larger-batch variant of Deng et al.'s batch-size-16 training protocol.
+# Use synchronous FedSGD with 30 IID clients and one local batch of 16 examples
+# per communication round, matching Deng et al.'s batch-size-16 protocol.
 total_users: 30
 sample_users: 30
-num_global_iters: 300
-batch_size: 32
+num_global_iters: 500
+batch_size: 16
 eval_batch_size: 32
-learning_rate: 0.001
-learning_rate_decay: 1.0
-learning_rate_decay_interval: 50
-eval_interval: 5
+# Keep the effective 5e-3 step through 300 completed rounds, then halve it for
+# the last 200 rounds to refine the SST-5 solution after its observed plateau.
+learning_rate: 0.005
+learning_rate_decay: 0.5
+learning_rate_decay_interval: 300
+eval_interval: 50
 aggregation_weighting: uniform
 
 max_length: 128
@@ -24,10 +25,10 @@ adapter:
   activation: relu
   classifier_dropout: 0.0
   gradient_checkpointing: false
-  # Preserve the pretrained representation at round 0. The Adapter residual
-  # branch becomes trainable as soon as its zero-initialized up projection
-  # receives the first gradient.
-  zero_init_up: true
+  # Initialize the up projection from N(0, 0.02^2), using the pretrained
+  # BERT initializer range, so both Adapter projections receive gradients from
+  # the first client step without an exact-zero residual branch.
+  zero_init_up: false
 
 # Keep real one-batch vanilla-SGD uploads and one scalar learning rate for all
 # trainable parameters, so cosine attacks retain their original definition.
@@ -35,7 +36,8 @@ optimization:
   client_optimizer: sgd
   momentum: 0.0
   weight_decay: 0.0
-  max_grad_norm: 1.0
+  # Zero disables gradient clipping and preserves the raw one-batch SGD update.
+  max_grad_norm: 0.0
 
 gpu: 0
 require_cuda: false
@@ -59,12 +61,15 @@ audit:
   audit_client_ids: [0]
   candidate_sampling: balanced_holdout
   audit_batch_size: 16
-  audit_interval: 10
+  # Collect every configured attack after 50, 100, ..., 500 completed rounds.
+  audit_interval: 50
   attack_audit_intervals:
-    loss_series: 10
-    avg_cosine: 10
-    fedmia_loss: 10
-    fedmia_cosine: 10
+    blackbox_loss: 50
+    loss_series: 50
+    grad_cosine: 50
+    avg_cosine: 50
+    fedmia_loss: 50
+    fedmia_cosine: 50
   signal_storage: compact
   # Deng et al. repeat each member state 100 times. This cap affects IMDB;
   # the smaller per-client SST-5/CoLA holdouts remain fully included.
@@ -73,10 +78,11 @@ audit:
 
 projres:
   enabled: true
-  evaluation_round: last
+  # Audit real target-client uploads after rounds 50, 100, ..., 500.
+  evaluation_interval: 50
   threshold: 0.01
   # Audit the complete observed FedSGD batch.
-  max_candidates: 32
+  max_candidates: 16
   min_nonmembers: 100
   max_nonmembers: 1000
   token_reduction: auto

@@ -1,20 +1,21 @@
-model_type: gpt2_adapter
-architecture: gpt2
-model_path: ./checkpoints/gpt2-large
-dataset_path: ./data/huggingface/sst5
-dataset_name: sst5
+model_type: bert_adapter
+architecture: bert
+model_path: ./checkpoints/bert-base-uncased
+dataset_path: ./data/huggingface/imdb
+dataset_name: imdb
 
-# Match BERT and the paper protocol: synchronous one-batch FedSGD with 16
-# examples per client and communication round.
+# Use synchronous FedSGD with 30 IID clients and one local batch of 16 examples
+# per communication round, matching Deng et al.'s batch-size-16 protocol.
 total_users: 30
 sample_users: 30
-num_global_iters: 500
+num_global_iters: 750
 batch_size: 16
-eval_batch_size: 16
-# Keep GPT2-Large on its independently tuned constant learning rate.
-learning_rate: 0.001
-learning_rate_decay: 1.0
-learning_rate_decay_interval: 50
+eval_batch_size: 32
+# IMDb was still improving at round 500 with 5e-3. Keep that rate through 500
+# completed rounds, then halve it for the final 250-round refinement phase.
+learning_rate: 0.005
+learning_rate_decay: 0.5
+learning_rate_decay_interval: 500
 eval_interval: 50
 aggregation_weighting: uniform
 
@@ -23,20 +24,17 @@ adapter:
   reduction: 2
   activation: relu
   classifier_dropout: 0.0
-  gradient_checkpointing: true
-  # Initialize the up projection from N(0, 0.02^2), using GPT2's pretrained
-  # initializer range instead of an exact-zero residual branch.
+  gradient_checkpointing: false
   zero_init_up: false
 
 optimization:
   client_optimizer: sgd
   momentum: 0.0
   weight_decay: 0.0
-  # Zero disables gradient clipping and preserves the raw one-batch SGD update.
   max_grad_norm: 0.0
 
 gpu: 0
-require_cuda: true
+require_cuda: false
 seed: 42
 save_models: false
 results_dir: ./results
@@ -54,10 +52,7 @@ audit:
   target_client_id: 0
   audit_client_ids: [0]
   candidate_sampling: balanced_holdout
-  # Match training/evaluation batching for candidate forward passes. Cosine
-  # gradients remain streamed one sample at a time.
   audit_batch_size: 16
-  # Collect every configured attack after 50, 100, ..., 500 completed rounds.
   audit_interval: 50
   attack_audit_intervals:
     blackbox_loss: 50
@@ -72,10 +67,8 @@ audit:
 
 projres:
   enabled: true
-  # Audit real target-client uploads after rounds 50, 100, ..., 500.
   evaluation_interval: 50
   threshold: 0.01
-  # Audit the complete observed FedSGD batch.
   max_candidates: 16
   min_nonmembers: 100
   max_nonmembers: 1000

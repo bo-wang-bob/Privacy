@@ -33,6 +33,52 @@ def _is_evaluation_round(
     return completed_round % eval_interval == 0 or completed_round == total_rounds
 
 
+def _resolve_projres_evaluation_rounds(
+    config: dict, total_rounds: int
+) -> tuple[int, ...]:
+    """Resolve backward-compatible single-round or periodic ProjRes schedules."""
+    if total_rounds <= 0:
+        raise ValueError("num_global_iters must be positive.")
+    configured_interval = config.get("evaluation_interval")
+    has_explicit_round = "evaluation_round" in config
+    if configured_interval is not None:
+        if has_explicit_round:
+            raise ValueError(
+                "Configure only one of projres.evaluation_interval and "
+                "projres.evaluation_round."
+            )
+        if isinstance(configured_interval, bool):
+            raise ValueError(
+                "projres.evaluation_interval must be a positive integer."
+            )
+        try:
+            interval = int(configured_interval)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "projres.evaluation_interval must be a positive integer."
+            ) from error
+        if interval <= 0 or str(configured_interval).strip() != str(interval):
+            raise ValueError(
+                "projres.evaluation_interval must be a positive integer."
+            )
+        rounds = list(range(interval, total_rounds + 1, interval))
+        if not rounds or rounds[-1] != total_rounds:
+            rounds.append(total_rounds)
+        return tuple(rounds)
+
+    configured_round = config.get("evaluation_round", "last")
+    if str(configured_round).lower() == "last":
+        evaluation_round = total_rounds
+    else:
+        evaluation_round = int(configured_round)
+    if not 1 <= evaluation_round <= total_rounds:
+        raise ValueError(
+            "projres.evaluation_round must be 'last' or a communication "
+            "round in [1, num_global_iters]."
+        )
+    return (evaluation_round,)
+
+
 def _scheduled_learning_rate(
     initial_learning_rate: float,
     decay: float,
@@ -191,18 +237,11 @@ class ServerBase:
                 "FedSGD uses exactly one mini-batch per client and requires "
                 "local_epochs=1."
             )
-        configured_projres_round = self.projres_config.get(
-            "evaluation_round", "last"
+        self.projres_evaluation_rounds = _resolve_projres_evaluation_rounds(
+            self.projres_config, self.num_glob_iters
         )
-        if str(configured_projres_round).lower() == "last":
-            self.projres_evaluation_round = self.num_glob_iters
-        else:
-            self.projres_evaluation_round = int(configured_projres_round)
-        if not 1 <= self.projres_evaluation_round <= self.num_glob_iters:
-            raise ValueError(
-                "projres.evaluation_round must be 'last' or a communication "
-                "round in [1, num_global_iters]."
-            )
+        self.projres_evaluation_round = self.projres_evaluation_rounds[-1]
+        self._projres_series_entries: list[dict] = []
         self.defense_config = defense_config or {"name": "none"}
         self.target_client_id = int(self.audit_config.get("target_client_id", 0))
         self.ensure_target = bool(self.audit_config.get("enabled", True)) and bool(
@@ -652,7 +691,7 @@ class ServerBase:
 
             if (
                 bool(self.projres_config.get("enabled", False))
-                and round_index + 1 == self.projres_evaluation_round
+                and round_index + 1 in self.projres_evaluation_rounds
             ):
                 projres_client_ids = list(self.auditor.audit_client_ids)
                 missing_clients = sorted(
@@ -664,7 +703,22 @@ class ServerBase:
                         f"{missing_clients}. Enable ensure_target_participation or "
                         "increase sample_users."
                     )
-                run_integrated_projres(
+                completed_round = round_index + 1
+                periodic_projres = len(self.projres_evaluation_rounds) > 1
+                if periodic_projres:
+                    projres_output_path = os.path.join(
+                        self.results_dir,
+                        "privacy_audit",
+                        "projres_rounds",
+                        f"round_{completed_round:04d}.json",
+                    )
+                else:
+                    projres_output_path = os.path.join(
+                        self.results_dir,
+                        "privacy_audit",
+                        "projres_strict.json",
+                    )
+                projres_payload = run_integrated_projres(
                     model=self.model,
                     users=self.ctx.users,
                     device=self.device,
@@ -680,12 +734,54 @@ class ServerBase:
                     dataset_name=self.dataset_name,
                     client_ids=projres_client_ids,
                     config=self.projres_config,
-                    output_path=os.path.join(
-                        self.results_dir,
-                        "privacy_audit",
-                        "projres_strict.json",
-                    ),
+                    output_path=projres_output_path,
                 )
+                if periodic_projres:
+                    privacy_audit_dir = os.path.join(
+                        self.results_dir, "privacy_audit"
+                    )
+                    os.makedirs(privacy_audit_dir, exist_ok=True)
+                    with open(
+                        os.path.join(privacy_audit_dir, "projres_strict.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as file:
+                        json.dump(projres_payload, file, indent=2, sort_keys=True)
+                        file.write("\n")
+                    self._projres_series_entries.append(
+                        {
+                            "communication_round": completed_round,
+                            "path": os.path.relpath(
+                                projres_output_path, privacy_audit_dir
+                            ),
+                        }
+                    )
+                    with open(
+                        os.path.join(privacy_audit_dir, "projres_series.json"),
+                        "w",
+                        encoding="utf-8",
+                    ) as file:
+                        json.dump(
+                            {
+                                "experiment": "periodic_integrated_projres",
+                                "evaluation_interval": int(
+                                    self.projres_config["evaluation_interval"]
+                                ),
+                                "scheduled_rounds": list(
+                                    self.projres_evaluation_rounds
+                                ),
+                                "completed_rounds": [
+                                    item["communication_round"]
+                                    for item in self._projres_series_entries
+                                ],
+                                "round_results": self._projres_series_entries,
+                                "latest_result": "projres_strict.json",
+                            },
+                            file,
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        file.write("\n")
 
             self.aggregator.aggregate(self.ctx)
             previous_selected_ids = set(selected_ids)

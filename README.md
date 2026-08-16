@@ -179,7 +179,7 @@ LoRA 工作槽位，结束后恢复全局槽位；客户端上传也只导出自
 
 文本入口复现 Deng 等人的 Adapter-based PEFT 协议，支持 SST-5、CoLA 和 IMDB。
 所选训练集以固定种子 IID 随机划分给 30 个客户端。BERT 与 GPT2-Large 每轮每客户端
-均使用一个大小为 32 的本地 batch。
+均使用一个大小为 16 的本地 batch。
 服务器执行同步等权 FedSGD。BERT 和 GPT2 的每个 Transformer block 后均插入
 `down -> ReLU -> up + residual`，down-projection ratio 为 2；预训练主干全部冻结，
 只训练各层 Adapter 与新增的任务分类头。SST-5 使用五分类头，CoLA 和 IMDB 使用
@@ -199,7 +199,7 @@ bash scripts/run_all_fedllm_attacks.sh
 ```
 
 默认依次运行 BERT-Base、GPT2-Large 在 SST-5、CoLA、IMDB 上的 6 个独立任务；
-每个任务均启用六种通用成员推理攻击和最终轮严格 ProjRes。每个一级结果目录仍只
+每个任务均启用六种通用成员推理攻击和每 50 轮一次的严格 ProjRes。每个一级结果目录仍只
 对应一次训练任务。正式运行前可检查完整展开参数：
 
 ```bash
@@ -241,11 +241,11 @@ python scripts/run_fedllm_adapter.py \
   --dataset sst5
 ```
 
-CoLA 和 IMDB 使用相同模型配置作为数据集预设，无需复制 YAML。例如：
+BERT 使用数据集专用配置保存不同轮数和学习率计划；GPT2-Large 仍使用共享模型配置。例如：
 
 ```bash
 python scripts/run_fedllm_adapter.py \
-  --config configs/bert_base_sst5_adapter.yaml \
+  --config configs/bert_base_cola_adapter.yaml \
   --dataset cola
 
 python scripts/run_fedllm_adapter.py \
@@ -253,20 +253,29 @@ python scripts/run_fedllm_adapter.py \
   --dataset imdb
 ```
 
-将 `--dataset` 分别替换为 `cola` 或 `imdb`，即可运行四种模型/数据集组合。
+BERT/IMDB 对应 `configs/bert_base_imdb_adapter.yaml`。GPT2-Large 可将 `--dataset`
+分别替换为 `cola` 或 `imdb`。
 入口会在配置中 `dataset_path` 的同级目录解析数据，例如
 `data/huggingface/cola` 和 `data/huggingface/imdb`。SST-5、CoLA 分别使用各自
 `train/validation`；IMDB 使用官方 `train/test`。
 所有 evaluation 样本都不会参与联邦训练，因此仍可作为有效全局非成员。
 
-BERT 与 GPT2-Large 默认均训练 300 轮，客户端学习率恒定为 `0.001`；BERT 允许
-CPU 调试，GPT2-Large 要求 CUDA。Adapter 的 up-projection 零初始化，使残差分支
-从恒等映射开始；全部可训练
-参数使用同一个标量学习率，并对每个真实 one-batch 客户端梯度执行 norm 1.0 裁剪。
+BERT/SST-5 默认训练 500 轮：前 300 轮学习率为 `0.005`，后 200 轮为
+`0.0025`。BERT/CoLA 与 BERT/IMDB 默认训练 750 轮：前 500 轮为 `0.005`，
+后 250 轮为 `0.0025`。GPT2-Large 仍训练 500 轮并使用恒定 `0.001`。
+BERT 允许 CPU 调试，GPT2-Large 要求 CUDA。
+Adapter 的 up-projection 使用预训练模型的
+initializer range（当前两者均为标准差 `0.02`）做小随机初始化，不再精确置零；全部
+可训练参数使用同一个标量学习率，真实 one-batch 客户端梯度不执行 norm clipping。
+普通任务在训练前记录一次基线，之后每 50 轮评估；SST-5/GPT2-Large 最后评估到
+第 500 轮，BERT/CoLA 与 BERT/IMDB 最后评估到第 750 轮。
 两个配置默认同时运行六种通用攻击。SST-5 与 IMDB 以 accuracy 为主任务指标；
 CoLA 以 MCC 为主，同时保留 accuracy 作为辅助指标。六种通用攻击包括：
 `blackbox_loss`、`loss_series`、`grad_cosine`、`avg_cosine`、`fedmia_loss` 和
-`fedmia_cosine`，并在最后一轮运行严格 ProjRes。通用攻击对目标客户端构建
+`fedmia_cosine`。六种通用攻击与严格 ProjRes 均按已完成通信轮每 50 轮统计，并包含
+各任务最后一轮；六种通用攻击的逐轮指标写入
+`privacy_audit/attack_round_metrics.csv`。其中 Blackbox-Loss 与 Grad-Cosine 每行只使用
+该轮信号，其余四种时序攻击使用截至该轮的累计信号。通用攻击对目标客户端构建
 train/evaluation 严格 1:1、逐类别同数量的候选池；非成员只来自从未参与任何客户端
 训练的独立 evaluation split。可用 `--attacks` 覆盖通用攻击列表，用 `--no-projres`
 只关闭 ProjRes。
@@ -277,12 +286,17 @@ IMDB/GPT2-Large 对 800 余个客户端测试样本逐一计算完整 PEFT 梯�
 其全部可配对样本。
 
 GPT2-Large 的逐样本梯度不会组成“候选数 × 全部 PEFT 参数”的常驻矩阵，而是逐样本
-计算与真实上传的精确余弦后立即释放。ProjRes 观察目标客户端最后一轮真实 FedSGD
+计算与真实上传的精确余弦后立即释放。ProjRes 每 50 轮观察一次目标客户端真实 FedSGD
 batch，攻击首个 Transformer block 后 Adapter 的 `down.weight`；成员定义严格等于
-该 batch，非成员来自独立 evaluation 分区，最多使用 1,000 个。
-BERT 与 GPT2-Large 的 batch-size-32 设置是相对论文 batch-size-16 协议的较大
-batch 变体，因此两者的 ProjRes 元数据都会记录 `paper_fedsgd_exact: false`。
-上述优化仍保留同步 vanilla SGD、真实客户端上传、六种通用攻击和最终轮 ProjRes；
+各轮对应 batch，非成员来自独立 evaluation 分区，最多使用 1,000 个。每轮完整结果
+写入 `privacy_audit/projres_rounds/round_NNNN.json`，索引保存在
+`privacy_audit/projres_series.json`；`projres_strict.json` 始终指向最近一轮结果以兼容
+已有分析脚本。
+BERT 与 GPT2-Large 均使用 batch size 16，因此真实 one-batch 上传满足 ProjRes 的
+batch-size-16 协议条件，元数据会记录 `paper_fedsgd_exact: true`。
+GPT2-Large 的训练、普通任务评估、ProjRes 非成员编码和通用攻击候选前向分块均设为
+16；余弦攻击仍逐样本流式计算梯度。
+上述优化仍保留同步 vanilla SGD、真实客户端上传，以及每 50 轮执行的七种攻击；
 没有通过关闭隐私评估提高普通任务准确率。
 
 `PromptFL` 是针对可训练 `prompt_learner` 定义的算法，不能直接应用到 MLP

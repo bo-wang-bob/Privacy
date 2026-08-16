@@ -171,6 +171,37 @@ def validate_config(config: dict) -> None:
     target_client_id = int(audit.get("target_client_id", 0))
     if not 0 <= target_client_id < int(config["total_users"]):
         raise ValueError("audit.target_client_id is outside the client range.")
+    projres = dict(config.get("projres", {}))
+    if "evaluation_interval" in projres and "evaluation_round" in projres:
+        raise ValueError(
+            "Configure only one of projres.evaluation_interval and "
+            "projres.evaluation_round."
+        )
+    if "evaluation_interval" in projres:
+        configured_interval = projres["evaluation_interval"]
+        if isinstance(configured_interval, bool):
+            raise ValueError(
+                "projres.evaluation_interval must be a positive integer."
+            )
+        try:
+            evaluation_interval = int(configured_interval)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "projres.evaluation_interval must be a positive integer."
+            ) from error
+        if (
+            evaluation_interval <= 0
+            or str(configured_interval).strip() != str(evaluation_interval)
+        ):
+            raise ValueError(
+                "projres.evaluation_interval must be a positive integer."
+            )
+    elif str(projres.get("evaluation_round", "last")).lower() != "last":
+        evaluation_round = int(projres["evaluation_round"])
+        if not 1 <= evaluation_round <= int(config["num_global_iters"]):
+            raise ValueError(
+                "projres.evaluation_round is outside the communication rounds."
+            )
 
 
 def resolve_path(value: str) -> Path:
@@ -246,7 +277,17 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
         ("privacy_audit.target_client_id", audit.get("target_client_id", 0)),
         ("privacy_audit.candidate_sampling", audit.get("candidate_sampling")),
         ("projres.enabled", projres.get("enabled", True)),
-        ("projres.evaluation_round", projres.get("evaluation_round", "last")),
+        (
+            "projres.evaluation_interval",
+            projres.get("evaluation_interval"),
+        ),
+        (
+            "projres.evaluation_round",
+            projres.get(
+                "evaluation_round",
+                None if "evaluation_interval" in projres else "last",
+            ),
+        ),
     )
     logger.info("Resolved FedLLM task configuration")
     for key, value in rows:

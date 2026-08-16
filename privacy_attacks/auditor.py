@@ -101,6 +101,10 @@ _FEDMIA_BASELINE_ATTACKS = {
     "avg_cosine",
 }
 _SINGLE_ROUND_ATTACKS = {"blackbox_loss", "grad_cosine"}
+_PERIODIC_METRIC_ATTACKS = _FEDMIA_BASELINE_ATTACKS | {
+    "fedmia_loss",
+    "fedmia_cosine",
+}
 
 
 def _signal_needs(attacks: set[str], full_signals: bool = False) -> dict[str, bool]:
@@ -1623,6 +1627,11 @@ class MembershipAuditor:
     def _single_round_index_for_attack(self, attack: str) -> int | None:
         if attack not in _SINGLE_ROUND_ATTACKS:
             return None
+        # An explicit per-attack interval intentionally promotes the otherwise
+        # single-round baseline to a periodic diagnostic.  Each stored point is
+        # still evaluated with the original single-round attack definition.
+        if attack in self.attack_audit_intervals:
+            return None
         selector = self.config.get("fedmia_baseline_single_round", "last")
         if isinstance(selector, str):
             normalized = selector.lower()
@@ -2739,6 +2748,102 @@ class MembershipAuditor:
             )
         raise AssertionError(f"Unhandled attack {attack}")
 
+    def _run_periodic_attack_prefix(
+        self, attack: str, observations: list[dict]
+    ) -> AttackResult:
+        """Evaluate one configured checkpoint without changing final metrics."""
+        if attack in _FEDMIA_BASELINE_ATTACKS:
+            selected = (
+                observations[-1:]
+                if attack in _SINGLE_ROUND_ATTACKS
+                else observations
+            )
+            return run_fedmia_baseline(
+                selected,
+                self.membership,
+                self.target_client_id,
+                attack,
+                "last",
+            )
+        measurement = "confidence" if attack == "fedmia_loss" else "cosine"
+        aggregation = str(
+            self.config.get(f"{attack}_aggregation", "mean")
+        )
+        tail = str(
+            self.config.get(
+                f"{attack}_tail", self.config.get("fedmia_tail", "upper")
+            )
+        )
+        return run_fedmia(
+            observations,
+            self.membership,
+            self.target_client_id,
+            measurement,
+            aggregation,
+            tail,
+            float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
+            self.seed,
+        )
+
+    def _write_periodic_attack_metrics(self) -> int:
+        """Persist one metric row per explicitly scheduled attack checkpoint."""
+        if self.pooled_client_audit:
+            return 0
+        rows = []
+        for attack in self.attacks:
+            if (
+                attack not in _PERIODIC_METRIC_ATTACKS
+                or attack not in self.attack_audit_intervals
+            ):
+                continue
+            observations = self._observations_for_attack(attack)
+            for position, observation in enumerate(observations):
+                completed_round = int(observation["round"]) + 1
+                try:
+                    result = self._run_periodic_attack_prefix(
+                        attack, observations[: position + 1]
+                    )
+                    summary = result.to_summary()
+                except Exception as error:
+                    error_key = f"round_metrics:{attack}:round_{completed_round}"
+                    self.errors[error_key] = f"{type(error).__name__}: {error}"
+                    logger.exception(
+                        "Periodic metric for %s at round %d failed",
+                        attack,
+                        completed_round,
+                    )
+                    continue
+                reportable = summary["reportable_metrics"]
+                rows.append(
+                    {
+                        "communication_round": completed_round,
+                        "attack": attack,
+                        "temporal_scope": (
+                            "single_round"
+                            if attack in _SINGLE_ROUND_ATTACKS
+                            else "cumulative"
+                        ),
+                        "auc": summary["auc"],
+                        "tpr_at_fpr_0.1": reportable["tpr_at_fpr_0.1"],
+                        "tpr_at_fpr_0.01": reportable["tpr_at_fpr_0.01"],
+                        "tpr_at_fpr_0.001": reportable["tpr_at_fpr_0.001"],
+                        "num_samples": summary["num_samples"],
+                        "member_count": summary["member_count"],
+                        "nonmember_count": summary["nonmember_count"],
+                        "fpr_resolution": summary["fpr_resolution"],
+                        "score_degenerate": summary["score_degenerate"],
+                    }
+                )
+        if not rows:
+            return 0
+        path = os.path.join(self.results_dir, "attack_round_metrics.csv")
+        with open(path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info("Saved %d periodic attack metric rows to %s", len(rows), path)
+        return len(rows)
+
     def finalize(
         self,
         final_model: torch.nn.Module,
@@ -2817,6 +2922,7 @@ class MembershipAuditor:
                 logger.exception("Membership attack %s failed", attack)
                 self.errors[attack] = f"{type(error).__name__}: {error}"
         summaries = [result.to_summary() for result in self.results]
+        periodic_metric_rows = self._write_periodic_attack_metrics()
         signal_health_enabled = bool(
             self.config.get("fedmia_signal_health_check", False)
         )
@@ -2937,6 +3043,12 @@ class MembershipAuditor:
                                 for key in observation
                             }
                         ),
+                        "periodic_metrics_file": (
+                            "attack_round_metrics.csv"
+                            if periodic_metric_rows
+                            else None
+                        ),
+                        "periodic_metric_rows": periodic_metric_rows,
                     },
                     "few_shot": {
                         "enabled": self.few_shot,

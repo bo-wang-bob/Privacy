@@ -142,12 +142,12 @@ Options forwarded to each single-task Python runner include:
   --target-client-id N     --require-cuda | --no-require-cuda
 
 ProjRes options:
-  --projres                Run strict ProjRes on the last round (default).
+  --projres                Run strict ProjRes every 50 completed rounds.
   --no-projres             Disable ProjRes.
   --skip-projres           Alias for --no-projres.
 
 Every real task prints its resolved configuration only when that task starts.
-Each task runs six common attacks and final-round strict ProjRes by default.
+Each task evaluates all six common attacks and strict ProjRes every 50 rounds.
 EOF
   "$python_bin" scripts/run_fedllm_adapter.py --help
   exit 0
@@ -227,13 +227,25 @@ if ((${#normalized_gpus[@]} == 0)); then
   exit 2
 fi
 
-config_for_model() {
-  case "$1" in
-    bert)
+config_for_task() {
+  local model="$1"
+  local dataset="$2"
+  case "$model/$dataset" in
+    bert/sst5)
       echo "configs/bert_base_sst5_adapter.yaml"
       ;;
-    gpt2)
+    bert/cola)
+      echo "configs/bert_base_cola_adapter.yaml"
+      ;;
+    bert/imdb)
+      echo "configs/bert_base_imdb_adapter.yaml"
+      ;;
+    gpt2/*)
       echo "configs/gpt2_large_sst5_adapter.yaml"
+      ;;
+    *)
+      echo "No configuration for model=$model dataset=$dataset" >&2
+      return 1
       ;;
   esac
 }
@@ -275,7 +287,7 @@ for model in "${normalized_models[@]}"; do
     task_models+=("$model")
     task_datasets+=("$dataset")
     task_gpus+=("$gpu")
-    task_configs+=("$(config_for_model "$model")")
+    task_configs+=("$(config_for_task "$model" "$dataset")")
     seen_tasks+="$task_key,"
     ((task_index += 1))
   done
