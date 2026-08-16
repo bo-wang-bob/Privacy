@@ -69,6 +69,7 @@ def per_sample_prompt_gradients(
     labels: torch.Tensor,
     parameter_names: Iterable[str] | None = None,
     forward: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    gradient_loss: str = "true_label",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return flattened gradients, compact signatures, and losses per sample."""
     allowed = None if parameter_names is None else set(parameter_names)
@@ -89,13 +90,25 @@ def per_sample_prompt_gradients(
     for image, label in zip(images, labels):
         model.zero_grad(set_to_none=True)
         logits = model_forward(image.unsqueeze(0))
-        loss = F.cross_entropy(logits, label.view(1))
-        gradients = torch.autograd.grad(loss, parameters, retain_graph=False)
+        true_label_loss = F.cross_entropy(logits, label.view(1))
+        if gradient_loss == "true_label":
+            differentiated_loss = true_label_loss
+        elif gradient_loss == "sum_over_labels":
+            differentiated_loss = (
+                logits.shape[1] * torch.logsumexp(logits, dim=1) - logits.sum(dim=1)
+            ).sum()
+        else:
+            raise ValueError(
+                "gradient_loss must be true_label or sum_over_labels."
+            )
+        gradients = torch.autograd.grad(
+            differentiated_loss, parameters, retain_graph=False
+        )
         flattened.append(
             torch.cat([gradient.detach().flatten().cpu() for gradient in gradients])
         )
         signatures.append(gradient_signature(list(gradients)))
-        losses.append(loss.detach().cpu())
+        losses.append(true_label_loss.detach().cpu())
     return torch.stack(flattened), torch.stack(signatures), torch.stack(losses)
 
 

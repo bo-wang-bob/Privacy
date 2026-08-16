@@ -813,6 +813,7 @@ class ServerBase:
                 base_states=base_states,
                 protocol_messages=self.ctx.protocol_messages,
                 released_states=self.ctx.new_model_state,
+                learning_rate=self.current_learning_rate,
             )
             self._save_round(round_index + 1)
             if _is_evaluation_round(

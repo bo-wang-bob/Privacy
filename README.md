@@ -199,7 +199,7 @@ bash scripts/run_all_fedllm_attacks.sh
 ```
 
 默认依次运行 BERT-Base、GPT2-Large 在 SST-5、CoLA、IMDB 上的 6 个独立任务；
-每个任务均启用六种通用成员推理攻击和每 50 轮一次的严格 ProjRes。每个一级结果目录仍只
+每个任务均启用十种通用成员推理攻击和每 50 轮一次的严格 ProjRes。每个一级结果目录仍只
 对应一次训练任务。正式运行前可检查完整展开参数：
 
 ```bash
@@ -268,21 +268,29 @@ Adapter 的 down-projection 使用预训练模型的 initializer range（当前�
 identity 开始；全部可训练参数使用同一个标量学习率，真实 one-batch 客户端梯度不执行
 norm clipping。
 普通任务在训练前记录一次基线，之后每 50 轮评估，最后评估到第 500 轮。
-两个配置默认同时运行六种通用攻击。SST-5 与 IMDB 以 accuracy 为主任务指标；
-CoLA 以 MCC 为主，同时保留 accuracy 作为辅助指标。六种通用攻击包括：
+两个配置默认同时运行十种通用攻击。SST-5 与 IMDB 以 accuracy 为主任务指标；
+CoLA 以 MCC 为主，同时保留 accuracy 作为辅助指标。十种通用攻击包括：
 `blackbox_loss`、`loss_series`、`grad_cosine`、`avg_cosine`、`fedmia_loss` 和
-`fedmia_cosine`。六种通用攻击与严格 ProjRes 均按已完成通信轮每 50 轮统计，并包含
-各任务最后一轮；六种通用攻击的逐轮指标写入
-`privacy_audit/attack_round_metrics.csv`。其中 Blackbox-Loss 与 Grad-Cosine 每行只使用
-该轮信号，其余四种时序攻击使用截至该轮的累计信号。通用攻击从目标客户端训练分区
-抽取 100 个成员，并从所有客户端的独立 evaluation 分区汇总抽取 1,000 个从未训练的
-非成员；每个类别的非成员数量严格等于成员数量的 10 倍，因此两组标签分布完全一致。
-固定种子、分层、无放回抽样得到的同一候选池会被六种攻击和所有轮次共同复用，FPR
-最小步长为 `0.001`。可用 `--attacks` 覆盖通用攻击列表，用 `--no-projres` 只关闭
-ProjRes。
+`fedmia_cosine`，以及 `gradient_diff`、`score_diff`、`score_ratio` 和 `fta`。
+十种通用攻击与严格 ProjRes 均按已完成通信轮每 50 轮统计，并包含
+各任务最后一轮；十种通用攻击的逐轮指标写入
+`privacy_audit/attack_round_metrics.csv`。BERT 的 `grad_cosine`、`gradient_diff`、
+`score_diff` 和 `score_ratio` 在每个审计轮独立使用目标客户端该轮真实上传 Batch 作为
+成员，并从所有客户端的独立 evaluation 分区按该 Batch 的标签直方图无放回抽取 10 倍
+非成员；攻击公式保持不变，不跨轮合并不同候选样本。最终 `summary.json` 使用最后一个
+审计轮，逐轮 CSV 保留全部检查点。Batch 为 16 时有 160 个非成员，因此该视图主要报告
+AUC 与 `TPR@1%FPR`，`TPR@0.1%FPR` 明确不可解析；逐轮候选索引另存为
+`privacy_audit/exact_batch_candidate_selection.pt`。
 
-同一候选池还固定派生一个逐类别严格匹配的 100 成员/100 非成员视图，用于对照
-ProjRes 论文的平衡评估规模。六种攻击不会重复计算分数；最终结果在
+其余攻击仍从目标客户端训练分区抽取 100 个历史成员，并从全局独立 evaluation 池抽取
+1,000 个从未训练的标签比例匹配非成员。该固定 100/1000 候选池跨轮复用，FPR 最小步长
+为 `0.001`；FTA 首个检查点使用该轮更新前/后两个模型快照，之后使用实际通信轮编号上的
+OLS 斜率。GPT2-Large 当前仍对全部十种攻击使用固定候选池。可用 `--attacks` 覆盖攻击
+列表，用 `--no-projres` 只关闭 ProjRes。
+
+固定候选池还派生一个逐类别严格匹配的 100 成员/100 非成员视图，用于对照
+ProjRes 论文的平衡评估规模。BERT 的四种真实 Batch 攻击不使用该历史成员视图；其余
+攻击最终结果在
 `summary.json` 的每个攻击项下增加 `paper_balanced_evaluation`，逐轮结果在
 `attack_round_metrics.csv` 增加 `paper_100_100_*` 列。100 个非成员只能正式解析到
 1% FPR，因此该视图的 `TPR@0.1%FPR` 记为不可用，低 FPR 主结论仍使用 100/1000 视图。
@@ -294,7 +302,8 @@ BERT 还启用只排名、不修改训练的 ICLR 分析。在第 50、100、…
 `iclr_round_metrics.csv`，逐样本分数写入 `iclr_round_samples.csv`，已完成轮次索引写入
 `iclr_series.json`，完整汇总写入
 `defense_summary.json`；最终还会把具有稳定
-本地索引的 100 个审计成员与六种通用攻击结果对齐。GPT2-Large 暂不启用 ICLR。
+本地索引的 100 个固定审计成员与非 Batch 通用攻击结果对齐；四种真实 Batch 攻击的
+逐轮关系可由保存的 Batch 本地索引另行配对分析。GPT2-Large 暂不启用 ICLR。
 同轮 ICLR 与 ProjRes 还会按
 `communication_round + client_id + batch_position + local_sample_index` 严格连接，结果写入
 `privacy_audit/iclr_projres_samples.csv`、`iclr_projres_relationship.csv` 和

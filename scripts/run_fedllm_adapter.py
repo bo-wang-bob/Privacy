@@ -56,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attacks",
         help=(
-            "Comma-separated common attacks. Defaults to the six attacks in "
+            "Comma-separated common attacks. Defaults to the ten attacks in "
             "the YAML configuration."
         ),
     )
@@ -100,9 +100,16 @@ def load_config(args: argparse.Namespace) -> dict:
         config["dataset_name"] = args.dataset
         config["dataset_path"] = str(configured_path.parent / args.dataset)
     if args.attacks is not None:
-        config.setdefault("audit", {})["attacks"] = [
+        audit = config.setdefault("audit", {})
+        audit["attacks"] = [
             attack.strip() for attack in args.attacks.split(",") if attack.strip()
         ]
+        if "exact_batch_membership_attacks" in audit:
+            audit["exact_batch_membership_attacks"] = [
+                attack
+                for attack in audit["exact_batch_membership_attacks"]
+                if attack in audit["attacks"]
+            ]
     if args.target_client_id is not None:
         config.setdefault("audit", {})["target_client_id"] = (
             args.target_client_id
@@ -158,6 +165,10 @@ def validate_config(config: dict) -> None:
         "avg_cosine",
         "fedmia_loss",
         "fedmia_cosine",
+        "gradient_diff",
+        "score_diff",
+        "score_ratio",
+        "fta",
     }
     audit = dict(config.get("audit", {}))
     unknown_attacks = sorted(set(audit.get("attacks", [])) - supported_attacks)
@@ -168,6 +179,53 @@ def validate_config(config: dict) -> None:
             + ". Unsupported: "
             + ", ".join(unknown_attacks)
         )
+    exact_batch_attacks = audit.get("exact_batch_membership_attacks", [])
+    if not isinstance(exact_batch_attacks, list):
+        raise ValueError(
+            "audit.exact_batch_membership_attacks must be a list."
+        )
+    supported_exact_batch_attacks = {
+        "grad_cosine",
+        "gradient_diff",
+        "score_diff",
+        "score_ratio",
+    }
+    unknown_exact_batch_attacks = sorted(
+        set(exact_batch_attacks) - supported_exact_batch_attacks
+    )
+    if unknown_exact_batch_attacks:
+        raise ValueError(
+            "Exact-batch membership supports only: "
+            + ", ".join(sorted(supported_exact_batch_attacks))
+        )
+    missing_exact_batch_attacks = sorted(
+        set(exact_batch_attacks) - set(audit.get("attacks", []))
+    )
+    if missing_exact_batch_attacks:
+        raise ValueError(
+            "Exact-batch attacks must also appear in audit.attacks: "
+            + ", ".join(missing_exact_batch_attacks)
+        )
+    exact_batch_ratio = audit.get(
+        "exact_batch_nonmember_to_member_ratio",
+        audit.get("nonmember_to_member_ratio", 1),
+    )
+    if (
+        isinstance(exact_batch_ratio, bool)
+        or int(exact_batch_ratio) < 1
+        or float(exact_batch_ratio) != int(exact_batch_ratio)
+    ):
+        raise ValueError(
+            "audit.exact_batch_nonmember_to_member_ratio must be a positive "
+            "integer."
+        )
+    if float(audit.get("score_ratio_damping", 1e-6)) <= 0:
+        raise ValueError("audit.score_ratio_damping must be positive.")
+    if str(audit.get("fta_measurement", "confidence")).lower() not in {
+        "confidence",
+        "loss",
+    }:
+        raise ValueError("audit.fta_measurement must be confidence or loss.")
     candidate_sampling = str(
         audit.get("candidate_sampling", "legacy")
     ).lower()
@@ -178,6 +236,11 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "Text Adapter experiments support candidate_sampling=legacy or "
             "balanced_global_holdout."
+        )
+    if exact_batch_attacks and candidate_sampling != "balanced_global_holdout":
+        raise ValueError(
+            "Exact-batch membership requires "
+            "candidate_sampling=balanced_global_holdout."
         )
     if candidate_sampling == "balanced_global_holdout":
         ratio = float(audit.get("nonmember_to_member_ratio", 1.0))
@@ -345,6 +408,14 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
             config.get("optimization", {}).get("max_grad_norm", 0.0),
         ),
         ("privacy_audit.attacks", ", ".join(audit.get("attacks", []))),
+        (
+            "privacy_audit.exact_batch_membership_attacks",
+            ", ".join(audit.get("exact_batch_membership_attacks", [])),
+        ),
+        (
+            "privacy_audit.exact_batch_nonmember_ratio",
+            audit.get("exact_batch_nonmember_to_member_ratio"),
+        ),
         ("privacy_audit.target_client_id", audit.get("target_client_id", 0)),
         ("privacy_audit.candidate_sampling", audit.get("candidate_sampling")),
         ("iclr.enabled", defense.get("name", "none") == "iclr"),

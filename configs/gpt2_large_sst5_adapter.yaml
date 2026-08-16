@@ -52,6 +52,10 @@ audit:
     - avg_cosine
     - fedmia_loss
     - fedmia_cosine
+    - gradient_diff
+    - score_diff
+    - score_ratio
+    - fta
   target_client_id: 0
   audit_client_ids: [0]
   candidate_sampling: balanced_global_holdout
@@ -69,6 +73,12 @@ audit:
     avg_cosine: 50
     fedmia_loss: 50
     fedmia_cosine: 50
+    gradient_diff: 50
+    score_diff: 50
+    score_ratio: 50
+    fta: 50
+  score_ratio_damping: 1.0e-6
+  fta_measurement: confidence
   signal_storage: compact
   low_fpr_min_nonmembers: 1000
   low_fpr_max_members: 100

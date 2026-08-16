@@ -30,6 +30,7 @@ from privacy_attacks.quantile import run_quantile_mia
 from privacy_attacks.query_attacks import run_canary, run_yoqo
 from privacy_attacks.rmia import run_rmia
 from privacy_attacks.transfer import run_transfer_representation_attack
+from privacy_attacks.update_attacks import run_update_attack
 from privacy_attacks.whitebox import run_active_whitebox, run_passive_whitebox
 from privacy_defenses import (
     attach_hamp_output_transform,
@@ -51,6 +52,10 @@ SUPPORTED_ATTACKS = {
     "nasr_active",
     "fedmia_loss",
     "fedmia_cosine",
+    "gradient_diff",
+    "score_diff",
+    "score_ratio",
+    "fta",
     "transfer_representation",
     "codepoison",
     "pipra",
@@ -75,6 +80,10 @@ POOLED_CLIENT_ATTACKS = {
     "nasr_passive",
     "fedmia_loss",
     "fedmia_cosine",
+    "gradient_diff",
+    "score_diff",
+    "score_ratio",
+    "fta",
     "transfer_representation",
     "rmia",
     "quantile_mia",
@@ -83,8 +92,12 @@ POOLED_CLIENT_ATTACKS = {
 
 _CLIENT_CANDIDATE_FIELDS = {
     "confidence",
+    "pre_confidence",
+    "true_label_confidence",
+    "pre_true_label_confidence",
     "cosine",
     "gradient_difference",
+    "gradient_diff_score",
     "probabilities",
     "representations",
     "promptres",
@@ -100,11 +113,19 @@ _FEDMIA_BASELINE_ATTACKS = {
     "grad_cosine",
     "avg_cosine",
 }
+_UPDATE_ATTACKS = {"gradient_diff", "score_diff", "score_ratio", "fta"}
+_EXACT_BATCH_MEMBERSHIP_ATTACKS = {
+    "grad_cosine",
+    "gradient_diff",
+    "score_diff",
+    "score_ratio",
+}
+_TARGET_ONLY_SIGNAL_ATTACKS = _FEDMIA_BASELINE_ATTACKS | _UPDATE_ATTACKS
 _SINGLE_ROUND_ATTACKS = {"blackbox_loss", "grad_cosine"}
 _PERIODIC_METRIC_ATTACKS = _FEDMIA_BASELINE_ATTACKS | {
     "fedmia_loss",
     "fedmia_cosine",
-}
+} | _UPDATE_ATTACKS
 
 
 def _signal_needs(attacks: set[str], full_signals: bool = False) -> dict[str, bool]:
@@ -113,14 +134,27 @@ def _signal_needs(attacks: set[str], full_signals: bool = False) -> dict[str, bo
         "confidence": full_signals
         or bool(
             attacks
-            & {"blackbox_loss", "loss_series", "nasr_passive", "fedmia_loss"}
+            & {
+                "blackbox_loss",
+                "loss_series",
+                "nasr_passive",
+                "fedmia_loss",
+                "score_diff",
+                "score_ratio",
+                "fta",
+            }
         ),
+        "pre_confidence": full_signals
+        or bool(attacks & {"score_diff", "score_ratio", "fta"}),
+        "true_label_confidence": full_signals or "fta" in attacks,
+        "pre_true_label_confidence": full_signals or "fta" in attacks,
         "cosine": full_signals
         or bool(
             attacks
             & {"grad_cosine", "avg_cosine", "nasr_passive", "fedmia_cosine"}
         ),
         "promptres": full_signals or "promptres" in attacks,
+        "gradient_diff_score": full_signals or "gradient_diff" in attacks,
         "whitebox_features": full_signals or "nasr_passive" in attacks,
         "probabilities": full_signals
         or bool(attacks & {"nasr_passive", "rmia", "quantile_mia"}),
@@ -136,6 +170,8 @@ def _signal_needs(attacks: set[str], full_signals: bool = False) -> dict[str, bo
 
 class MembershipAuditor:
     """Collect once, then run configured parameter-efficient membership attacks."""
+
+    exact_batch_membership_attacks: set[str] = set()
 
     def __init__(
         self,
@@ -205,7 +241,17 @@ class MembershipAuditor:
         requested_attacks = set(self.attacks)
         configured_needs = _signal_needs(requested_attacks, full_signals)
         self._needs_confidence = configured_needs["confidence"]
+        self._needs_pre_confidence = configured_needs["pre_confidence"]
+        self._needs_true_label_confidence = configured_needs[
+            "true_label_confidence"
+        ]
+        self._needs_pre_true_label_confidence = configured_needs[
+            "pre_true_label_confidence"
+        ]
         self._needs_cosine = configured_needs["cosine"]
+        self._needs_gradient_diff_score = configured_needs[
+            "gradient_diff_score"
+        ]
         self._needs_promptres = configured_needs["promptres"]
         self._needs_whitebox_features = configured_needs["whitebox_features"]
         self._needs_probabilities = configured_needs["probabilities"]
@@ -357,6 +403,54 @@ class MembershipAuditor:
             raise ValueError(
                 "audit.nonmember_to_member_ratio must be positive."
             )
+        configured_batch_attacks = self.config.get(
+            "exact_batch_membership_attacks", []
+        )
+        if not isinstance(configured_batch_attacks, list):
+            raise ValueError(
+                "audit.exact_batch_membership_attacks must be a list."
+            )
+        self.exact_batch_membership_attacks = {
+            str(attack).lower() for attack in configured_batch_attacks
+        }
+        unsupported_batch_attacks = sorted(
+            self.exact_batch_membership_attacks
+            - _EXACT_BATCH_MEMBERSHIP_ATTACKS
+        )
+        if unsupported_batch_attacks:
+            raise ValueError(
+                "Exact-batch membership is supported only for: "
+                + ", ".join(sorted(_EXACT_BATCH_MEMBERSHIP_ATTACKS))
+                + ". Unsupported: "
+                + ", ".join(unsupported_batch_attacks)
+            )
+        unconfigured_batch_attacks = sorted(
+            self.exact_batch_membership_attacks - set(self.attacks)
+        )
+        if unconfigured_batch_attacks:
+            raise ValueError(
+                "Exact-batch attacks must also appear in audit.attacks: "
+                + ", ".join(unconfigured_batch_attacks)
+            )
+        if self.exact_batch_membership_attacks and self.pooled_client_audit:
+            raise ValueError(
+                "Exact-batch membership currently requires one audit client."
+            )
+        configured_exact_batch_ratio = self.config.get(
+            "exact_batch_nonmember_to_member_ratio",
+            self.nonmember_to_member_ratio,
+        )
+        self.exact_batch_nonmember_ratio = int(configured_exact_batch_ratio)
+        if (
+            isinstance(configured_exact_batch_ratio, bool)
+            or self.exact_batch_nonmember_ratio < 1
+            or float(configured_exact_batch_ratio)
+            != self.exact_batch_nonmember_ratio
+        ):
+            raise ValueError(
+                "audit.exact_batch_nonmember_to_member_ratio must be a "
+                "positive integer."
+            )
         if self.candidate_sampling_mode == "balanced_global_holdout" and (
             not self.nonmember_to_member_ratio.is_integer()
             or self.nonmember_to_member_ratio < 1
@@ -427,6 +521,10 @@ class MembershipAuditor:
         if self.audit_interval <= 0 or self.audit_batch_size <= 0:
             raise ValueError("audit_interval and audit_batch_size must be positive.")
         self.observations: list[dict] = []
+        self.exact_batch_observations: list[dict] = []
+        self.exact_batch_candidate_selections: list[dict] = []
+        self._exact_batch_nonmember_dataset = None
+        self._exact_batch_nonmember_groups = None
         self.results = []
         self.errors: dict[str, str] = {}
         self.candidate_inputs_are_features = False
@@ -822,6 +920,10 @@ class MembershipAuditor:
             "avg_cosine",
             "fedmia_loss",
             "fedmia_cosine",
+            "gradient_diff",
+            "score_diff",
+            "score_ratio",
+            "fta",
         }
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
@@ -1235,6 +1337,10 @@ class MembershipAuditor:
             "avg_cosine",
             "fedmia_loss",
             "fedmia_cosine",
+            "gradient_diff",
+            "score_diff",
+            "score_ratio",
+            "fta",
         }
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
@@ -1261,6 +1367,13 @@ class MembershipAuditor:
             for user in users
             if len(user.test_data)
         ]
+        if self.exact_batch_membership_attacks:
+            self._exact_batch_nonmember_dataset = ConcatDataset(
+                nonmember_datasets
+            )
+            self._exact_batch_nonmember_groups = group_idx_by_class(
+                self._exact_batch_nonmember_dataset, self.num_classes
+            )
 
         image_parts = []
         label_parts = []
@@ -1540,6 +1653,10 @@ class MembershipAuditor:
             "avg_cosine",
             "fedmia_loss",
             "fedmia_cosine",
+            "gradient_diff",
+            "score_diff",
+            "score_ratio",
+            "fta",
         }
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
@@ -1812,6 +1929,128 @@ class MembershipAuditor:
                 for tensor in tensors
             ]
         return torch.cat(tensors)
+
+    def _build_exact_batch_candidates(self, round_index: int) -> dict:
+        """Pair the target client's real upload batch with matched holdouts."""
+        target = self.users[self.target_client_id]
+        if target.last_train_batch is None:
+            raise ValueError(
+                "Exact-batch membership requires the target client's retained "
+                "local-update batch."
+            )
+        if (
+            self._exact_batch_nonmember_dataset is None
+            or self._exact_batch_nonmember_groups is None
+        ):
+            raise ValueError(
+                "Exact-batch membership requires the never-trained global "
+                "evaluation pool from candidate_sampling=balanced_global_holdout."
+            )
+        member_inputs, member_labels = target.last_train_batch
+        member_inputs = member_inputs.detach().cpu()
+        member_labels = member_labels.detach().cpu().long().reshape(-1)
+        if member_labels.numel() < 2:
+            raise ValueError(
+                "Exact-batch membership needs at least two batch members."
+            )
+        member_histogram = torch.bincount(
+            member_labels, minlength=self.num_classes
+        )
+        ratio = self.exact_batch_nonmember_ratio
+        sampling_seed = (
+            self.seed
+            + 1000003 * (int(round_index) + 1)
+            + 104729 * (int(self.target_client_id) + 1)
+        )
+        selected_nonmembers = []
+        for class_id, member_count in enumerate(member_histogram.tolist()):
+            if member_count == 0:
+                continue
+            candidates = self._exact_batch_nonmember_groups[class_id]
+            required = int(member_count) * ratio
+            if len(candidates) < required:
+                raise ValueError(
+                    "Exact-batch label matching lacks never-trained "
+                    f"nonmembers for class {class_id}: required={required}, "
+                    f"available={len(candidates)}."
+                )
+            generator = torch.Generator().manual_seed(
+                sampling_seed + 2 * class_id
+            )
+            order = torch.randperm(len(candidates), generator=generator)
+            selected_nonmembers.extend(
+                candidates[position] for position in order[:required].tolist()
+            )
+        shuffle_generator = torch.Generator().manual_seed(
+            sampling_seed + 999983
+        )
+        order = torch.randperm(
+            len(selected_nonmembers), generator=shuffle_generator
+        )
+        nonmember_indices = torch.tensor(
+            [selected_nonmembers[position] for position in order.tolist()],
+            dtype=torch.long,
+        )
+        nonmember_inputs, nonmember_labels = self._collect_many(
+            [Subset(self._exact_batch_nonmember_dataset, nonmember_indices)],
+            int(nonmember_indices.numel()),
+        )
+        nonmember_histogram = torch.bincount(
+            nonmember_labels, minlength=self.num_classes
+        )
+        if not torch.equal(
+            nonmember_histogram, member_histogram * ratio
+        ):
+            raise AssertionError(
+                "Exact-batch nonmember label matching drifted."
+            )
+        inputs = self._cat_candidate_inputs(
+            (member_inputs, nonmember_inputs)
+        )
+        labels = torch.cat((member_labels, nonmember_labels))
+        membership = torch.cat(
+            (
+                torch.ones(member_labels.numel(), dtype=torch.long),
+                torch.zeros(nonmember_labels.numel(), dtype=torch.long),
+            )
+        )
+        local_indices = getattr(target, "last_train_indices", None)
+        if local_indices is None:
+            local_indices = torch.full(
+                (member_labels.numel(),), -1, dtype=torch.long
+            )
+        else:
+            local_indices = local_indices.detach().cpu().long().reshape(-1)
+        if local_indices.numel() != member_labels.numel():
+            raise ValueError(
+                "Retained target-client batch indices do not match the batch size."
+            )
+        return {
+            "inputs": inputs,
+            "labels": labels,
+            "membership": membership,
+            "member_local_indices": local_indices,
+            "nonmember_pool_indices": nonmember_indices,
+            "selection": {
+                "communication_round": int(round_index) + 1,
+                "target_client_id": int(self.target_client_id),
+                "membership_definition": "current_round_exact_upload_batch",
+                "nonmember_training_exposure": "never_trained",
+                "label_matching_mode": "exact_batch_histogram_ratio",
+                "sampling_seed": int(sampling_seed),
+                "nonmember_to_member_ratio": int(ratio),
+                "member_count": int(member_labels.numel()),
+                "nonmember_count": int(nonmember_labels.numel()),
+                "member_label_histogram": member_histogram.tolist(),
+                "nonmember_label_histogram": nonmember_histogram.tolist(),
+                "member_local_indices": local_indices,
+                "nonmember_pool_indices": nonmember_indices,
+                "nonmember_index_convention": (
+                    "zero-based positions in the client-id ordered "
+                    "concatenation of all independent evaluation datasets"
+                ),
+            },
+        }
 
     def _collect_source_balanced(
         self,
@@ -2198,7 +2437,7 @@ class MembershipAuditor:
         if (
             self.signal_storage != "full"
             and not self.pooled_client_audit
-            and set(active_attacks).issubset(_FEDMIA_BASELINE_ATTACKS)
+            and set(active_attacks).issubset(_TARGET_ONLY_SIGNAL_ATTACKS)
         ):
             return [
                 user_id
@@ -2222,6 +2461,13 @@ class MembershipAuditor:
         }
 
     def _observations_for_attack(self, attack: str) -> list[dict]:
+        if attack in self.exact_batch_membership_attacks:
+            return [
+                observation
+                for observation in self.exact_batch_observations
+                if attack in observation["attacks"]
+                and self._attack_is_due(attack, int(observation["round"]))
+            ]
         return [
             observation
             for observation in self.observations
@@ -2233,8 +2479,20 @@ class MembershipAuditor:
         self,
         model: torch.nn.Module,
         require_representation: bool = True,
+        candidate_inputs: torch.Tensor | None = None,
+        candidate_labels: torch.Tensor | None = None,
+        candidate_inputs_are_features: bool | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Evaluate large audit candidate pools without one oversized CLIP batch."""
+        inputs = self.images if candidate_inputs is None else candidate_inputs
+        labels_cpu = self.labels if candidate_labels is None else candidate_labels
+        inputs_are_features = (
+            getattr(self, "candidate_inputs_are_features", False)
+            if candidate_inputs_are_features is None
+            else bool(candidate_inputs_are_features)
+        )
+        if inputs.shape[0] != labels_cpu.numel():
+            raise ValueError("Candidate inputs and labels must have equal length.")
         logits_parts = []
         representation_parts = []
         loss_parts = []
@@ -2242,11 +2500,11 @@ class MembershipAuditor:
         feature_representation = getattr(
             model, "get_audit_representation_from_image_features", None
         )
-        for start in range(0, self.labels.numel(), self.audit_batch_size):
+        for start in range(0, labels_cpu.numel(), self.audit_batch_size):
             stop = start + self.audit_batch_size
-            images = self.images[start:stop].to(self.device)
-            labels = self.labels[start:stop].to(self.device)
-            if getattr(self, "candidate_inputs_are_features", False):
+            images = inputs[start:stop].to(self.device)
+            labels = labels_cpu[start:stop].to(self.device)
+            if inputs_are_features:
                 if feature_forward is None:
                     raise TypeError(
                         "Cached audit features require forward_from_image_features."
@@ -2288,6 +2546,7 @@ class MembershipAuditor:
         self,
         model: torch.nn.Module,
         parameter_names: list[str],
+        gradient_loss: str = "true_label",
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute per-sample gradients while bounding resident GPU images."""
         gradient_parts = []
@@ -2313,6 +2572,7 @@ class MembershipAuditor:
                 self.labels[start:stop].to(self.device),
                 parameter_names,
                 forward=feature_forward,
+                gradient_loss=gradient_loss,
             )
             gradient_parts.append(gradients)
             signature_parts.append(signatures)
@@ -2372,12 +2632,55 @@ class MembershipAuditor:
             )
         return torch.cat(score_parts).t().contiguous()
 
-    def _raw_input_gradient_cosines(
+    def _cached_feature_gradient_differences(
         self,
         model: torch.nn.Module,
         parameter_names: list[str],
-        updates: list[tuple[dict[str, torch.Tensor], float]],
+        updates: list[torch.Tensor],
     ) -> torch.Tensor:
+        """Compute the exact Gradient-Diff statistic for cached CLIP features."""
+        if not updates:
+            raise ValueError("At least one client gradient is required.")
+        feature_forward = getattr(model, "forward_from_image_features", None)
+        if feature_forward is None:
+            raise TypeError("Cached features require forward_from_image_features.")
+        update_matrix = torch.stack([update.detach().cpu() for update in updates])
+        score_parts = []
+        gradient_batch_size = int(
+            self.config.get("low_fpr_gradient_batch_size", 8)
+        )
+        if gradient_batch_size <= 0:
+            raise ValueError("low_fpr_gradient_batch_size must be positive.")
+        for start in range(0, self.labels.numel(), gradient_batch_size):
+            stop = start + gradient_batch_size
+            gradients, _, _ = per_sample_prompt_gradients(
+                model,
+                self.images[start:stop].to(self.device),
+                self.labels[start:stop].to(self.device),
+                parameter_names,
+                forward=feature_forward,
+                gradient_loss="sum_over_labels",
+            )
+            gradients = gradients.to(torch.float64)
+            gradient_sq = gradients.square().sum(dim=1)
+            dots = gradients @ update_matrix.to(torch.float64).t()
+            score_parts.append(
+                (2.0 * dots - gradient_sq[:, None]).to(torch.float32)
+            )
+        return torch.cat(score_parts).t().contiguous()
+
+    def _raw_input_gradient_measurements(
+        self,
+        model: torch.nn.Module,
+        parameter_names: list[str],
+        updates: list[tuple[dict[str, torch.Tensor], float, float]],
+        *,
+        need_cosine: bool,
+        need_gradient_difference: bool,
+        gradient_difference_update_indices: list[int] | None = None,
+        candidate_inputs: torch.Tensor | None = None,
+        candidate_labels: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """Stream exact text-sample gradients without retaining the full pool."""
         if not updates:
             raise ValueError("At least one client update is required.")
@@ -2389,50 +2692,121 @@ class MembershipAuditor:
         ]
         parameters = [parameter for _, parameter in named_parameters]
         if not parameters or any(
-            set(update) != allowed for update, _ in updates
+            set(update) != allowed for update, _, _ in updates
         ):
             raise ValueError(
                 "Text gradient observations and uploaded PEFT updates must "
                 "have identical parameter scopes."
             )
         update_norms = []
-        for update, _ in updates:
+        for update, _, scale in updates:
             norm_sq = torch.zeros((), dtype=torch.float64)
             for name in parameter_names:
-                values = update[name].detach().cpu().to(torch.float64)
+                values = (
+                    update[name].detach().cpu().to(torch.float64) * float(scale)
+                )
                 norm_sq += values.square().sum()
             update_norms.append(norm_sq.sqrt().clamp_min(1e-12))
-        rows = []
+        cosine_rows = []
+        difference_rows = []
+        difference_indices = (
+            list(range(len(updates)))
+            if gradient_difference_update_indices is None
+            else list(gradient_difference_update_indices)
+        )
+        if need_gradient_difference and not difference_indices:
+            raise ValueError("Gradient-Diff requires a target client update.")
+        inputs = self.images if candidate_inputs is None else candidate_inputs
+        labels = self.labels if candidate_labels is None else candidate_labels
+        if inputs.shape[0] != labels.numel():
+            raise ValueError("Candidate inputs and labels must have equal length.")
         model.eval()
-        for candidate_input, candidate_label in zip(self.images, self.labels):
+        for candidate_input, candidate_label in zip(inputs, labels):
             model.zero_grad(set_to_none=True)
             logits = model(candidate_input.unsqueeze(0).to(self.device))
-            loss = F.cross_entropy(
+            true_label_loss = F.cross_entropy(
                 logits, candidate_label.view(1).to(self.device)
             )
-            gradients = torch.autograd.grad(loss, parameters, retain_graph=False)
-            gradient_norm_sq = torch.zeros((), dtype=torch.float64)
-            dots = [torch.zeros((), dtype=torch.float64) for _ in updates]
-            for (name, _), gradient in zip(named_parameters, gradients):
-                flat = gradient.detach().flatten().cpu()
-                gradient_norm_sq += flat.to(torch.float64).square().sum()
-                for index, (update, sign) in enumerate(updates):
-                    dots[index] += (
-                        flat.to(torch.float64)
-                        * update[name].detach().flatten().cpu().to(torch.float64)
-                    ).sum() * float(sign)
-                del flat
-            gradient_norm = gradient_norm_sq.sqrt().clamp_min(1e-12)
-            rows.append(
-                torch.stack(
-                    [
-                        dot / (gradient_norm * norm.to(torch.float64))
-                        for dot, norm in zip(dots, update_norms)
-                    ]
-                ).to(torch.float32)
+            losses = []
+            if need_cosine:
+                losses.append(("cosine", true_label_loss))
+            if need_gradient_difference:
+                sum_label_loss = (
+                    logits.shape[1] * torch.logsumexp(logits, dim=1)
+                    - logits.sum(dim=1)
+                ).sum()
+                losses.append(("gradient_difference", sum_label_loss))
+            for position, (measurement, differentiated_loss) in enumerate(losses):
+                gradients = torch.autograd.grad(
+                    differentiated_loss,
+                    parameters,
+                    retain_graph=position + 1 < len(losses),
+                )
+                gradient_norm_sq = torch.zeros((), dtype=torch.float64)
+                measurement_indices = (
+                    list(range(len(updates)))
+                    if measurement == "cosine"
+                    else difference_indices
+                )
+                dots = [
+                    torch.zeros((), dtype=torch.float64)
+                    for _ in measurement_indices
+                ]
+                for (name, _), gradient in zip(named_parameters, gradients):
+                    flat = gradient.detach().flatten().cpu().to(torch.float64)
+                    gradient_norm_sq += flat.square().sum()
+                    for index, update_index in enumerate(measurement_indices):
+                        update, sign, scale = updates[update_index]
+                        dots[index] += (
+                            flat
+                            * update[name]
+                            .detach()
+                            .flatten()
+                            .cpu()
+                            .to(torch.float64)
+                        ).sum() * float(sign) * float(scale)
+                    del flat
+                if measurement == "cosine":
+                    gradient_norm = gradient_norm_sq.sqrt().clamp_min(1e-12)
+                    cosine_rows.append(
+                        torch.stack(
+                            [
+                                dot / (gradient_norm * norm)
+                                for dot, norm in zip(dots, update_norms)
+                            ]
+                        ).to(torch.float32)
+                    )
+                else:
+                    difference_rows.append(
+                        torch.stack(
+                            [2.0 * dot - gradient_norm_sq for dot in dots]
+                        ).to(torch.float32)
+                    )
+                del gradients
+        measurements = {}
+        if need_cosine:
+            measurements["cosine"] = torch.stack(cosine_rows).t().contiguous()
+        if need_gradient_difference:
+            measurements["gradient_difference"] = (
+                torch.stack(difference_rows).t().contiguous()
             )
-            del gradients
-        return torch.stack(rows).t().contiguous()
+        return measurements
+
+    def _raw_input_gradient_cosines(
+        self,
+        model: torch.nn.Module,
+        parameter_names: list[str],
+        updates: list[tuple[dict[str, torch.Tensor], float]],
+    ) -> torch.Tensor:
+        """Backward-compatible wrapper for exact streamed cosine signals."""
+        scaled_updates = [(update, sign, 1.0) for update, sign in updates]
+        return self._raw_input_gradient_measurements(
+            model,
+            parameter_names,
+            scaled_updates,
+            need_cosine=True,
+            need_gradient_difference=False,
+        )["cosine"]
 
     @staticmethod
     def _clone_prompt_state(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -2464,6 +2838,138 @@ class MembershipAuditor:
             raise ValueError(f"No released prompt is available for client {user_id}.")
         return released
 
+    def _observe_exact_batch_round(
+        self,
+        *,
+        round_index: int,
+        active_attacks: set[str],
+        base_state: dict[str, torch.Tensor],
+        updated_states: dict[int, dict[str, torch.Tensor]],
+        selected_ids: list[int],
+        base_states: dict[int, dict[str, torch.Tensor]] | None,
+        protocol_messages: dict[int, dict] | None,
+        released_states: dict[int, dict[str, torch.Tensor]] | None,
+        learning_rate: float | None,
+    ) -> None:
+        """Collect unchanged attack scores on the exact current upload batch."""
+        attacks = active_attacks & self.exact_batch_membership_attacks
+        if not attacks:
+            return
+        target_id = self.target_client_id
+        if target_id not in selected_ids:
+            raise ValueError(
+                "Exact-batch membership cannot audit a round where the target "
+                "client did not upload."
+            )
+        candidates = self._build_exact_batch_candidates(round_index)
+        inputs = candidates["inputs"]
+        labels = candidates["labels"]
+        client_base = base_state if base_states is None else base_states[target_id]
+        observable_base = self._observable_base_state(client_base)
+        observable_state = self._observable_client_state(
+            target_id, updated_states[target_id], released_states
+        )
+        observation = {
+            "round": int(round_index),
+            "client_ids": torch.tensor([target_id], dtype=torch.long),
+            "membership": candidates["membership"],
+            "candidate_labels": labels,
+            "member_local_indices": candidates["member_local_indices"],
+            "nonmember_pool_indices": candidates["nonmember_pool_indices"],
+            "attacks": sorted(attacks),
+        }
+
+        score_attacks = attacks & {"score_diff", "score_ratio"}
+        if score_attacks:
+            self.model.load_state_dict(observable_state, strict=False)
+            self.model.eval()
+            _, _, post_losses = self._candidate_outputs(
+                self.model,
+                require_representation=False,
+                candidate_inputs=inputs,
+                candidate_labels=labels,
+                candidate_inputs_are_features=False,
+            )
+            self.model.load_state_dict(observable_base, strict=False)
+            self.model.eval()
+            _, _, pre_losses = self._candidate_outputs(
+                self.model,
+                require_representation=False,
+                candidate_inputs=inputs,
+                candidate_labels=labels,
+                candidate_inputs_are_features=False,
+            )
+            observation["confidence"] = (-post_losses).unsqueeze(0)
+            observation["pre_confidence"] = (-pre_losses).unsqueeze(0)
+
+        gradient_attacks = attacks & {"grad_cosine", "gradient_diff"}
+        if gradient_attacks:
+            names = trainable_names(self.model)
+            if (
+                self.audit_view == "protocol_plus_released_prompts"
+                and protocol_messages is not None
+                and target_id in protocol_messages
+            ):
+                message = protocol_messages[target_id]
+                tensors = message.get("tensors", {})
+                sign = (
+                    -1.0
+                    if message.get("kind")
+                    in {"model_update", "global_prompt_update"}
+                    else 1.0
+                )
+                scale = (
+                    1.0 / float(learning_rate)
+                    if message.get("kind")
+                    in {"model_update", "global_prompt_update"}
+                    and learning_rate is not None
+                    else 1.0
+                )
+            else:
+                if self.audit_view == "released_prompt":
+                    raise ValueError(
+                        "Exact-batch gradient attacks require an observable "
+                        "target-client update."
+                    )
+                tensors = {
+                    name: client_base[name] - observable_state[name]
+                    for name in names
+                }
+                sign = 1.0
+                scale = (
+                    1.0 / float(learning_rate)
+                    if learning_rate is not None
+                    else 1.0
+                )
+            self.model.load_state_dict(observable_base, strict=False)
+            self.model.eval()
+            measurements = self._raw_input_gradient_measurements(
+                self.model,
+                names,
+                [(tensors, sign, scale)],
+                need_cosine="grad_cosine" in attacks,
+                need_gradient_difference="gradient_diff" in attacks,
+                candidate_inputs=inputs,
+                candidate_labels=labels,
+            )
+            if "grad_cosine" in attacks:
+                observation["cosine"] = measurements["cosine"]
+            if "gradient_diff" in attacks:
+                observation["gradient_diff_score"] = measurements[
+                    "gradient_difference"
+                ]
+
+        self.exact_batch_observations.append(observation)
+        self.exact_batch_candidate_selections.append(candidates["selection"])
+        logger.info(
+            "Collected exact-batch membership signals for round %d: "
+            "attacks=%s, members=%d, nonmembers=%d",
+            round_index + 1,
+            ",".join(sorted(attacks)),
+            int((candidates["membership"] == 1).sum()),
+            int((candidates["membership"] == 0).sum()),
+        )
+
     def observe_round(
         self,
         round_index: int,
@@ -2473,14 +2979,31 @@ class MembershipAuditor:
         base_states: dict[int, dict[str, torch.Tensor]] | None = None,
         protocol_messages: dict[int, dict] | None = None,
         released_states: dict[int, dict[str, torch.Tensor]] | None = None,
+        learning_rate: float | None = None,
     ) -> None:
         active_attacks = self._attacks_for_round(round_index)
         if not self.enabled or not active_attacks:
             return
+        self._observe_exact_batch_round(
+            round_index=round_index,
+            active_attacks=set(active_attacks),
+            base_state=base_state,
+            updated_states=updated_states,
+            selected_ids=selected_ids,
+            base_states=base_states,
+            protocol_messages=protocol_messages,
+            released_states=released_states,
+            learning_rate=learning_rate,
+        )
+        static_attacks = [
+            attack
+            for attack in active_attacks
+            if attack not in self.exact_batch_membership_attacks
+        ]
         full_signals = self.signal_storage == "full"
-        needs = _signal_needs(set(active_attacks), full_signals)
+        needs = _signal_needs(set(static_attacks), full_signals)
         selected_ids = self._audit_client_ids_for_attacks(
-            active_attacks, selected_ids
+            static_attacks, selected_ids
         )
         if not selected_ids:
             return
@@ -2488,14 +3011,16 @@ class MembershipAuditor:
         observable_names = names
         needs_gradients = (
             needs["cosine"]
+            or needs["gradient_diff_score"]
             or needs["whitebox_features"]
             or needs["promptres"]
         )
         sample_gradients = None
+        gradient_diff_gradients = None
         signatures = None
-        streaming_text_cosines = bool(
+        streaming_text_gradients = bool(
             self.model_type in {"bert_adapter", "gpt2_adapter"}
-            and needs["cosine"]
+            and (needs["cosine"] or needs["gradient_diff_score"])
             and not needs["whitebox_features"]
             and not needs["promptres"]
         )
@@ -2503,25 +3028,42 @@ class MembershipAuditor:
         if (
             needs_gradients
             and not self.candidate_inputs_are_features
-            and not streaming_text_cosines
+            and not streaming_text_gradients
         ):
             self.model.load_state_dict(
                 observable_base_state, strict=False
             )
             self.model.eval()
-            sample_gradients, signatures, _ = self._candidate_gradients(
-                self.model, observable_names
-            )
+            if needs["cosine"] or needs["whitebox_features"] or needs["promptres"]:
+                sample_gradients, signatures, _ = self._candidate_gradients(
+                    self.model, observable_names
+                )
+            if needs["gradient_diff_score"]:
+                gradient_diff_gradients, _, _ = self._candidate_gradients(
+                    self.model,
+                    observable_names,
+                    gradient_loss="sum_over_labels",
+                )
 
         confidence = []
+        pre_confidence = []
+        true_label_confidence = []
+        pre_true_label_confidence = []
         cosine = []
         gradient_difference = []
+        gradient_diff_score = []
         probabilities = []
         representations = []
         promptres_updates = []
         promptres_gradients = []
         cached_feature_updates = []
         streaming_text_updates = []
+        audited_ids = set(self.audit_client_ids)
+        gradient_diff_positions = [
+            position
+            for position, user_id in enumerate(selected_ids)
+            if user_id in audited_ids
+        ]
         observable_states = {}
         for user_id in selected_ids:
             state = self._observable_client_state(
@@ -2533,7 +3075,7 @@ class MembershipAuditor:
                 client_base = (
                     base_state if base_states is None else base_states[user_id]
                 )
-                if streaming_text_cosines and (
+                if streaming_text_gradients and (
                     self.audit_view == "protocol_plus_released_prompts"
                     and protocol_messages is not None
                     and user_id in protocol_messages
@@ -2546,9 +3088,16 @@ class MembershipAuditor:
                         in {"model_update", "global_prompt_update"}
                         else 1.0
                     )
-                    streaming_text_updates.append((tensors, sign))
+                    scale = (
+                        1.0 / float(learning_rate)
+                        if message.get("kind")
+                        in {"model_update", "global_prompt_update"}
+                        and learning_rate is not None
+                        else 1.0
+                    )
+                    streaming_text_updates.append((tensors, sign, scale))
                     update = None
-                elif streaming_text_cosines:
+                elif streaming_text_gradients:
                     if self.audit_view == "released_prompt":
                         raise ValueError(
                             "Text gradient-cosine attacks require an observable "
@@ -2561,6 +3110,11 @@ class MembershipAuditor:
                                 for name in observable_names
                             },
                             1.0,
+                            (
+                                1.0 / float(learning_rate)
+                                if learning_rate is not None
+                                else 1.0
+                            ),
                         )
                     )
                     update = None
@@ -2590,7 +3144,7 @@ class MembershipAuditor:
                     update = flatten_state_delta(
                         client_base, state, observable_names
                     )
-                if streaming_text_cosines:
+                if streaming_text_gradients:
                     pass
                 elif self.candidate_inputs_are_features:
                     cached_feature_updates.append(update)
@@ -2626,8 +3180,46 @@ class MembershipAuditor:
                             .square()
                             .sum(dim=1)
                         )
+                    if needs["gradient_diff_score"]:
+                        if user_id not in audited_ids:
+                            gradient_diff_score.append(
+                                torch.full(
+                                    (self.labels.numel(),), float("nan")
+                                )
+                            )
+                        else:
+                            if gradient_diff_gradients is None:
+                                raise AssertionError(
+                                    "Gradient-Diff lost its all-label gradients."
+                                )
+                            compared_diff_gradients = gradient_diff_gradients
+                            gradient_update = update
+                            if learning_rate is not None:
+                                gradient_update = (
+                                    gradient_update / float(learning_rate)
+                                )
+                            if (
+                                gradient_update.numel()
+                                != gradient_diff_gradients.shape[1]
+                            ):
+                                width = min(
+                                    64,
+                                    gradient_update.numel(),
+                                    gradient_diff_gradients.shape[1],
+                                )
+                                gradient_update = F.adaptive_avg_pool1d(
+                                    gradient_update.view(1, 1, -1), width
+                                ).flatten()
+                                compared_diff_gradients = F.adaptive_avg_pool1d(
+                                    gradient_diff_gradients.unsqueeze(1), width
+                                ).squeeze(1)
+                            gradient_diff_score.append(
+                                2.0 * (compared_diff_gradients @ gradient_update)
+                                - compared_diff_gradients.square().sum(dim=1)
+                            )
             needs_outputs = (
                 needs["confidence"]
+                or needs["true_label_confidence"]
                 or needs["probabilities"]
                 or needs["representations"]
             )
@@ -2639,6 +3231,12 @@ class MembershipAuditor:
                 )
                 if needs["confidence"]:
                     confidence.append(-losses)
+                if needs["true_label_confidence"]:
+                    true_label_confidence.append(
+                        torch.softmax(logits, dim=1)
+                        .gather(1, self.labels.detach().cpu().view(-1, 1))
+                        .squeeze(1)
+                    )
                 if needs["probabilities"]:
                     probabilities.append(torch.softmax(logits, dim=1))
                 if needs["representations"]:
@@ -2648,12 +3246,44 @@ class MembershipAuditor:
                         )
                     representations.append(representation)
 
+        if needs["pre_confidence"] or needs["pre_true_label_confidence"]:
+            for user_id in selected_ids:
+                if user_id not in audited_ids:
+                    pre_confidence.append(
+                        torch.full((self.labels.numel(),), float("nan"))
+                    )
+                    pre_true_label_confidence.append(
+                        torch.full((self.labels.numel(),), float("nan"))
+                    )
+                    continue
+                client_base = base_state if base_states is None else base_states[user_id]
+                self.model.load_state_dict(client_base, strict=False)
+                logits, _, losses = self._candidate_outputs(
+                    self.model, require_representation=False
+                )
+                pre_confidence.append(-losses)
+                pre_true_label_confidence.append(
+                    torch.softmax(logits, dim=1)
+                    .gather(1, self.labels.detach().cpu().view(-1, 1))
+                    .squeeze(1)
+                )
+
         observation = {
             "round": int(round_index),
             "client_ids": torch.tensor(selected_ids, dtype=torch.long),
         }
         if needs["confidence"]:
             observation["confidence"] = torch.stack(confidence)
+        if needs["pre_confidence"]:
+            observation["pre_confidence"] = torch.stack(pre_confidence)
+        if needs["true_label_confidence"]:
+            observation["true_label_confidence"] = torch.stack(
+                true_label_confidence
+            )
+        if needs["pre_true_label_confidence"]:
+            observation["pre_true_label_confidence"] = torch.stack(
+                pre_true_label_confidence
+            )
         if needs["cosine"]:
             if self.candidate_inputs_are_features:
                 self.model.load_state_dict(observable_base_state, strict=False)
@@ -2663,16 +3293,67 @@ class MembershipAuditor:
                     observable_names,
                     cached_feature_updates,
                 )
-            elif streaming_text_cosines:
+            elif streaming_text_gradients:
                 self.model.load_state_dict(observable_base_state, strict=False)
                 self.model.eval()
-                observation["cosine"] = self._raw_input_gradient_cosines(
+                measurements = self._raw_input_gradient_measurements(
                     self.model,
                     observable_names,
                     streaming_text_updates,
+                    need_cosine=True,
+                    need_gradient_difference=needs["gradient_diff_score"],
+                    gradient_difference_update_indices=gradient_diff_positions,
                 )
+                observation["cosine"] = measurements["cosine"]
             else:
                 observation["cosine"] = torch.stack(cosine)
+        if needs["gradient_diff_score"]:
+            if self.candidate_inputs_are_features:
+                normalized_updates = [
+                    (
+                        cached_feature_updates[position] / float(learning_rate)
+                        if learning_rate is not None
+                        else cached_feature_updates[position]
+                    )
+                    for position in gradient_diff_positions
+                ]
+                self.model.load_state_dict(observable_base_state, strict=False)
+                self.model.eval()
+                selected_scores = self._cached_feature_gradient_differences(
+                    self.model,
+                    observable_names,
+                    normalized_updates,
+                )
+                observation["gradient_diff_score"] = torch.full(
+                    (len(selected_ids), self.labels.numel()), float("nan")
+                )
+                observation["gradient_diff_score"][gradient_diff_positions] = (
+                    selected_scores
+                )
+            elif streaming_text_gradients:
+                if not needs["cosine"]:
+                    self.model.load_state_dict(observable_base_state, strict=False)
+                    self.model.eval()
+                    measurements = self._raw_input_gradient_measurements(
+                        self.model,
+                        observable_names,
+                        streaming_text_updates,
+                        need_cosine=False,
+                        need_gradient_difference=True,
+                        gradient_difference_update_indices=(
+                            gradient_diff_positions
+                        ),
+                    )
+                observation["gradient_diff_score"] = torch.full(
+                    (len(selected_ids), self.labels.numel()), float("nan")
+                )
+                observation["gradient_diff_score"][gradient_diff_positions] = (
+                    measurements["gradient_difference"]
+                )
+            else:
+                observation["gradient_diff_score"] = torch.stack(
+                    gradient_diff_score
+                )
         if needs["whitebox_features"]:
             if signatures is None:
                 raise AssertionError("White-box audit lost its gradient signatures.")
@@ -2930,6 +3611,19 @@ class MembershipAuditor:
                 attack,
                 self.config.get("fedmia_baseline_single_round", "last"),
             )
+        if attack in _UPDATE_ATTACKS:
+            return run_update_attack(
+                observations,
+                membership,
+                client_id,
+                attack,
+                score_ratio_damping=float(
+                    self.config.get("score_ratio_damping", 1e-6)
+                ),
+                fta_measurement=str(
+                    self.config.get("fta_measurement", "confidence")
+                ),
+            )
         if attack == "promptres":
             return run_promptres(
                 observations,
@@ -3040,7 +3734,58 @@ class MembershipAuditor:
             },
         )
 
+    def _run_exact_batch_attack(
+        self, attack: str, observation: dict
+    ) -> AttackResult:
+        """Evaluate one round because exact batch identities change each round."""
+        membership = observation["membership"]
+        if attack == "grad_cosine":
+            result = run_fedmia_baseline(
+                [observation],
+                membership,
+                self.target_client_id,
+                attack,
+                "last",
+            )
+        else:
+            result = run_update_attack(
+                [observation],
+                membership,
+                self.target_client_id,
+                attack,
+                score_ratio_damping=float(
+                    self.config.get("score_ratio_damping", 1e-6)
+                ),
+            )
+        result.metadata.update(
+            {
+                "membership_definition": "current_round_exact_upload_batch",
+                "nonmember_training_exposure": "never_trained",
+                "label_matching_mode": "exact_batch_histogram_ratio",
+                "nonmember_to_member_ratio": (
+                    self.exact_batch_nonmember_ratio
+                ),
+                "communication_round": int(observation["round"]) + 1,
+                "temporal_information": "single_round",
+                "round_reduction": "none",
+                "member_local_indices": observation[
+                    "member_local_indices"
+                ].tolist(),
+                "nonmember_pool_indices": observation[
+                    "nonmember_pool_indices"
+                ].tolist(),
+            }
+        )
+        return result
+
     def _run(self, attack: str, final_model, final_state):
+        if attack in self.exact_batch_membership_attacks:
+            observations = self._observations_for_attack(attack)
+            if not observations:
+                raise ValueError(
+                    f"Exact-batch {attack} has no observed target-client batch."
+                )
+            return self._run_exact_batch_attack(attack, observations[-1])
         if self.pooled_client_audit and attack in POOLED_CLIENT_ATTACKS:
             if attack == "fedmia_loss":
                 return self._run_fedmia_signal(
@@ -3078,6 +3823,19 @@ class MembershipAuditor:
                 self.target_client_id,
                 attack,
                 self.config.get("fedmia_baseline_single_round", "last"),
+            )
+        if attack in _UPDATE_ATTACKS:
+            return run_update_attack(
+                observations,
+                self.membership,
+                self.target_client_id,
+                attack,
+                score_ratio_damping=float(
+                    self.config.get("score_ratio_damping", 1e-6)
+                ),
+                fta_measurement=str(
+                    self.config.get("fta_measurement", "confidence")
+                ),
             )
         if attack == "promptres":
             return run_promptres(
@@ -3272,6 +4030,8 @@ class MembershipAuditor:
         self, attack: str, observations: list[dict]
     ) -> AttackResult:
         """Evaluate one configured checkpoint without changing final metrics."""
+        if attack in self.exact_batch_membership_attacks:
+            return self._run_exact_batch_attack(attack, observations[-1])
         if attack in _FEDMIA_BASELINE_ATTACKS:
             selected = (
                 observations[-1:]
@@ -3284,6 +4044,19 @@ class MembershipAuditor:
                 self.target_client_id,
                 attack,
                 "last",
+            )
+        if attack in _UPDATE_ATTACKS:
+            return run_update_attack(
+                observations,
+                self.membership,
+                self.target_client_id,
+                attack,
+                score_ratio_damping=float(
+                    self.config.get("score_ratio_damping", 1e-6)
+                ),
+                fta_measurement=str(
+                    self.config.get("fta_measurement", "confidence")
+                ),
             )
         measurement = "confidence" if attack == "fedmia_loss" else "cosine"
         aggregation = str(
@@ -3380,8 +4153,10 @@ class MembershipAuditor:
                         attack, observations[: position + 1]
                     )
                     summary = result.to_summary()
-                    paper_balanced = self._paper_balanced_attack_summary(
-                        result
+                    paper_balanced = (
+                        None
+                        if attack in self.exact_batch_membership_attacks
+                        else self._paper_balanced_attack_summary(result)
                     )
                 except Exception as error:
                     error_key = f"round_metrics:{attack}:round_{completed_round}"
@@ -3399,6 +4174,7 @@ class MembershipAuditor:
                     "temporal_scope": (
                         "single_round"
                         if attack in _SINGLE_ROUND_ATTACKS
+                        or attack in self.exact_batch_membership_attacks
                         else "cumulative"
                     ),
                     "auc": summary["auc"],
@@ -3430,8 +4206,13 @@ class MembershipAuditor:
         if not rows:
             return 0
         path = os.path.join(self.results_dir, "attack_round_metrics.csv")
+        fieldnames = []
+        for row in rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
         with open(path, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
         logger.info("Saved %d periodic attack metric rows to %s", len(rows), path)
@@ -3452,6 +4233,20 @@ class MembershipAuditor:
             torch.save(
                 low_fpr_candidate_selection,
                 os.path.join(self.results_dir, "candidate_selection.pt"),
+            )
+        if self.exact_batch_candidate_selections:
+            torch.save(
+                {
+                    "membership_definition": (
+                        "current_round_exact_upload_batch"
+                    ),
+                    "nonmember_training_exposure": "never_trained",
+                    "attacks": sorted(self.exact_batch_membership_attacks),
+                    "rounds": self.exact_batch_candidate_selections,
+                },
+                os.path.join(
+                    self.results_dir, "exact_batch_candidate_selection.pt"
+                ),
             )
         final_model = (
             final_model
@@ -3517,7 +4312,11 @@ class MembershipAuditor:
         summaries = []
         for result in self.results:
             summary = result.to_summary()
-            paper_balanced = self._paper_balanced_attack_summary(result)
+            paper_balanced = (
+                None
+                if result.name in self.exact_batch_membership_attacks
+                else self._paper_balanced_attack_summary(result)
+            )
             if paper_balanced is not None:
                 summary["paper_balanced_evaluation"] = paper_balanced
             summaries.append(summary)
@@ -3582,7 +4381,12 @@ class MembershipAuditor:
         if self.defense_name == "iclr":
             try:
                 validation = validate_iclr_attack_relationships(
-                    results=self.results,
+                    results=[
+                        result
+                        for result in self.results
+                        if result.name
+                        not in self.exact_batch_membership_attacks
+                    ],
                     users=self.users,
                     candidate_labels=candidate_labels,
                     candidate_membership=candidate_membership,
@@ -3660,6 +4464,33 @@ class MembershipAuditor:
                             else None
                         ),
                         "periodic_metric_rows": periodic_metric_rows,
+                        "exact_batch_membership": {
+                            "enabled": bool(
+                                self.exact_batch_membership_attacks
+                            ),
+                            "attacks": sorted(
+                                self.exact_batch_membership_attacks
+                            ),
+                            "membership_definition": (
+                                "current_round_exact_upload_batch"
+                            ),
+                            "nonmember_training_exposure": "never_trained",
+                            "label_matching_mode": (
+                                "exact_batch_histogram_ratio"
+                            ),
+                            "nonmember_to_member_ratio": (
+                                self.exact_batch_nonmember_ratio
+                            ),
+                            "candidate_selection_file": (
+                                "exact_batch_candidate_selection.pt"
+                                if self.exact_batch_candidate_selections
+                                else None
+                            ),
+                            "stored_rounds": [
+                                int(observation["round"])
+                                for observation in self.exact_batch_observations
+                            ],
+                        },
                     },
                     "few_shot": {
                         "enabled": self.few_shot,
@@ -3800,7 +4631,12 @@ class MembershipAuditor:
                         (
                             result.name,
                             index,
-                            int(self.candidate_client_ids[index]),
+                            (
+                                self.target_client_id
+                                if result.name
+                                in self.exact_batch_membership_attacks
+                                else int(self.candidate_client_ids[index])
+                            ),
                             label,
                             score,
                         )
@@ -3812,6 +4648,7 @@ class MembershipAuditor:
                     "candidate_client_ids": self.candidate_client_ids,
                     "membership": self.membership,
                     "observations": self.observations,
+                    "exact_batch_observations": self.exact_batch_observations,
                     "storage_mode": self.signal_storage,
                 },
                 os.path.join(self.results_dir, "signals.pt"),

@@ -49,6 +49,26 @@ FedMIA 官方仓库将四个相关基线按“度量、时间信息、空间信�
 固定的轮次，而不实现 oracle best-round。四个基线都只使用目标客户端，不使用
 FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的对照意义。
 
+### ProjRes 论文采用的四个传统基线
+
+Deng 等人的 FedLLM ProjRes 实验还比较 Gradient-Diff、Score-Diff、Score-Ratio
+和 FTA。本仓库以如下运行名实现，并统一将分数方向转换为“越大越像成员”：
+
+| 运行名 | 原始信号 | 当前 FedLLM 实现 |
+|---|---|---|
+| `gradient_diff` | `||g_client||² - ||g_client - sum_y grad L(x,y)||²` | 对 vanilla SGD 上传除以该轮学习率，恢复 one-batch 梯度；逐候选流式计算对全部标签求和的梯度 |
+| `score_diff` | `L_post(x)-L_pre(x)` | 同轮客户端更新前后各前向一次；输出其相反数 `L_pre-L_post` |
+| `score_ratio` | `(L_post(x)+c)/(L_pre(x)+c)` | 默认 `c=1e-6`；输出负比值，避免改变全仓库“高分为成员”的 ROC 约定 |
+| `fta` | 多个 FL 模型快照上性能指标的变化斜率 | 默认对真实标签置信度使用实际通信轮编号做 OLS；首个检查点使用该轮更新前/后两个快照，也可设置 `audit.fta_measurement: loss` |
+
+Gradient-Diff 来源于 [Li、Li 与 Ribeiro，ICLR 2023](https://openreview.net/forum?id=QsCSLPP55Ku)；
+Score-Diff/Score-Ratio 来源于 [Jagielski 等，PoPETs 2023](https://petsymposium.org/popets/2023/popets-2023-0078.php)；
+FTA（free training attack）来源于 [Chang 等，USENIX Security 2024](https://www.usenix.org/conference/usenixsecurity24/presentation/chang)。
+四者在 `scripts/run_all_fedllm_attacks.sh` 的默认任务中每 50 个已完成通信轮采集一次。
+BERT 的 Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
+作为成员，并按标签从从未训练的全局 evaluation 池抽取 10 倍非成员；每轮独立评估，
+不改变攻击分数公式。FTA 与其他攻击继续使用固定的 100/1000 历史成员候选池。
+
 ## 3. Rethinking Membership Inference Attacks Against Transfer Learning
 
 检索时未发现作者发布的官方实现，因此 `privacy_attacks/transfer.py` 按论文描述实现。
@@ -117,7 +137,7 @@ FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的�
 
 ## Shared evaluation
 
-所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC、TPR@10% FPR 和 TPR@0.1% FPR 作为诊断信息。文本六攻击任务还会从 100/1000 类别比例匹配主池固定派生一个类别严格匹配的 100/100 论文对照视图；两种视图复用同一攻击分数。100/100 视图不能解析 0.1% FPR，该指标明确记为不可用。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
+所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC、TPR@10% FPR 和 TPR@0.1% FPR 作为诊断信息。固定 100/1000 候选池还派生一个类别严格匹配的 100/100 论文对照视图；BERT 的四种真实 Batch 攻击不使用该视图。真实 Batch 为 16、非成员为 160 时也不能解析 0.1% FPR。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
 
 ## CLIP 图像编码器 + 两层 MLP 场景
 
