@@ -56,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--attacks",
         help=(
-            "Comma-separated common attacks. Defaults to the ten attacks in "
-            "the YAML configuration."
+            "Comma-separated attacks. Defaults to the attacks in the YAML "
+            "configuration."
         ),
     )
     parser.add_argument("--target-client-id", type=int)
@@ -117,6 +117,20 @@ def load_config(args: argparse.Namespace) -> dict:
         config["audit"]["audit_client_ids"] = [args.target_client_id]
     if args.projres is not None:
         config.setdefault("projres", {})["enabled"] = args.projres
+        if args.projres is False:
+            audit = config.setdefault("audit", {})
+            audit["attacks"] = [
+                attack
+                for attack in audit.get("attacks", [])
+                if attack != "projres"
+            ]
+            audit["exact_batch_membership_attacks"] = [
+                attack
+                for attack in audit.get(
+                    "exact_batch_membership_attacks", []
+                )
+                if attack != "projres"
+            ]
     if args.require_cuda is not None:
         config["require_cuda"] = args.require_cuda
     validate_config(config)
@@ -169,6 +183,7 @@ def validate_config(config: dict) -> None:
         "score_diff",
         "score_ratio",
         "fta",
+        "projres",
     }
     audit = dict(config.get("audit", {}))
     unknown_attacks = sorted(set(audit.get("attacks", [])) - supported_attacks)
@@ -185,8 +200,10 @@ def validate_config(config: dict) -> None:
             "audit.exact_batch_membership_attacks must be a list."
         )
     supported_exact_batch_attacks = {
+        "blackbox_loss",
         "grad_cosine",
         "gradient_diff",
+        "projres",
         "score_diff",
         "score_ratio",
     }
@@ -205,6 +222,13 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "Exact-batch attacks must also appear in audit.attacks: "
             + ", ".join(missing_exact_batch_attacks)
+        )
+    if "projres" in audit.get("attacks", []) and "projres" not in set(
+        exact_batch_attacks
+    ):
+        raise ValueError(
+            "Text Adapter ProjRes must use the shared exact-batch membership "
+            "protocol."
         )
     exact_batch_ratio = audit.get(
         "exact_batch_nonmember_to_member_ratio",
@@ -305,10 +329,38 @@ def validate_config(config: dict) -> None:
     if not 0 <= target_client_id < int(config["total_users"]):
         raise ValueError("audit.target_client_id is outside the client range.")
     projres = dict(config.get("projres", {}))
+    unified_projres = "projres" in set(exact_batch_attacks)
+    if unified_projres:
+        if not bool(projres.get("enabled", True)):
+            raise ValueError(
+                "audit exact-batch ProjRes requires projres.enabled=true."
+            )
+        expected_nonmembers = int(config["batch_size"]) * int(
+            exact_batch_ratio
+        )
+        if int(projres.get("max_candidates", 0)) != int(
+            config["batch_size"]
+        ):
+            raise ValueError(
+                "Unified ProjRes must audit the complete real training batch."
+            )
+        if int(projres.get("min_nonmembers", 0)) != expected_nonmembers or int(
+            projres.get("max_nonmembers", 0)
+        ) != expected_nonmembers:
+            raise ValueError(
+                "Unified ProjRes min_nonmembers and max_nonmembers must equal "
+                "batch_size * exact_batch_nonmember_to_member_ratio."
+            )
     if "evaluation_interval" in projres and "evaluation_round" in projres:
         raise ValueError(
             "Configure only one of projres.evaluation_interval and "
             "projres.evaluation_round."
+        )
+    if unified_projres and "evaluation_round" in projres:
+        raise ValueError(
+            "Unified ProjRes is scheduled by audit.attack_audit_intervals; "
+            "use projres.evaluation_interval only as the matching protocol "
+            "declaration."
         )
     if "evaluation_interval" in projres:
         configured_interval = projres["evaluation_interval"]
@@ -329,6 +381,17 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "projres.evaluation_interval must be a positive integer."
             )
+        if unified_projres:
+            audit_interval = int(
+                audit.get("attack_audit_intervals", {}).get(
+                    "projres", audit.get("audit_interval", 1)
+                )
+            )
+            if evaluation_interval != audit_interval:
+                raise ValueError(
+                    "Unified ProjRes evaluation_interval must match its "
+                    "shared audit interval."
+                )
     elif str(projres.get("evaluation_round", "last")).lower() != "last":
         evaluation_round = int(projres["evaluation_round"])
         if not 1 <= evaluation_round <= int(config["num_global_iters"]):

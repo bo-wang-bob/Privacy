@@ -229,6 +229,28 @@ class ServerBase:
         self.audit_config = dict(audit_config or {"enabled": True})
         self.audit_config.setdefault("total_rounds", num_glob_iters)
         self.projres_config = dict(projres_config or {"enabled": False})
+        self.unified_exact_batch_projres = (
+            "projres"
+            in set(
+                self.audit_config.get("exact_batch_membership_attacks", [])
+            )
+        )
+        if self.unified_exact_batch_projres:
+            if not bool(self.projres_config.get("enabled", True)):
+                raise ValueError(
+                    "Exact-batch audit includes projres but projres.enabled is "
+                    "false."
+                )
+            self.audit_config["exact_batch_projres"] = {
+                key: value
+                for key, value in self.projres_config.items()
+                if key
+                in {
+                    "attacked_parameter",
+                    "threshold",
+                    "token_reduction",
+                }
+            }
         self.batch_size = int(batch_size)
         self.eval_batch_size = int(eval_batch_size)
         self.local_epochs = int(local_epochs)
@@ -691,7 +713,8 @@ class ServerBase:
 
             projres_payload = None
             if (
-                bool(self.projres_config.get("enabled", False))
+                not self.unified_exact_batch_projres
+                and bool(self.projres_config.get("enabled", False))
                 and round_index + 1 in self.projres_evaluation_rounds
             ):
                 projres_client_ids = list(self.auditor.audit_client_ids)
@@ -795,17 +818,9 @@ class ServerBase:
             )
             if iclr_analyzed:
                 self.defense.save_iclr_round_metrics(self.results_dir)
-                if projres_payload is not None:
-                    self.defense.record_iclr_projres_relationship(
-                        projres_payload=projres_payload,
-                        output_dir=os.path.join(
-                            self.results_dir, "privacy_audit"
-                        ),
-                        round_index=round_index,
-                    )
             previous_selected_ids = set(selected_ids)
             previous_aggregation_weights = dict(self.ctx.aggregation_weights)
-            self.auditor.observe_round(
+            unified_projres_payload = self.auditor.observe_round(
                 round_index=round_index,
                 base_state=base_state,
                 updated_states=self.ctx.updated_model_state,
@@ -815,6 +830,16 @@ class ServerBase:
                 released_states=self.ctx.new_model_state,
                 learning_rate=self.current_learning_rate,
             )
+            if unified_projres_payload is not None:
+                projres_payload = unified_projres_payload
+            if iclr_analyzed and projres_payload is not None:
+                self.defense.record_iclr_projres_relationship(
+                    projres_payload=projres_payload,
+                    output_dir=os.path.join(
+                        self.results_dir, "privacy_audit"
+                    ),
+                    round_index=round_index,
+                )
             self._save_round(round_index + 1)
             if _is_evaluation_round(
                 round_index, self.num_glob_iters, self.eval_interval

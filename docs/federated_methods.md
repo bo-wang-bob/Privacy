@@ -69,8 +69,8 @@ checkpoint 均不包含冻结的 BERT/GPT2 参数。
 
 这两个文本模型复用通用审计器的 Blackbox/Fed-loss、Loss-Series、Grad-Cosine、
 Avg-Cosine、两种 FedMIA 信号，以及 Gradient-Diff、Score-Diff、Score-Ratio 和
-FTA。默认只审计客户端 0。BERT 的 Grad-Cosine、Gradient-Diff、Score-Diff 和
-Score-Ratio 将每轮真实上传 Batch 定义为成员，并从全部客户端的独立 evaluation 分区
+FTA。默认只审计客户端 0。BERT 的 Blackbox-Loss、Grad-Cosine、Gradient-Diff、
+Score-Diff、Score-Ratio 和 ProjRes 将每轮真实上传 Batch 定义为成员，并从全部客户端的独立 evaluation 分区
 逐类别抽取 10 倍从未训练的非成员；每轮候选集独立构造和评估。其余攻击从目标客户端
 训练分区抽取 100 个历史成员，再从相同 evaluation 池抽取 1,000 个标签比例匹配
 非成员，并跨轮复用固定候选池。余弦攻击比较候选样本对全部可训练 Adapter/分类头参数
@@ -80,26 +80,27 @@ Score-Ratio 将每轮真实上传 Batch 定义为成员，并从全部客户端�
 固定候选攻击同时采用两个评估视图：主视图为 100 成员/1000 非成员；论文对照视图从
 主视图非成员中按类别固定抽取 100 个，与全部 100 个成员组成 100/100。后者复用同一
 分数，不重新执行模型前向或梯度计算。主视图可解析到 TPR@0.1%FPR；论文视图只有
-100 个非成员，不能解析该指标。真实 Batch 攻击通常为 16 成员/160 非成员，同样只
-正式解析到 TPR@1%FPR。
+100 个非成员，不能解析该指标。六种真实 Batch 攻击固定为 16 成员/160 非成员，只
+统计 AUC、TPR@10%FPR 与 TPR@1%FPR，不生成 TPR@0.1%FPR。
 
 BERT 同时启用周期性 ICLR 排名分析。服务器在第 50、100、…、500 个通信轮完成聚合后，
 根据该轮真实客户端上传和等权聚合系数，为每个客户端精确重建其他客户端的聚合模型，
 并在该轮真实 one-batch 训练样本上计算 `L(x; theta_-k) - L(x; theta_k)`。该分析只记录
 排名与统计，不筛选样本、不改变优化步骤；逐轮结果写入 `iclr_round_metrics.csv`、
 `iclr_round_samples.csv` 和 `iclr_series.json`，最终
-与具有稳定本地索引的固定攻击成员候选对齐。四种真实 Batch 攻击另存逐轮成员本地索引，
+与具有稳定本地索引的固定攻击成员候选对齐。六种真实 Batch 攻击另存逐轮成员本地索引，
 不会错误套用固定候选池的位置。GPT2-Large 当前保持 `defense.name: none`。
 由于 ICLR 和 ProjRes 使用同轮同客户端的真实 FedSGD batch，两者还会按通信轮、客户端、
 batch 位置和本地样本索引进行严格逐样本连接，并报告分数相关性与 Top-K 富集倍数。
-ProjRes 命中率使用每轮非成员连续分数分别在 10%、1% 和 0.1% FPR 下复算，再比较高低
+ProjRes 命中率使用同轮共享的 160 个非成员连续分数分别在 10% 和 1% FPR 下复算，再比较高低
 ICLR 组；固定残差阈值预测只作为明确命名的逐样本诊断值保留。
 
 严格 ProjRes 每 50 个已完成通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
 down-projection 权重更新构造子空间，并在同一全局模型下提取进入该层的样本级隐藏
-表示。成员只取该轮保留的真实 batch，非成员只取从未训练的 evaluation 样本。
-两种模型的 `projres.max_candidates: 16` 都会审计完整的 16 条上传 batch，结果元数据
-会将 `paper_fedsgd_exact` 记为 `true`。
+表示。BERT 的成员和非成员直接复用共享真实 Batch 候选视图，即 16 个成员及按标签
+匹配的 160 个从未训练 evaluation 样本；结果与其他攻击统一写入审计器输出。GPT2-Large
+仍使用独立 ProjRes 路径。两种模型的 `projres.max_candidates: 16` 都会审计完整的
+16 条上传 batch，结果元数据会将 `paper_fedsgd_exact` 记为 `true`。
 
 ## 攻击可见性
 

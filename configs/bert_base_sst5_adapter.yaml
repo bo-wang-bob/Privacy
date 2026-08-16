@@ -61,15 +61,18 @@ audit:
     - score_diff
     - score_ratio
     - fta
+    - projres
   target_client_id: 0
   audit_client_ids: [0]
   candidate_sampling: balanced_global_holdout
   nonmember_to_member_ratio: 10
-  # These four update-sensitive attacks use the target client's exact upload
+  # These six update-sensitive attacks use the target client's exact upload
   # batch as members at every audit round. Formulas remain unchanged.
   exact_batch_membership_attacks:
+    - blackbox_loss
     - grad_cosine
     - gradient_diff
+    - projres
     - score_diff
     - score_ratio
   exact_batch_nonmember_to_member_ratio: 10
@@ -89,6 +92,7 @@ audit:
     score_diff: 50
     score_ratio: 50
     fta: 50
+    projres: 50
   score_ratio_damping: 1.0e-6
   fta_measurement: confidence
   signal_storage: compact
@@ -110,8 +114,9 @@ projres:
   # Audit real target-client uploads after rounds 50, 100, ..., 500.
   evaluation_interval: 50
   threshold: 0.01
-  # Audit the complete observed FedSGD batch.
+  # The unified scorer audits the complete batch and its shared 1:10
+  # nonmember view; these bounds document the full 16/160 case.
   max_candidates: 16
-  min_nonmembers: 100
-  max_nonmembers: 1000
+  min_nonmembers: 160
+  max_nonmembers: 160
   token_reduction: auto

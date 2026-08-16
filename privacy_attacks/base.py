@@ -14,13 +14,26 @@ class AttackResult:
     sample_indices: torch.Tensor
     metadata: dict = field(default_factory=dict)
 
-    def to_summary(self) -> dict:
-        metrics = membership_metrics(self.labels, self.scores)
+    def to_summary(
+        self,
+        fpr_targets: tuple[float, ...] = (0.1, 0.01, 0.001),
+    ) -> dict:
+        if PRIMARY_METRIC not in {
+            f"tpr_at_fpr_{target:g}" for target in fpr_targets
+        }:
+            raise ValueError(
+                f"fpr_targets must include the primary metric {PRIMARY_METRIC}."
+            )
+        metrics = membership_metrics(
+            self.labels,
+            self.scores,
+            target_fprs=fpr_targets,
+        )
         member_count = int((self.labels == 1).sum())
         nonmember_count = int((self.labels == 0).sum())
         availability = {}
         reportable_metrics = {"auc": metrics["auc"]}
-        for target in (0.1, 0.01, 0.001):
+        for target in fpr_targets:
             key = f"tpr_at_fpr_{target:g}"
             minimum_nonmembers = math.ceil(1.0 / target)
             resolvable = nonmember_count >= minimum_nonmembers

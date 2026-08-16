@@ -50,8 +50,8 @@ BERT 的同轮 ProjRes 结果会额外保存成员的 `batch_position` 和 `loca
 ICLR 记录做四键严格连接。`privacy_audit/iclr_projres_samples.csv` 保存逐样本配对；
 `iclr_projres_relationship.csv/json` 保存 Pearson/Spearman、类别控制 Spearman、ICLR
 高低分组的 ProjRes 分数，以及双方 Top-K 的重合率和富集倍数。ProjRes 命中率不再复用
-固定残差阈值预测，而是以同轮非成员连续分数分别在 10%、1% 和 0.1% FPR 下复算，并报告
-ICLR 高低分组的命中率差与比值。
+固定残差阈值预测，而是以同轮共享的 160 个非成员连续分数分别在 10% 和 1% FPR 下复算，
+并报告 ICLR 高低分组的命中率差与比值；不再统计 0.1% FPR。
 
 为了验证该分数能否衡量样本特异性，ICLR 会为训练 batch 携带相对于客户端训练集的稳定本地索引，并在训练期间为每个样本累计 `mean`、`last`、`max`、标准差和观测次数。审计完成后，这些索引会与 `low_fpr_full` 候选池中的成员索引严格连接，并针对每种攻击分别计算：
 

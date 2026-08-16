@@ -65,7 +65,7 @@ Gradient-Diff 来源于 [Li、Li 与 Ribeiro，ICLR 2023](https://openreview.net
 Score-Diff/Score-Ratio 来源于 [Jagielski 等，PoPETs 2023](https://petsymposium.org/popets/2023/popets-2023-0078.php)；
 FTA（free training attack）来源于 [Chang 等，USENIX Security 2024](https://www.usenix.org/conference/usenixsecurity24/presentation/chang)。
 四者在 `scripts/run_all_fedllm_attacks.sh` 的默认任务中每 50 个已完成通信轮采集一次。
-BERT 的 Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
+BERT 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
 作为成员，并按标签从从未训练的全局 evaluation 池抽取 10 倍非成员；每轮独立评估，
 不改变攻击分数公式。FTA 与其他攻击继续使用固定的 100/1000 历史成员候选池。
 
@@ -137,7 +137,7 @@ BERT 的 Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使�
 
 ## Shared evaluation
 
-所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC、TPR@10% FPR 和 TPR@0.1% FPR 作为诊断信息。固定 100/1000 候选池还派生一个类别严格匹配的 100/100 论文对照视图；BERT 的四种真实 Batch 攻击不使用该视图。真实 Batch 为 16、非成员为 160 时也不能解析 0.1% FPR。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
+所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。固定 100/1000 候选池仍可另外报告 TPR@0.1% FPR，并派生一个类别严格匹配的 100/100 论文对照视图。BERT 的 Blackbox-Loss、Grad-Cosine、Gradient-Diff、Score-Diff、Score-Ratio 与 ProjRes 统一使用 16 个真实 Batch 成员和 160 个按标签匹配的非成员；这六种攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
 
 ## CLIP 图像编码器 + 两层 MLP 场景
 

@@ -142,13 +142,14 @@ Options forwarded to each single-task Python runner include:
   --target-client-id N     --require-cuda | --no-require-cuda
 
 ProjRes options:
-  --projres                Run strict ProjRes every 50 completed rounds.
+  --projres                Run ProjRes every 50 completed rounds.
   --no-projres             Disable ProjRes.
   --skip-projres           Alias for --no-projres.
 
 Every real task prints its resolved configuration only when that task starts.
-Each task evaluates all ten common attacks and strict ProjRes every 50 rounds.
-BERT tasks also run observational ICLR ranking every 50 completed rounds.
+Each task evaluates all ten common attacks and ProjRes every 50 rounds. BERT
+runs ProjRes inside the shared exact-batch auditor; GPT2 keeps the standalone
+observed-update path. BERT also runs observational ICLR every 50 rounds.
 EOF
   "$python_bin" scripts/run_fedllm_adapter.py --help
   exit 0

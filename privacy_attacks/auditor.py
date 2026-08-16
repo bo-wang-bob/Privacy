@@ -26,6 +26,7 @@ from privacy_attacks.model_utils import last_client_states, trainable_scope_name
 from privacy_attacks.pipra import run_pipra
 from privacy_attacks.promptmia import run_promptmia
 from privacy_attacks.promptres import promptres_round_scores, run_promptres
+from privacy_attacks.projres_mlp import strict_mlp_projres
 from privacy_attacks.quantile import run_quantile_mia
 from privacy_attacks.query_attacks import run_canary, run_yoqo
 from privacy_attacks.rmia import run_rmia
@@ -56,6 +57,7 @@ SUPPORTED_ATTACKS = {
     "score_diff",
     "score_ratio",
     "fta",
+    "projres",
     "transfer_representation",
     "codepoison",
     "pipra",
@@ -115,17 +117,20 @@ _FEDMIA_BASELINE_ATTACKS = {
 }
 _UPDATE_ATTACKS = {"gradient_diff", "score_diff", "score_ratio", "fta"}
 _EXACT_BATCH_MEMBERSHIP_ATTACKS = {
+    "blackbox_loss",
     "grad_cosine",
     "gradient_diff",
+    "projres",
     "score_diff",
     "score_ratio",
 }
 _TARGET_ONLY_SIGNAL_ATTACKS = _FEDMIA_BASELINE_ATTACKS | _UPDATE_ATTACKS
-_SINGLE_ROUND_ATTACKS = {"blackbox_loss", "grad_cosine"}
+_SINGLE_ROUND_ATTACKS = {"blackbox_loss", "grad_cosine", "projres"}
 _PERIODIC_METRIC_ATTACKS = _FEDMIA_BASELINE_ATTACKS | {
     "fedmia_loss",
     "fedmia_cosine",
-} | _UPDATE_ATTACKS
+} | _UPDATE_ATTACKS | {"projres"}
+_EXACT_BATCH_REPORTED_FPR_TARGETS = (0.1, 0.01)
 
 
 def _signal_needs(attacks: set[str], full_signals: bool = False) -> dict[str, bool]:
@@ -432,9 +437,23 @@ class MembershipAuditor:
                 "Exact-batch attacks must also appear in audit.attacks: "
                 + ", ".join(unconfigured_batch_attacks)
             )
+        if "projres" in self.attacks and "projres" not in (
+            self.exact_batch_membership_attacks
+        ):
+            raise ValueError(
+                "Text Adapter ProjRes must use the shared exact-batch "
+                "membership protocol."
+            )
         if self.exact_batch_membership_attacks and self.pooled_client_audit:
             raise ValueError(
                 "Exact-batch membership currently requires one audit client."
+            )
+        if self.exact_batch_membership_attacks and (
+            self.candidate_sampling_mode != "balanced_global_holdout"
+        ):
+            raise ValueError(
+                "Exact-batch membership requires "
+                "candidate_sampling=balanced_global_holdout."
             )
         configured_exact_batch_ratio = self.config.get(
             "exact_batch_nonmember_to_member_ratio",
@@ -451,6 +470,23 @@ class MembershipAuditor:
                 "audit.exact_batch_nonmember_to_member_ratio must be a "
                 "positive integer."
             )
+        self.exact_batch_projres_config = dict(
+            self.config.get("exact_batch_projres", {})
+        )
+        if "projres" in self.exact_batch_membership_attacks:
+            if self.model_type not in {"bert_adapter", "gpt2_adapter"}:
+                raise ValueError(
+                    "Unified exact-batch ProjRes currently requires a text "
+                    "Adapter model."
+                )
+            threshold = float(
+                self.exact_batch_projres_config.get("threshold", 0.01)
+            )
+            if threshold < 0 or not math.isfinite(threshold):
+                raise ValueError(
+                    "audit.exact_batch_projres.threshold must be finite and "
+                    "non-negative."
+                )
         if self.candidate_sampling_mode == "balanced_global_holdout" and (
             not self.nonmember_to_member_ratio.is_integer()
             or self.nonmember_to_member_ratio < 1
@@ -924,6 +960,7 @@ class MembershipAuditor:
             "score_diff",
             "score_ratio",
             "fta",
+            "projres",
         }
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
@@ -1341,6 +1378,7 @@ class MembershipAuditor:
             "score_diff",
             "score_ratio",
             "fta",
+            "projres",
         }
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
@@ -1657,6 +1695,7 @@ class MembershipAuditor:
             "score_diff",
             "score_ratio",
             "fta",
+            "projres",
         }
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
@@ -2027,6 +2066,8 @@ class MembershipAuditor:
             )
         return {
             "inputs": inputs,
+            "member_inputs": member_inputs,
+            "nonmember_inputs": nonmember_inputs,
             "labels": labels,
             "membership": membership,
             "member_local_indices": local_indices,
@@ -2051,6 +2092,162 @@ class MembershipAuditor:
                 ),
             },
         }
+
+    def _score_exact_batch_projres(
+        self,
+        *,
+        round_index: int,
+        member_inputs: torch.Tensor,
+        nonmember_inputs: torch.Tensor,
+        labels: torch.Tensor,
+        membership: torch.Tensor,
+        member_local_indices: torch.Tensor,
+        nonmember_pool_indices: torch.Tensor,
+        base_state: dict[str, torch.Tensor],
+        updated_state: dict[str, torch.Tensor],
+        learning_rate: float | None,
+    ) -> tuple[torch.Tensor, dict, dict]:
+        """Run ProjRes on the shared exact-batch candidate view."""
+        member_count = int((membership == 1).sum())
+        nonmember_count = int((membership == 0).sum())
+        if member_count + nonmember_count != labels.numel():
+            raise ValueError("ProjRes candidates and membership are misaligned.")
+        parameter_name, attacked_layer = self.model.get_projres_attack_surface(
+            self.exact_batch_projres_config.get("attacked_parameter")
+        )
+        token_reduction = str(
+            self.exact_batch_projres_config.get("token_reduction", "auto")
+        ).lower()
+        if token_reduction == "auto":
+            token_reduction = (
+                "cls"
+                if str(getattr(self.model, "architecture", "")) == "bert"
+                else "last"
+            )
+        self.model.load_state_dict(base_state, strict=False)
+        extractor = self.model.get_projres_representations
+        member_representations, hidden_vector_count = extractor(
+            member_inputs,
+            parameter_name=parameter_name,
+            token_reduction=token_reduction,
+        )
+        representation_parts = [member_representations.detach().cpu().float()]
+        for start in range(0, nonmember_count, self.audit_batch_size):
+            stop = start + self.audit_batch_size
+            representations, _ = extractor(
+                nonmember_inputs[start:stop],
+                parameter_name=parameter_name,
+                token_reduction=token_reduction,
+            )
+            representation_parts.append(
+                representations.detach().cpu().float()
+            )
+        candidate_representations = torch.cat(representation_parts)
+        if parameter_name not in base_state or parameter_name not in updated_state:
+            raise ValueError(
+                f"Observed target update does not contain {parameter_name}."
+            )
+        observed_update = (
+            base_state[parameter_name].detach().cpu().float()
+            - updated_state[parameter_name].detach().cpu().float()
+        )
+        threshold = float(
+            self.exact_batch_projres_config.get("threshold", 0.01)
+        )
+        attack = strict_mlp_projres(
+            observed_update,
+            candidate_representations,
+            threshold=threshold,
+            max_rank=int(hidden_vector_count),
+        )
+        attack_result = AttackResult(
+            name="projres",
+            scores=attack.scores.detach().cpu(),
+            labels=membership.detach().cpu(),
+            sample_indices=torch.arange(labels.numel()),
+        )
+        summary = attack_result.to_summary(
+            fpr_targets=_EXACT_BATCH_REPORTED_FPR_TARGETS
+        )
+        metadata = {
+            **attack.metadata,
+            "attacked_parameter": parameter_name,
+            "sample_representation": (
+                f"{token_reduction}_sample_embedding_input_to_"
+                "adapter_down_projection"
+            ),
+            "membership_definition": "current_round_exact_upload_batch",
+            "nonmember_training_exposure": "never_trained",
+            "label_matching_mode": "exact_batch_histogram_ratio",
+            "nonmember_to_member_ratio": self.exact_batch_nonmember_ratio,
+            "communication_round": int(round_index) + 1,
+            "observed_hidden_vector_count": int(hidden_vector_count),
+            "observed_update_norm": float(observed_update.norm()),
+            "learning_rate": (
+                None if learning_rate is None else float(learning_rate)
+            ),
+            "paper_fedsgd_exact": member_count == 16,
+            "reported_fpr_targets": list(
+                _EXACT_BATCH_REPORTED_FPR_TARGETS
+            ),
+        }
+        batch_positions = list(range(member_count))
+        result_payload = {
+            "client_id": int(self.target_client_id),
+            "model_type": self.model_type,
+            "threat_model": {
+                "communication_round": int(round_index) + 1,
+                "member_definition": (
+                    "present_in_the_observed_target_client_fedsgd_batch"
+                ),
+                "execution": "unified_exact_batch_auditor",
+                "paper_fedsgd_exact": member_count == 16,
+            },
+            "dimensions": {
+                "candidate_sampling_batch_size": member_count,
+                "member_candidate_count": member_count,
+                "nonmember_candidate_count": nonmember_count,
+                "input_dimension": int(attacked_layer.in_features),
+                "first_layer_output_dimension": int(attacked_layer.out_features),
+                "observed_hidden_vector_count": int(hidden_vector_count),
+            },
+            "optimization": {
+                "learning_rate": (
+                    None if learning_rate is None else float(learning_rate)
+                ),
+                "observed_update_norm": float(observed_update.norm()),
+                "update_source": (
+                    "base_adapter_down_minus_uploaded_adapter_down"
+                ),
+            },
+            "attack": {"metrics": summary, "metadata": metadata},
+            "raw": {
+                "labels": membership.tolist(),
+                "scores": attack.scores.detach().cpu().tolist(),
+                "l1_residuals": attack.l1_residuals.detach().cpu().tolist(),
+                "predictions": attack.predictions.detach().cpu().tolist(),
+            },
+            "candidate_controls": {
+                "label_matched_nonmembers": True,
+                "label_matching_mode": "exact_batch_histogram_ratio",
+                "member_labels": labels[:member_count].tolist(),
+                "member_batch_positions": batch_positions,
+                "member_local_indices": member_local_indices.tolist(),
+                "nonmember_labels": labels[member_count:].tolist(),
+                "nonmember_pool_indices": nonmember_pool_indices.tolist(),
+                "nonmember_training_exposure": "never_trained",
+            },
+        }
+        payload = {
+            "communication_round": int(round_index) + 1,
+            "result": result_payload,
+        }
+        diagnostics = {
+            "l1_residuals": attack.l1_residuals.detach().cpu(),
+            "predictions": attack.predictions.detach().cpu(),
+            "metadata": metadata,
+        }
+        return attack.scores.detach().cpu(), diagnostics, payload
 
     def _collect_source_balanced(
         self,
@@ -2850,11 +3047,11 @@ class MembershipAuditor:
         protocol_messages: dict[int, dict] | None,
         released_states: dict[int, dict[str, torch.Tensor]] | None,
         learning_rate: float | None,
-    ) -> None:
+    ) -> dict | None:
         """Collect unchanged attack scores on the exact current upload batch."""
         attacks = active_attacks & self.exact_batch_membership_attacks
         if not attacks:
-            return
+            return None
         target_id = self.target_client_id
         if target_id not in selected_ids:
             raise ValueError(
@@ -2879,8 +3076,12 @@ class MembershipAuditor:
             "attacks": sorted(attacks),
         }
 
-        score_attacks = attacks & {"score_diff", "score_ratio"}
-        if score_attacks:
+        loss_attacks = attacks & {
+            "blackbox_loss",
+            "score_diff",
+            "score_ratio",
+        }
+        if loss_attacks:
             self.model.load_state_dict(observable_state, strict=False)
             self.model.eval()
             _, _, post_losses = self._candidate_outputs(
@@ -2890,17 +3091,18 @@ class MembershipAuditor:
                 candidate_labels=labels,
                 candidate_inputs_are_features=False,
             )
-            self.model.load_state_dict(observable_base, strict=False)
-            self.model.eval()
-            _, _, pre_losses = self._candidate_outputs(
-                self.model,
-                require_representation=False,
-                candidate_inputs=inputs,
-                candidate_labels=labels,
-                candidate_inputs_are_features=False,
-            )
             observation["confidence"] = (-post_losses).unsqueeze(0)
-            observation["pre_confidence"] = (-pre_losses).unsqueeze(0)
+            if attacks & {"score_diff", "score_ratio"}:
+                self.model.load_state_dict(observable_base, strict=False)
+                self.model.eval()
+                _, _, pre_losses = self._candidate_outputs(
+                    self.model,
+                    require_representation=False,
+                    candidate_inputs=inputs,
+                    candidate_labels=labels,
+                    candidate_inputs_are_features=False,
+                )
+                observation["pre_confidence"] = (-pre_losses).unsqueeze(0)
 
         gradient_attacks = attacks & {"grad_cosine", "gradient_diff"}
         if gradient_attacks:
@@ -2959,6 +3161,27 @@ class MembershipAuditor:
                     "gradient_difference"
                 ]
 
+        projres_payload = None
+        if "projres" in attacks:
+            projres_scores, projres_diagnostics, projres_payload = (
+                self._score_exact_batch_projres(
+                    round_index=round_index,
+                    member_inputs=candidates["member_inputs"],
+                    nonmember_inputs=candidates["nonmember_inputs"],
+                    labels=labels,
+                    membership=candidates["membership"],
+                    member_local_indices=candidates["member_local_indices"],
+                    nonmember_pool_indices=candidates[
+                        "nonmember_pool_indices"
+                    ],
+                    base_state=client_base,
+                    updated_state=updated_states[target_id],
+                    learning_rate=learning_rate,
+                )
+            )
+            observation["projres"] = projres_scores.unsqueeze(0)
+            observation["projres_diagnostics"] = projres_diagnostics
+
         self.exact_batch_observations.append(observation)
         self.exact_batch_candidate_selections.append(candidates["selection"])
         logger.info(
@@ -2969,6 +3192,7 @@ class MembershipAuditor:
             int((candidates["membership"] == 1).sum()),
             int((candidates["membership"] == 0).sum()),
         )
+        return projres_payload
 
     def observe_round(
         self,
@@ -2980,11 +3204,11 @@ class MembershipAuditor:
         protocol_messages: dict[int, dict] | None = None,
         released_states: dict[int, dict[str, torch.Tensor]] | None = None,
         learning_rate: float | None = None,
-    ) -> None:
+    ) -> dict | None:
         active_attacks = self._attacks_for_round(round_index)
         if not self.enabled or not active_attacks:
-            return
-        self._observe_exact_batch_round(
+            return None
+        exact_batch_payload = self._observe_exact_batch_round(
             round_index=round_index,
             active_attacks=set(active_attacks),
             base_state=base_state,
@@ -3006,7 +3230,7 @@ class MembershipAuditor:
             static_attacks, selected_ids
         )
         if not selected_ids:
-            return
+            return exact_batch_payload
         names = trainable_names(self.model)
         observable_names = names
         needs_gradients = (
@@ -3413,6 +3637,7 @@ class MembershipAuditor:
             observation["audit_view"] = self.audit_view
         self.observations.append(observation)
         logger.debug("Collected privacy signals for round %s", round_index)
+        return exact_batch_payload
 
     def _run_fedmia_signal(
         self,
@@ -3739,7 +3964,16 @@ class MembershipAuditor:
     ) -> AttackResult:
         """Evaluate one round because exact batch identities change each round."""
         membership = observation["membership"]
-        if attack == "grad_cosine":
+        if attack == "projres":
+            diagnostics = observation["projres_diagnostics"]
+            result = AttackResult(
+                name="projres",
+                scores=observation["projres"][0].detach().cpu(),
+                labels=membership.detach().cpu(),
+                sample_indices=torch.arange(membership.numel()),
+                metadata=dict(diagnostics["metadata"]),
+            )
+        elif attack in {"blackbox_loss", "grad_cosine"}:
             result = run_fedmia_baseline(
                 [observation],
                 membership,
@@ -4152,7 +4386,13 @@ class MembershipAuditor:
                     result = self._run_periodic_attack_prefix(
                         attack, observations[: position + 1]
                     )
-                    summary = result.to_summary()
+                    summary = result.to_summary(
+                        fpr_targets=(
+                            _EXACT_BATCH_REPORTED_FPR_TARGETS
+                            if attack in self.exact_batch_membership_attacks
+                            else (0.1, 0.01, 0.001)
+                        )
+                    )
                     paper_balanced = (
                         None
                         if attack in self.exact_batch_membership_attacks
@@ -4180,13 +4420,16 @@ class MembershipAuditor:
                     "auc": summary["auc"],
                     "tpr_at_fpr_0.1": reportable["tpr_at_fpr_0.1"],
                     "tpr_at_fpr_0.01": reportable["tpr_at_fpr_0.01"],
-                    "tpr_at_fpr_0.001": reportable["tpr_at_fpr_0.001"],
                     "num_samples": summary["num_samples"],
                     "member_count": summary["member_count"],
                     "nonmember_count": summary["nonmember_count"],
                     "fpr_resolution": summary["fpr_resolution"],
                     "score_degenerate": summary["score_degenerate"],
                 }
+                if attack not in self.exact_batch_membership_attacks:
+                    row["tpr_at_fpr_0.001"] = reportable[
+                        "tpr_at_fpr_0.001"
+                    ]
                 if paper_balanced is not None:
                     row.update(
                         {
@@ -4311,7 +4554,13 @@ class MembershipAuditor:
                 self.errors[attack] = f"{type(error).__name__}: {error}"
         summaries = []
         for result in self.results:
-            summary = result.to_summary()
+            summary = result.to_summary(
+                fpr_targets=(
+                    _EXACT_BATCH_REPORTED_FPR_TARGETS
+                    if result.name in self.exact_batch_membership_attacks
+                    else (0.1, 0.01, 0.001)
+                )
+            )
             paper_balanced = (
                 None
                 if result.name in self.exact_batch_membership_attacks
@@ -4480,6 +4729,9 @@ class MembershipAuditor:
                             ),
                             "nonmember_to_member_ratio": (
                                 self.exact_batch_nonmember_ratio
+                            ),
+                            "reported_fpr_targets": list(
+                                _EXACT_BATCH_REPORTED_FPR_TARGETS
                             ),
                             "candidate_selection_file": (
                                 "exact_batch_candidate_selection.pt"

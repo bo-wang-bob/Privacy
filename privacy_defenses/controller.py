@@ -2291,7 +2291,10 @@ class DefenseController:
                     else None
                 ),
             }
-            for target_fpr in (0.1, 0.01, 0.001):
+            # Unified exact-batch ProjRes uses the same 1:10 candidate view as
+            # the other update-sensitive attacks (normally 160 nonmembers), so
+            # 0.1% FPR is intentionally not reported.
+            for target_fpr in (0.1, 0.01):
                 suffix = f"{target_fpr:g}"
                 hits = _low_fpr_hits(
                     projres_scores,

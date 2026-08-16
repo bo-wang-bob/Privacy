@@ -25,11 +25,15 @@ def roc_curve(labels: torch.Tensor, scores: torch.Tensor):
     return fpr, tpr
 
 
-def membership_metrics(labels: torch.Tensor, scores: torch.Tensor) -> dict[str, float]:
+def membership_metrics(
+    labels: torch.Tensor,
+    scores: torch.Tensor,
+    target_fprs: tuple[float, ...] = (0.1, 0.01, 0.001),
+) -> dict[str, float]:
     fpr, tpr = roc_curve(labels, scores)
     auc = float(torch.trapz(tpr, fpr).item())
     result = {}
-    for target in (0.1, 0.01, 0.001):
+    for target in target_fprs:
         valid = tpr[fpr <= target]
         result[f"tpr_at_fpr_{target:g}"] = (
             float(valid.max().item()) if valid.numel() else 0.0

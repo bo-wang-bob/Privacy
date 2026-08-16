@@ -199,8 +199,9 @@ bash scripts/run_all_fedllm_attacks.sh
 ```
 
 默认依次运行 BERT-Base、GPT2-Large 在 SST-5、CoLA、IMDB 上的 6 个独立任务；
-每个任务均启用十种通用成员推理攻击和每 50 轮一次的严格 ProjRes。每个一级结果目录仍只
-对应一次训练任务。正式运行前可检查完整展开参数：
+每个任务均启用十种通用成员推理攻击和每 50 轮一次的 ProjRes。BERT 将 ProjRes
+作为共享审计器中的第十一种打分器，GPT2-Large 暂时保留独立的观察上传实现。每个一级
+结果目录仍只对应一次训练任务。正式运行前可检查完整展开参数：
 
 ```bash
 bash scripts/run_all_fedllm_attacks.sh --dry-run
@@ -272,14 +273,15 @@ norm clipping。
 CoLA 以 MCC 为主，同时保留 accuracy 作为辅助指标。十种通用攻击包括：
 `blackbox_loss`、`loss_series`、`grad_cosine`、`avg_cosine`、`fedmia_loss` 和
 `fedmia_cosine`，以及 `gradient_diff`、`score_diff`、`score_ratio` 和 `fta`。
-十种通用攻击与严格 ProjRes 均按已完成通信轮每 50 轮统计，并包含
-各任务最后一轮；十种通用攻击的逐轮指标写入
-`privacy_audit/attack_round_metrics.csv`。BERT 的 `grad_cosine`、`gradient_diff`、
-`score_diff` 和 `score_ratio` 在每个审计轮独立使用目标客户端该轮真实上传 Batch 作为
+十种通用攻击与 ProjRes 均按已完成通信轮每 50 轮统计，并包含各任务最后一轮。
+BERT 的全部十一种打分器都由共享审计器调度，逐轮指标统一写入
+`privacy_audit/attack_round_metrics.csv`。其中 `blackbox_loss`、`grad_cosine`、
+`gradient_diff`、`score_diff`、`score_ratio` 和 `projres` 在每个审计轮独立使用目标客户端该轮真实上传 Batch 作为
 成员，并从所有客户端的独立 evaluation 分区按该 Batch 的标签直方图无放回抽取 10 倍
 非成员；攻击公式保持不变，不跨轮合并不同候选样本。最终 `summary.json` 使用最后一个
-审计轮，逐轮 CSV 保留全部检查点。Batch 为 16 时有 160 个非成员，因此该视图主要报告
-AUC 与 `TPR@1%FPR`，`TPR@0.1%FPR` 明确不可解析；逐轮候选索引另存为
+审计轮，逐轮 CSV 保留全部检查点。Batch 为 16 时六种攻击严格共享 16 个成员和 160 个
+非成员，因此该视图只统计 AUC、`TPR@10%FPR` 与 `TPR@1%FPR`，不生成
+`TPR@0.1%FPR`；逐轮候选索引另存为
 `privacy_audit/exact_batch_candidate_selection.pt`。
 
 其余攻击仍从目标客户端训练分区抽取 100 个历史成员，并从全局独立 evaluation 池抽取
@@ -289,7 +291,7 @@ OLS 斜率。GPT2-Large 当前仍对全部十种攻击使用固定候选池。�
 列表，用 `--no-projres` 只关闭 ProjRes。
 
 固定候选池还派生一个逐类别严格匹配的 100 成员/100 非成员视图，用于对照
-ProjRes 论文的平衡评估规模。BERT 的四种真实 Batch 攻击不使用该历史成员视图；其余
+ProjRes 论文的平衡评估规模。BERT 的六种真实 Batch 攻击不使用该历史成员视图；其余
 攻击最终结果在
 `summary.json` 的每个攻击项下增加 `paper_balanced_evaluation`，逐轮结果在
 `attack_round_metrics.csv` 增加 `paper_100_100_*` 列。100 个非成员只能正式解析到
@@ -302,16 +304,19 @@ BERT 还启用只排名、不修改训练的 ICLR 分析。在第 50、100、…
 `iclr_round_metrics.csv`，逐样本分数写入 `iclr_round_samples.csv`，已完成轮次索引写入
 `iclr_series.json`，完整汇总写入
 `defense_summary.json`；最终还会把具有稳定
-本地索引的 100 个固定审计成员与非 Batch 通用攻击结果对齐；四种真实 Batch 攻击的
+本地索引的 100 个固定审计成员与非 Batch 通用攻击结果对齐；六种真实 Batch 攻击的
 逐轮关系可由保存的 Batch 本地索引另行配对分析。GPT2-Large 暂不启用 ICLR。
 同轮 ICLR 与 ProjRes 还会按
 `communication_round + client_id + batch_position + local_sample_index` 严格连接，结果写入
 `privacy_audit/iclr_projres_samples.csv`、`iclr_projres_relationship.csv` 和
 `iclr_projres_relationship.json`。连接过程会同时校验本地索引和类别，避免仅凭数组顺序
-误配。关系文件中的 ProjRes 命中率使用每轮未训练非成员连续分数分别在 10%、1% 和
-0.1% FPR 下复算，不使用固定残差阈值产生的二值预测。
+误配。关系文件中的 ProjRes 命中率使用共享的 160 个未训练非成员连续分数分别在
+10% 和 1% FPR 下复算，不使用固定残差阈值产生的二值预测，也不统计 0.1% FPR。
 
-GPT2-Large 的逐样本梯度不会组成“候选数 × 全部 PEFT 参数”的常驻矩阵，而是逐样本
+对 BERT，ProjRes 不再生成独立的 `projres_rounds/`、`projres_series.json` 或
+`projres_strict.json`；它与另外五种真实 Batch 攻击共同写入 `summary.json`、
+`predictions.csv`、`signals.pt` 和逐轮指标 CSV。GPT2-Large 的逐样本梯度不会组成
+“候选数 × 全部 PEFT 参数”的常驻矩阵，而是逐样本
 计算与真实上传的精确余弦后立即释放。ProjRes 每 50 轮观察一次目标客户端真实 FedSGD
 batch，攻击首个 Transformer block 后 Adapter 的 `down.weight`；成员定义严格等于
 各轮对应 batch，非成员来自独立 evaluation 分区，最多使用 1,000 个。每轮完整结果
@@ -322,7 +327,7 @@ BERT 与 GPT2-Large 均使用 batch size 16，因此真实 one-batch 上传满�
 batch-size-16 协议条件，元数据会记录 `paper_fedsgd_exact: true`。
 GPT2-Large 的训练、普通任务评估、ProjRes 非成员编码和通用攻击候选前向分块均设为
 16；余弦攻击仍逐样本流式计算梯度。
-上述优化仍保留同步 vanilla SGD、真实客户端上传，以及每 50 轮执行的七种攻击；
+上述优化仍保留同步 vanilla SGD、真实客户端上传和每 50 轮执行的全部配置攻击；
 没有通过关闭隐私评估提高普通任务准确率。
 
 `PromptFL` 是针对可训练 `prompt_learner` 定义的算法，不能直接应用到 MLP
