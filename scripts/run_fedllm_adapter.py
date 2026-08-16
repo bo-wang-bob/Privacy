@@ -168,6 +168,76 @@ def validate_config(config: dict) -> None:
             + ". Unsupported: "
             + ", ".join(unknown_attacks)
         )
+    candidate_sampling = str(
+        audit.get("candidate_sampling", "legacy")
+    ).lower()
+    if candidate_sampling not in {
+        "legacy",
+        "balanced_global_holdout",
+    }:
+        raise ValueError(
+            "Text Adapter experiments support candidate_sampling=legacy or "
+            "balanced_global_holdout."
+        )
+    if candidate_sampling == "balanced_global_holdout":
+        ratio = float(audit.get("nonmember_to_member_ratio", 1.0))
+        minimum_nonmembers = int(
+            audit.get("low_fpr_min_nonmembers", 1000)
+        )
+        maximum_members = int(audit.get("low_fpr_max_members", 0))
+        maximum_nonmembers = int(
+            audit.get("low_fpr_max_nonmembers", 0)
+        )
+        if ratio < 1 or not ratio.is_integer():
+            raise ValueError(
+                "balanced_global_holdout requires a positive integer "
+                "nonmember_to_member_ratio."
+            )
+        if maximum_members < 2:
+            raise ValueError(
+                "balanced_global_holdout requires low_fpr_max_members >= 2."
+            )
+        if minimum_nonmembers < 2:
+            raise ValueError(
+                "balanced_global_holdout requires low_fpr_min_nonmembers >= 2."
+            )
+        if maximum_nonmembers < minimum_nonmembers:
+            raise ValueError(
+                "balanced_global_holdout requires low_fpr_max_nonmembers >= "
+                "low_fpr_min_nonmembers."
+            )
+        if maximum_nonmembers < maximum_members * ratio:
+            raise ValueError(
+                "balanced_global_holdout requires enough non-member capacity "
+                "for the configured member cap and ratio."
+            )
+    defense = dict(config.get("defense", {"name": "none"}))
+    defense_name = str(defense.get("name", "none")).lower()
+    if defense_name not in {"none", "iclr"}:
+        raise ValueError("Text Adapter experiments support defense=none or iclr.")
+    if defense_name == "iclr":
+        if architecture != "bert":
+            raise ValueError("Text Adapter ICLR currently supports BERT only.")
+        interval = int(defense.get("iclr_analysis_interval", 50))
+        if interval <= 0:
+            raise ValueError("defense.iclr_analysis_interval must be positive.")
+        if interval > int(config["num_global_iters"]):
+            raise ValueError(
+                "defense.iclr_analysis_interval cannot exceed num_global_iters."
+            )
+        if str(
+            defense.get("iclr_analysis_timing", "post_round")
+        ).lower() != "post_round":
+            raise ValueError(
+                "BERT ICLR requires iclr_analysis_timing=post_round."
+            )
+        top_fraction = float(
+            defense.get("iclr_validation_top_fraction", 0.2)
+        )
+        if not 0.0 < top_fraction <= 0.5:
+            raise ValueError(
+                "defense.iclr_validation_top_fraction must be in (0, 0.5]."
+            )
     target_client_id = int(audit.get("target_client_id", 0))
     if not 0 <= target_client_id < int(config["total_users"]):
         raise ValueError("audit.target_client_id is outside the client range.")
@@ -242,6 +312,7 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
     """Emit one task's resolved settings only after that task has started."""
     audit = dict(config.get("audit", {}))
     projres = dict(config.get("projres", {}))
+    defense = dict(config.get("defense", {"name": "none"}))
     rows = (
         ("model_type", config["model_type"]),
         ("dataset", config["dataset_name"]),
@@ -276,6 +347,12 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
         ("privacy_audit.attacks", ", ".join(audit.get("attacks", []))),
         ("privacy_audit.target_client_id", audit.get("target_client_id", 0)),
         ("privacy_audit.candidate_sampling", audit.get("candidate_sampling")),
+        ("iclr.enabled", defense.get("name", "none") == "iclr"),
+        (
+            "iclr.analysis_interval",
+            defense.get("iclr_analysis_interval"),
+        ),
+        ("iclr.analysis_timing", defense.get("iclr_analysis_timing")),
         ("projres.enabled", projres.get("enabled", True)),
         (
             "projres.evaluation_interval",
@@ -388,6 +465,9 @@ def main() -> None:
     audit_config.setdefault("audit_client_ids", [audit_config["target_client_id"]])
     audit_config["seed"] = seed
     audit_config["training_health_check"] = True
+    defense_config = copy.deepcopy(config.get("defense", {"name": "none"}))
+    defense_config.setdefault("name", "none")
+    defense_config.setdefault("seed", seed)
     projres_config = copy.deepcopy(config.get("projres", {}))
     projres_config.setdefault("enabled", True)
     server = ServerBase(
@@ -419,7 +499,7 @@ def main() -> None:
         eval_interval=int(config["eval_interval"]),
         audit_config=audit_config,
         projres_config=projres_config,
-        defense_config={"name": "none"},
+        defense_config=defense_config,
         method_config=method_config,
     )
     server.train()

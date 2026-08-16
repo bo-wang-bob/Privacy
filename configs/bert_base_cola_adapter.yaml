@@ -8,11 +8,11 @@ dataset_name: cola
 # per communication round, matching Deng et al.'s batch-size-16 protocol.
 total_users: 30
 sample_users: 30
-num_global_iters: 750
+num_global_iters: 500
 batch_size: 16
 eval_batch_size: 32
-# CoLA was still improving at round 500 with 5e-3. Keep that rate through 500
-# completed rounds, then halve it for the final 250-round refinement phase.
+# Keep the existing round-500 decay boundary. With a 500-round run, every
+# completed training round still uses 5e-3 and the later refinement phase is omitted.
 learning_rate: 0.005
 learning_rate_decay: 0.5
 learning_rate_decay_interval: 500
@@ -25,7 +25,8 @@ adapter:
   activation: relu
   classifier_dropout: 0.0
   gradient_checkpointing: false
-  zero_init_up: false
+  # Start the residual Adapter as an exact identity mapping.
+  zero_init_up: true
 
 optimization:
   client_optimizer: sgd
@@ -51,7 +52,9 @@ audit:
     - fedmia_cosine
   target_client_id: 0
   audit_client_ids: [0]
-  candidate_sampling: balanced_holdout
+  candidate_sampling: balanced_global_holdout
+  nonmember_to_member_ratio: 10
+  paper_balanced_evaluation_size: 100
   audit_batch_size: 16
   audit_interval: 50
   attack_audit_intervals:
@@ -62,8 +65,18 @@ audit:
     fedmia_loss: 50
     fedmia_cosine: 50
   signal_storage: compact
+  low_fpr_min_nonmembers: 1000
   low_fpr_max_members: 100
-  low_fpr_max_nonmembers: 100
+  low_fpr_max_nonmembers: 1000
+
+# Rank each client's exact upload batch after rounds 50, 100, ..., 500.
+# This analysis is observational and does not filter samples or alter training.
+defense:
+  name: iclr
+  iclr_analysis_interval: 50
+  iclr_analysis_timing: post_round
+  iclr_feature_statistics: false
+  iclr_validation_top_fraction: 0.2
 
 projres:
   enabled: true

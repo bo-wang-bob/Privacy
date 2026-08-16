@@ -230,8 +230,9 @@ def validate_iclr_attack_relationships(
         summary = {
             "status": "unavailable",
             "reason": (
-                "Candidate local indices are unavailable. Use "
-                "audit.candidate_sampling=low_fpr_full."
+                "Candidate local indices are unavailable. Use a sampling mode "
+                "that records target-client member indices, such as "
+                "low_fpr_full or balanced_global_holdout."
             ),
         }
         with open(summary_path, "w", encoding="utf-8") as file:

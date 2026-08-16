@@ -436,6 +436,20 @@ def _run_text_adapter_client(
     member_labels = member_labels.detach().cpu().long()
     actual_batch_size = int(member_labels.numel())
     member_count = min(actual_batch_size, int(max_candidates))
+    member_batch_positions = list(range(member_count))
+    retained_local_indices = getattr(target, "last_train_indices", None)
+    member_local_indices = (
+        retained_local_indices.detach().cpu().long()[:member_count].tolist()
+        if retained_local_indices is not None
+        else None
+    )
+    if (
+        member_local_indices is not None
+        and len(member_local_indices) != member_count
+    ):
+        raise ValueError(
+            "Retained text ProjRes member indices do not match the batch."
+        )
     if attacked_parameter not in base_state or attacked_parameter not in updated_state:
         raise ValueError(
             f"Observed client update does not contain {attacked_parameter}."
@@ -535,6 +549,8 @@ def _run_text_adapter_client(
         "candidate_controls": {
             "label_matched_nonmembers": False,
             "member_labels": member_labels[:member_count].tolist(),
+            "member_batch_positions": member_batch_positions,
+            "member_local_indices": member_local_indices,
             "nonmember_labels": nonmember_labels.tolist(),
             "nonmember_source_counts": nonmember_source_counts,
             "nonmember_training_exposure": "never_trained",

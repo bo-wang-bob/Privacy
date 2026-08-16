@@ -338,12 +338,17 @@ class MembershipAuditor:
             "fedmia_mix",
             "low_fpr_full",
             "balanced_holdout",
+            "balanced_global_holdout",
         }:
             raise ValueError(
                 "audit.candidate_sampling must be legacy, fedmia_mix, "
-                "low_fpr_full, or balanced_holdout."
+                "low_fpr_full, balanced_holdout, or "
+                "balanced_global_holdout."
             )
-        if self.candidate_sampling_mode == "balanced_holdout":
+        if self.candidate_sampling_mode in {
+            "balanced_holdout",
+            "balanced_global_holdout",
+        }:
             self.match_candidate_labels = True
         self.nonmember_to_member_ratio = float(
             self.config.get("nonmember_to_member_ratio", 1.0)
@@ -351,6 +356,28 @@ class MembershipAuditor:
         if self.nonmember_to_member_ratio <= 0:
             raise ValueError(
                 "audit.nonmember_to_member_ratio must be positive."
+            )
+        if self.candidate_sampling_mode == "balanced_global_holdout" and (
+            not self.nonmember_to_member_ratio.is_integer()
+            or self.nonmember_to_member_ratio < 1
+        ):
+            raise ValueError(
+                "balanced_global_holdout requires a positive integer "
+                "nonmember_to_member_ratio."
+            )
+        self.paper_balanced_evaluation_size = int(
+            self.config.get("paper_balanced_evaluation_size", 0)
+        )
+        if self.paper_balanced_evaluation_size not in {0, 100}:
+            raise ValueError(
+                "audit.paper_balanced_evaluation_size must be 0 or 100."
+            )
+        if self.paper_balanced_evaluation_size and (
+            self.candidate_sampling_mode != "balanced_global_holdout"
+        ):
+            raise ValueError(
+                "paper_balanced_evaluation_size requires "
+                "candidate_sampling=balanced_global_holdout."
             )
         if self.candidate_sampling_mode == "fedmia_mix" and self.match_candidate_labels:
             raise ValueError(
@@ -369,6 +396,7 @@ class MembershipAuditor:
         if self.candidate_sampling_mode in {
             "low_fpr_full",
             "balanced_holdout",
+            "balanced_global_holdout",
         }:
             if self.low_fpr_max_members < 0 or self.low_fpr_max_members == 1:
                 raise ValueError(
@@ -404,8 +432,15 @@ class MembershipAuditor:
         self.candidate_inputs_are_features = False
         self.low_fpr_candidate_selection: dict | None = None
         self.candidate_local_indices: torch.Tensor | None = None
+        self.paper_balanced_candidate_indices: torch.Tensor | None = None
+        self.paper_balanced_evaluation: dict | None = None
 
         if self.enabled:
+            if self.candidate_sampling_mode == "balanced_global_holdout":
+                self._initialize_balanced_global_holdout_candidates(
+                    users, target_client_id
+                )
+                return
             if self.candidate_sampling_mode == "balanced_holdout":
                 self._initialize_balanced_holdout_candidates(
                     users, target_client_id
@@ -1001,6 +1036,491 @@ class MembershipAuditor:
         )
         self.null_client_candidate_label_overlap_by_client = overlap_by_client
         self.nonmember_source_priority = list(dict.fromkeys(source_priority))
+
+    @staticmethod
+    def _allocate_proportional_with_capacities(
+        weights: list[int], capacities: list[int], total: int
+    ) -> list[int]:
+        """Allocate an exact proportional budget without exceeding capacities."""
+        if len(weights) != len(capacities) or not weights:
+            raise ValueError("Weights and capacities must be non-empty and aligned.")
+        if total < 0 or sum(capacities) < total:
+            raise ValueError("Candidate capacities cannot satisfy the requested total.")
+        if total == 0:
+            return [0] * len(weights)
+        weight_total = sum(weights)
+        if weight_total <= 0:
+            raise ValueError("At least one candidate class must have positive weight.")
+
+        ideals = [total * weight / weight_total for weight in weights]
+        allocation = [0] * len(weights)
+        for _ in range(total):
+            available = [
+                class_id
+                for class_id, capacity in enumerate(capacities)
+                if allocation[class_id] < capacity
+            ]
+            if not available:
+                raise AssertionError("Proportional candidate allocation stalled.")
+            selected = max(
+                available,
+                key=lambda class_id: (
+                    ideals[class_id] - allocation[class_id],
+                    weights[class_id],
+                    -class_id,
+                ),
+            )
+            allocation[selected] += 1
+        return allocation
+
+    def _collect_global_proportional_candidates(
+        self,
+        member_dataset,
+        nonmember_datasets: list,
+        nonmember_source_names: list[str],
+        member_limit: int,
+        nonmember_limit: int,
+        client_id: int,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        dict,
+    ]:
+        """Sample exact-ratio label-matched train/global-test candidates."""
+        if len(nonmember_datasets) != len(nonmember_source_names):
+            raise ValueError("Global holdout datasets and sources must be aligned.")
+        if not nonmember_datasets:
+            raise ValueError("Global holdout sampling requires evaluation data.")
+        ratio = int(self.nonmember_to_member_ratio)
+        nonmember_dataset = ConcatDataset(nonmember_datasets)
+        member_groups = group_idx_by_class(member_dataset, self.num_classes)
+        nonmember_groups = group_idx_by_class(
+            nonmember_dataset, self.num_classes
+        )
+        member_pool_histogram = [len(group) for group in member_groups]
+        nonmember_pool_histogram = [len(group) for group in nonmember_groups]
+        member_capacities = [
+            min(
+                member_pool_histogram[class_id],
+                nonmember_pool_histogram[class_id] // ratio,
+            )
+            for class_id in range(self.num_classes)
+        ]
+        maximum_members = (
+            len(member_dataset) if member_limit <= 0 else member_limit
+        )
+        maximum_nonmembers = (
+            len(nonmember_dataset)
+            if nonmember_limit <= 0
+            else nonmember_limit
+        )
+        member_budget = min(
+            maximum_members,
+            maximum_nonmembers // ratio,
+            sum(member_capacities),
+        )
+        if member_budget < 2:
+            raise ValueError(
+                f"Client {client_id} cannot construct two exact-ratio "
+                "label-matched member candidates."
+            )
+        member_quotas = self._allocate_proportional_with_capacities(
+            member_pool_histogram,
+            member_capacities,
+            member_budget,
+        )
+        nonmember_quotas = [quota * ratio for quota in member_quotas]
+
+        def select_indices(
+            groups: list[list[int]], quotas: list[int], salt: int
+        ) -> list[int]:
+            selected = []
+            for class_id, count in enumerate(quotas):
+                if count == 0:
+                    continue
+                generator = torch.Generator().manual_seed(
+                    self.seed
+                    + 104729 * (client_id + 1)
+                    + salt
+                    + 2 * class_id
+                )
+                order = torch.randperm(
+                    len(groups[class_id]), generator=generator
+                )[:count]
+                selected.extend(
+                    groups[class_id][position] for position in order.tolist()
+                )
+            shuffle_generator = torch.Generator().manual_seed(
+                self.seed + 999983 * (client_id + 1) + salt
+            )
+            order = torch.randperm(len(selected), generator=shuffle_generator)
+            return [selected[position] for position in order.tolist()]
+
+        member_indices = select_indices(member_groups, member_quotas, 11)
+        nonmember_indices = select_indices(
+            nonmember_groups, nonmember_quotas, 17
+        )
+        member_images, member_labels = self._collect_many(
+            [Subset(member_dataset, member_indices)], len(member_indices)
+        )
+        nonmember_images, nonmember_labels = self._collect_many(
+            [Subset(nonmember_dataset, nonmember_indices)],
+            len(nonmember_indices),
+        )
+        member_histogram = torch.bincount(
+            member_labels, minlength=self.num_classes
+        )
+        nonmember_histogram = torch.bincount(
+            nonmember_labels, minlength=self.num_classes
+        )
+        if not torch.equal(nonmember_histogram, member_histogram * ratio):
+            raise AssertionError(
+                "Global holdout candidate label distributions drifted."
+            )
+        nonmember_pool_source_counts = {
+            source: len(dataset)
+            for source, dataset in zip(
+                nonmember_source_names, nonmember_datasets
+            )
+        }
+        selected_nonmember_source_counts = self._selected_source_counts(
+            torch.as_tensor(nonmember_indices, dtype=torch.long),
+            nonmember_pool_source_counts,
+        )
+        return (
+            member_images,
+            member_labels,
+            nonmember_images,
+            nonmember_labels,
+            {
+                "client_id": int(client_id),
+                "member_count": int(member_labels.numel()),
+                "nonmember_count": int(nonmember_labels.numel()),
+                "member_label_histogram": member_histogram.tolist(),
+                "nonmember_label_histogram": nonmember_histogram.tolist(),
+                "member_pool_label_histogram": member_pool_histogram,
+                "nonmember_pool_label_histogram": nonmember_pool_histogram,
+                "member_capacity_by_label": member_capacities,
+                "sampling_seed": int(self.seed),
+                "member_indices": member_indices,
+                "nonmember_indices": nonmember_indices,
+                "member_pool_source_counts": {
+                    f"target_train:{client_id}": len(member_dataset)
+                },
+                "nonmember_pool_source_counts": nonmember_pool_source_counts,
+                "member_source_counts": {
+                    f"target_train:{client_id}": int(member_labels.numel())
+                },
+                "nonmember_source_counts": selected_nonmember_source_counts,
+                "index_convention": (
+                    "member indices are zero-based positions in the target "
+                    "client train dataset; non-member indices are zero-based "
+                    "positions in the client-id ordered concatenation of all "
+                    "independent evaluation datasets"
+                ),
+            },
+        )
+
+    def _initialize_balanced_global_holdout_candidates(
+        self, users: list, target_client_id: int
+    ) -> None:
+        """Build exact-ratio target-train/global-test candidate pools."""
+        del target_client_id
+        supported = {
+            "blackbox_loss",
+            "loss_series",
+            "grad_cosine",
+            "avg_cosine",
+            "fedmia_loss",
+            "fedmia_cosine",
+        }
+        unsupported = sorted(set(self.attacks) - supported)
+        if self.model_type not in {
+            "clip_mlp",
+            "visual_adapter",
+            "clip_lora",
+            "bert_adapter",
+            "gpt2_adapter",
+        }:
+            raise ValueError(
+                "balanced_global_holdout requires a supported "
+                "parameter-efficient model."
+            )
+        if unsupported:
+            raise ValueError(
+                "balanced_global_holdout does not support: "
+                + ", ".join(unsupported)
+            )
+        nonmember_datasets = [
+            user.test_data for user in users if len(user.test_data)
+        ]
+        nonmember_source_names = [
+            f"independent_test:{user.id}"
+            for user in users
+            if len(user.test_data)
+        ]
+
+        image_parts = []
+        label_parts = []
+        membership_parts = []
+        client_parts = []
+        local_index_parts = []
+        candidate_sampling_by_client = {}
+        selection_by_client = {}
+        overlap_by_client = {}
+        eligible_client_ids = []
+
+        for client_id in self.audit_client_ids:
+            target = users[client_id]
+            try:
+                (
+                    member_images,
+                    member_labels,
+                    nonmember_images,
+                    nonmember_labels,
+                    sampling,
+                ) = self._collect_global_proportional_candidates(
+                    target.train_data,
+                    nonmember_datasets,
+                    nonmember_source_names,
+                    self.low_fpr_max_members,
+                    self.low_fpr_max_nonmembers,
+                    client_id,
+                )
+                if nonmember_labels.numel() < self.low_fpr_min_nonmembers:
+                    raise ValueError(
+                        "balanced_global_holdout needs at least "
+                        f"{self.low_fpr_min_nonmembers} non-members, but "
+                        f"only constructed {nonmember_labels.numel()}."
+                    )
+            except ValueError as error:
+                if not self.allow_partial_client_audit:
+                    raise
+                self.skipped_audit_clients[str(client_id)] = str(error)
+                logger.warning(
+                    "Skipping client %d in balanced global holdout audit: %s",
+                    client_id,
+                    error,
+                )
+                continue
+
+            member_indices = torch.as_tensor(
+                sampling.pop("member_indices"), dtype=torch.long
+            )
+            nonmember_indices = torch.as_tensor(
+                sampling.pop("nonmember_indices"), dtype=torch.long
+            )
+            member_count = int(member_labels.numel())
+            nonmember_count = int(nonmember_labels.numel())
+            actual_ratio = nonmember_count / member_count
+            if actual_ratio != self.nonmember_to_member_ratio:
+                raise AssertionError(
+                    "Balanced global holdout candidate ratio drifted."
+                )
+
+            images = self._cat_candidate_inputs(
+                (member_images, nonmember_images)
+            )
+            labels = torch.cat((member_labels, nonmember_labels))
+            memberships = torch.cat(
+                (
+                    torch.ones(member_count, dtype=torch.long),
+                    torch.zeros(nonmember_count, dtype=torch.long),
+                )
+            )
+            image_parts.append(images)
+            label_parts.append(labels)
+            membership_parts.append(memberships)
+            client_parts.append(
+                torch.full((labels.numel(),), client_id, dtype=torch.long)
+            )
+            local_index_parts.append(
+                torch.cat(
+                    (
+                        member_indices,
+                        torch.full((nonmember_count,), -1, dtype=torch.long),
+                    )
+                )
+            )
+            eligible_client_ids.append(client_id)
+            selection_by_client[str(client_id)] = {
+                "seed": self.seed,
+                "member_pool_indices": member_indices,
+                "nonmember_pool_indices": nonmember_indices,
+                "member_pool_source_counts": sampling[
+                    "member_pool_source_counts"
+                ],
+                "nonmember_pool_source_counts": sampling[
+                    "nonmember_pool_source_counts"
+                ],
+                "index_convention": sampling["index_convention"],
+            }
+            candidate_sampling_by_client[str(client_id)] = {
+                **sampling,
+                "mode": "balanced_global_holdout",
+                "member_count": member_count,
+                "nonmember_count": nonmember_count,
+                "member_pool_count": len(target.train_data),
+                "nonmember_pool_count": sum(
+                    len(dataset) for dataset in nonmember_datasets
+                ),
+                "minimum_nonmembers": self.low_fpr_min_nonmembers,
+                "maximum_members": self.low_fpr_max_members,
+                "maximum_nonmembers": self.low_fpr_max_nonmembers,
+                "selection_method": (
+                    "exact_proportional_class_stratified_without_replacement"
+                ),
+                "selection_artifact": "candidate_selection.pt",
+                "membership_definition": "global_model_record_membership",
+                "nonmember_training_exposure": "never_trained",
+                "requested_nonmember_to_member_ratio": (
+                    self.nonmember_to_member_ratio
+                ),
+                "actual_nonmember_to_member_ratio": actual_ratio,
+                "fpr_resolution": 1.0 / nonmember_count,
+            }
+            member_histogram = torch.bincount(
+                member_labels, minlength=self.num_classes
+            )
+            overlap_by_client[str(client_id)] = [
+                class_id
+                for class_id, count in enumerate(member_histogram.tolist())
+                if count > 0
+            ]
+            logger.info(
+                "Balanced global holdout client %d candidates selected: "
+                "members=%d/%d, non-members=%d/%d, ratio=1:%d",
+                client_id,
+                member_count,
+                len(target.train_data),
+                nonmember_count,
+                sum(len(dataset) for dataset in nonmember_datasets),
+                int(self.nonmember_to_member_ratio),
+            )
+
+        if not eligible_client_ids:
+            raise ValueError(
+                "Balanced global holdout audit found no client with enough "
+                "label-matched train/evaluation candidates."
+            )
+        self.audit_client_ids = eligible_client_ids
+        self.pooled_client_audit = len(eligible_client_ids) > 1
+        if not self.pooled_client_audit:
+            self.target_client_id = eligible_client_ids[0]
+        self.low_fpr_candidate_selection = (
+            {
+                "scope": "pooled_clients",
+                "seed": self.seed,
+                "audit_client_ids": eligible_client_ids,
+                "per_client": selection_by_client,
+            }
+            if self.pooled_client_audit
+            else selection_by_client[str(eligible_client_ids[0])]
+        )
+        self.images = self._cat_candidate_inputs(image_parts)
+        self.labels = torch.cat(label_parts)
+        self.membership = torch.cat(membership_parts)
+        self.candidate_client_ids = torch.cat(client_parts)
+        self.candidate_local_indices = torch.cat(local_index_parts)
+        self.candidate_inputs_are_features = bool(
+            self.images.ndim == 2
+            and self.images.shape[1]
+            == int(getattr(self.model, "projection_dim", -1))
+        )
+        self.candidate_sampling_by_client = candidate_sampling_by_client
+        self.candidate_label_support = sorted(
+            set(self.labels.detach().cpu().unique().tolist())
+        )
+        self.null_client_candidate_label_overlap = sorted(
+            {
+                class_id
+                for overlap in overlap_by_client.values()
+                for class_id in overlap
+            }
+        )
+        self.null_client_candidate_label_overlap_by_client = overlap_by_client
+        self.nonmember_source_priority = nonmember_source_names
+        self._initialize_paper_balanced_evaluation_view()
+
+    def _initialize_paper_balanced_evaluation_view(self) -> None:
+        """Select one fixed, exactly class-matched balanced evaluation view."""
+        size = self.paper_balanced_evaluation_size
+        if size == 0:
+            return
+        if len(self.audit_client_ids) != 1:
+            raise ValueError(
+                "Paper-balanced evaluation currently requires one audit client."
+            )
+        client_id = int(self.audit_client_ids[0])
+        client_mask = self.candidate_client_ids == client_id
+        member_positions = torch.nonzero(
+            client_mask & (self.membership == 1), as_tuple=False
+        ).flatten()
+        nonmember_positions = torch.nonzero(
+            client_mask & (self.membership == 0), as_tuple=False
+        ).flatten()
+        if member_positions.numel() != size:
+            raise ValueError(
+                "Paper-balanced evaluation requires exactly "
+                f"{size} selected members, but found "
+                f"{member_positions.numel()}."
+            )
+
+        selected_nonmembers = []
+        member_histogram = torch.bincount(
+            self.labels[member_positions], minlength=self.num_classes
+        )
+        for class_id, required in enumerate(member_histogram.tolist()):
+            if required == 0:
+                continue
+            class_positions = nonmember_positions[
+                self.labels[nonmember_positions] == class_id
+            ]
+            if class_positions.numel() < required:
+                raise ValueError(
+                    "Paper-balanced evaluation lacks class-matched "
+                    f"nonmembers for class {class_id}: "
+                    f"required={required}, available={class_positions.numel()}."
+                )
+            generator = torch.Generator().manual_seed(
+                self.seed + 15485863 * (client_id + 1) + 2 * class_id
+            )
+            order = torch.randperm(
+                class_positions.numel(), generator=generator
+            )[:required]
+            selected_nonmembers.append(class_positions[order])
+        selected_nonmembers = torch.cat(selected_nonmembers)
+        selected_histogram = torch.bincount(
+            self.labels[selected_nonmembers], minlength=self.num_classes
+        )
+        if not torch.equal(selected_histogram, member_histogram):
+            raise AssertionError(
+                "Paper-balanced evaluation label matching drifted."
+            )
+        self.paper_balanced_candidate_indices = torch.cat(
+            (member_positions, selected_nonmembers)
+        )
+        self.paper_balanced_evaluation = {
+            "name": f"paper_{size}_{size}",
+            "client_id": client_id,
+            "seed": self.seed,
+            "member_count": size,
+            "nonmember_count": size,
+            "candidate_indices": self.paper_balanced_candidate_indices,
+            "member_label_histogram": member_histogram.tolist(),
+            "nonmember_label_histogram": selected_histogram.tolist(),
+            "selection_method": (
+                "fixed_class_matched_subset_of_low_fpr_candidates"
+            ),
+            "shared_across_attacks_and_rounds": True,
+        }
+        if self.low_fpr_candidate_selection is None:
+            raise AssertionError("Candidate selection metadata was not initialized.")
+        self.low_fpr_candidate_selection["paper_balanced_evaluation"] = (
+            self.paper_balanced_evaluation
+        )
 
     def _initialize_balanced_holdout_candidates(
         self, users: list, target_client_id: int
@@ -2785,6 +3305,62 @@ class MembershipAuditor:
             self.seed,
         )
 
+    def _paper_balanced_attack_summary(
+        self, result: AttackResult
+    ) -> dict | None:
+        """Evaluate one attack on the fixed balanced subset of its scores."""
+        candidate_indices = getattr(
+            self, "paper_balanced_candidate_indices", None
+        )
+        metadata = getattr(self, "paper_balanced_evaluation", None)
+        if candidate_indices is None or metadata is None:
+            return None
+        result_positions = {
+            int(candidate_index): position
+            for position, candidate_index in enumerate(
+                result.sample_indices.detach().cpu().tolist()
+            )
+        }
+        try:
+            selected_positions = torch.tensor(
+                [
+                    result_positions[int(candidate_index)]
+                    for candidate_index in candidate_indices.tolist()
+                ],
+                dtype=torch.long,
+            )
+        except KeyError as error:
+            raise ValueError(
+                "Attack result does not contain every paper-balanced candidate."
+            ) from error
+        balanced = AttackResult(
+            name=result.name,
+            scores=result.scores[selected_positions],
+            labels=result.labels[selected_positions],
+            sample_indices=result.sample_indices[selected_positions],
+        ).to_summary()
+        return {
+            "name": metadata["name"],
+            "selection_method": metadata["selection_method"],
+            "shared_across_attacks_and_rounds": True,
+            "member_count": balanced["member_count"],
+            "nonmember_count": balanced["nonmember_count"],
+            "num_samples": balanced["num_samples"],
+            "fpr_resolution": balanced["fpr_resolution"],
+            "auc": balanced["auc"],
+            "tpr_at_fpr_0.1": balanced["reportable_metrics"][
+                "tpr_at_fpr_0.1"
+            ],
+            "tpr_at_fpr_0.01": balanced["reportable_metrics"][
+                "tpr_at_fpr_0.01"
+            ],
+            "tpr_at_fpr_0.001": balanced["reportable_metrics"][
+                "tpr_at_fpr_0.001"
+            ],
+            "metric_availability": balanced["metric_availability"],
+            "score_degenerate": balanced["score_degenerate"],
+        }
+
     def _write_periodic_attack_metrics(self) -> int:
         """Persist one metric row per explicitly scheduled attack checkpoint."""
         if self.pooled_client_audit:
@@ -2804,6 +3380,9 @@ class MembershipAuditor:
                         attack, observations[: position + 1]
                     )
                     summary = result.to_summary()
+                    paper_balanced = self._paper_balanced_attack_summary(
+                        result
+                    )
                 except Exception as error:
                     error_key = f"round_metrics:{attack}:round_{completed_round}"
                     self.errors[error_key] = f"{type(error).__name__}: {error}"
@@ -2814,26 +3393,40 @@ class MembershipAuditor:
                     )
                     continue
                 reportable = summary["reportable_metrics"]
-                rows.append(
-                    {
-                        "communication_round": completed_round,
-                        "attack": attack,
-                        "temporal_scope": (
-                            "single_round"
-                            if attack in _SINGLE_ROUND_ATTACKS
-                            else "cumulative"
-                        ),
-                        "auc": summary["auc"],
-                        "tpr_at_fpr_0.1": reportable["tpr_at_fpr_0.1"],
-                        "tpr_at_fpr_0.01": reportable["tpr_at_fpr_0.01"],
-                        "tpr_at_fpr_0.001": reportable["tpr_at_fpr_0.001"],
-                        "num_samples": summary["num_samples"],
-                        "member_count": summary["member_count"],
-                        "nonmember_count": summary["nonmember_count"],
-                        "fpr_resolution": summary["fpr_resolution"],
-                        "score_degenerate": summary["score_degenerate"],
-                    }
-                )
+                row = {
+                    "communication_round": completed_round,
+                    "attack": attack,
+                    "temporal_scope": (
+                        "single_round"
+                        if attack in _SINGLE_ROUND_ATTACKS
+                        else "cumulative"
+                    ),
+                    "auc": summary["auc"],
+                    "tpr_at_fpr_0.1": reportable["tpr_at_fpr_0.1"],
+                    "tpr_at_fpr_0.01": reportable["tpr_at_fpr_0.01"],
+                    "tpr_at_fpr_0.001": reportable["tpr_at_fpr_0.001"],
+                    "num_samples": summary["num_samples"],
+                    "member_count": summary["member_count"],
+                    "nonmember_count": summary["nonmember_count"],
+                    "fpr_resolution": summary["fpr_resolution"],
+                    "score_degenerate": summary["score_degenerate"],
+                }
+                if paper_balanced is not None:
+                    row.update(
+                        {
+                            "paper_100_100_auc": paper_balanced["auc"],
+                            "paper_100_100_tpr_at_fpr_0.1": (
+                                paper_balanced["tpr_at_fpr_0.1"]
+                            ),
+                            "paper_100_100_tpr_at_fpr_0.01": (
+                                paper_balanced["tpr_at_fpr_0.01"]
+                            ),
+                            "paper_100_100_tpr_at_fpr_0.001": (
+                                paper_balanced["tpr_at_fpr_0.001"]
+                            ),
+                        }
+                    )
+                rows.append(row)
         if not rows:
             return 0
         path = os.path.join(self.results_dir, "attack_round_metrics.csv")
@@ -2921,7 +3514,13 @@ class MembershipAuditor:
                     torch.cuda.empty_cache()
                 logger.exception("Membership attack %s failed", attack)
                 self.errors[attack] = f"{type(error).__name__}: {error}"
-        summaries = [result.to_summary() for result in self.results]
+        summaries = []
+        for result in self.results:
+            summary = result.to_summary()
+            paper_balanced = self._paper_balanced_attack_summary(result)
+            if paper_balanced is not None:
+                summary["paper_balanced_evaluation"] = paper_balanced
+            summaries.append(summary)
         periodic_metric_rows = self._write_periodic_attack_metrics()
         signal_health_enabled = bool(
             self.config.get("fedmia_signal_health_check", False)
@@ -2966,6 +3565,18 @@ class MembershipAuditor:
         label_tv_distance = 0.5 * sum(
             abs(member / member_count - nonmember / nonmember_count)
             for member, nonmember in zip(member_histogram, nonmember_histogram)
+        )
+        paper_balanced_evaluation = getattr(
+            self, "paper_balanced_evaluation", None
+        )
+        paper_balanced_summary = (
+            None
+            if paper_balanced_evaluation is None
+            else {
+                key: value
+                for key, value in paper_balanced_evaluation.items()
+                if key != "candidate_indices"
+            }
         )
         iclr_validation = None
         if self.defense_name == "iclr":
@@ -3088,18 +3699,25 @@ class MembershipAuditor:
                         "membership_definition": (
                             "global_model_record_membership"
                             if self.candidate_sampling_mode
-                            == "balanced_holdout"
+                            in {
+                                "balanced_holdout",
+                                "balanced_global_holdout",
+                            }
                             else "target_client_membership"
                         ),
                         "nonmember_training_exposure": (
                             "never_trained"
                             if self.candidate_sampling_mode
-                            == "balanced_holdout"
+                            in {
+                                "balanced_holdout",
+                                "balanced_global_holdout",
+                            }
                             else "source_dependent"
                         ),
                         "requested_nonmember_to_member_ratio": (
                             self.nonmember_to_member_ratio
-                            if self.candidate_sampling_mode == "fedmia_mix"
+                            if self.candidate_sampling_mode
+                            in {"fedmia_mix", "balanced_global_holdout"}
                             else None
                         ),
                         "actual_nonmember_to_member_ratio": (
@@ -3113,6 +3731,9 @@ class MembershipAuditor:
                             "balanced_target_train_test_per_class"
                             if self.candidate_sampling_mode
                             == "balanced_holdout"
+                            else "exact_proportional_target_train_global_test"
+                            if self.candidate_sampling_mode
+                            == "balanced_global_holdout"
                             else "fedmia_mix_unmatched"
                             if self.candidate_sampling_mode == "fedmia_mix"
                             else "exact_paired_per_client"
@@ -3131,6 +3752,14 @@ class MembershipAuditor:
                         "nonmember_source_priority": self.nonmember_source_priority,
                         "member_label_histogram": member_histogram,
                         "nonmember_label_histogram": nonmember_histogram,
+                        "evaluation_views": {
+                            "low_fpr": {
+                                "member_count": member_count,
+                                "nonmember_count": nonmember_count,
+                                "fpr_resolution": 1.0 / nonmember_count,
+                            },
+                            "paper_balanced": paper_balanced_summary,
+                        },
                         "candidate_label_support": self.candidate_label_support,
                         "null_client_candidate_label_overlap": (
                             self.null_client_candidate_label_overlap

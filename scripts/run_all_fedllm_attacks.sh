@@ -148,6 +148,7 @@ ProjRes options:
 
 Every real task prints its resolved configuration only when that task starts.
 Each task evaluates all six common attacks and strict ProjRes every 50 rounds.
+BERT tasks also run observational ICLR ranking every 50 completed rounds.
 EOF
   "$python_bin" scripts/run_fedllm_adapter.py --help
   exit 0

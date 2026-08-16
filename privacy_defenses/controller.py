@@ -8,11 +8,13 @@ selects exactly one controller, so the methods are never silently combined.
 from __future__ import annotations
 
 import copy
+import csv
 import itertools
 import json
 import math
 import os
 from collections import defaultdict
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -26,6 +28,14 @@ from privacy_defenses.iclr import (
     encode_training_batches,
     infer_other_clients_state,
     rank_loss_differences,
+)
+from privacy_defenses.iclr_validation import (
+    _class_adjusted_spearman,
+    _low_fpr_hits,
+    _pearson,
+    _safe_mean,
+    _spearman,
+    _top_bottom_masks,
 )
 
 
@@ -245,6 +255,28 @@ class DefenseController:
             int,
             tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]],
         ] = {}
+        self.iclr_analysis_interval = int(
+            self.config.get("iclr_analysis_interval", 1)
+        )
+        self.iclr_analysis_timing = str(
+            self.config.get("iclr_analysis_timing", "pre_update")
+        ).lower()
+        self.iclr_feature_statistics_enabled = bool(
+            self.config.get("iclr_feature_statistics", True)
+        )
+        self._iclr_round_metrics: list[dict[str, int | float]] = []
+        self._iclr_round_samples: list[dict[str, int | float]] = []
+        self._iclr_projres_samples: list[dict[str, int | float]] = []
+        self._iclr_projres_metrics: list[
+            dict[str, int | float | None]
+        ] = []
+        if self.name == "iclr":
+            if self.iclr_analysis_interval <= 0:
+                raise ValueError("iclr_analysis_interval must be positive.")
+            if self.iclr_analysis_timing not in {"pre_update", "post_round"}:
+                raise ValueError(
+                    "iclr_analysis_timing must be pre_update or post_round."
+                )
         self.federated_method = "fedavg"
         self.method_config: dict = {}
         self.additional_private_steps = 0
@@ -390,7 +422,11 @@ class DefenseController:
             [indices.detach().cpu().long() for _, _, indices in indexed_batches]
         )
         reference_states = self._iclr_pending_states.pop(user.id, None)
-        if reference_states is not None:
+        should_rank = (
+            self.iclr_analysis_timing == "pre_update"
+            and (round_index + 1) % self.iclr_analysis_interval == 0
+        )
+        if reference_states is not None and should_rank:
             own_state, other_state = reference_states
             restore_state = user.get_parameters()
             ranking = rank_loss_differences(
@@ -402,34 +438,12 @@ class DefenseController:
                 device=self.device,
                 sample_indices=local_indices,
             )
-            user.iclr_ranking_round = int(round_index)
-            user.iclr_own_losses = ranking.own_losses
-            user.iclr_other_losses = ranking.other_losses
-            user.iclr_scores = ranking.scores
-            user.iclr_ranked_positions = ranking.ranked_positions
-            user.iclr_ranked_scores = ranking.scores[ranking.ranked_positions]
-            user.iclr_ranked_labels = ranking.labels[ranking.ranked_positions]
-            user.iclr_local_indices = ranking.sample_indices
-            user.iclr_ranked_local_indices = ranking.sample_indices[
-                ranking.ranked_positions
-            ]
-            self._update_iclr_score_statistics(user, ranking, round_index)
-            self._iclr_client_stats.setdefault(user.id, {}).update(
-                {
-                    "latest_ranking_round": int(round_index),
-                    "latest_ranking_source_round": int(user.iclr_source_round),
-                    "latest_ranked_samples": int(ranking.scores.numel()),
-                    "latest_ranking_weight": float(
-                        user.iclr_aggregation_weight
-                    ),
-                }
-            )
-            self._record("iclr_score_mean", float(ranking.scores.mean()))
-            self._record("iclr_score_min", float(ranking.scores.min()))
-            self._record("iclr_score_max", float(ranking.scores.max()))
-            self._record(
-                "iclr_positive_score_fraction",
-                float((ranking.scores > 0).float().mean()),
+            self._record_iclr_ranking(
+                user=user,
+                ranking=ranking,
+                ranking_round=round_index,
+                source_round=int(user.iclr_source_round),
+                aggregation_weight=float(user.iclr_aggregation_weight),
             )
 
         for images, labels in batches:
@@ -451,9 +465,133 @@ class DefenseController:
             optimizer.step()
             self.steps[user.id] += 1
 
+    def _record_iclr_ranking(
+        self,
+        user,
+        ranking,
+        ranking_round: int,
+        source_round: int,
+        aggregation_weight: float,
+    ) -> None:
+        """Store one sample-aligned ICLR ranking and its compact statistics."""
+        user.iclr_ranking_round = int(ranking_round)
+        user.iclr_source_round = int(source_round)
+        user.iclr_aggregation_weight = float(aggregation_weight)
+        user.iclr_own_losses = ranking.own_losses
+        user.iclr_other_losses = ranking.other_losses
+        user.iclr_scores = ranking.scores
+        user.iclr_ranked_positions = ranking.ranked_positions
+        user.iclr_ranked_scores = ranking.scores[ranking.ranked_positions]
+        user.iclr_ranked_labels = ranking.labels[ranking.ranked_positions]
+        user.iclr_local_indices = ranking.sample_indices
+        user.iclr_ranked_local_indices = ranking.sample_indices[
+            ranking.ranked_positions
+        ]
+        self._update_iclr_score_statistics(user, ranking, ranking_round)
+        self._iclr_client_stats.setdefault(user.id, {}).update(
+            {
+                "latest_ranking_round": int(ranking_round),
+                "latest_ranking_source_round": int(source_round),
+                "latest_ranked_samples": int(ranking.scores.numel()),
+                "latest_ranking_weight": float(aggregation_weight),
+            }
+        )
+        self._record("iclr_score_mean", float(ranking.scores.mean()))
+        self._record("iclr_score_min", float(ranking.scores.min()))
+        self._record("iclr_score_max", float(ranking.scores.max()))
+        self._record(
+            "iclr_positive_score_fraction",
+            float((ranking.scores > 0).float().mean()),
+        )
+
+    def analyze_iclr_completed_round(
+        self,
+        users,
+        global_state: dict[str, torch.Tensor],
+        updated_states: dict[int, dict[str, torch.Tensor]],
+        aggregation_weights: dict[int, float],
+        selected_ids: list[int],
+        round_index: int,
+    ) -> bool:
+        """Analyze the exact FedSGD batches uploaded at a scheduled round."""
+        completed_round = int(round_index) + 1
+        if (
+            self.name != "iclr"
+            or self.iclr_analysis_timing != "post_round"
+            or completed_round % self.iclr_analysis_interval != 0
+        ):
+            return False
+        if self.federated_method != "fedsgd":
+            raise ValueError(
+                "Post-round ICLR analysis currently requires one-batch FedSGD."
+            )
+
+        for client_id in selected_ids:
+            user = users[client_id]
+            if user.last_train_batch is None or user.last_train_indices is None:
+                raise RuntimeError(
+                    f"Client {client_id} has no indexed FedSGD batch for ICLR."
+                )
+            own_state = updated_states[client_id]
+            weight = float(aggregation_weights[client_id])
+            other_state = infer_other_clients_state(
+                global_state=global_state,
+                own_state=own_state,
+                own_weight=weight,
+            )
+            shared_session = getattr(user.model, "use_shared_model", None)
+            session = shared_session() if callable(shared_session) else nullcontext()
+            with session:
+                restore_state = user.get_parameters()
+                ranking = rank_loss_differences(
+                    model=user.model,
+                    batches=[user.last_train_batch],
+                    own_state=own_state,
+                    other_state=other_state,
+                    restore_state=restore_state,
+                    device=self.device,
+                    sample_indices=user.last_train_indices,
+                )
+            self._record_iclr_ranking(
+                user=user,
+                ranking=ranking,
+                ranking_round=round_index,
+                source_round=round_index,
+                aggregation_weight=weight,
+            )
+            self._iclr_round_metrics.append(
+                {
+                    "communication_round": completed_round,
+                    "client_id": int(client_id),
+                    "sample_count": int(ranking.scores.numel()),
+                    "score_mean": float(ranking.scores.mean()),
+                    "score_min": float(ranking.scores.min()),
+                    "score_max": float(ranking.scores.max()),
+                    "positive_score_fraction": float(
+                        (ranking.scores > 0).float().mean()
+                    ),
+                }
+            )
+            for position in range(ranking.scores.numel()):
+                self._iclr_round_samples.append(
+                    {
+                        "communication_round": completed_round,
+                        "client_id": int(client_id),
+                        "batch_position": int(position),
+                        "local_sample_index": int(
+                            ranking.sample_indices[position]
+                        ),
+                        "class_label": int(ranking.labels[position]),
+                        "own_loss": float(ranking.own_losses[position]),
+                        "other_loss": float(ranking.other_losses[position]),
+                        "iclr_score": float(ranking.scores[position]),
+                    }
+                )
+        return True
+
     def initialize_iclr_feature_statistics(self, users) -> None:
         """Compute fixed feature statistics from every complete local dataset."""
-        if self.name != "iclr":
+        if self.name != "iclr" or not self.iclr_feature_statistics_enabled:
             return
         for user in users:
             user.iclr_feature_seen = None
@@ -656,7 +794,10 @@ class DefenseController:
         own_state: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Build the two ICLR references immediately before global overwrite."""
-        if self.name != "iclr":
+        if self.name != "iclr" or self.iclr_analysis_timing == "post_round":
+            return
+        upcoming_completed_round = int(source_round) + 2
+        if upcoming_completed_round % self.iclr_analysis_interval != 0:
             return
         own_state = user.get_parameters() if own_state is None else own_state
         weight = float(own_weight)
@@ -1800,12 +1941,50 @@ class DefenseController:
             "metrics": averaged,
         }
         if self.name == "iclr":
+            periodic_post_round = self.iclr_analysis_timing == "post_round"
+            completed_rounds = (
+                sorted(
+                    {
+                        int(row["communication_round"])
+                        for row in self._iclr_round_metrics
+                    }
+                )
+                if periodic_post_round
+                else None
+            )
             summary["iclr"] = {
                 "score": "L(x; theta_-k) - L(x; theta_k)",
                 "ranking": "descending",
                 "training_action": "rank_only",
+                "analysis_timing": self.iclr_analysis_timing,
+                "analysis_interval": self.iclr_analysis_interval,
+                "scheduled_rounds": (
+                    list(
+                        range(
+                            self.iclr_analysis_interval,
+                            self.total_rounds + 1,
+                            self.iclr_analysis_interval,
+                        )
+                    )
+                    if periodic_post_round
+                    else None
+                ),
+                "completed_rounds": completed_rounds,
+                "round_metric_rows": len(self._iclr_round_metrics),
+                "round_sample_rows": len(self._iclr_round_samples),
+                "projres_alignment_sample_rows": len(
+                    self._iclr_projres_samples
+                ),
+                "projres_alignment_relationship_rows": len(
+                    self._iclr_projres_metrics
+                ),
                 "feature_statistics": {
-                    "feature_space": "frozen_clip_image_encoder_output",
+                    "enabled": self.iclr_feature_statistics_enabled,
+                    "feature_space": (
+                        "frozen_clip_image_encoder_output"
+                        if self.iclr_feature_statistics_enabled
+                        else None
+                    ),
                     "sample_weighting": "full_local_training_set_once",
                     "computation_stage": "before_federated_training",
                     "class_means": "per_client_per_class",
@@ -1836,6 +2015,25 @@ class DefenseController:
 
     def save_summary(self, results_dir: str) -> dict:
         summary = self.summary()
+        if self.name == "iclr" and self._iclr_round_metrics:
+            self.save_iclr_round_metrics(results_dir)
+            summary["iclr"]["round_metrics_artifact"] = (
+                "iclr_round_metrics.csv"
+            )
+            summary["iclr"]["round_samples_artifact"] = (
+                "iclr_round_samples.csv"
+            )
+            summary["iclr"]["round_series_artifact"] = "iclr_series.json"
+        if self.name == "iclr" and self._iclr_projres_samples:
+            relationship_dir = os.path.join(results_dir, "privacy_audit")
+            self._save_iclr_projres_relationship(relationship_dir)
+            summary["iclr"]["projres_alignment_artifacts"] = {
+                "samples": "privacy_audit/iclr_projres_samples.csv",
+                "relationships": (
+                    "privacy_audit/iclr_projres_relationship.csv"
+                ),
+                "summary": "privacy_audit/iclr_projres_relationship.json",
+            }
         with open(
             os.path.join(results_dir, "defense_summary.json"),
             "w",
@@ -1843,3 +2041,392 @@ class DefenseController:
         ) as file:
             json.dump(summary, file, indent=2, allow_nan=False)
         return summary
+
+    def save_iclr_round_metrics(self, results_dir: str) -> None:
+        """Persist completed periodic ICLR rows so long runs are resumable."""
+        if self.name != "iclr" or not self._iclr_round_metrics:
+            return
+        os.makedirs(results_dir, exist_ok=True)
+        metric_path = os.path.join(results_dir, "iclr_round_metrics.csv")
+        with open(metric_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=list(self._iclr_round_metrics[0]),
+            )
+            writer.writeheader()
+            writer.writerows(self._iclr_round_metrics)
+        sample_path = os.path.join(results_dir, "iclr_round_samples.csv")
+        with open(sample_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=list(self._iclr_round_samples[0]),
+            )
+            writer.writeheader()
+            writer.writerows(self._iclr_round_samples)
+        completed_rounds = sorted(
+            {
+                int(row["communication_round"])
+                for row in self._iclr_round_metrics
+            }
+        )
+        with open(
+            os.path.join(results_dir, "iclr_series.json"),
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                {
+                    "experiment": "periodic_post_round_iclr",
+                    "analysis_interval": self.iclr_analysis_interval,
+                    "scheduled_rounds": list(
+                        range(
+                            self.iclr_analysis_interval,
+                            self.total_rounds + 1,
+                            self.iclr_analysis_interval,
+                        )
+                    ),
+                    "completed_rounds": completed_rounds,
+                    "metric_rows": len(self._iclr_round_metrics),
+                    "sample_rows": len(self._iclr_round_samples),
+                    "round_metrics": os.path.basename(metric_path),
+                    "round_samples": os.path.basename(sample_path),
+                },
+                file,
+                indent=2,
+                allow_nan=False,
+            )
+
+    def record_iclr_projres_relationship(
+        self,
+        projres_payload: dict,
+        output_dir: str,
+        round_index: int,
+    ) -> bool:
+        """Strictly join one periodic ProjRes result to its ICLR batch rows."""
+        if self.name != "iclr" or self.iclr_analysis_timing != "post_round":
+            return False
+        completed_round = int(round_index) + 1
+        payload_round = int(projres_payload.get("communication_round", -1))
+        if payload_round != completed_round:
+            raise ValueError(
+                "ICLR and ProjRes communication rounds do not match: "
+                f"{completed_round} != {payload_round}."
+            )
+        if "result" in projres_payload:
+            client_results = [projres_payload["result"]]
+        else:
+            client_results = list(projres_payload.get("per_client", []))
+        if not client_results:
+            raise ValueError("ProjRes payload contains no client results.")
+
+        current_iclr = {
+            (
+                int(row["client_id"]),
+                int(row["batch_position"]),
+            ): row
+            for row in self._iclr_round_samples
+            if int(row["communication_round"]) == completed_round
+        }
+        if not current_iclr:
+            raise ValueError(
+                f"No ICLR sample rows exist for communication round {completed_round}."
+            )
+
+        new_rows = []
+        new_metrics = []
+        top_fraction = float(
+            self.config.get("iclr_validation_top_fraction", 0.2)
+        )
+        for result in client_results:
+            client_id = int(result["client_id"])
+            member_count = int(result["dimensions"]["member_candidate_count"])
+            controls = dict(result.get("candidate_controls", {}))
+            batch_positions = controls.get("member_batch_positions")
+            local_indices = controls.get("member_local_indices")
+            member_labels = controls.get("member_labels")
+            if batch_positions is None or local_indices is None:
+                raise ValueError(
+                    "ProjRes result lacks explicit member batch/local indices."
+                )
+            if not (
+                len(batch_positions)
+                == len(local_indices)
+                == len(member_labels)
+                == member_count
+            ):
+                raise ValueError("ProjRes member alignment fields are inconsistent.")
+            raw = dict(result["raw"])
+            for key in ("labels", "scores", "l1_residuals", "predictions"):
+                if len(raw[key]) < member_count:
+                    raise ValueError(
+                        f"ProjRes raw field {key!r} is shorter than its members."
+                    )
+            if not (
+                len(raw["labels"])
+                == len(raw["scores"])
+                == len(raw["l1_residuals"])
+                == len(raw["predictions"])
+            ):
+                raise ValueError("ProjRes raw candidate fields are inconsistent.")
+            raw_labels = torch.tensor(raw["labels"], dtype=torch.long)
+            all_projres_scores = torch.tensor(
+                raw["scores"], dtype=torch.float64
+            )
+            nonmember_scores = all_projres_scores[raw_labels == 0]
+            if nonmember_scores.numel() == 0:
+                raise ValueError(
+                    "ICLR-ProjRes low-FPR analysis requires nonmember scores."
+                )
+            if int((raw_labels == 1).sum()) != member_count:
+                raise ValueError(
+                    "ProjRes member labels do not match member_candidate_count."
+                )
+
+            client_rows = []
+            for offset in range(member_count):
+                batch_position = int(batch_positions[offset])
+                local_sample_index = int(local_indices[offset])
+                iclr = current_iclr.get((client_id, batch_position))
+                if iclr is None:
+                    raise ValueError(
+                        "Missing ICLR row for ProjRes member "
+                        f"round={completed_round}, client={client_id}, "
+                        f"batch_position={batch_position}."
+                    )
+                if int(iclr["local_sample_index"]) != local_sample_index:
+                    raise ValueError(
+                        "ICLR and ProjRes local sample indices do not match."
+                    )
+                class_label = int(member_labels[offset])
+                if int(iclr["class_label"]) != class_label:
+                    raise ValueError("ICLR and ProjRes class labels do not match.")
+                if int(raw["labels"][offset]) != 1:
+                    raise ValueError("ProjRes aligned batch entry is not a member.")
+                row = {
+                    "communication_round": completed_round,
+                    "client_id": client_id,
+                    "batch_position": batch_position,
+                    "local_sample_index": local_sample_index,
+                    "class_label": class_label,
+                    "iclr_score": float(iclr["iclr_score"]),
+                    "iclr_own_loss": float(iclr["own_loss"]),
+                    "iclr_other_loss": float(iclr["other_loss"]),
+                    "projres_score": float(raw["scores"][offset]),
+                    "projres_l1_residual": float(
+                        raw["l1_residuals"][offset]
+                    ),
+                    "projres_fixed_threshold_prediction": int(
+                        raw["predictions"][offset]
+                    ),
+                }
+                client_rows.append(row)
+                new_rows.append(row)
+
+            iclr_scores = torch.tensor(
+                [row["iclr_score"] for row in client_rows],
+                dtype=torch.float64,
+            )
+            projres_scores = torch.tensor(
+                [row["projres_score"] for row in client_rows],
+                dtype=torch.float64,
+            )
+            negative_residuals = -torch.tensor(
+                [row["projres_l1_residual"] for row in client_rows],
+                dtype=torch.float64,
+            )
+            class_labels = torch.tensor(
+                [row["class_label"] for row in client_rows],
+                dtype=torch.long,
+            )
+            top, bottom, top_count = _top_bottom_masks(
+                iclr_scores, top_fraction
+            )
+            projres_top = torch.zeros(member_count, dtype=torch.bool)
+            projres_order = torch.argsort(
+                projres_scores, descending=True, stable=True
+            )
+            projres_top[projres_order[:top_count]] = True
+            overlap_count = int((top & projres_top).sum())
+            expected_overlap = top_count * top_count / max(member_count, 1)
+            adjusted, macro, adjusted_classes = _class_adjusted_spearman(
+                iclr_scores,
+                projres_scores,
+                class_labels,
+            )
+            top_score = _safe_mean(projres_scores[top])
+            bottom_score = _safe_mean(projres_scores[bottom])
+            metric_row = {
+                "communication_round": completed_round,
+                "client_id": client_id,
+                "aligned_member_samples": member_count,
+                "projres_nonmember_samples": int(nonmember_scores.numel()),
+                "top_fraction": top_fraction,
+                "top_count": top_count,
+                "pearson_iclr_projres_score": _pearson(
+                    iclr_scores, projres_scores
+                ),
+                "spearman_iclr_projres_score": _spearman(
+                    iclr_scores, projres_scores
+                ),
+                "class_adjusted_spearman": adjusted,
+                "class_macro_spearman": macro,
+                "class_adjusted_classes": adjusted_classes,
+                "pearson_iclr_negative_l1_residual": _pearson(
+                    iclr_scores, negative_residuals
+                ),
+                "spearman_iclr_negative_l1_residual": _spearman(
+                    iclr_scores, negative_residuals
+                ),
+                "projres_score_mean_iclr_top": top_score,
+                "projres_score_mean_iclr_bottom": bottom_score,
+                "projres_score_top_minus_bottom": (
+                    top_score - bottom_score
+                    if top_score is not None and bottom_score is not None
+                    else None
+                ),
+                "top_set_overlap": overlap_count / top_count,
+                "top_set_enrichment": (
+                    overlap_count / expected_overlap
+                    if expected_overlap > 0
+                    else None
+                ),
+            }
+            for target_fpr in (0.1, 0.01, 0.001):
+                suffix = f"{target_fpr:g}"
+                hits = _low_fpr_hits(
+                    projres_scores,
+                    nonmember_scores,
+                    target_fpr,
+                )
+                if hits is None:
+                    overall_hit = None
+                    top_hit = None
+                    bottom_hit = None
+                else:
+                    overall_hit = _safe_mean(hits)
+                    top_hit = _safe_mean(hits[top])
+                    bottom_hit = _safe_mean(hits[bottom])
+                metric_row[f"projres_hit_rate_fpr_{suffix}"] = overall_hit
+                metric_row[
+                    f"projres_hit_rate_iclr_top_fpr_{suffix}"
+                ] = top_hit
+                metric_row[
+                    f"projres_hit_rate_iclr_bottom_fpr_{suffix}"
+                ] = bottom_hit
+                metric_row[
+                    f"projres_hit_top_minus_bottom_fpr_{suffix}"
+                ] = (
+                    top_hit - bottom_hit
+                    if top_hit is not None and bottom_hit is not None
+                    else None
+                )
+                metric_row[
+                    f"projres_hit_top_over_bottom_fpr_{suffix}"
+                ] = (
+                    top_hit / bottom_hit
+                    if top_hit is not None
+                    and bottom_hit is not None
+                    and bottom_hit > 0
+                    else None
+                )
+            new_metrics.append(metric_row)
+
+        existing_keys = {
+            (
+                int(row["communication_round"]),
+                int(row["client_id"]),
+                int(row["batch_position"]),
+            )
+            for row in self._iclr_projres_samples
+        }
+        duplicate_keys = {
+            (
+                int(row["communication_round"]),
+                int(row["client_id"]),
+                int(row["batch_position"]),
+            )
+            for row in new_rows
+        } & existing_keys
+        if duplicate_keys:
+            raise ValueError(
+                f"Duplicate ICLR-ProjRes alignment rows: {sorted(duplicate_keys)}"
+            )
+        self._iclr_projres_samples.extend(new_rows)
+        self._iclr_projres_metrics.extend(new_metrics)
+        self._save_iclr_projres_relationship(output_dir)
+        return True
+
+    def _save_iclr_projres_relationship(self, output_dir: str) -> None:
+        """Persist all completed exact ICLR-ProjRes joins."""
+        if not self._iclr_projres_samples:
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        sample_path = os.path.join(output_dir, "iclr_projres_samples.csv")
+        with open(sample_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=list(self._iclr_projres_samples[0]),
+            )
+            writer.writeheader()
+            writer.writerows(self._iclr_projres_samples)
+        metric_path = os.path.join(
+            output_dir, "iclr_projres_relationship.csv"
+        )
+        with open(metric_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(
+                file,
+                fieldnames=list(self._iclr_projres_metrics[0]),
+            )
+            writer.writeheader()
+            writer.writerows(self._iclr_projres_metrics)
+        completed_rounds = sorted(
+            {
+                int(row["communication_round"])
+                for row in self._iclr_projres_metrics
+            }
+        )
+        with open(
+            os.path.join(output_dir, "iclr_projres_relationship.json"),
+            "w",
+            encoding="utf-8",
+        ) as file:
+            json.dump(
+                {
+                    "status": "ok",
+                    "methodology": {
+                        "join_keys": [
+                            "communication_round",
+                            "client_id",
+                            "batch_position",
+                            "local_sample_index",
+                        ],
+                        "population": (
+                            "exact members in the observed one-batch FedSGD upload"
+                        ),
+                        "iclr_score": "L(x; theta_-k) - L(x; theta_k)",
+                        "projres_score_direction": "higher_is_more_member_like",
+                        "projres_residual_direction": "lower_is_more_member_like",
+                        "low_fpr_hit_rule": (
+                            "member score is a hit when the number of nonmember "
+                            "scores at least as large does not exceed "
+                            "floor(target_fpr * N_nonmember)"
+                        ),
+                        "low_fpr_targets": [0.1, 0.01, 0.001],
+                        "interpretation": (
+                            "correlation and enrichment quantify score alignment; "
+                            "they do not establish causality"
+                        ),
+                    },
+                    "completed_rounds": completed_rounds,
+                    "sample_rows": len(self._iclr_projres_samples),
+                    "relationship_rows": len(self._iclr_projres_metrics),
+                    "artifacts": {
+                        "samples": os.path.basename(sample_path),
+                        "relationships": os.path.basename(metric_path),
+                    },
+                    "relationships": self._iclr_projres_metrics,
+                },
+                file,
+                indent=2,
+                allow_nan=False,
+            )

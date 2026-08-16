@@ -352,10 +352,11 @@ def validate_config(config: dict) -> None:
         "fedmia_mix",
         "low_fpr_full",
         "balanced_holdout",
+        "balanced_global_holdout",
     }:
         raise ValueError(
             "audit.candidate_sampling must be legacy, fedmia_mix, "
-            "low_fpr_full, or balanced_holdout."
+            "low_fpr_full, balanced_holdout, or balanced_global_holdout."
         )
     nonmember_ratio = float(audit.get("nonmember_to_member_ratio", 1.0))
     if nonmember_ratio <= 0:
@@ -374,7 +375,11 @@ def validate_config(config: dict) -> None:
             "clip_lora cannot use low_fpr_full because vision LoRA makes "
             "precomputed image features stale; use balanced_holdout."
         )
-    if candidate_sampling in {"low_fpr_full", "balanced_holdout"}:
+    if candidate_sampling in {
+        "low_fpr_full",
+        "balanced_holdout",
+        "balanced_global_holdout",
+    }:
         low_fpr_attacks = {
             "blackbox_loss",
             "loss_series",
@@ -418,7 +423,10 @@ def validate_config(config: dict) -> None:
                 "audit.low_fpr_max_nonmembers must be 0 (unlimited) or at "
                 "least audit.low_fpr_min_nonmembers."
             )
-    if candidate_sampling == "balanced_holdout":
+    if candidate_sampling in {
+        "balanced_holdout",
+        "balanced_global_holdout",
+    }:
         low_fpr_max_members = int(audit.get("low_fpr_max_members", 0))
         low_fpr_max_nonmembers = int(audit.get("low_fpr_max_nonmembers", 0))
         if low_fpr_max_members < 0 or low_fpr_max_members == 1:
@@ -428,6 +436,29 @@ def validate_config(config: dict) -> None:
         if low_fpr_max_nonmembers < 0 or low_fpr_max_nonmembers == 1:
             raise ValueError(
                 "audit.low_fpr_max_nonmembers must be 0 (unlimited) or at least 2."
+            )
+    if candidate_sampling == "balanced_global_holdout":
+        if not nonmember_ratio.is_integer():
+            raise ValueError(
+                "balanced_global_holdout requires an integer "
+                "audit.nonmember_to_member_ratio."
+            )
+        low_fpr_min_nonmembers = int(
+            audit.get("low_fpr_min_nonmembers", 1000)
+        )
+        low_fpr_max_nonmembers = int(
+            audit.get("low_fpr_max_nonmembers", 0)
+        )
+        if low_fpr_min_nonmembers < 2:
+            raise ValueError(
+                "audit.low_fpr_min_nonmembers must be at least 2."
+            )
+        if (
+            0 < low_fpr_max_nonmembers < low_fpr_min_nonmembers
+        ):
+            raise ValueError(
+                "audit.low_fpr_max_nonmembers must be 0 (unlimited) or at "
+                "least audit.low_fpr_min_nonmembers."
             )
     if pooled_audit and attacks - POOLED_CLIENT_ATTACKS:
         raise ValueError(

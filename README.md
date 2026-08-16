@@ -260,30 +260,47 @@ BERT/IMDB 对应 `configs/bert_base_imdb_adapter.yaml`。GPT2-Large 可将 `--da
 `train/validation`；IMDB 使用官方 `train/test`。
 所有 evaluation 样本都不会参与联邦训练，因此仍可作为有效全局非成员。
 
-BERT/SST-5 默认训练 500 轮：前 300 轮学习率为 `0.005`，后 200 轮为
-`0.0025`。BERT/CoLA 与 BERT/IMDB 默认训练 750 轮：前 500 轮为 `0.005`，
-后 250 轮为 `0.0025`。GPT2-Large 仍训练 500 轮并使用恒定 `0.001`。
+BERT 三个数据集默认均训练 500 轮并使用恒定学习率 `0.005`；GPT2-Large
+训练 500 轮并使用恒定 `0.001`。
 BERT 允许 CPU 调试，GPT2-Large 要求 CUDA。
-Adapter 的 up-projection 使用预训练模型的
-initializer range（当前两者均为标准差 `0.02`）做小随机初始化，不再精确置零；全部
-可训练参数使用同一个标量学习率，真实 one-batch 客户端梯度不执行 norm clipping。
-普通任务在训练前记录一次基线，之后每 50 轮评估；SST-5/GPT2-Large 最后评估到
-第 500 轮，BERT/CoLA 与 BERT/IMDB 最后评估到第 750 轮。
+Adapter 的 down-projection 使用预训练模型的 initializer range（当前两者均为标准差
+`0.02`）做小随机初始化，up-projection 与两侧 bias 精确置零，使插入的残差分支从
+identity 开始；全部可训练参数使用同一个标量学习率，真实 one-batch 客户端梯度不执行
+norm clipping。
+普通任务在训练前记录一次基线，之后每 50 轮评估，最后评估到第 500 轮。
 两个配置默认同时运行六种通用攻击。SST-5 与 IMDB 以 accuracy 为主任务指标；
 CoLA 以 MCC 为主，同时保留 accuracy 作为辅助指标。六种通用攻击包括：
 `blackbox_loss`、`loss_series`、`grad_cosine`、`avg_cosine`、`fedmia_loss` 和
 `fedmia_cosine`。六种通用攻击与严格 ProjRes 均按已完成通信轮每 50 轮统计，并包含
 各任务最后一轮；六种通用攻击的逐轮指标写入
 `privacy_audit/attack_round_metrics.csv`。其中 Blackbox-Loss 与 Grad-Cosine 每行只使用
-该轮信号，其余四种时序攻击使用截至该轮的累计信号。通用攻击对目标客户端构建
-train/evaluation 严格 1:1、逐类别同数量的候选池；非成员只来自从未参与任何客户端
-训练的独立 evaluation split。可用 `--attacks` 覆盖通用攻击列表，用 `--no-projres`
-只关闭 ProjRes。
+该轮信号，其余四种时序攻击使用截至该轮的累计信号。通用攻击从目标客户端训练分区
+抽取 100 个成员，并从所有客户端的独立 evaluation 分区汇总抽取 1,000 个从未训练的
+非成员；每个类别的非成员数量严格等于成员数量的 10 倍，因此两组标签分布完全一致。
+固定种子、分层、无放回抽样得到的同一候选池会被六种攻击和所有轮次共同复用，FPR
+最小步长为 `0.001`。可用 `--attacks` 覆盖通用攻击列表，用 `--no-projres` 只关闭
+ProjRes。
 
-通用攻击每个成员状态最多使用 100 个候选，符合论文的 100 次重复评估规模，并避免
-IMDB/GPT2-Large 对 800 余个客户端测试样本逐一计算完整 PEFT 梯度；成员和非成员
-仍保持严格 1:1。SST-5 和 CoLA 的单客户端 evaluation 分区少于 100，因此默认使用
-其全部可配对样本。
+同一候选池还固定派生一个逐类别严格匹配的 100 成员/100 非成员视图，用于对照
+ProjRes 论文的平衡评估规模。六种攻击不会重复计算分数；最终结果在
+`summary.json` 的每个攻击项下增加 `paper_balanced_evaluation`，逐轮结果在
+`attack_round_metrics.csv` 增加 `paper_100_100_*` 列。100 个非成员只能正式解析到
+1% FPR，因此该视图的 `TPR@0.1%FPR` 记为不可用，低 FPR 主结论仍使用 100/1000 视图。
+
+BERT 还启用只排名、不修改训练的 ICLR 分析。在第 50、100、…、500 轮完成聚合后，
+它使用该轮真实 one-batch FedSGD 上传及真实等权聚合系数，重建“除当前客户端以外”的
+聚合模型，并对该轮实际训练 batch 计算
+`L(x; theta_-k) - L(x; theta_k)`。逐客户端结果写入
+`iclr_round_metrics.csv`，逐样本分数写入 `iclr_round_samples.csv`，已完成轮次索引写入
+`iclr_series.json`，完整汇总写入
+`defense_summary.json`；最终还会把具有稳定
+本地索引的 100 个审计成员与六种通用攻击结果对齐。GPT2-Large 暂不启用 ICLR。
+同轮 ICLR 与 ProjRes 还会按
+`communication_round + client_id + batch_position + local_sample_index` 严格连接，结果写入
+`privacy_audit/iclr_projres_samples.csv`、`iclr_projres_relationship.csv` 和
+`iclr_projres_relationship.json`。连接过程会同时校验本地索引和类别，避免仅凭数组顺序
+误配。关系文件中的 ProjRes 命中率使用每轮未训练非成员连续分数分别在 10%、1% 和
+0.1% FPR 下复算，不使用固定残差阈值产生的二值预测。
 
 GPT2-Large 的逐样本梯度不会组成“候选数 × 全部 PEFT 参数”的常驻矩阵，而是逐样本
 计算与真实上传的精确余弦后立即释放。ProjRes 每 50 轮观察一次目标客户端真实 FedSGD

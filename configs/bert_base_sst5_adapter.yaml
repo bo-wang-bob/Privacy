@@ -11,11 +11,11 @@ sample_users: 30
 num_global_iters: 500
 batch_size: 16
 eval_batch_size: 32
-# Keep the effective 5e-3 step through 300 completed rounds, then halve it for
-# the last 200 rounds to refine the SST-5 solution after its observed plateau.
+# The round-300 decay underperformed the constant-rate baseline, so retain the
+# effective 5e-3 step for all 500 completed rounds.
 learning_rate: 0.005
-learning_rate_decay: 0.5
-learning_rate_decay_interval: 300
+learning_rate_decay: 1.0
+learning_rate_decay_interval: 50
 eval_interval: 50
 aggregation_weighting: uniform
 
@@ -25,10 +25,10 @@ adapter:
   activation: relu
   classifier_dropout: 0.0
   gradient_checkpointing: false
-  # Initialize the up projection from N(0, 0.02^2), using the pretrained
-  # BERT initializer range, so both Adapter projections receive gradients from
-  # the first client step without an exact-zero residual branch.
-  zero_init_up: false
+  # Keep the inserted residual branch exactly zero at initialization: the down
+  # projection uses BERT's N(0, 0.02^2) initializer while the up projection and
+  # both biases start at zero. This preserves the pretrained hidden states.
+  zero_init_up: true
 
 # Keep real one-batch vanilla-SGD uploads and one scalar learning rate for all
 # trainable parameters, so cosine attacks retain their original definition.
@@ -45,8 +45,8 @@ seed: 42
 save_models: false
 results_dir: ./results
 
-# All candidates for a client are 1:1 exact class-matched train/validation
-# pairs. Validation examples are never used by any federated client.
+# Use 100 target-client train members and 1,000 never-trained evaluation
+# non-members with an exact 1:10 per-class histogram ratio.
 audit:
   enabled: true
   strict: true
@@ -59,7 +59,10 @@ audit:
     - fedmia_cosine
   target_client_id: 0
   audit_client_ids: [0]
-  candidate_sampling: balanced_holdout
+  candidate_sampling: balanced_global_holdout
+  nonmember_to_member_ratio: 10
+  # Also report a fixed class-matched 100-member/100-nonmember paper view.
+  paper_balanced_evaluation_size: 100
   audit_batch_size: 16
   # Collect every configured attack after 50, 100, ..., 500 completed rounds.
   audit_interval: 50
@@ -71,10 +74,18 @@ audit:
     fedmia_loss: 50
     fedmia_cosine: 50
   signal_storage: compact
-  # Deng et al. repeat each member state 100 times. This cap affects IMDB;
-  # the smaller per-client SST-5/CoLA holdouts remain fully included.
+  low_fpr_min_nonmembers: 1000
   low_fpr_max_members: 100
-  low_fpr_max_nonmembers: 100
+  low_fpr_max_nonmembers: 1000
+
+# Rank each client's exact upload batch after rounds 50, 100, ..., 500.
+# This analysis is observational and does not filter samples or alter training.
+defense:
+  name: iclr
+  iclr_analysis_interval: 50
+  iclr_analysis_timing: post_round
+  iclr_feature_statistics: false
+  iclr_validation_top_fraction: 0.2
 
 projres:
   enabled: true

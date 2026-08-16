@@ -45,11 +45,10 @@ down-projection ratio 为 2，即瓶颈宽度等于主干隐藏宽度的一半�
 数据入口支持 SST-5、CoLA 和 IMDB；前两者
 使用 `train/validation`，IMDB 使用 `train/test`，评估 split 从不参与训练。
 默认使用 30 个 IID 客户端，BERT 与 GPT2-Large 均使用 batch size 16。
-BERT/SST-5 训练 500 轮并在第 301 轮将学习率从 `0.005` 降至 `0.0025`；
-BERT/CoLA 与 BERT/IMDB 训练 750 轮并在第 501 轮执行相同衰减。
-GPT2-Large 训练 500 轮并保持 `0.001`。Adapter 的 up-projection 使用主干
-initializer range 做小随机初始化；全部可训练参数使用同一个标量学习率，客户端梯度
-不执行 norm clipping。
+BERT 三个数据集均训练 500 轮并保持学习率 `0.005`；GPT2-Large 训练 500 轮并保持
+`0.001`。Adapter 的 down-projection 使用主干 initializer range 做小随机初始化，
+up-projection 与 bias 置零，使残差分支在初始化时严格保持主干隐藏表示；全部可训练参数
+使用同一个标量学习率，客户端梯度不执行 norm clipping。
 两者均由所有客户端同步参与；每个客户端每轮执行一次无 momentum、无 weight decay 的 SGD，
 服务器对客户端上传等权平均，构成 one-batch FedSGD。
 这些普通任务优化不关闭或绕过审计：上传仍是攻击器观察到的真实 one-batch 更新，
@@ -69,10 +68,28 @@ checkpoint 均不包含冻结的 BERT/GPT2 参数。
 完整解析配置仅在对应任务实际启动后写入终端和该任务的 `run.log`。
 
 这两个文本模型复用通用审计器的 Blackbox/Fed-loss、Loss-Series、Grad-Cosine、
-Avg-Cosine 和两种 FedMIA 信号。默认只审计客户端 0，成员来自该客户端训练分区，
-非成员来自该客户端独立 evaluation 分区，并按标签精确配成 1:1。余弦攻击比较候选
-样本对全部可训练 Adapter/分类头参数的精确梯度与服务器收到的真实 FedSGD 上传；
-GPT2-Large 使用逐样本流式点积控制内存。
+Avg-Cosine 和两种 FedMIA 信号。默认只审计客户端 0，从其训练分区抽取 100 个成员，
+再从全部客户端的独立 evaluation 分区抽取 1,000 个从未训练的非成员。非成员逐类别
+严格取成员数量的 10 倍，使两组标签分布完全一致；固定候选池由六种攻击和全部轮次
+共享。余弦攻击比较候选样本对全部可训练 Adapter/分类头参数的精确梯度与服务器收到
+的真实 FedSGD 上传；GPT2-Large 使用逐样本流式点积控制内存。
+
+为兼顾 ProjRes 论文的平衡规模对照和低 FPR 统计，同一批攻击分数同时采用两个固定
+评估视图：主视图为 100 成员/1000 非成员；论文对照视图从主视图非成员中按类别固定
+抽取 100 个，与全部 100 个成员组成 100/100。后者由全部攻击和轮次复用，不重新执行
+模型前向或梯度计算。100/100 视图报告 AUC、TPR@10%FPR 和 TPR@1%FPR；由于仅有
+100 个非成员，TPR@0.1%FPR 不可解析。
+
+BERT 同时启用周期性 ICLR 排名分析。服务器在第 50、100、…、500 个通信轮完成聚合后，
+根据该轮真实客户端上传和等权聚合系数，为每个客户端精确重建其他客户端的聚合模型，
+并在该轮真实 one-batch 训练样本上计算 `L(x; theta_-k) - L(x; theta_k)`。该分析只记录
+排名与统计，不筛选样本、不改变优化步骤；逐轮结果写入 `iclr_round_metrics.csv`、
+`iclr_round_samples.csv` 和 `iclr_series.json`，最终
+与具有稳定本地索引的通用攻击成员候选对齐。GPT2-Large 当前保持 `defense.name: none`。
+由于 ICLR 和 ProjRes 使用同轮同客户端的真实 FedSGD batch，两者还会按通信轮、客户端、
+batch 位置和本地样本索引进行严格逐样本连接，并报告分数相关性与 Top-K 富集倍数。
+ProjRes 命中率使用每轮非成员连续分数分别在 10%、1% 和 0.1% FPR 下复算，再比较高低
+ICLR 组；固定残差阈值预测只作为明确命名的逐样本诊断值保留。
 
 严格 ProjRes 每 50 个已完成通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
 down-projection 权重更新构造子空间，并在同一全局模型下提取进入该层的样本级隐藏

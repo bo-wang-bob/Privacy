@@ -689,6 +689,7 @@ class ServerBase:
                         self.ctx.updated_model_state[user_id]
                     )
 
+            projres_payload = None
             if (
                 bool(self.projres_config.get("enabled", False))
                 and round_index + 1 in self.projres_evaluation_rounds
@@ -784,6 +785,24 @@ class ServerBase:
                         file.write("\n")
 
             self.aggregator.aggregate(self.ctx)
+            iclr_analyzed = self.defense.analyze_iclr_completed_round(
+                users=self.ctx.users,
+                global_state=self.ctx.new_model_state[0],
+                updated_states=self.ctx.updated_model_state,
+                aggregation_weights=self.ctx.aggregation_weights,
+                selected_ids=selected_ids,
+                round_index=round_index,
+            )
+            if iclr_analyzed:
+                self.defense.save_iclr_round_metrics(self.results_dir)
+                if projres_payload is not None:
+                    self.defense.record_iclr_projres_relationship(
+                        projres_payload=projres_payload,
+                        output_dir=os.path.join(
+                            self.results_dir, "privacy_audit"
+                        ),
+                        round_index=round_index,
+                    )
             previous_selected_ids = set(selected_ids)
             previous_aggregation_weights = dict(self.ctx.aggregation_weights)
             self.auditor.observe_round(

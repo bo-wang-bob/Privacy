@@ -40,6 +40,19 @@ s_i = L(x_i; theta_-k^t) - L(x_i; theta_k^t)
 
 两套参考参数只在当前客户端打分期间临时存在，打分完成后立即释放，不在聚合后为每个客户端保存完整模型副本。`iclr_ranked_positions` 是上述 batch 流拼接后的降序位置，而不是原始数据集的永久索引；`iclr_ranked_scores` 和 `iclr_ranked_labels` 分别保存对应的有序分数与标签。首轮没有历史模型对，因此不打分。若采用部分客户端参与，只有连续两轮均被选中的客户端能够执行这种精确反演。现阶段只生成排名并保存在客户端运行态，同时将汇总统计写入 `defense_summary.json`；不会根据排名筛样本、改变损失或改变原有训练顺序。该实现支持预计算特征的 CLIP-MLP/Visual Adapter，也支持直接编码原始图像的 CLIP-LoRA，并要求每轮至少聚合两个客户端。LoRA 使用一个全局共享的冻结 CLIP 主干，但每个客户端模型独立持有自己的 `lora_A/lora_B`；下一轮 ICLR 在全局参数覆盖之前直接读取该客户端模型中的上次上传状态。这些因子不会形成服务器端客户端状态映射，也不会写入结果目录。
 
+BERT Adapter 使用 `iclr_analysis_timing: post_round`：在每个配置的分析轮完成聚合后，
+直接对该轮真实 one-batch FedSGD 样本比较客户端自身上传模型与其他客户端聚合模型。
+默认 `iclr_analysis_interval: 50`，因此 500 轮任务分析第 50、100、…、500 轮，并将
+逐客户端统计写入 `iclr_round_metrics.csv`，逐样本分数写入 `iclr_round_samples.csv`，
+轮次索引写入 `iclr_series.json`。这个后聚合模式不需要 CLIP 辅助特征统计，
+所以 BERT 配置使用 `iclr_feature_statistics: false`。CLIP 原有的下一轮打分协议不变。
+BERT 的同轮 ProjRes 结果会额外保存成员的 `batch_position` 和 `local_sample_index`，并与
+ICLR 记录做四键严格连接。`privacy_audit/iclr_projres_samples.csv` 保存逐样本配对；
+`iclr_projres_relationship.csv/json` 保存 Pearson/Spearman、类别控制 Spearman、ICLR
+高低分组的 ProjRes 分数，以及双方 Top-K 的重合率和富集倍数。ProjRes 命中率不再复用
+固定残差阈值预测，而是以同轮非成员连续分数分别在 10%、1% 和 0.1% FPR 下复算，并报告
+ICLR 高低分组的命中率差与比值。
+
 为了验证该分数能否衡量样本特异性，ICLR 会为训练 batch 携带相对于客户端训练集的稳定本地索引，并在训练期间为每个样本累计 `mean`、`last`、`max`、标准差和观测次数。审计完成后，这些索引会与 `low_fpr_full` 候选池中的成员索引严格连接，并针对每种攻击分别计算：
 
 - Pearson 和 Spearman 相关性；
@@ -48,7 +61,7 @@ s_i = L(x_i; theta_-k^t) - L(x_i; theta_k^t)
 - ICLR Top-K 与攻击 Top-K 的重合率和相对随机期望的富集倍数；
 - 在 `FPR=0.1/0.01/0.001` 下，全部成员、ICLR 高分组和低分组被攻击命中的比例及其差值。
 
-`defense.iclr_validation_top_fraction` 控制高分组和低分组比例，默认 `0.2`。验证只比较能够严格对齐且至少获得一次 ICLR 观测的成员样本；它衡量的是 ICLR 分数与“成员样本被攻击识别的难易程度”之间的关联，不能单独证明因果关系或防御有效性。当前只有 `candidate_sampling: low_fpr_full` 能提供所需的稳定候选索引；其他采样方式会在验证 JSON 中标记为不可用。
+`defense.iclr_validation_top_fraction` 控制高分组和低分组比例，默认 `0.2`。验证只比较能够严格对齐且至少获得一次 ICLR 观测的成员样本；它衡量的是 ICLR 分数与“成员样本被攻击识别的难易程度”之间的关联，不能单独证明因果关系或防御有效性。`candidate_sampling: low_fpr_full` 和 `balanced_global_holdout` 都会保存目标客户端成员的稳定本地索引，可用于该验证；缺少本地索引的采样方式会在验证 JSON 中标记为不可用。
 
 验证产物位于任务的 `privacy_audit/`：
 

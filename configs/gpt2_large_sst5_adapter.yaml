@@ -24,9 +24,10 @@ adapter:
   activation: relu
   classifier_dropout: 0.0
   gradient_checkpointing: true
-  # Initialize the up projection from N(0, 0.02^2), using GPT2's pretrained
-  # initializer range instead of an exact-zero residual branch.
-  zero_init_up: false
+  # Keep the inserted residual branch exactly zero at initialization: the down
+  # projection uses GPT2's N(0, 0.02^2) initializer while the up projection and
+  # both biases start at zero.
+  zero_init_up: true
 
 optimization:
   client_optimizer: sgd
@@ -53,7 +54,9 @@ audit:
     - fedmia_cosine
   target_client_id: 0
   audit_client_ids: [0]
-  candidate_sampling: balanced_holdout
+  candidate_sampling: balanced_global_holdout
+  nonmember_to_member_ratio: 10
+  paper_balanced_evaluation_size: 100
   # Match training/evaluation batching for candidate forward passes. Cosine
   # gradients remain streamed one sample at a time.
   audit_batch_size: 16
@@ -67,8 +70,9 @@ audit:
     fedmia_loss: 50
     fedmia_cosine: 50
   signal_storage: compact
+  low_fpr_min_nonmembers: 1000
   low_fpr_max_members: 100
-  low_fpr_max_nonmembers: 100
+  low_fpr_max_nonmembers: 1000
 
 projres:
   enabled: true
