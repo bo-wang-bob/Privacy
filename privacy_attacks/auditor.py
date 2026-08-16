@@ -441,7 +441,7 @@ class MembershipAuditor:
             self.exact_batch_membership_attacks
         ):
             raise ValueError(
-                "Text Adapter ProjRes must use the shared exact-batch "
+                "Unified ProjRes must use the shared exact-batch "
                 "membership protocol."
             )
         if self.exact_batch_membership_attacks and self.pooled_client_audit:
@@ -474,10 +474,14 @@ class MembershipAuditor:
             self.config.get("exact_batch_projres", {})
         )
         if "projres" in self.exact_batch_membership_attacks:
-            if self.model_type not in {"bert_adapter", "gpt2_adapter"}:
+            if self.model_type not in {
+                "bert_adapter",
+                "gpt2_adapter",
+                "visual_adapter",
+            }:
                 raise ValueError(
-                    "Unified exact-batch ProjRes currently requires a text "
-                    "Adapter model."
+                    "Unified exact-batch ProjRes requires a Transformer or "
+                    "visual Adapter model."
                 )
             threshold = float(
                 self.exact_batch_projres_config.get("threshold", 0.01)
@@ -1969,6 +1973,11 @@ class MembershipAuditor:
             ]
         return torch.cat(tensors)
 
+    def _exact_batch_membership_definition(self) -> str:
+        if getattr(self, "federated_method", "fedsgd") == "fedsgd":
+            return "current_round_exact_upload_batch"
+        return "current_round_last_local_training_batch"
+
     def _build_exact_batch_candidates(self, round_index: int) -> dict:
         """Pair the target client's real upload batch with matched holdouts."""
         target = self.users[self.target_client_id]
@@ -2075,7 +2084,9 @@ class MembershipAuditor:
             "selection": {
                 "communication_round": int(round_index) + 1,
                 "target_client_id": int(self.target_client_id),
-                "membership_definition": "current_round_exact_upload_batch",
+                "membership_definition": (
+                    self._exact_batch_membership_definition()
+                ),
                 "nonmember_training_exposure": "never_trained",
                 "label_matching_mode": "exact_batch_histogram_ratio",
                 "sampling_seed": int(sampling_seed),
@@ -2119,11 +2130,14 @@ class MembershipAuditor:
             self.exact_batch_projres_config.get("token_reduction", "auto")
         ).lower()
         if token_reduction == "auto":
-            token_reduction = (
-                "cls"
-                if str(getattr(self.model, "architecture", "")) == "bert"
-                else "last"
-            )
+            if self.model_type == "visual_adapter":
+                token_reduction = "none"
+            else:
+                token_reduction = (
+                    "cls"
+                    if str(getattr(self.model, "architecture", "")) == "bert"
+                    else "last"
+                )
         self.model.load_state_dict(base_state, strict=False)
         extractor = self.model.get_projres_representations
         member_representations, hidden_vector_count = extractor(
@@ -2169,14 +2183,22 @@ class MembershipAuditor:
         summary = attack_result.to_summary(
             fpr_targets=_EXACT_BATCH_REPORTED_FPR_TARGETS
         )
+        paper_fedsgd_exact = (
+            getattr(self, "federated_method", "fedsgd") == "fedsgd"
+        ) and (
+            self.model_type == "visual_adapter" or member_count == 16
+        )
+        sample_representation = (
+            "clip_image_feature_input_to_adapter_down_projection"
+            if self.model_type == "visual_adapter"
+            else f"{token_reduction}_sample_embedding_input_to_"
+            "adapter_down_projection"
+        )
         metadata = {
             **attack.metadata,
             "attacked_parameter": parameter_name,
-            "sample_representation": (
-                f"{token_reduction}_sample_embedding_input_to_"
-                "adapter_down_projection"
-            ),
-            "membership_definition": "current_round_exact_upload_batch",
+            "sample_representation": sample_representation,
+            "membership_definition": self._exact_batch_membership_definition(),
             "nonmember_training_exposure": "never_trained",
             "label_matching_mode": "exact_batch_histogram_ratio",
             "nonmember_to_member_ratio": self.exact_batch_nonmember_ratio,
@@ -2186,7 +2208,7 @@ class MembershipAuditor:
             "learning_rate": (
                 None if learning_rate is None else float(learning_rate)
             ),
-            "paper_fedsgd_exact": member_count == 16,
+            "paper_fedsgd_exact": paper_fedsgd_exact,
             "reported_fpr_targets": list(
                 _EXACT_BATCH_REPORTED_FPR_TARGETS
             ),
@@ -2201,7 +2223,7 @@ class MembershipAuditor:
                     "present_in_the_observed_target_client_fedsgd_batch"
                 ),
                 "execution": "unified_exact_batch_auditor",
-                "paper_fedsgd_exact": member_count == 16,
+                "paper_fedsgd_exact": paper_fedsgd_exact,
             },
             "dimensions": {
                 "candidate_sampling_batch_size": member_count,
@@ -3993,7 +4015,9 @@ class MembershipAuditor:
             )
         result.metadata.update(
             {
-                "membership_definition": "current_round_exact_upload_batch",
+                "membership_definition": (
+                    self._exact_batch_membership_definition()
+                ),
                 "nonmember_training_exposure": "never_trained",
                 "label_matching_mode": "exact_batch_histogram_ratio",
                 "nonmember_to_member_ratio": (
@@ -4481,7 +4505,7 @@ class MembershipAuditor:
             torch.save(
                 {
                     "membership_definition": (
-                        "current_round_exact_upload_batch"
+                        self._exact_batch_membership_definition()
                     ),
                     "nonmember_training_exposure": "never_trained",
                     "attacks": sorted(self.exact_batch_membership_attacks),
@@ -4721,7 +4745,7 @@ class MembershipAuditor:
                                 self.exact_batch_membership_attacks
                             ),
                             "membership_definition": (
-                                "current_round_exact_upload_batch"
+                                self._exact_batch_membership_definition()
                             ),
                             "nonmember_training_exposure": "never_trained",
                             "label_matching_mode": (

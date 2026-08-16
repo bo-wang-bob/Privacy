@@ -77,6 +77,10 @@ common:
       - avg_cosine
       - fedmia_loss
       - fedmia_cosine
+      - gradient_diff
+      - score_diff
+      - score_ratio
+      - fta
     candidate_sampling: balanced_holdout
     # Per client, pair target-train members with never-trained target-test
     # non-members using identical class counts and a strict 1:1 ratio.
@@ -90,14 +94,20 @@ common:
       avg_cosine: 10
       fedmia_loss: 10
       fedmia_cosine: 10
+      gradient_diff: 10
+      score_diff: 10
+      score_ratio: 10
+      fta: 10
+    score_ratio_damping: 1.0e-6
+    fta_measurement: confidence
     low_fpr_gradient_batch_size: 16
     signal_storage: compact
     fedmia_tail: upper
     fedmia_tail_calibration_fraction: 0.25
     training_health_check: true
 
-# ProjRes is reserved for the Visual Adapter FedSGD sweep. CLIP-MLP runs only
-# the six generic attacks in this unified experiment.
+# ProjRes is reserved for the Visual Adapter FedSGD sweep. CLIP-MLP runs the
+# ten common attacks with its original fixed-candidate FedAvg protocol.
 projres:
   enabled: false
   evaluation_round: last

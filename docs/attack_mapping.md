@@ -65,7 +65,7 @@ Gradient-Diff 来源于 [Li、Li 与 Ribeiro，ICLR 2023](https://openreview.net
 Score-Diff/Score-Ratio 来源于 [Jagielski 等，PoPETs 2023](https://petsymposium.org/popets/2023/popets-2023-0078.php)；
 FTA（free training attack）来源于 [Chang 等，USENIX Security 2024](https://www.usenix.org/conference/usenixsecurity24/presentation/chang)。
 四者在 `scripts/run_all_fedllm_attacks.sh` 的默认任务中每 50 个已完成通信轮采集一次。
-BERT 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
+BERT、GPT2-Large 与 Visual Adapter 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
 作为成员，并按标签从从未训练的全局 evaluation 池抽取 10 倍非成员；每轮独立评估，
 不改变攻击分数公式。FTA 与其他攻击继续使用固定的 100/1000 历史成员候选池。
 
@@ -137,7 +137,7 @@ BERT 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosin
 
 ## Shared evaluation
 
-所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。固定 100/1000 候选池仍可另外报告 TPR@0.1% FPR，并派生一个类别严格匹配的 100/100 论文对照视图。BERT 的 Blackbox-Loss、Grad-Cosine、Gradient-Diff、Score-Diff、Score-Ratio 与 ProjRes 统一使用 16 个真实 Batch 成员和 160 个按标签匹配的非成员；这六种攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
+所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。固定 100/1000 候选池仍可另外报告 TPR@0.1% FPR，并派生一个类别严格匹配的 100/100 论文对照视图。BERT 与 GPT2-Large 的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员，完整 Batch 时为 16/160；Visual Adapter 同样使用 `N/10N`，完整 Batch 时为 32/320。这些攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。CLIP-MLP 运行全部十种通用攻击，但继续使用原有固定候选协议，不启用真实 Batch 成员定义。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
 
 ## CLIP 图像编码器 + 两层 MLP 场景
 
@@ -184,9 +184,9 @@ batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。�
 边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
 余弦相似度的 `promptres`。
 
-统一 sweep 对 Visual Adapter 和 CLIP-LoRA 提供进程内 ProjRes：它在配置的
-真实通信轮（默认最后一轮）读取 `base_state - uploaded_client_state`，不重新
-构造训练前更新。Adapter 攻击第一层 down-projection；LoRA 攻击视觉 Q 投影的
+统一 sweep 对 Visual Adapter 和 CLIP-LoRA 提供进程内 ProjRes：它读取
+`base_state - uploaded_client_state`，不重新构造训练前更新。Visual Adapter 每 10 轮
+在共享 exact-batch 审计器中攻击第一层 down-projection；LoRA 在独立配置轮攻击视觉 Q 投影的
 `lora_A` 下投影因子，并使用该层输入的 CLIP class-token 隐藏表示。两者真实
 上传均只来自一个 batch，因此与论文 FedSGD 观测一致。CLIP-MLP 的统一攻击任务
 不执行 ProjRes；其独立严格验证入口仍然保留。

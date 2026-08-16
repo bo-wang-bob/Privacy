@@ -199,8 +199,8 @@ bash scripts/run_all_fedllm_attacks.sh
 ```
 
 默认依次运行 BERT-Base、GPT2-Large 在 SST-5、CoLA、IMDB 上的 6 个独立任务；
-每个任务均启用十种通用成员推理攻击和每 50 轮一次的 ProjRes。BERT 将 ProjRes
-作为共享审计器中的第十一种打分器，GPT2-Large 暂时保留独立的观察上传实现。每个一级
+每个任务均启用十种通用成员推理攻击和每 50 轮一次的 ProjRes。BERT 与 GPT2-Large
+都将 ProjRes 作为共享审计器中的第十一种打分器。每个一级
 结果目录仍只对应一次训练任务。正式运行前可检查完整展开参数：
 
 ```bash
@@ -274,7 +274,7 @@ CoLA 以 MCC 为主，同时保留 accuracy 作为辅助指标。十种通用攻
 `blackbox_loss`、`loss_series`、`grad_cosine`、`avg_cosine`、`fedmia_loss` 和
 `fedmia_cosine`，以及 `gradient_diff`、`score_diff`、`score_ratio` 和 `fta`。
 十种通用攻击与 ProjRes 均按已完成通信轮每 50 轮统计，并包含各任务最后一轮。
-BERT 的全部十一种打分器都由共享审计器调度，逐轮指标统一写入
+BERT 与 GPT2-Large 的全部十一种打分器都由共享审计器调度，逐轮指标统一写入
 `privacy_audit/attack_round_metrics.csv`。其中 `blackbox_loss`、`grad_cosine`、
 `gradient_diff`、`score_diff`、`score_ratio` 和 `projres` 在每个审计轮独立使用目标客户端该轮真实上传 Batch 作为
 成员，并从所有客户端的独立 evaluation 分区按该 Batch 的标签直方图无放回抽取 10 倍
@@ -287,11 +287,11 @@ BERT 的全部十一种打分器都由共享审计器调度，逐轮指标统一
 其余攻击仍从目标客户端训练分区抽取 100 个历史成员，并从全局独立 evaluation 池抽取
 1,000 个从未训练的标签比例匹配非成员。该固定 100/1000 候选池跨轮复用，FPR 最小步长
 为 `0.001`；FTA 首个检查点使用该轮更新前/后两个模型快照，之后使用实际通信轮编号上的
-OLS 斜率。GPT2-Large 当前仍对全部十种攻击使用固定候选池。可用 `--attacks` 覆盖攻击
+OLS 斜率。可用 `--attacks` 覆盖攻击
 列表，用 `--no-projres` 只关闭 ProjRes。
 
 固定候选池还派生一个逐类别严格匹配的 100 成员/100 非成员视图，用于对照
-ProjRes 论文的平衡评估规模。BERT 的六种真实 Batch 攻击不使用该历史成员视图；其余
+ProjRes 论文的平衡评估规模。BERT 与 GPT2-Large 的六种真实 Batch 攻击不使用该历史成员视图；其余
 攻击最终结果在
 `summary.json` 的每个攻击项下增加 `paper_balanced_evaluation`，逐轮结果在
 `attack_round_metrics.csv` 增加 `paper_100_100_*` 列。100 个非成员只能正式解析到
@@ -313,16 +313,12 @@ BERT 还启用只排名、不修改训练的 ICLR 分析。在第 50、100、…
 误配。关系文件中的 ProjRes 命中率使用共享的 160 个未训练非成员连续分数分别在
 10% 和 1% FPR 下复算，不使用固定残差阈值产生的二值预测，也不统计 0.1% FPR。
 
-对 BERT，ProjRes 不再生成独立的 `projres_rounds/`、`projres_series.json` 或
+对 BERT 与 GPT2-Large，ProjRes 不再生成独立的 `projres_rounds/`、`projres_series.json` 或
 `projres_strict.json`；它与另外五种真实 Batch 攻击共同写入 `summary.json`、
 `predictions.csv`、`signals.pt` 和逐轮指标 CSV。GPT2-Large 的逐样本梯度不会组成
 “候选数 × 全部 PEFT 参数”的常驻矩阵，而是逐样本
-计算与真实上传的精确余弦后立即释放。ProjRes 每 50 轮观察一次目标客户端真实 FedSGD
-batch，攻击首个 Transformer block 后 Adapter 的 `down.weight`；成员定义严格等于
-各轮对应 batch，非成员来自独立 evaluation 分区，最多使用 1,000 个。每轮完整结果
-写入 `privacy_audit/projres_rounds/round_NNNN.json`，索引保存在
-`privacy_audit/projres_series.json`；`projres_strict.json` 始终指向最近一轮结果以兼容
-已有分析脚本。
+计算与真实上传的精确余弦后立即释放。ProjRes 每 50 轮攻击首个 Transformer block 后
+Adapter 的 `down.weight`，并与另外五种攻击严格共享当轮 16 个成员和 160 个非成员。
 BERT 与 GPT2-Large 均使用 batch size 16，因此真实 one-batch 上传满足 ProjRes 的
 batch-size-16 协议条件，元数据会记录 `paper_fedsgd_exact: true`。
 GPT2-Large 的训练、普通任务评估、ProjRes 非成员编码和通用攻击候选前向分块均设为
@@ -371,14 +367,16 @@ bash scripts/run_clip_mlp_fedmia_attacks.sh \
 重新运行不会复用或覆盖之前的任务目录。可复现配置保存在该目录的
 `run_config.yaml`，默认攻击列表可通过 `--attacks` 覆盖。
 
-Visual Adapter 的 ProjRes 直接复用主任务已缓存的 CLIP 向量，并观察实际通信轮的客户端上传更新，
-不再启动第二个 Python 进程或重新加载数据；默认评估最后一轮，也可通过
-`--projres-round 50` 对齐论文通常使用的第 50 轮。结果写入每个作业的
-`privacy_audit/projres_strict.json`。可使用 `--projres-threshold` 调整阈值；仅运行
-通用审计攻击时传入 `--skip-projres`。普通攻击汇总以实验组为文件名前缀写入
+Visual Adapter 的 ProjRes 直接复用主任务已缓存的 CLIP 向量和共享 exact-batch
+候选池，每 10 轮观察一次真实 one-batch FedSGD 上传。它与 Blackbox-Loss、
+Grad-Cosine、Gradient-Diff、Score-Diff、Score-Ratio 共享当轮真实 Batch 的 `N` 个
+成员及按标签匹配的 `10N` 个从未训练非成员（完整 Batch 时为 32/320），统一写入
+`summary.json`、`predictions.csv`、`signals.pt` 和
+逐轮指标 CSV，不再生成 `projres_strict.json`。可使用 `--projres-threshold` 调整阈值；
+禁用 ProjRes 时传入 `--skip-projres`。攻击汇总以实验组为文件名前缀写入
 `results/<实验组>_summary_by_run.csv`、`<实验组>_summary_by_client.csv` 与
-`<实验组>_summary_aggregate.csv`，
-ProjRes 汇总写入 `<实验组>_summary_projres.csv`；不会生成 HTML 文件。
+`<实验组>_summary_aggregate.csv`；不会生成 HTML 文件。独立的
+`<实验组>_summary_projres.csv` 只用于仍采用独立 ProjRes 的 CLIP-LoRA。
 
 该脚本默认加载 `configs/clip_mlp_fedmia_attacks_sweep.yaml`，其基础配置是
 `configs/clip_mlp_low_fpr_attacks.yaml`：默认只训练一次，并依次把每个客户端的
@@ -388,9 +386,10 @@ ProjRes 汇总写入 `<实验组>_summary_projres.csv`；不会生成 HTML 文�
 向量。每个客户端独立构建候选池和计算指标，再报告客户端宏平均；协议强制每个
 客户端至少 1000 个非成员，因此
 `TPR@0.1%FPR` 的经验分辨率达到要求；实际成员数、非成员数和
-`fpr_resolution` 会写入 `privacy_audit/summary.json`。Adapter ProjRes 的成员
-定义与被观察轮次的 FedSGD 协议一致，即当前实际 batch；它使用完整非成员池计算
-低 FPR 指标。CLIP-MLP 的统一 sweep 不生成 ProjRes 结果。
+`fpr_resolution` 会写入 `privacy_audit/summary.json`。Visual Adapter 的六种真实
+Batch 攻击只统计 AUC、TPR@10%FPR 与 TPR@1%FPR，不统计 TPR@0.1%FPR。
+CLIP-MLP 的统一 sweep 保持固定候选协议，运行十种通用攻击且不生成 ProjRes
+结果；新增的 Gradient-Diff、Score-Diff、Score-Ratio 和 FTA 每 10 轮统计一次。
 
 Visual Adapter 对应的全数据五数据集 sweep 使用相同参数接口；严格 ProjRes
 攻击 Adapter 的第一层下采样参数：
@@ -409,7 +408,7 @@ bash scripts/run_all_clip_fedmia_attacks.sh
 该入口默认运行三种模型和五个数据集。可通过 `--models clip_mlp`、
 `--models visual_adapter` 或 `--models clip_lora` 只运行一个模型，并可用
 `--learning-rate` 临时覆盖学习率。`--models all` 同样表示三种模型。ProjRes
-在 Adapter 与 LoRA 主任务内执行；MLP 运行六种通用攻击。独立的 MLP ProjRes
+在 Adapter 与 LoRA 主任务内执行；MLP 运行十种通用攻击。独立的 MLP ProjRes
 验证入口仍保留用于单独复现实验。
 
 常用筛选、覆盖和并行命令：

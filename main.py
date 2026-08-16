@@ -330,6 +330,52 @@ def validate_config(config: dict) -> None:
         raise ValueError(f"Unknown membership attacks: {', '.join(unknown)}")
     if audit.get("enabled", True) and not attacks:
         raise ValueError("audit.enabled=true requires at least one membership attack.")
+    configured_exact_batch_attacks = audit.get(
+        "exact_batch_membership_attacks", []
+    )
+    if not isinstance(configured_exact_batch_attacks, list):
+        raise ValueError(
+            "audit.exact_batch_membership_attacks must be a list."
+        )
+    exact_batch_attacks = {
+        str(attack).lower() for attack in configured_exact_batch_attacks
+    }
+    supported_exact_batch_attacks = {
+        "blackbox_loss",
+        "grad_cosine",
+        "gradient_diff",
+        "projres",
+        "score_diff",
+        "score_ratio",
+    }
+    unsupported_exact_batch_attacks = sorted(
+        exact_batch_attacks - supported_exact_batch_attacks
+    )
+    if unsupported_exact_batch_attacks:
+        raise ValueError(
+            "Exact-batch membership supports only: "
+            + ", ".join(sorted(supported_exact_batch_attacks))
+        )
+    missing_exact_batch_attacks = sorted(exact_batch_attacks - attacks)
+    if missing_exact_batch_attacks:
+        raise ValueError(
+            "Exact-batch attacks must also appear in audit.attacks: "
+            + ", ".join(missing_exact_batch_attacks)
+        )
+    if exact_batch_attacks and model_type != "visual_adapter":
+        raise ValueError(
+            "CLIP exact-batch membership is enabled only for Visual Adapter; "
+            "CLIP-MLP keeps its original fixed-candidate protocol."
+        )
+    if "projres" in attacks and "projres" not in exact_batch_attacks:
+        raise ValueError(
+            "Visual Adapter ProjRes must use the shared exact-batch "
+            "membership protocol."
+        )
+    if "projres" in exact_batch_attacks and model_type != "visual_adapter":
+        raise ValueError(
+            "Unified CLIP ProjRes is supported only for Visual Adapter."
+        )
     pooled_audit = audit_client_ids == "all" or (
         isinstance(audit_client_ids, list) and len(audit_client_ids) > 1
     )
@@ -363,6 +409,24 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "audit.nonmember_to_member_ratio must be positive."
         )
+    configured_exact_batch_ratio = audit.get(
+        "exact_batch_nonmember_to_member_ratio", nonmember_ratio
+    )
+    if (
+        isinstance(configured_exact_batch_ratio, bool)
+        or int(configured_exact_batch_ratio) < 1
+        or float(configured_exact_batch_ratio)
+        != int(configured_exact_batch_ratio)
+    ):
+        raise ValueError(
+            "audit.exact_batch_nonmember_to_member_ratio must be a positive "
+            "integer."
+        )
+    if exact_batch_attacks and candidate_sampling != "balanced_global_holdout":
+        raise ValueError(
+            "Exact-batch membership requires "
+            "candidate_sampling=balanced_global_holdout."
+        )
     if candidate_sampling == "fedmia_mix" and bool(
         audit.get("match_candidate_labels", False)
     ):
@@ -387,6 +451,11 @@ def validate_config(config: dict) -> None:
             "avg_cosine",
             "fedmia_loss",
             "fedmia_cosine",
+            "gradient_diff",
+            "score_diff",
+            "score_ratio",
+            "fta",
+            "projres",
         }
         if model_type not in {"clip_mlp", "visual_adapter", "clip_lora"}:
             raise ValueError(
@@ -464,6 +533,10 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "Multi-client pooled auditing currently supports only: "
             + ", ".join(sorted(POOLED_CLIENT_ATTACKS))
+        )
+    if exact_batch_attacks and pooled_audit:
+        raise ValueError(
+            "Exact-batch membership currently requires one audit client."
         )
     if (
         pooled_audit
@@ -554,6 +627,11 @@ def validate_config(config: dict) -> None:
             "nasr_passive, fedmia_cosine, grad_cosine, avg_cosine, or promptres."
         )
     projres = config.get("projres", {})
+    unified_projres = "projres" in exact_batch_attacks
+    if unified_projres and not bool(projres.get("enabled", False)):
+        raise ValueError(
+            "Exact-batch audit includes ProjRes but projres.enabled is false."
+        )
     if bool(projres.get("enabled", False)):
         if model_type not in {"clip_mlp", "visual_adapter", "clip_lora"}:
             raise ValueError(
@@ -613,10 +691,20 @@ def validate_config(config: dict) -> None:
         max_candidates = int(projres.get("max_candidates", 32))
         min_nonmembers = int(projres.get("min_nonmembers", 1000))
         max_nonmembers = int(projres.get("max_nonmembers", 20000))
-        if threshold < 0 or max_candidates <= 0 or min_nonmembers < 1000:
+        minimum_required_nonmembers = (
+            int(config["batch_size"]) * int(configured_exact_batch_ratio)
+            if unified_projres
+            else 1000
+        )
+        if (
+            threshold < 0
+            or max_candidates <= 0
+            or min_nonmembers < minimum_required_nonmembers
+        ):
             raise ValueError(
                 "ProjRes threshold must be non-negative, max_candidates must "
-                "be positive, and min_nonmembers must be at least 1000."
+                "be positive, and min_nonmembers must satisfy the configured "
+                "candidate protocol."
             )
         if max_nonmembers < 0 or (
             max_nonmembers and max_nonmembers < min_nonmembers
@@ -624,8 +712,50 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "ProjRes max_nonmembers must be 0 or at least min_nonmembers."
             )
-        evaluation_round = projres.get("evaluation_round", "last")
-        if str(evaluation_round).lower() != "last":
+        if unified_projres:
+            expected_nonmembers = int(config["batch_size"]) * int(
+                configured_exact_batch_ratio
+            )
+            if max_candidates != int(config["batch_size"]):
+                raise ValueError(
+                    "Unified ProjRes must audit the complete real training batch."
+                )
+            if (
+                min_nonmembers != expected_nonmembers
+                or max_nonmembers != expected_nonmembers
+            ):
+                raise ValueError(
+                    "Unified ProjRes min_nonmembers and max_nonmembers must "
+                    "equal batch_size * exact_batch_nonmember_to_member_ratio."
+                )
+            if "evaluation_round" in projres:
+                raise ValueError(
+                    "Unified ProjRes is scheduled by the shared audit interval; "
+                    "remove projres.evaluation_round."
+                )
+            evaluation_interval = int(
+                projres.get(
+                    "evaluation_interval",
+                    audit.get("attack_audit_intervals", {}).get(
+                        "projres", audit.get("audit_interval", 1)
+                    ),
+                )
+            )
+            audit_interval = int(
+                audit.get("attack_audit_intervals", {}).get(
+                    "projres", audit.get("audit_interval", 1)
+                )
+            )
+            if evaluation_interval <= 0 or evaluation_interval != audit_interval:
+                raise ValueError(
+                    "Unified ProjRes evaluation_interval must be positive and "
+                    "match its shared audit interval."
+                )
+        else:
+            evaluation_round = projres.get("evaluation_round", "last")
+            if str(evaluation_round).lower() == "last":
+                evaluation_round = None
+        if not unified_projres and evaluation_round is not None:
             try:
                 evaluation_round = int(evaluation_round)
             except (TypeError, ValueError) as error:

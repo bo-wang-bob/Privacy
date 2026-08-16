@@ -56,10 +56,20 @@ audit:
     - score_diff
     - score_ratio
     - fta
+    - projres
   target_client_id: 0
   audit_client_ids: [0]
   candidate_sampling: balanced_global_holdout
   nonmember_to_member_ratio: 10
+  # Use the same real one-batch membership view as BERT.
+  exact_batch_membership_attacks:
+    - blackbox_loss
+    - grad_cosine
+    - gradient_diff
+    - projres
+    - score_diff
+    - score_ratio
+  exact_batch_nonmember_to_member_ratio: 10
   paper_balanced_evaluation_size: 100
   # Match training/evaluation batching for candidate forward passes. Cosine
   # gradients remain streamed one sample at a time.
@@ -77,6 +87,7 @@ audit:
     score_diff: 50
     score_ratio: 50
     fta: 50
+    projres: 50
   score_ratio_damping: 1.0e-6
   fta_measurement: confidence
   signal_storage: compact
@@ -89,8 +100,8 @@ projres:
   # Audit real target-client uploads after rounds 50, 100, ..., 500.
   evaluation_interval: 50
   threshold: 0.01
-  # Audit the complete observed FedSGD batch.
+  # Shared 16-member/160-nonmember exact-batch view.
   max_candidates: 16
-  min_nonmembers: 100
-  max_nonmembers: 1000
+  min_nonmembers: 160
+  max_nonmembers: 160
   token_reduction: auto

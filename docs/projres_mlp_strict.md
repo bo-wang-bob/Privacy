@@ -77,8 +77,9 @@ rowspan(dL/dA) is a subspace of the attacked-layer token inputs
 - 数据协议与对应正常训练保持一致：CLIP-MLP、Visual Adapter 和 CLIP-LoRA
   均使用完整训练集。
 
-这也是为什么该入口独立于仓库的通用多轮审计器。通用 `promptres` 是余弦
-代理攻击，不等同于本文的投影残差算法。
+独立入口继续用于 CLIP-MLP 严格复现和 CLIP-LoRA/Visual Adapter 的单独诊断；
+通用 `promptres` 是余弦代理攻击，不等同于本文的投影残差算法。正式 Visual
+Adapter sweep 已将 ProjRes 接入共享多轮审计器，但不改变这里的投影残差公式。
 
 ## 统一训练入口中的真实轮次评估
 
@@ -86,12 +87,12 @@ rowspan(dL/dA) is a subspace of the attacked-layer token inputs
 第 3.1 节要求的是目标客户端单个通信轮的上传梯度，而不是训练初始化时额外构造
 一次更新。论文第 4.1 节的默认实验通常在第 50 个通信轮评估。
 
-统一 Adapter/LoRA sweep 因此直接观察实际客户端上传，并默认在最后一个通信轮执行
-ProjRes；设置 `--projres-round 50` 可选择第 50 轮。该路径与上述独立严格入口有一
-个重要区别：若一次本地训练包含多个 batch，实际 FedAvg 参数差是多步更新的累积，
-不再与论文的单 batch FedSGD 梯度完全等价。此时成员定义为该轮参与本地训练的
-客户端数据，结果 JSON 会记录 `paper_fedsgd_exact: false` 和实际本地 batch 数，
-避免把扩展实验误标为论文原始协议。
+Visual Adapter 的统一 sweep 因此每 10 轮直接观察实际 one-batch FedSGD 上传，
+ProjRes 与另外五种真实 Batch 攻击共享当轮 `N` 个成员和按标签匹配的 `10N` 个
+非成员，并由共享审计器统一保存结果。CLIP-LoRA 仍使用独立 ProjRes 路径，默认
+观察最后一轮，可用 `--projres-round 50` 选择第 50 轮。若独立入口观察的是包含
+多个本地 batch 的 FedAvg 参数差，它是多步更新的累积，不再与论文的单-batch
+FedSGD 梯度完全等价；结果元数据会明确记录这一差异。
 
 ## 运行
 
@@ -123,11 +124,13 @@ python scripts/validate_projres_mlp_real.py \
 准确率、梯度秩、第一层维度，以及 `update / learning_rate` 与 autograd 梯度
 的一致性误差。
 
-默认评估使用当前上传梯度所对应 batch 中的全部成员候选，并从互斥非成员池
+独立入口默认使用当前上传梯度所对应 batch 中的全部成员候选，并从互斥非成员池
 （所有客户端测试集和其他客户端训练集）中最多选取 20,000 个样本。非成员不得
 少于 1000 个，因而 `TPR@0.1%FPR` 的经验 FPR 步长不大于 `1/1000`。可显式使用
-`--max-nonmembers 0` 改为完整非成员池，或指定另一个不小于 1000 的上限。目标
-客户端不在当前 batch 中的其他训练样本不能算作本文严格威胁模型下的成员。
+`--max-nonmembers 0` 改为完整非成员池，或指定另一个不小于 1000 的上限。
+Visual Adapter 正式统一 sweep 改为按真实 Batch 标签匹配的 `N/10N` 候选视图，
+不报告 `TPR@0.1%FPR`。无论哪条入口，目标客户端不在当前 batch 中的其他训练样本
+都不能算作严格威胁模型下的成员。
 
 ## 适用边界
 

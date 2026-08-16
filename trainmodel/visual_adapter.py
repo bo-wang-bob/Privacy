@@ -284,6 +284,31 @@ class VisualCLIPAdapter(nn.Module):
         text_features = self.mixed_text_features()
         return mixed, text_features[labels.to(text_features.device)]
 
+    def get_projres_attack_surface(
+        self, parameter_name: str | None = None
+    ) -> tuple[str, nn.Linear]:
+        """Expose the first visual Adapter down-projection."""
+        name = "adapter.net.0.weight"
+        layer = cast(nn.Linear, self.adapter.net[0])
+        if parameter_name not in {None, name}:
+            raise ValueError(
+                f"ProjRes parameter {parameter_name!r} must be {name!r}."
+            )
+        return name, layer
+
+    @torch.no_grad()
+    def get_projres_representations(
+        self,
+        images: torch.Tensor,
+        parameter_name: str | None = None,
+        token_reduction: str = "none",
+    ) -> tuple[torch.Tensor, int]:
+        """Return sample vectors entering the attacked down-projection."""
+        del token_reduction
+        self.get_projres_attack_surface(parameter_name)
+        features = self.encode_images(images)
+        return features, int(features.shape[0])
+
     def get_audit_key_parameter(self) -> torch.nn.Parameter:
         first_layer = cast(nn.Linear, self.adapter.net[0])
         return first_layer.weight

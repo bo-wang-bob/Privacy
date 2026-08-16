@@ -51,6 +51,10 @@ audit:
     - avg_cosine
     - fedmia_loss
     - fedmia_cosine
+    - gradient_diff
+    - score_diff
+    - score_ratio
+    - fta
   # Build the candidate pool from every target-client member and every disjoint
   # non-member, then apply deterministic class-stratified caps when needed.
   candidate_sampling: balanced_holdout
@@ -58,6 +62,13 @@ audit:
   low_fpr_max_nonmembers: 5000
   match_candidate_labels: true
   audit_batch_size: 512
+  attack_audit_intervals:
+    gradient_diff: 10
+    score_diff: 10
+    score_ratio: 10
+    fta: 10
+  score_ratio_damping: 1.0e-6
+  fta_measurement: confidence
   low_fpr_gradient_batch_size: 16
   signal_storage: compact
   fedmia_tail: upper

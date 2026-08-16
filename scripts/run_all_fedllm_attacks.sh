@@ -148,8 +148,8 @@ ProjRes options:
 
 Every real task prints its resolved configuration only when that task starts.
 Each task evaluates all ten common attacks and ProjRes every 50 rounds. BERT
-runs ProjRes inside the shared exact-batch auditor; GPT2 keeps the standalone
-observed-update path. BERT also runs observational ICLR every 50 rounds.
+and GPT2 both run six update-sensitive scorers inside the shared exact-batch
+auditor. BERT also runs observational ICLR every 50 rounds.
 EOF
   "$python_bin" scripts/run_fedllm_adapter.py --help
   exit 0

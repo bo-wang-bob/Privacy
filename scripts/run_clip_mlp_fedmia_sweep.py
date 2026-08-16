@@ -304,9 +304,15 @@ def _completed_result(job: SweepJob) -> Path | None:
         return None
     completed = {row.get("attack") for row in audit.get("attacks", [])}
     expected = set(job.config.get("audit", {}).get("attacks", []))
+    exact_batch_attacks = set(
+        job.config.get("audit", {}).get(
+            "exact_batch_membership_attacks", []
+        )
+    )
+    unified_projres = "projres" in exact_batch_attacks
     projres_complete = not bool(
         job.config.get("projres", {}).get("enabled", False)
-    ) or _projres_path(job).is_file()
+    ) or unified_projres or _projres_path(job).is_file()
     iclr_complete = True
     if str(job.defense).lower() == "iclr":
         validation = audit.get("iclr_validation") or {}
@@ -381,6 +387,7 @@ def _job_hyperparameters_block(job: SweepJob) -> str:
         },
         model_type: config.get(model_type, {}),
         "privacy_audit": config.get("audit", {}),
+        "projres": config.get("projres", {}),
         "privacy_defense": config.get("defense", {}),
     }
     rows = _flatten(selected)
@@ -697,7 +704,16 @@ def _announce_job_start(
         ),
         _job_hyperparameters_block(job),
     ]
-    if not skip_projres and bool(projres.get("enabled", True)):
+    unified_projres = "projres" in set(
+        job.config.get("audit", {}).get(
+            "exact_batch_membership_attacks", []
+        )
+    )
+    if (
+        not unified_projres
+        and not skip_projres
+        and bool(projres.get("enabled", True))
+    ):
         blocks.append(_projres_parameters_block(job, projres))
     # One print under a lock keeps concurrent jobs from interleaving parameter
     # blocks while still announcing each job only when its worker really starts.
@@ -840,7 +856,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--projres-threshold", type=float)
     parser.add_argument(
         "--projres-round",
-        help="One-based communication round for ProjRes, or 'last'.",
+        help=(
+            "One-based communication round for standalone ProjRes, or "
+            "'last'; unavailable to unified Visual Adapter ProjRes."
+        ),
     )
     parser.add_argument("--projres-max-candidates", type=int)
     parser.add_argument("--projres-min-out", type=int)
@@ -859,9 +878,16 @@ def main() -> int:
     spec = copy.deepcopy(_load_yaml(spec_path))
     sweep_name = str(spec.get("name", "clip_mlp_fedmia_attacks"))
     if args.attacks is not None:
-        spec.setdefault("common", {}).setdefault("audit", {})["attacks"] = (
-            _parse_csv(args.attacks)
-        )
+        audit_override = spec.setdefault("common", {}).setdefault("audit", {})
+        audit_override["attacks"] = _parse_csv(args.attacks)
+        if "exact_batch_membership_attacks" in audit_override:
+            audit_override["exact_batch_membership_attacks"] = [
+                attack
+                for attack in audit_override[
+                    "exact_batch_membership_attacks"
+                ]
+                if attack in audit_override["attacks"] or attack == "projres"
+            ]
     if args.defense is not None:
         spec["defenses"] = [{"name": args.defense}]
     if args.target_client is not None:
@@ -899,11 +925,62 @@ def main() -> int:
     projres.update({key: value for key, value in overrides.items() if value is not None})
     if float(projres.get("threshold", 0.01)) < 0:
         raise ValueError("ProjRes threshold must be non-negative.")
-    if int(projres.get("min_nonmembers", 1000)) < 1000:
-        raise ValueError("ProjRes needs at least 1000 non-members for 0.1% FPR.")
-    projres.setdefault("max_nonmembers", 20000)
     projres["enabled"] = projres_enabled
     spec["projres"] = projres
+    audit_override = spec.setdefault("common", {}).setdefault("audit", {})
+    configured_exact_batch_attacks = list(
+        audit_override.get("exact_batch_membership_attacks", [])
+    )
+    unified_projres = "projres" in configured_exact_batch_attacks
+    if args.skip_projres:
+        audit_override["attacks"] = [
+            attack
+            for attack in audit_override.get("attacks", [])
+            if attack != "projres"
+        ]
+        audit_override["exact_batch_membership_attacks"] = [
+            attack
+            for attack in configured_exact_batch_attacks
+            if attack != "projres"
+        ]
+        unified_projres = False
+    elif unified_projres and projres_enabled:
+        attacks = audit_override.setdefault("attacks", [])
+        if "projres" not in attacks:
+            attacks.append("projres")
+    if unified_projres and args.projres_round is not None:
+        raise ValueError(
+            "Unified Visual Adapter ProjRes uses the shared attack interval; "
+            "--projres-round is only available to standalone ProjRes."
+        )
+    if projres_enabled:
+        if unified_projres:
+            batch_size = int(spec.get("common", {}).get("batch_size", 0))
+            ratio = int(
+                audit_override.get(
+                    "exact_batch_nonmember_to_member_ratio",
+                    audit_override.get("nonmember_to_member_ratio", 1),
+                )
+            )
+            expected_nonmembers = batch_size * ratio
+            if int(projres.get("max_candidates", 0)) != batch_size or (
+                int(projres.get("min_nonmembers", 0))
+                != expected_nonmembers
+                or int(projres.get("max_nonmembers", 0))
+                != expected_nonmembers
+            ):
+                raise ValueError(
+                    "Unified Visual Adapter ProjRes must use the shared full "
+                    "batch and exact 1:N nonmember count."
+                )
+        else:
+            if int(projres.get("min_nonmembers", 1000)) < 1000:
+                raise ValueError(
+                    "Standalone ProjRes needs at least 1000 non-members for "
+                    "0.1% FPR."
+                )
+            projres.setdefault("max_nonmembers", 20000)
+    standalone_projres_enabled = projres_enabled and not unified_projres
 
     jobs, results_root = build_jobs(
         spec,
@@ -930,7 +1007,7 @@ def main() -> int:
     if args.dry_run:
         for index, job in enumerate(jobs):
             print(_job_hyperparameters_block(job))
-            if projres_enabled:
+            if standalone_projres_enabled:
                 print(_projres_parameters_block(job, projres))
             for command in _commands(job, gpus[index % len(gpus)]):
                 print("COMMAND " + _command_text(command))
@@ -947,7 +1024,7 @@ def main() -> int:
         complete, attack_rows = summarize(jobs, results_root, sweep_name)
         projres_rows = (
             summarize_projres(jobs, results_root, sweep_name)
-            if projres_enabled
+            if standalone_projres_enabled
             else 0
         )
         print(
@@ -980,7 +1057,7 @@ def main() -> int:
     complete, attack_rows = summarize(jobs, results_root, sweep_name)
     projres_rows = (
         summarize_projres(jobs, results_root, sweep_name)
-        if projres_enabled
+        if standalone_projres_enabled
         else 0
     )
     print(

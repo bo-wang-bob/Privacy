@@ -117,13 +117,14 @@ All options below are forwarded to each selected sweep, including:
   --learning-rate-decay-interval ROUNDS
   --rounds VALUE        --dirichlet-alpha VALUE (selects dirichlet unless
                          --partition-mode was explicitly provided)
-  --projres-round N|last
+  --projres-round N|last  Standalone CLIP-LoRA ProjRes only.
   --skip-projres        --force                --dry-run
   --summarize-only      --max-runs VALUE
 
-ProjRes runs for Visual Adapter and CLIP-LoRA from a selected real one-batch
-FedSGD upload. It attacks the first Adapter downsampling layer or the first
-vision Q-projection LoRA-A matrix. CLIP-MLP runs the six generic attacks only.
+Visual Adapter runs ProjRes in the shared exact-batch auditor every 10 rounds;
+CLIP-LoRA keeps standalone ProjRes on a selected one-batch FedSGD upload.
+CLIP-MLP runs all ten common attacks with its fixed-candidate protocol and no
+ProjRes or exact-batch membership.
 EOF
   "$python_bin" scripts/run_clip_mlp_fedmia_sweep.py --help
   exit 0
