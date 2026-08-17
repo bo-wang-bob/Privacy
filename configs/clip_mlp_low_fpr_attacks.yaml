@@ -50,7 +50,6 @@ audit:
     - grad_cosine
     - avg_cosine
     - fedmia_loss
-    - fedmia_cosine
     - gradient_diff
     - score_diff
     - score_ratio

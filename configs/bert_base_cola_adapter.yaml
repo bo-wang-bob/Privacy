@@ -49,7 +49,6 @@ audit:
     - grad_cosine
     - avg_cosine
     - fedmia_loss
-    - fedmia_cosine
     - gradient_diff
     - score_diff
     - score_ratio
@@ -78,7 +77,6 @@ audit:
     grad_cosine: 50
     avg_cosine: 50
     fedmia_loss: 50
-    fedmia_cosine: 50
     gradient_diff: 50
     score_diff: 50
     score_ratio: 50
@@ -103,7 +101,8 @@ defense:
 projres:
   enabled: true
   evaluation_interval: 50
-  threshold: 0.01
+  decision_mode: ranking
+  threshold: null
   # Shared exact-batch view; 160 is the full-batch 16 * 10 case.
   max_candidates: 16
   min_nonmembers: 160

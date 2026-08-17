@@ -1,6 +1,6 @@
 # Paper-to-code mapping
 
-当前公共审计器只注册 FedMIA 四个基线、FedMIA-I/II、Gradient-Diff、
+当前公共审计器只注册 FedMIA 四个基线、FedMIA-I、Gradient-Diff、
 Score-Diff、Score-Ratio、FTA 和 ProjRes。下文其他攻击的研究实现仍保留在仓库中，
 但已从配置、命令行和公共审计器注册表移除，不能作为新实验攻击启用。
 
@@ -22,7 +22,6 @@ Score-Diff、Score-Ratio、FTA 和 ProjRes。下文其他攻击的研究实现�
 `privacy_attacks/fedmia.py` 重新实现论文的 all-for-one 单尾检验：
 
 - FedMIA-I 使用负交叉熵（置信度）；
-- FedMIA-II 使用候选样本 prompt gradient 与客户端 prompt update 的余弦相似度；
 - 同一轮其他客户端构成 non-target/null 分布；
 - 对多个通信轮的单尾 CDF 分数支持 `mean`、`max`、`last` 与 `late3` 聚合。
 
@@ -44,14 +43,14 @@ FedMIA 官方仓库将四个相关基线按“度量、时间信息、空间信�
 | `avg_cosine` | 同上 | 多轮 | 仅目标客户端 | 对逐轮余弦取均值 |
 
 默认 sweep 使用按需审计调度：两个单轮基线只在固定轮次使用信号；两个时序
-基线每轮只需要目标客户端；FedMIA-I/II 根据公式 (5)、公式 (12) 和 Algorithm 1
+基线每轮只需要目标客户端；FedMIA-I 根据公式 (5) 和 Algorithm 1
 对所有通信轮、所有当轮客户端构造跨客户端 null 分布，因此也显式配置为每轮
 采集。若任务没有选择 FedMIA，调度器不会为它计算跨客户端信号。
 
 官方绘图代码还会查看每一轮的攻击效果并报告其中的最大 TPR。那种选择依赖
 真实成员标签，不能作为部署时可实现的攻击规则，因此本仓库的单轮基线使用预先
 固定的轮次，而不实现 oracle best-round。四个基线都只使用目标客户端，不使用
-FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II/III/IV 的对照意义。
+FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I 的对照意义。
 
 ### ProjRes 论文采用的四个传统基线
 
@@ -60,9 +59,9 @@ Deng 等人的 FedLLM ProjRes 实验还比较 Gradient-Diff、Score-Diff、Score
 
 | 运行名 | 原始信号 | 当前 FedLLM 实现 |
 |---|---|---|
-| `gradient_diff` | `||g_client||² - ||g_client - sum_y grad L(x,y)||²` | 对 vanilla SGD 上传除以该轮学习率，恢复 one-batch 梯度；逐候选流式计算对全部标签求和的梯度 |
-| `score_diff` | `L_post(x)-L_pre(x)` | 同轮客户端更新前后各前向一次；FedSGD post-state 由目标客户端上传增量重建；输出其相反数 `L_pre-L_post` |
-| `score_ratio` | `(L_post(x)+c)/(L_pre(x)+c)` | FedSGD post-state 由目标客户端上传增量重建；默认 `c=1e-6`；输出负比值，避免改变全仓库“高分为成员”的 ROC 约定 |
+| `gradient_diff` | `||g_client||² - ||g_client - sum_y grad L(x,y)||²` | 直接使用目标客户端上传的 one-batch 梯度；逐候选流式计算对全部标签求和的梯度 |
+| `score_diff` | `L_post(x)-L_pre(x)` | 同轮客户端更新前后各前向一次；FedSGD post-state 由 `base - learning_rate * uploaded_gradient` 构造；输出其相反数 `L_pre-L_post` |
+| `score_ratio` | `(L_post(x)+c)/(L_pre(x)+c)` | FedSGD post-state 由 `base - learning_rate * uploaded_gradient` 构造；默认 `c=1e-6`；输出负比值，避免改变全仓库“高分为成员”的 ROC 约定 |
 | `fta` | 多个 FL 模型快照上性能指标的变化斜率 | 默认对真实标签置信度使用实际通信轮编号做 OLS；首个检查点使用该轮更新前/后两个快照，也可设置 `audit.fta_measurement: loss` |
 
 Gradient-Diff 来源于 [Li、Li 与 Ribeiro，ICLR 2023](https://openreview.net/forum?id=QsCSLPP55Ku)；
@@ -141,7 +140,7 @@ BERT、GPT2-Large 与 Visual Adapter 的 Blackbox-Loss、Gradient-Diff、Score-D
 
 ## Shared evaluation
 
-所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。固定 100/1000 候选池仍可另外报告 TPR@0.1% FPR，并派生一个类别严格匹配的 100/100 论文对照视图。BERT 与 GPT2-Large 的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员，完整 Batch 时为 16/160；Visual Adapter 同样使用 `N/10N`，完整 Batch 时为 32/320。这些攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。CLIP-MLP 运行全部十种通用攻击，但继续使用原有固定候选协议，不启用真实 Batch 成员定义。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
+所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。固定 100/1000 候选池仍可另外报告 TPR@0.1% FPR，并派生一个类别严格匹配的 100/100 论文对照视图。BERT 与 GPT2-Large 的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员，完整 Batch 时为 16/160；Visual Adapter 同样使用 `N/10N`，完整 Batch 时为 32/320。这些攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。CLIP-MLP 运行全部九种通用攻击，但继续使用原有固定候选协议，不启用真实 Batch 成员定义。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
 
 ## CLIP 图像编码器 + 两层 MLP 场景
 
@@ -188,9 +187,10 @@ batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。�
 边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
 余弦相似度的 `promptres`。
 
-统一 sweep 对 Visual Adapter 和 CLIP-LoRA 提供进程内 ProjRes：它读取
-`base_state - uploaded_client_state`，不重新构造训练前更新。Visual Adapter 每 10 轮
+统一 sweep 对 Visual Adapter 和 CLIP-LoRA 提供进程内 ProjRes：FedSGD 路径直接读取
+客户端上传梯度，不再从参数差反推。Visual Adapter 每 10 轮
 在共享 exact-batch 审计器中攻击第一层 down-projection；LoRA 在独立配置轮攻击视觉 Q 投影的
 `lora_A` 下投影因子，并使用该层输入的 CLIP class-token 隐藏表示。两者真实
-上传均只来自一个 batch，因此与论文 FedSGD 观测一致。CLIP-MLP 的统一攻击任务
+上传均只来自一个 batch，因此与论文 FedSGD 观测一致。ProjRes 以负 L1 残差做
+ranking-only 评价，不再使用固定残差阈值。CLIP-MLP 的统一攻击任务
 不执行 ProjRes；其独立严格验证入口仍然保留。

@@ -76,7 +76,6 @@ common:
       - grad_cosine
       - avg_cosine
       - fedmia_loss
-      - fedmia_cosine
       - gradient_diff
       - score_diff
       - score_ratio
@@ -93,7 +92,6 @@ common:
       loss_series: 10
       avg_cosine: 10
       fedmia_loss: 10
-      fedmia_cosine: 10
       gradient_diff: 10
       score_diff: 10
       score_ratio: 10
@@ -111,7 +109,8 @@ common:
 projres:
   enabled: false
   evaluation_round: last
-  threshold: 0.01
+  decision_mode: ranking
+  threshold: null
   max_candidates: 32
   min_nonmembers: 1000
   max_nonmembers: 20000

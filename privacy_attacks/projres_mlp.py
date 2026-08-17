@@ -26,7 +26,7 @@ class MLPProjResResult:
 
     scores: torch.Tensor
     l1_residuals: torch.Tensor
-    predictions: torch.Tensor
+    predictions: torch.Tensor | None
     basis: torch.Tensor
     statistics: dict[str, torch.Tensor]
     metadata: dict[str, object]
@@ -46,7 +46,7 @@ class FedSGDStepResult:
 def strict_mlp_projres(
     first_layer_update: torch.Tensor,
     candidate_layer_inputs: torch.Tensor,
-    threshold: float = 1e-2,
+    threshold: float | None = None,
     *,
     max_rank: int | None = None,
     relative_tolerance: float | None = None,
@@ -62,8 +62,8 @@ def strict_mlp_projres(
             equivalent here.
         candidate_layer_inputs: Candidate representations immediately before
             that layer, shaped ``(candidate_count, input_dim)``.
-        threshold: The paper's raw L1 residual threshold. A candidate is
-            predicted as a member exactly when ``residual < threshold``.
+        threshold: Optional raw L1 residual threshold. ``None`` runs the
+            ranking-only protocol and does not emit binary predictions.
         max_rank: Optional theoretical upper bound on the observed gradient
             rank. For one-batch FedSGD this is at most the actual batch size.
             Applying this bound removes only finite-precision directions that
@@ -74,8 +74,10 @@ def strict_mlp_projres(
         likely member for ROC/AUC evaluation. The unmodified paper statistic
         is available as ``l1_residuals``.
     """
-    if threshold < 0 or not torch.isfinite(torch.tensor(float(threshold))):
-        raise ValueError("threshold must be finite and non-negative.")
+    if threshold is not None and (
+        threshold < 0 or not torch.isfinite(torch.tensor(float(threshold)))
+    ):
+        raise ValueError("threshold must be finite and non-negative when set.")
     if max_rank is not None and max_rank <= 0:
         raise ValueError("max_rank must be positive when provided.")
     if first_layer_update.ndim != 2:
@@ -141,7 +143,11 @@ def strict_mlp_projres(
         for name, value in stable_statistics.items()
     }
     residuals = statistics["l1_residual"]
-    predictions = (residuals < float(threshold)).to(torch.long)
+    predictions = (
+        None
+        if threshold is None
+        else (residuals < float(threshold)).to(torch.long)
+    )
     metadata: dict[str, object] = {
         "algorithm": "ProjRes Algorithm 1",
         "attacked_parameter": "first_trainable_linear_weight",
@@ -149,8 +155,13 @@ def strict_mlp_projres(
         "candidate_shape": list(candidate_layer_inputs.shape),
         "input_dimension": int(first_layer_update.shape[1]),
         "output_dimension": int(first_layer_update.shape[0]),
-        "threshold": float(threshold),
-        "decision_rule": "member iff raw_l1_residual < threshold",
+        "threshold": None if threshold is None else float(threshold),
+        "decision_mode": "ranking" if threshold is None else "fixed_threshold",
+        "decision_rule": (
+            "ranking_only_by_negative_raw_l1_residual"
+            if threshold is None
+            else "member iff raw_l1_residual < threshold"
+        ),
         "roc_score": "negative_raw_l1_residual",
         "subspace": rank_metadata,
         "numerical_stabilization": {

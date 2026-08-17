@@ -113,12 +113,10 @@ def _metric_payload(
     labels: torch.Tensor,
     scores: torch.Tensor,
     residuals: torch.Tensor,
-    predictions: torch.Tensor,
-) -> dict[str, float]:
+) -> dict[str, object]:
     labels = labels.detach().cpu()
     scores = scores.detach().cpu()
     residuals = residuals.detach().cpu()
-    predictions = predictions.detach().cpu()
     member_residuals = residuals[labels == 1]
     nonmember_residuals = residuals[labels == 0]
     metrics = membership_metrics(labels, scores)
@@ -140,7 +138,6 @@ def _metric_payload(
         "reportable_metrics": reportable_metrics,
         "metric_availability": availability,
         "fpr_resolution": 1.0 / nonmember_count,
-        "threshold_accuracy": float((predictions == labels).float().mean()),
         "member_mean_l1_residual": float(member_residuals.mean()),
         "nonmember_mean_l1_residual": float(nonmember_residuals.mean()),
         "l1_residual_gap": float(
@@ -245,7 +242,6 @@ def _run_client(
     processor,
     global_model: torch.nn.Module,
     device: torch.device,
-    threshold: float,
     max_candidates: int,
     min_nonmembers: int,
     max_nonmembers: int | None,
@@ -324,9 +320,9 @@ def _run_client(
         parameter_name=attacked_parameter,
     )
     attack = strict_mlp_projres(
-        step.observed_update,
+        step.gradient,
         candidate_features,
-        threshold=threshold,
+        threshold=None,
         # For dW = E.T @ X / batch, rank(dW) cannot exceed the actual
         # FedSGD batch size. This removes only float32 subtraction directions
         # that are impossible in the exact one-batch gradient.
@@ -340,19 +336,16 @@ def _run_client(
             ),
         )
     )
-    metrics = _metric_payload(
-        labels, attack.scores, attack.l1_residuals, attack.predictions
-    )
+    metrics = _metric_payload(labels, attack.scores, attack.l1_residuals)
     batch_size = int(member_labels.numel())
     input_dimension = int(first_layer.in_features)
     output_dimension = int(first_layer.out_features)
     logger.info(
-        "client=%d | batch=%d | rank=%d | auc=%.4f | threshold_acc=%.4f",
+        "client=%d | batch=%d | rank=%d | auc=%.4f",
         client_id,
         batch_size,
         int(attack.metadata["subspace"]["numerical_rank"]),
         metrics["auc"],
-        metrics["threshold_accuracy"],
     )
     return {
         "client_id": client_id,
@@ -378,7 +371,8 @@ def _run_client(
         "optimization": {
             "loss": step.loss,
             "learning_rate": float(config["learning_rate"]),
-            "observed_update_norm": float(step.observed_update.norm()),
+            "observed_gradient_norm": float(step.gradient.norm()),
+            "update_source": "uploaded_client_gradient",
             "update_over_lr_vs_gradient_relative_error": (
                 step.update_gradient_relative_error
             ),
@@ -388,7 +382,7 @@ def _run_client(
             "labels": labels.detach().cpu().tolist(),
             "scores": attack.scores.detach().cpu().tolist(),
             "l1_residuals": attack.l1_residuals.detach().cpu().tolist(),
-            "predictions": attack.predictions.detach().cpu().tolist(),
+            "predictions": None,
         },
         "candidate_controls": {
             "label_matched_nonmembers": False,
@@ -414,13 +408,7 @@ def _aggregate(
             for row in results
         ]
     )
-    predictions = torch.cat(
-        [
-            torch.tensor(row["raw"]["predictions"], dtype=torch.long)
-            for row in results
-        ]
-    )
-    pooled = _metric_payload(labels, scores, residuals, predictions)
+    pooled = _metric_payload(labels, scores, residuals)
     metric_rows = [row["attack"]["metrics"] for row in results]
     numeric_keys = [
         key
@@ -529,7 +517,6 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 processor,
                 global_model,
                 device,
-                args.threshold,
                 args.max_candidates,
                 args.min_nonmembers,
                 None if args.max_nonmembers == 0 else args.max_nonmembers,
@@ -573,7 +560,6 @@ def main() -> int:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--device")
     parser.add_argument("--target-client", default="all")
-    parser.add_argument("--threshold", type=float, default=1e-2)
     parser.add_argument("--max-candidates", type=int, default=32)
     parser.add_argument("--min-nonmembers", type=int, default=1000)
     parser.add_argument(
@@ -585,15 +571,14 @@ def main() -> int:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if (
-        args.threshold < 0
-        or args.max_candidates <= 0
+        args.max_candidates <= 0
         or args.min_nonmembers < 1000
         or args.max_nonmembers < 0
         or (args.max_nonmembers and args.max_nonmembers < args.min_nonmembers)
     ):
         parser.error(
-            "threshold must be non-negative; max-candidates must be positive; "
-            "min-nonmembers must be at least 1000; max-nonmembers must be 0 "
+            "max-candidates must be positive; min-nonmembers must be at least "
+            "1000; max-nonmembers must be 0 "
             "or no smaller than min-nonmembers"
         )
     logging.basicConfig(

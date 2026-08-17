@@ -551,7 +551,7 @@ def summarize(
 
 DEFAULT_ATTACKS = (
     "blackbox_loss,loss_series,grad_cosine,avg_cosine,"
-    "fedmia_loss,fedmia_cosine"
+    "fedmia_loss"
 )
 
 
@@ -628,7 +628,7 @@ def _projres_parameters_block(job, projres: dict[str, Any]) -> str:
             f"PROJRES ON OBSERVED CLIENT UPDATE | {job.run_id}",
             divider,
             f"  evaluation_round   : {projres.get('evaluation_round', 'last')}",
-            f"  threshold          : {projres.get('threshold', 0.01)}",
+            f"  decision_mode      : {projres.get('decision_mode', 'ranking')}",
             f"  max_candidates     : {projres.get('max_candidates', 32)}",
             f"  min_nonmembers     : {projres.get('min_nonmembers', 1000)}",
             f"  max_nonmembers     : {projres.get('max_nonmembers', 20000)}",
@@ -853,7 +853,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--learning-rate-decay", type=float)
     parser.add_argument("--learning-rate-decay-interval", type=int)
-    parser.add_argument("--projres-threshold", type=float)
     parser.add_argument(
         "--projres-round",
         help=(
@@ -917,14 +916,15 @@ def main() -> int:
     projres_enabled = bool(projres.get("enabled", True)) and not args.skip_projres
     overrides = {
         "evaluation_round": args.projres_round,
-        "threshold": args.projres_threshold,
         "max_candidates": args.projres_max_candidates,
         "min_nonmembers": args.projres_min_out,
         "max_nonmembers": args.projres_max_out,
     }
     projres.update({key: value for key, value in overrides.items() if value is not None})
-    if float(projres.get("threshold", 0.01)) < 0:
-        raise ValueError("ProjRes threshold must be non-negative.")
+    if projres.get("threshold") is not None:
+        raise ValueError("ProjRes is ranking-only; threshold must be null.")
+    if str(projres.get("decision_mode", "ranking")).lower() != "ranking":
+        raise ValueError("ProjRes decision_mode must be ranking.")
     projres["enabled"] = projres_enabled
     spec["projres"] = projres
     audit_override = spec.setdefault("common", {}).setdefault("audit", {})

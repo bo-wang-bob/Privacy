@@ -178,7 +178,6 @@ def validate_config(config: dict) -> None:
         "grad_cosine",
         "avg_cosine",
         "fedmia_loss",
-        "fedmia_cosine",
         "gradient_diff",
         "score_diff",
         "score_ratio",
@@ -329,6 +328,10 @@ def validate_config(config: dict) -> None:
     if not 0 <= target_client_id < int(config["total_users"]):
         raise ValueError("audit.target_client_id is outside the client range.")
     projres = dict(config.get("projres", {}))
+    if projres.get("threshold") is not None:
+        raise ValueError("ProjRes is ranking-only; threshold must be null.")
+    if str(projres.get("decision_mode", "ranking")).lower() != "ranking":
+        raise ValueError("ProjRes decision_mode must be ranking.")
     unified_projres = "projres" in set(exact_batch_attacks)
     if unified_projres:
         if not bool(projres.get("enabled", True)):

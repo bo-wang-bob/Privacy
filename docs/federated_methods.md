@@ -49,9 +49,10 @@ BERT 三个数据集均训练 500 轮并保持学习率 `0.005`；GPT2-Large 训
 `0.001`。Adapter 的 down-projection 使用主干 initializer range 做小随机初始化，
 up-projection 与 bias 置零，使残差分支在初始化时严格保持主干隐藏表示；全部可训练参数
 使用同一个标量学习率，客户端梯度不执行 norm clipping。
-两者均由所有客户端同步参与；每个客户端每轮执行一次无 momentum、无 weight decay 的 SGD，
-服务器对客户端上传等权平均，构成 one-batch FedSGD。
-这些普通任务优化不关闭或绕过审计：上传仍是攻击器观察到的真实 one-batch 更新，
+两者均由所有客户端同步参与；每个客户端每轮在一个 batch 上计算一次无 momentum、
+无 weight decay 的梯度并上传，服务器等权聚合真实梯度后执行
+`theta_(t+1) = theta_t - learning_rate * mean(g_k)`，再下发新的全局模型。
+这些普通任务优化不关闭或绕过审计：上传仍是攻击器观察到的真实 one-batch 梯度，
 十种通用攻击与每 50 轮一次的 ProjRes 均保持启用。
 普通任务评估中，SST-5 与 IMDB 以 accuracy 为主；CoLA 以 MCC 为主，并继续记录
 accuracy 以兼容已有结果分析。
@@ -92,7 +93,7 @@ BERT 同时启用周期性 ICLR 排名分析。服务器在第 50、100、…、
 由于 ICLR 和 ProjRes 使用同轮同客户端的真实 FedSGD batch，两者还会按通信轮、客户端、
 batch 位置和本地样本索引进行严格逐样本连接，并报告分数相关性与 Top-K 富集倍数。
 ProjRes 命中率使用同轮共享的 160 个非成员连续分数分别在 10% 和 1% FPR 下复算，再比较高低
-ICLR 组；固定残差阈值预测只作为明确命名的逐样本诊断值保留。
+ICLR 组；ProjRes 采用 ranking-only 协议，不再产生固定残差阈值预测。
 
 严格 ProjRes 每 50 个已完成通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
 down-projection 权重更新构造子空间，并在同一全局模型下提取进入该层的样本级隐藏
@@ -109,8 +110,9 @@ down-projection 权重更新构造子空间，并在同一全局模型下提取�
 - `released_prompt`：不使用通信更新，只审计公开 prompt；
 - `full_whitebox`：允许完整内部客户端状态，用作强攻击上界。
 
-在 FedSGD 的默认 `protocol_plus_released_prompts` 视图中，服务器由每个客户端上传的
-完整可训练参数增量与该轮 base state 重建对应 client post-step state。Blackbox-Loss、
+在 FedSGD 的默认 `protocol_plus_released_prompts` 视图中，服务器直接观察每个客户端
+上传的完整可训练参数梯度，并用 `base - learning_rate * gradient` 构造与该上传对应的
+虚拟 client post-step state。Blackbox-Loss、
 Score-Diff、Score-Ratio 以及基于 loss/confidence 的时序攻击使用这个可观测客户端状态，
 而不是各客户端聚合后的 global post-state；审计器不会读取模拟器内部未上传的状态。
 

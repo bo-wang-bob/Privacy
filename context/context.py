@@ -21,6 +21,7 @@ class Context:
         self.users = []
         self.base_model_state: dict[int, dict[str, torch.Tensor]] = {}
         self.updated_model_state: dict[int, dict[str, torch.Tensor]] = {}
+        self.client_gradients: dict[int, dict[str, torch.Tensor]] = {}
         self.new_model_state: dict[int, dict[str, torch.Tensor]] = {}
         self.protocol_messages: dict[int, dict] = {}
         self.user_selected: list[int] = []
@@ -49,6 +50,7 @@ class Context:
         self.base_model_state = self.new_model_state
         self.new_model_state = {}
         self.updated_model_state = {}
+        self.client_gradients = {}
         self.user_selected = []
         self.protocol_messages = {}
         self.update_sample_counts = {}

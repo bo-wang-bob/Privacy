@@ -118,6 +118,8 @@ class UserBase:
         self.last_update_sample_count = 0
         self.last_train_batch: tuple[torch.Tensor, torch.Tensor] | None = None
         self.last_train_indices: torch.Tensor | None = None
+        self.last_update_gradients: dict[str, torch.Tensor] | None = None
+        self.last_gradient_capture_count = 0
         self.iclr_source_round: int | None = None
         self.iclr_aggregation_weight: float | None = None
         self.iclr_ranking_round: int | None = None
@@ -155,6 +157,27 @@ class UserBase:
         self.last_update_sample_count = 0
         self.last_train_batch = None
         self.last_train_indices = None
+        self.last_update_gradients = None
+        self.last_gradient_capture_count = 0
+
+    def capture_protocol_gradients(self, model: torch.nn.Module) -> None:
+        """Retain the exact gradient transmitted by a one-step FedSGD client."""
+        if self.federated_method != "fedsgd":
+            return
+        gradients = {}
+        for name, parameter in model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            gradient = parameter.grad
+            gradients[name] = (
+                torch.zeros_like(parameter, device="cpu")
+                if gradient is None
+                else gradient.detach().cpu().clone()
+            )
+        if not gradients:
+            raise RuntimeError("FedSGD client produced no trainable gradients.")
+        self.last_update_gradients = gradients
+        self.last_gradient_capture_count += 1
 
     def _record_train_batch(
         self, images: torch.Tensor, labels: torch.Tensor
@@ -340,6 +363,7 @@ class UserBase:
                     raise ValueError("max_grad_norm must be non-negative.")
                 if max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(trainable, max_grad_norm)
+                self.capture_protocol_gradients(model)
                 optimizer.step()
 
     def train(self, code_poison: bool = False, round_index: int = 0) -> None:

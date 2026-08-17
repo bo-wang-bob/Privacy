@@ -382,6 +382,12 @@ class DefenseController:
         model.train()
         parameters = _trainable_parameters(model)
         optimizer = torch.optim.SGD(parameters, lr=user.learning_rate)
+        if user.federated_method == "fedsgd":
+            optimizer.register_step_pre_hook(
+                lambda _optimizer, _args, _kwargs: (
+                    user.capture_protocol_gradients(model)
+                )
+            )
         if self.name == "iclr" and not privacy_probe:
             self._iclr_training(
                 user, model, optimizer, round_index, code_poison
@@ -2156,7 +2162,7 @@ class DefenseController:
             ):
                 raise ValueError("ProjRes member alignment fields are inconsistent.")
             raw = dict(result["raw"])
-            for key in ("labels", "scores", "l1_residuals", "predictions"):
+            for key in ("labels", "scores", "l1_residuals"):
                 if len(raw[key]) < member_count:
                     raise ValueError(
                         f"ProjRes raw field {key!r} is shorter than its members."
@@ -2165,7 +2171,6 @@ class DefenseController:
                 len(raw["labels"])
                 == len(raw["scores"])
                 == len(raw["l1_residuals"])
-                == len(raw["predictions"])
             ):
                 raise ValueError("ProjRes raw candidate fields are inconsistent.")
             raw_labels = torch.tensor(raw["labels"], dtype=torch.long)
@@ -2214,9 +2219,6 @@ class DefenseController:
                     "projres_score": float(raw["scores"][offset]),
                     "projres_l1_residual": float(
                         raw["l1_residuals"][offset]
-                    ),
-                    "projres_fixed_threshold_prediction": int(
-                        raw["predictions"][offset]
                     ),
                 }
                 client_rows.append(row)

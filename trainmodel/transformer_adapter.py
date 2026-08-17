@@ -394,9 +394,9 @@ class TransformerAdapterClassifier(nn.Module):
     ) -> tuple[torch.Tensor, int]:
         """Capture sample embeddings entering the attacked Adapter layer.
 
-        The second return value is the number of padded hidden vectors processed
-        in this batch. It supplies ProjRes's theoretical rank cap without
-        turning individual tokens into independent membership candidates.
+        The second return value is the number of attention-active hidden vectors
+        processed in this batch. Padding tokens have zero downstream influence
+        and therefore cannot increase the uploaded Adapter gradient's rank.
         """
         _, attacked_layer = self.get_projres_attack_surface(parameter_name)
         captured: list[torch.Tensor] = []
@@ -437,7 +437,7 @@ class TransformerAdapterClassifier(nn.Module):
             ).clamp_min(1)
         else:
             raise ValueError("token_reduction must be auto, cls, last, or mean.")
-        return representations, int(hidden.shape[0] * hidden.shape[1])
+        return representations, int(attention_mask.sum().item())
 
 
 class ClientTransformerAdapterClassifier(nn.Module):

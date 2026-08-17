@@ -19,7 +19,7 @@ from privacy_attacks.features import (
     per_sample_prompt_gradients,
     trainable_names,
 )
-from privacy_attacks.fedmia import FEDMIA_MEASUREMENT_NAMES, run_fedmia
+from privacy_attacks.fedmia import run_fedmia
 from privacy_attacks.fedmia_baselines import run_fedmia_baseline
 from privacy_attacks.imia import run_imia
 from privacy_attacks.model_utils import last_client_states, trainable_scope_name
@@ -50,7 +50,6 @@ SUPPORTED_ATTACKS = {
     "grad_cosine",
     "avg_cosine",
     "fedmia_loss",
-    "fedmia_cosine",
     "gradient_diff",
     "score_diff",
     "score_ratio",
@@ -68,7 +67,6 @@ POOLED_CLIENT_ATTACKS = {
     "grad_cosine",
     "avg_cosine",
     "fedmia_loss",
-    "fedmia_cosine",
     "gradient_diff",
     "score_diff",
     "score_ratio",
@@ -111,7 +109,6 @@ _TARGET_ONLY_SIGNAL_ATTACKS = _FEDMIA_BASELINE_ATTACKS | _UPDATE_ATTACKS
 _SINGLE_ROUND_ATTACKS = {"blackbox_loss", "grad_cosine", "projres"}
 _PERIODIC_METRIC_ATTACKS = _FEDMIA_BASELINE_ATTACKS | {
     "fedmia_loss",
-    "fedmia_cosine",
 } | _UPDATE_ATTACKS | {"projres"}
 _EXACT_BATCH_REPORTED_FPR_TARGETS = (0.1, 0.01)
 
@@ -139,7 +136,7 @@ def _signal_needs(attacks: set[str], full_signals: bool = False) -> dict[str, bo
         "cosine": full_signals
         or bool(
             attacks
-            & {"grad_cosine", "avg_cosine", "nasr_passive", "fedmia_cosine"}
+            & {"grad_cosine", "avg_cosine", "nasr_passive"}
         ),
         "promptres": full_signals or "promptres" in attacks,
         "gradient_diff_score": full_signals or "gradient_diff" in attacks,
@@ -202,7 +199,6 @@ class MembershipAuditor:
                     "grad_cosine",
                     "avg_cosine",
                     "fedmia_loss",
-                    "fedmia_cosine",
                     "gradient_diff",
                     "score_diff",
                     "score_ratio",
@@ -459,14 +455,19 @@ class MembershipAuditor:
                     "Unified exact-batch ProjRes requires a Transformer or "
                     "visual Adapter model."
                 )
-            threshold = float(
-                self.exact_batch_projres_config.get("threshold", 0.01)
-            )
-            if threshold < 0 or not math.isfinite(threshold):
+            if self.exact_batch_projres_config.get("threshold") is not None:
                 raise ValueError(
-                    "audit.exact_batch_projres.threshold must be finite and "
-                    "non-negative."
+                    "Unified ProjRes is ranking-only and requires threshold=null."
                 )
+            if (
+                str(
+                    self.exact_batch_projres_config.get(
+                        "decision_mode", "ranking"
+                    )
+                ).lower()
+                != "ranking"
+            ):
+                raise ValueError("Unified ProjRes decision_mode must be ranking.")
         if self.candidate_sampling_mode == "balanced_global_holdout" and (
             not self.nonmember_to_member_ratio.is_integer()
             or self.nonmember_to_member_ratio < 1
@@ -935,7 +936,6 @@ class MembershipAuditor:
             "grad_cosine",
             "avg_cosine",
             "fedmia_loss",
-            "fedmia_cosine",
             "gradient_diff",
             "score_diff",
             "score_ratio",
@@ -1353,7 +1353,6 @@ class MembershipAuditor:
             "grad_cosine",
             "avg_cosine",
             "fedmia_loss",
-            "fedmia_cosine",
             "gradient_diff",
             "score_diff",
             "score_ratio",
@@ -1670,7 +1669,6 @@ class MembershipAuditor:
             "grad_cosine",
             "avg_cosine",
             "fedmia_loss",
-            "fedmia_cosine",
             "gradient_diff",
             "score_diff",
             "score_ratio",
@@ -2092,6 +2090,7 @@ class MembershipAuditor:
         nonmember_pool_indices: torch.Tensor,
         base_state: dict[str, torch.Tensor],
         updated_state: dict[str, torch.Tensor],
+        protocol_message: dict | None,
         learning_rate: float | None,
     ) -> tuple[torch.Tensor, dict, dict]:
         """Run ProjRes on the shared exact-batch candidate view."""
@@ -2137,17 +2136,28 @@ class MembershipAuditor:
             raise ValueError(
                 f"Observed target update does not contain {parameter_name}."
             )
-        observed_update = (
-            base_state[parameter_name].detach().cpu().float()
-            - updated_state[parameter_name].detach().cpu().float()
-        )
-        threshold = float(
-            self.exact_batch_projres_config.get("threshold", 0.01)
-        )
+        if getattr(self, "federated_method", "fedsgd") == "fedsgd":
+            if protocol_message is None or protocol_message.get("kind") != "gradient":
+                raise ValueError(
+                    "FedSGD ProjRes requires the target client's uploaded gradient."
+                )
+            tensors = protocol_message.get("tensors", {})
+            if parameter_name not in tensors:
+                raise ValueError(
+                    f"FedSGD gradient does not contain {parameter_name}."
+                )
+            observed_update = tensors[parameter_name].detach().cpu().float()
+            update_source = "uploaded_client_gradient"
+        else:
+            observed_update = (
+                base_state[parameter_name].detach().cpu().float()
+                - updated_state[parameter_name].detach().cpu().float()
+            )
+            update_source = "base_minus_client_post_state"
         attack = strict_mlp_projres(
             observed_update,
             candidate_representations,
-            threshold=threshold,
+            threshold=None,
             max_rank=int(hidden_vector_count),
         )
         attack_result = AttackResult(
@@ -2181,6 +2191,7 @@ class MembershipAuditor:
             "communication_round": int(round_index) + 1,
             "observed_hidden_vector_count": int(hidden_vector_count),
             "observed_update_norm": float(observed_update.norm()),
+            "update_source": update_source,
             "learning_rate": (
                 None if learning_rate is None else float(learning_rate)
             ),
@@ -2214,16 +2225,14 @@ class MembershipAuditor:
                     None if learning_rate is None else float(learning_rate)
                 ),
                 "observed_update_norm": float(observed_update.norm()),
-                "update_source": (
-                    "base_adapter_down_minus_uploaded_adapter_down"
-                ),
+                "update_source": update_source,
             },
             "attack": {"metrics": summary, "metadata": metadata},
             "raw": {
                 "labels": membership.tolist(),
                 "scores": attack.scores.detach().cpu().tolist(),
                 "l1_residuals": attack.l1_residuals.detach().cpu().tolist(),
-                "predictions": attack.predictions.detach().cpu().tolist(),
+                "predictions": None,
             },
             "candidate_controls": {
                 "label_matched_nonmembers": True,
@@ -2242,7 +2251,7 @@ class MembershipAuditor:
         }
         diagnostics = {
             "l1_residuals": attack.l1_residuals.detach().cpu(),
-            "predictions": attack.predictions.detach().cpu(),
+            "predictions": None,
             "metadata": metadata,
         }
         return attack.scores.detach().cpu(), diagnostics, payload
@@ -3020,6 +3029,7 @@ class MembershipAuditor:
         *,
         base_state: dict[str, torch.Tensor] | None = None,
         protocol_message: dict | None = None,
+        learning_rate: float | None = None,
     ) -> dict[str, torch.Tensor]:
         if self.audit_view == "full_whitebox":
             return updated_state
@@ -3032,22 +3042,27 @@ class MembershipAuditor:
                     "FedSGD client post-step auditing requires the observable "
                     "base state and target-client protocol message."
                 )
-            if protocol_message.get("kind") != "model_update":
+            if protocol_message.get("kind") != "gradient":
                 raise ValueError(
-                    "FedSGD client post-step auditing requires a model_update "
+                    "FedSGD client post-step auditing requires a gradient "
                     "protocol message."
                 )
             tensors = protocol_message.get("tensors", {})
             if set(tensors) != set(base_state):
                 raise ValueError(
-                    "FedSGD model_update tensors must exactly match the "
+                    "FedSGD gradient tensors must exactly match the "
                     "observable trainable base-state parameters."
                 )
+            if learning_rate is None or float(learning_rate) <= 0:
+                raise ValueError(
+                    "FedSGD client post-step reconstruction requires the "
+                    "current positive learning rate."
+                )
             # Reconstruct only what the server can infer from the uploaded
-            # parameter delta. Do not read the simulator's raw client state.
+            # gradient. Do not read the simulator's raw client state.
             return {
                 name: base_tensor.detach()
-                + tensors[name].detach().to(
+                - float(learning_rate) * tensors[name].detach().to(
                     device=base_tensor.device,
                     dtype=base_tensor.dtype,
                 )
@@ -3104,6 +3119,7 @@ class MembershipAuditor:
                 if protocol_messages is None
                 else protocol_messages.get(target_id)
             ),
+            learning_rate=learning_rate,
         )
         observation = {
             "round": int(round_index),
@@ -3215,6 +3231,11 @@ class MembershipAuditor:
                     ],
                     base_state=client_base,
                     updated_state=updated_states[target_id],
+                    protocol_message=(
+                        None
+                        if protocol_messages is None
+                        else protocol_messages.get(target_id)
+                    ),
                     learning_rate=learning_rate,
                 )
             )
@@ -3329,6 +3350,7 @@ class MembershipAuditor:
         ]
         observable_states = {}
         for user_id in selected_ids:
+            update_is_gradient = False
             client_base = (
                 base_state if base_states is None else base_states[user_id]
             )
@@ -3342,6 +3364,7 @@ class MembershipAuditor:
                     if protocol_messages is None
                     else protocol_messages.get(user_id)
                 ),
+                learning_rate=learning_rate,
             )
             if needs["client_states"]:
                 observable_states[user_id] = state
@@ -3353,6 +3376,7 @@ class MembershipAuditor:
                 ):
                     message = protocol_messages[user_id]
                     tensors = message.get("tensors", {})
+                    update_is_gradient = message.get("kind") == "gradient"
                     sign = (
                         -1.0
                         if message.get("kind")
@@ -3398,6 +3422,7 @@ class MembershipAuditor:
                 ):
                     message = protocol_messages[user_id]
                     tensors = message.get("tensors", {})
+                    update_is_gradient = message.get("kind") == "gradient"
                     update = torch.cat(
                         [
                             tensor.detach().flatten().cpu()
@@ -3418,6 +3443,12 @@ class MembershipAuditor:
                 if streaming_text_gradients:
                     pass
                 elif self.candidate_inputs_are_features:
+                    if (
+                        needs["gradient_diff_score"]
+                        and not update_is_gradient
+                        and learning_rate is not None
+                    ):
+                        update = update / float(learning_rate)
                     cached_feature_updates.append(update)
                 else:
                     if sample_gradients is None:
@@ -3465,7 +3496,7 @@ class MembershipAuditor:
                                 )
                             compared_diff_gradients = gradient_diff_gradients
                             gradient_update = update
-                            if learning_rate is not None:
+                            if learning_rate is not None and not update_is_gradient:
                                 gradient_update = (
                                     gradient_update / float(learning_rate)
                                 )
@@ -3686,20 +3717,19 @@ class MembershipAuditor:
         logger.debug("Collected privacy signals for round %s", round_index)
         return exact_batch_payload
 
-    def _run_fedmia_signal(
+    def _run_fedmia_loss(
         self,
-        measurement: str,
         aggregation: str,
         tail: str,
     ) -> AttackResult:
-        attack = FEDMIA_MEASUREMENT_NAMES[measurement]
+        attack = "fedmia_loss"
         observations = self._observations_for_attack(attack)
         if not self.pooled_client_audit:
             return run_fedmia(
                 observations,
                 self.membership,
                 self.target_client_id,
-                measurement,
+                "confidence",
                 aggregation,
                 tail,
                 float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
@@ -3727,7 +3757,7 @@ class MembershipAuditor:
                 logger.warning(
                     "Skipping client %d in pooled %s attack: %s",
                     client_id,
-                    measurement,
+                    attack,
                     error,
                 )
                 continue
@@ -3735,7 +3765,7 @@ class MembershipAuditor:
                 observations,
                 self.membership[indices],
                 client_id,
-                measurement,
+                "confidence",
                 aggregation,
                 tail,
                 float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
@@ -3767,7 +3797,7 @@ class MembershipAuditor:
                 "skipped_audit_clients": skipped_clients,
                 "few_shot": self.few_shot,
                 "fpl_shots": self.fpl_shots,
-                "measurement": measurement,
+                "measurement": "confidence",
                 "round_aggregation": aggregation,
                 "tail_policy": tail,
                 "score_pooling": "native_fedmia_null_cdf",
@@ -4071,23 +4101,11 @@ class MembershipAuditor:
             return self._run_exact_batch_attack(attack, observations[-1])
         if self.pooled_client_audit and attack in POOLED_CLIENT_ATTACKS:
             if attack == "fedmia_loss":
-                return self._run_fedmia_signal(
-                    "confidence",
+                return self._run_fedmia_loss(
                     str(self.config.get("fedmia_loss_aggregation", "mean")),
                     str(
                         self.config.get(
                             "fedmia_loss_tail",
-                            self.config.get("fedmia_tail", "upper"),
-                        )
-                    ),
-                )
-            if attack == "fedmia_cosine":
-                return self._run_fedmia_signal(
-                    "cosine",
-                    str(self.config.get("fedmia_cosine_aggregation", "mean")),
-                    str(
-                        self.config.get(
-                            "fedmia_cosine_tail",
                             self.config.get("fedmia_tail", "upper"),
                         )
                     ),
@@ -4128,22 +4146,11 @@ class MembershipAuditor:
                 str(self.config.get("promptres_aggregation", "mean")),
             )
         if attack == "fedmia_loss":
-            return self._run_fedmia_signal(
-                "confidence",
+            return self._run_fedmia_loss(
                 str(self.config.get("fedmia_loss_aggregation", "mean")),
                 str(
                     self.config.get(
                         "fedmia_loss_tail", self.config.get("fedmia_tail", "upper")
-                    )
-                ),
-            )
-        if attack == "fedmia_cosine":
-            return self._run_fedmia_signal(
-                "cosine",
-                str(self.config.get("fedmia_cosine_aggregation", "mean")),
-                str(
-                    self.config.get(
-                        "fedmia_cosine_tail", self.config.get("fedmia_tail", "upper")
                     )
                 ),
             )
@@ -4341,7 +4348,8 @@ class MembershipAuditor:
                     self.config.get("fta_measurement", "confidence")
                 ),
             )
-        measurement = "confidence" if attack == "fedmia_loss" else "cosine"
+        if attack != "fedmia_loss":
+            raise AssertionError(f"Unhandled periodic attack {attack}")
         aggregation = str(
             self.config.get(f"{attack}_aggregation", "mean")
         )
@@ -4354,7 +4362,7 @@ class MembershipAuditor:
             observations,
             self.membership,
             self.target_client_id,
-            measurement,
+            "confidence",
             aggregation,
             tail,
             float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
@@ -4625,11 +4633,7 @@ class MembershipAuditor:
         degenerate_fedmia = [
             item["attack"]
             for item in summaries
-            if item["attack"]
-            in {
-                "fedmia_loss",
-                "fedmia_cosine",
-            }
+            if item["attack"] == "fedmia_loss"
             and item["score_degenerate"]
         ]
         if signal_health_enabled:
@@ -4805,7 +4809,7 @@ class MembershipAuditor:
                         "protocol_messages": self.audit_view
                         in {"protocol_plus_released_prompts", "full_whitebox"},
                         "fedsgd_client_post_state_source": (
-                            "base_plus_observed_model_update"
+                            "base_minus_learning_rate_times_uploaded_gradient"
                             if self.audit_view
                             == "protocol_plus_released_prompts"
                             and self.federated_method == "fedsgd"

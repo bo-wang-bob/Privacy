@@ -18,16 +18,44 @@ from privacy_attacks.projres_mlp import strict_mlp_projres
 logger = logging.getLogger(__name__)
 
 
+def _observed_attack_tensor(
+    *,
+    parameter_name: str,
+    federated_method: str,
+    base_state: dict[str, torch.Tensor],
+    updated_state: dict[str, torch.Tensor],
+    client_gradient: dict[str, torch.Tensor] | None,
+) -> tuple[torch.Tensor, str]:
+    """Return the parameter signal actually visible to the server."""
+    if federated_method == "fedsgd":
+        if client_gradient is None or parameter_name not in client_gradient:
+            raise ValueError(
+                "FedSGD ProjRes requires the client's uploaded gradient for "
+                f"{parameter_name}."
+            )
+        return (
+            client_gradient[parameter_name].detach().cpu().float(),
+            "uploaded_client_gradient",
+        )
+    if parameter_name not in base_state or parameter_name not in updated_state:
+        raise ValueError(
+            f"Observed client update does not contain {parameter_name}."
+        )
+    return (
+        base_state[parameter_name].detach().cpu().float()
+        - updated_state[parameter_name].detach().cpu().float(),
+        "base_minus_client_post_state",
+    )
+
+
 def _metric_payload(
     labels: torch.Tensor,
     scores: torch.Tensor,
     residuals: torch.Tensor,
-    predictions: torch.Tensor,
 ) -> dict[str, object]:
     labels = labels.detach().cpu().long()
     scores = scores.detach().cpu()
     residuals = residuals.detach().cpu()
-    predictions = predictions.detach().cpu().long()
     member_residuals = residuals[labels == 1]
     nonmember_residuals = residuals[labels == 0]
     metrics = membership_metrics(labels, scores)
@@ -49,7 +77,6 @@ def _metric_payload(
         "reportable_metrics": reportable_metrics,
         "metric_availability": availability,
         "fpr_resolution": 1.0 / nonmember_count,
-        "threshold_accuracy": float((predictions == labels).float().mean()),
         "member_mean_l1_residual": float(member_residuals.mean()),
         "nonmember_mean_l1_residual": float(nonmember_residuals.mean()),
         "l1_residual_gap": float(
@@ -194,13 +221,14 @@ def _run_lora_client(
     global_model: torch.nn.Module,
     base_state: dict[str, torch.Tensor],
     updated_state: dict[str, torch.Tensor],
+    client_gradient: dict[str, torch.Tensor] | None,
     nonmember_representations: torch.Tensor,
     nonmember_labels: torch.Tensor,
     nonmember_source_counts: dict[str, int],
     nonmember_tokens_per_sample: int,
     learning_rate: float,
     round_index: int,
-    threshold: float,
+    threshold: float | None,
     max_candidates: int,
     attacked_parameter: str,
     token_reduction: str,
@@ -227,13 +255,12 @@ def _run_lora_client(
     actual_batch_size = int(member_labels.numel())
     member_count = min(actual_batch_size, int(max_candidates))
 
-    if attacked_parameter not in base_state or attacked_parameter not in updated_state:
-        raise ValueError(
-            f"Observed client update does not contain {attacked_parameter}."
-        )
-    observed_update = (
-        base_state[attacked_parameter].detach().cpu().float()
-        - updated_state[attacked_parameter].detach().cpu().float()
+    observed_update, update_source = _observed_attack_tensor(
+        parameter_name=attacked_parameter,
+        federated_method="fedsgd",
+        base_state=base_state,
+        updated_state=updated_state,
+        client_gradient=client_gradient,
     )
     candidate_representations = torch.cat(
         (member_representations[:member_count], nonmember_representations)
@@ -256,9 +283,7 @@ def _run_lora_client(
             torch.zeros(nonmember_labels.numel(), dtype=torch.long),
         )
     )
-    metrics = _metric_payload(
-        labels, attack.scores, attack.l1_residuals, attack.predictions
-    )
+    metrics = _metric_payload(labels, attack.scores, attack.l1_residuals)
     surface_getter = getattr(global_model, "get_projres_attack_surface")
     _, attacked_module = surface_getter(attacked_parameter)
     input_dimension = int(attacked_module.in_features)
@@ -288,7 +313,7 @@ def _run_lora_client(
             "member_definition": (
                 "present_in_the_observed_target_client_fedsgd_batch"
             ),
-            "execution": "integrated_from_observed_client_update",
+            "execution": "integrated_from_uploaded_client_gradient",
             "paper_fedsgd_exact": True,
             "paper_reference": (
                 "Deng et al. (2026), Toward Efficient Membership Inference "
@@ -312,15 +337,15 @@ def _run_lora_client(
         },
         "optimization": {
             "learning_rate": learning_rate,
-            "observed_update_norm": float(observed_update.norm()),
-            "update_source": "base_lora_A_minus_uploaded_client_lora_A",
+            "observed_signal_norm": float(observed_update.norm()),
+            "update_source": update_source,
         },
         "attack": {"metrics": metrics, "metadata": attack.metadata},
         "raw": {
             "labels": labels.tolist(),
             "scores": attack.scores.detach().cpu().tolist(),
             "l1_residuals": attack.l1_residuals.detach().cpu().tolist(),
-            "predictions": attack.predictions.detach().cpu().tolist(),
+            "predictions": None,
         },
         "candidate_controls": {
             "label_matched_nonmembers": False,
@@ -407,12 +432,13 @@ def _run_text_adapter_client(
     global_model: torch.nn.Module,
     base_state: dict[str, torch.Tensor],
     updated_state: dict[str, torch.Tensor],
+    client_gradient: dict[str, torch.Tensor] | None,
     nonmember_representations: torch.Tensor,
     nonmember_labels: torch.Tensor,
     nonmember_source_counts: dict[str, int],
     learning_rate: float,
     round_index: int,
-    threshold: float,
+    threshold: float | None,
     max_candidates: int,
     attacked_parameter: str,
     token_reduction: str,
@@ -450,13 +476,12 @@ def _run_text_adapter_client(
         raise ValueError(
             "Retained text ProjRes member indices do not match the batch."
         )
-    if attacked_parameter not in base_state or attacked_parameter not in updated_state:
-        raise ValueError(
-            f"Observed client update does not contain {attacked_parameter}."
-        )
-    observed_update = (
-        base_state[attacked_parameter].detach().cpu().float()
-        - updated_state[attacked_parameter].detach().cpu().float()
+    observed_update, update_source = _observed_attack_tensor(
+        parameter_name=attacked_parameter,
+        federated_method="fedsgd",
+        base_state=base_state,
+        updated_state=updated_state,
+        client_gradient=client_gradient,
     )
     candidates = torch.cat(
         (member_representations[:member_count], nonmember_representations)
@@ -477,9 +502,7 @@ def _run_text_adapter_client(
             torch.zeros(nonmember_labels.numel(), dtype=torch.long),
         )
     )
-    metrics = _metric_payload(
-        labels, attack.scores, attack.l1_residuals, attack.predictions
-    )
+    metrics = _metric_payload(labels, attack.scores, attack.l1_residuals)
     _, attacked_layer = global_model.get_projres_attack_surface(
         attacked_parameter
     )
@@ -510,7 +533,7 @@ def _run_text_adapter_client(
             "member_definition": (
                 "present_in_the_observed_target_client_fedsgd_batch"
             ),
-            "execution": "integrated_from_observed_client_update",
+            "execution": "integrated_from_uploaded_client_gradient",
             # The paper training protocol uses one batch of 16 examples. A
             # larger one-batch run remains a valid observed-update ProjRes
             # experiment, but must not be labeled as the exact paper setup.
@@ -536,15 +559,15 @@ def _run_text_adapter_client(
         },
         "optimization": {
             "learning_rate": learning_rate,
-            "observed_update_norm": float(observed_update.norm()),
-            "update_source": "base_adapter_down_minus_uploaded_adapter_down",
+            "observed_signal_norm": float(observed_update.norm()),
+            "update_source": update_source,
         },
         "attack": {"metrics": metrics, "metadata": attack.metadata},
         "raw": {
             "labels": labels.tolist(),
             "scores": attack.scores.detach().cpu().tolist(),
             "l1_residuals": attack.l1_residuals.detach().cpu().tolist(),
-            "predictions": attack.predictions.detach().cpu().tolist(),
+            "predictions": None,
         },
         "candidate_controls": {
             "label_matched_nonmembers": False,
@@ -564,6 +587,7 @@ def _run_client(
     global_model: torch.nn.Module,
     base_state: dict[str, torch.Tensor],
     updated_state: dict[str, torch.Tensor],
+    client_gradient: dict[str, torch.Tensor] | None,
     learning_rate: float,
     batch_size: int,
     eval_batch_size: int,
@@ -571,7 +595,7 @@ def _run_client(
     federated_method: str,
     round_index: int,
     seed: int,
-    threshold: float,
+    threshold: float | None,
     max_candidates: int,
     min_nonmembers: int,
     max_nonmembers: int | None,
@@ -639,13 +663,12 @@ def _run_client(
         )
 
     attacked_parameter, first_layer = _attacked_layer(global_model)
-    if attacked_parameter not in base_state or attacked_parameter not in updated_state:
-        raise ValueError(
-            f"Observed client update does not contain {attacked_parameter}."
-        )
-    observed_update = (
-        base_state[attacked_parameter].detach().cpu()
-        - updated_state[attacked_parameter].detach().cpu()
+    observed_update, update_source = _observed_attack_tensor(
+        parameter_name=attacked_parameter,
+        federated_method=federated_method,
+        base_state=base_state,
+        updated_state=updated_state,
+        client_gradient=client_gradient,
     )
     candidate_features = torch.cat(
         (member_features[:member_count], nonmember_features)
@@ -661,9 +684,7 @@ def _run_client(
             torch.zeros(nonmember_labels.numel(), dtype=torch.long),
         )
     )
-    metrics = _metric_payload(
-        labels, attack.scores, attack.l1_residuals, attack.predictions
-    )
+    metrics = _metric_payload(labels, attack.scores, attack.l1_residuals)
     actual_batch_size = int(member_labels.numel())
     if federated_method == "fedsgd":
         local_batches = 1
@@ -701,7 +722,11 @@ def _run_client(
                 else "present_in_the_target_client_local_training_data_for_the_"
                 "observed_round"
             ),
-            "execution": "integrated_from_observed_client_update",
+            "execution": (
+                "integrated_from_uploaded_client_gradient"
+                if federated_method == "fedsgd"
+                else "integrated_from_client_post_state"
+            ),
             "paper_fedsgd_exact": local_batches == 1,
         },
         "dimensions": {
@@ -719,15 +744,15 @@ def _run_client(
         },
         "optimization": {
             "learning_rate": learning_rate,
-            "observed_update_norm": float(observed_update.norm()),
-            "update_source": "base_state_minus_uploaded_client_state",
+            "observed_signal_norm": float(observed_update.norm()),
+            "update_source": update_source,
         },
         "attack": {"metrics": metrics, "metadata": attack.metadata},
         "raw": {
             "labels": labels.tolist(),
             "scores": attack.scores.detach().cpu().tolist(),
             "l1_residuals": attack.l1_residuals.detach().cpu().tolist(),
-            "predictions": attack.predictions.detach().cpu().tolist(),
+            "predictions": None,
         },
         "candidate_controls": {
             "label_matched_nonmembers": False,
@@ -753,13 +778,7 @@ def _aggregate(
             for row in results
         ]
     )
-    predictions = torch.cat(
-        [
-            torch.tensor(row["raw"]["predictions"], dtype=torch.long)
-            for row in results
-        ]
-    )
-    pooled = _metric_payload(labels, scores, residuals, predictions)
+    pooled = _metric_payload(labels, scores, residuals)
     metric_rows = [row["attack"]["metrics"] for row in results]
     numeric_keys = [
         key
@@ -786,6 +805,7 @@ def run_integrated_projres(
     device: torch.device,
     base_states: dict[int, dict[str, torch.Tensor]],
     updated_states: dict[int, dict[str, torch.Tensor]],
+    client_gradients: dict[int, dict[str, torch.Tensor]] | None = None,
     learning_rate: float,
     batch_size: int,
     eval_batch_size: int,
@@ -812,12 +832,25 @@ def run_integrated_projres(
             "Integrated ProjRes requires a supported CLIP or Transformer "
             "parameter-efficient model."
         )
-    threshold = float(config.get("threshold", 0.01))
+    threshold = config.get("threshold")
+    if threshold is not None:
+        raise ValueError("ProjRes is ranking-only and requires threshold=null.")
+    if str(config.get("decision_mode", "ranking")).lower() != "ranking":
+        raise ValueError("ProjRes decision_mode must be ranking.")
     max_candidates = int(config.get("max_candidates", 32))
     min_nonmembers = int(config.get("min_nonmembers", 1000))
     configured_max_nonmembers = int(config.get("max_nonmembers", 20000))
     results = []
     model_type = str(getattr(model, "model_type", ""))
+    if federated_method == "fedsgd":
+        missing_gradients = sorted(
+            set(client_ids) - set(client_gradients or {})
+        )
+        if missing_gradients:
+            raise ValueError(
+                "FedSGD ProjRes requires uploaded gradients for all audited "
+                f"clients; missing={missing_gradients}."
+            )
     if model_type in {"bert_adapter", "gpt2_adapter"}:
         if federated_method != "fedsgd" or int(local_epochs) != 1:
             raise ValueError(
@@ -866,6 +899,7 @@ def run_integrated_projres(
                     model,
                     base_states[client_id],
                     updated_states[client_id],
+                    client_gradients[client_id],
                     nonmember_representations,
                     nonmember_labels,
                     nonmember_source_counts,
@@ -931,6 +965,7 @@ def run_integrated_projres(
                     model,
                     base_states[client_id],
                     updated_states[client_id],
+                    client_gradients[client_id],
                     nonmember_representations,
                     nonmember_labels,
                     nonmember_source_counts,
@@ -955,6 +990,11 @@ def run_integrated_projres(
                     model,
                     base_states[client_id],
                     updated_states[client_id],
+                    (
+                        client_gradients[client_id]
+                        if client_gradients is not None
+                        else None
+                    ),
                     learning_rate,
                     batch_size,
                     eval_batch_size,
@@ -983,7 +1023,11 @@ def run_integrated_projres(
             "seed": seed,
             "device": str(device),
             "communication_round": round_index + 1,
-            "execution": "integrated_from_observed_client_update",
+            "execution": (
+                "integrated_from_uploaded_client_gradient"
+                if federated_method == "fedsgd"
+                else "integrated_from_client_post_state"
+            ),
             "result": results[0],
         }
     else:
@@ -994,7 +1038,11 @@ def run_integrated_projres(
                 "seed": seed,
                 "device": str(device),
                 "communication_round": round_index + 1,
-                "execution": "integrated_from_observed_client_update",
+                "execution": (
+                    "integrated_from_uploaded_client_gradient"
+                    if federated_method == "fedsgd"
+                    else "integrated_from_client_post_state"
+                ),
             }
         )
     path = Path(output_path)

@@ -39,7 +39,6 @@ FAIR_CONFIG_PATHS = (
     "audit.match_candidate_labels",
     "audit.auxiliary_fraction",
     "audit.fedmia_loss_aggregation",
-    "audit.fedmia_cosine_aggregation",
     "audit.rmia_offline_a",
     "audit.rmia_gamma",
     "audit.qmia_quantile",
@@ -52,7 +51,6 @@ FAIR_CONFIG_DEFAULTS = {
     "use_full_dataset": False,
     "audit.match_candidate_labels": False,
     "audit.fedmia_loss_aggregation": "mean",
-    "audit.fedmia_cosine_aggregation": "mean",
 }
 
 

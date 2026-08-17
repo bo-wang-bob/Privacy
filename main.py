@@ -450,7 +450,6 @@ def validate_config(config: dict) -> None:
             "grad_cosine",
             "avg_cosine",
             "fedmia_loss",
-            "fedmia_cosine",
             "gradient_diff",
             "score_diff",
             "score_ratio",
@@ -578,7 +577,6 @@ def validate_config(config: dict) -> None:
     for key in (
         "fedmia_tail",
         "fedmia_loss_tail",
-        "fedmia_cosine_tail",
     ):
         if key in audit and str(audit[key]).lower() not in {
             "upper",
@@ -617,14 +615,13 @@ def validate_config(config: dict) -> None:
         audit.get("audit_view", "protocol_plus_released_prompts")
     ).lower() == "released_prompt" and attacks & {
         "nasr_passive",
-        "fedmia_cosine",
         "grad_cosine",
         "avg_cosine",
         "promptres",
     }:
         raise ValueError(
             "released_prompt audit view cannot run update-dependent attacks "
-            "nasr_passive, fedmia_cosine, grad_cosine, avg_cosine, or promptres."
+            "nasr_passive, grad_cosine, avg_cosine, or promptres."
         )
     projres = config.get("projres", {})
     unified_projres = "projres" in exact_batch_attacks
@@ -687,7 +684,12 @@ def validate_config(config: dict) -> None:
                 "mean",
             }:
                 raise ValueError("projres.token_reduction must be cls or mean.")
-        threshold = float(projres.get("threshold", 0.01))
+        if projres.get("threshold") is not None:
+            raise ValueError(
+                "ProjRes is ranking-only; projres.threshold must be null."
+            )
+        if str(projres.get("decision_mode", "ranking")).lower() != "ranking":
+            raise ValueError("ProjRes decision_mode must be ranking.")
         max_candidates = int(projres.get("max_candidates", 32))
         min_nonmembers = int(projres.get("min_nonmembers", 1000))
         max_nonmembers = int(projres.get("max_nonmembers", 20000))
@@ -697,14 +699,12 @@ def validate_config(config: dict) -> None:
             else 1000
         )
         if (
-            threshold < 0
-            or max_candidates <= 0
+            max_candidates <= 0
             or min_nonmembers < minimum_required_nonmembers
         ):
             raise ValueError(
-                "ProjRes threshold must be non-negative, max_candidates must "
-                "be positive, and min_nonmembers must satisfy the configured "
-                "candidate protocol."
+                "ProjRes max_candidates must be positive and min_nonmembers "
+                "must satisfy the configured candidate protocol."
             )
         if max_nonmembers < 0 or (
             max_nonmembers and max_nonmembers < min_nonmembers
@@ -903,7 +903,6 @@ def validate_config(config: dict) -> None:
         raise ValueError("defense.local_ggeur_original_mode is invalid.")
     spatial = {
         "fedmia_loss",
-        "fedmia_cosine",
         "transfer_representation",
         "rmia",
         "yoqo",
@@ -1253,7 +1252,6 @@ def default_config() -> dict:
                 "grad_cosine",
                 "avg_cosine",
                 "fedmia_loss",
-                "fedmia_cosine",
                 "gradient_diff",
                 "score_diff",
                 "score_ratio",
@@ -1322,7 +1320,8 @@ def default_config() -> dict:
         "projres": {
             "enabled": False,
             "evaluation_round": "last",
-            "threshold": 0.01,
+            "decision_mode": "ranking",
+            "threshold": None,
             "max_candidates": 32,
             "min_nonmembers": 1000,
             "max_nonmembers": 20000,

@@ -94,6 +94,10 @@ ProjRes 与另外五种真实 Batch 攻击共享当轮 `N` 个成员和按标签
 多个本地 batch 的 FedAvg 参数差，它是多步更新的累积，不再与论文的单-batch
 FedSGD 梯度完全等价；结果元数据会明确记录这一差异。
 
+文本 Adapter 的 rank cap 使用当轮 attention mask 中的有效 token 总数，而不是
+`batch_size × padding_length`。因此 padding 不会人为扩大保留的梯度子空间；BERT
+的 CLS、GPT2 的 last-token 候选表示仍保持不变，仅数值 SVD 的最大保留秩被收紧。
+
 ## 运行
 
 ```bash
@@ -106,7 +110,6 @@ bash scripts/run_projres_mlp_real.sh
 python scripts/validate_projres_mlp_real.py \
   --config configs/clip_mlp_projres.yaml \
   --target-client 0 \
-  --threshold 0.01 \
   --output results/projres_mlp_client0.json
 ```
 
@@ -116,13 +119,12 @@ Visual Adapter 单客户端示例：
 python scripts/validate_projres_mlp_real.py \
   --config configs/visual_adapter_low_fpr_attacks.yaml \
   --target-client 0 \
-  --threshold 0.01 \
   --output results/projres_visual_adapter_client0.json
 ```
 
-输出是 JSON，不生成 HTML。除 AUC/低 FPR TPR 外，还记录原始残差、固定阈值
-准确率、梯度秩、第一层维度，以及 `update / learning_rate` 与 autograd 梯度
-的一致性误差。
+输出是 JSON，不生成 HTML。ProjRes 采用 ranking-only 判断：保存原始 L1 残差及其
+反向连续分数，通过 AUC 和可解析 FPR 下的 TPR 评价，不生成固定阈值二元预测。
+结果还记录梯度秩、第一层维度，以及模拟上传梯度与参数更新的一致性误差。
 
 独立入口默认使用当前上传梯度所对应 batch 中的全部成员候选，并从互斥非成员池
 （所有客户端测试集和其他客户端训练集）中最多选取 20,000 个样本。非成员不得

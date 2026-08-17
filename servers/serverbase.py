@@ -247,6 +247,7 @@ class ServerBase:
                 if key
                 in {
                     "attacked_parameter",
+                    "decision_mode",
                     "threshold",
                     "token_reduction",
                 }
@@ -259,12 +260,47 @@ class ServerBase:
                 "FedSGD uses exactly one mini-batch per client and requires "
                 "local_epochs=1."
             )
+        if self.federated_method == "fedsgd":
+            client_optimizer = str(
+                self.method_config.get("client_optimizer", "sgd")
+            ).lower()
+            momentum = float(self.method_config.get("momentum", 0.0))
+            weight_decay = float(self.method_config.get("weight_decay", 0.0))
+            max_grad_norm = float(self.method_config.get("max_grad_norm", 0.0))
+            if (
+                client_optimizer != "sgd"
+                or momentum != 0.0
+                or weight_decay != 0.0
+                or max_grad_norm != 0.0
+            ):
+                raise ValueError(
+                    "True-gradient FedSGD requires vanilla SGD semantics: "
+                    "client_optimizer=sgd and momentum=weight_decay="
+                    "max_grad_norm=0. Use an explicit gradient defense for "
+                    "clipping or perturbation."
+                )
         self.projres_evaluation_rounds = _resolve_projres_evaluation_rounds(
             self.projres_config, self.num_glob_iters
         )
         self.projres_evaluation_round = self.projres_evaluation_rounds[-1]
         self._projres_series_entries: list[dict] = []
         self.defense_config = defense_config or {"name": "none"}
+        if self.federated_method == "fedsgd" and str(
+            self.defense_config.get("name", "none")
+        ).lower() in {
+            "mist",
+            "cofedmid",
+            "local_ggeur",
+            "mirage",
+            "veil",
+            "perturb",
+            "sparse",
+        }:
+            raise ValueError(
+                "True-gradient FedSGD cannot use a defense that rewrites a "
+                "post-step model delta; the defense must operate on the "
+                "uploaded gradient itself."
+            )
         self.target_client_id = int(self.audit_config.get("target_client_id", 0))
         self.ensure_target = bool(self.audit_config.get("enabled", True)) and bool(
             self.audit_config.get("ensure_target_participation", True)
@@ -693,6 +729,18 @@ class ServerBase:
                     self.ctx.update_sample_counts[user_id] = (
                         user.last_update_sample_count
                     )
+                    if (
+                        user.last_update_gradients is None
+                        or user.last_gradient_capture_count != 1
+                    ):
+                        raise RuntimeError(
+                            "FedSGD requires exactly one captured client gradient; "
+                            f"client={user_id}, captures="
+                            f"{user.last_gradient_capture_count}."
+                        )
+                    self.ctx.client_gradients[user_id] = self._clone_state(
+                        user.last_update_gradients
+                    )
                 self.ctx.set_updated_model_state(
                     user_id, self._clone_state(user.get_parameters())
                 )
@@ -748,6 +796,7 @@ class ServerBase:
                     device=self.device,
                     base_states=base_states,
                     updated_states=self.ctx.updated_model_state,
+                    client_gradients=self.ctx.client_gradients,
                     learning_rate=self.current_learning_rate,
                     batch_size=self.batch_size,
                     eval_batch_size=self.eval_batch_size,
@@ -808,10 +857,24 @@ class ServerBase:
                         file.write("\n")
 
             self.aggregator.aggregate(self.ctx)
+            protocol_client_states = self.ctx.updated_model_state
+            if self.federated_method == "fedsgd":
+                protocol_client_states = {
+                    user_id: {
+                        name: base_states[user_id][name].detach()
+                        - self.current_learning_rate
+                        * self.ctx.client_gradients[user_id][name].detach().to(
+                            device=base_states[user_id][name].device,
+                            dtype=base_states[user_id][name].dtype,
+                        )
+                        for name in self.ctx.trainable_param_names
+                    }
+                    for user_id in selected_ids
+                }
             iclr_analyzed = self.defense.analyze_iclr_completed_round(
                 users=self.ctx.users,
                 global_state=self.ctx.new_model_state[0],
-                updated_states=self.ctx.updated_model_state,
+                updated_states=protocol_client_states,
                 aggregation_weights=self.ctx.aggregation_weights,
                 selected_ids=selected_ids,
                 round_index=round_index,
@@ -887,6 +950,15 @@ class ServerBase:
             method_summary["paper_alignment"] = (
                 "CoOp-style shared soft text prompt with sample-weighted FedAvg"
             )
+        if self.federated_method == "fedsgd":
+            method_summary["gradient_protocol"] = {
+                "client_upload": "trainable_parameter_gradients",
+                "server_update": "base_minus_learning_rate_times_aggregated_gradient",
+                "aggregation_weighting": str(
+                    getattr(self.aggregator, "aggregation_weighting", "uniform")
+                ),
+                "local_batches_per_client_round": 1,
+            }
         if str(getattr(self.model, "model_type", "")).lower() == "clip_lora":
             method_summary["lora"] = {
                 "trainable_scope": "attention_lora_A_and_lora_B_only",

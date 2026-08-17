@@ -41,7 +41,8 @@ s_i = L(x_i; theta_-k^t) - L(x_i; theta_k^t)
 两套参考参数只在当前客户端打分期间临时存在，打分完成后立即释放，不在聚合后为每个客户端保存完整模型副本。`iclr_ranked_positions` 是上述 batch 流拼接后的降序位置，而不是原始数据集的永久索引；`iclr_ranked_scores` 和 `iclr_ranked_labels` 分别保存对应的有序分数与标签。首轮没有历史模型对，因此不打分。若采用部分客户端参与，只有连续两轮均被选中的客户端能够执行这种精确反演。现阶段只生成排名并保存在客户端运行态，同时将汇总统计写入 `defense_summary.json`；不会根据排名筛样本、改变损失或改变原有训练顺序。该实现支持预计算特征的 CLIP-MLP/Visual Adapter，也支持直接编码原始图像的 CLIP-LoRA，并要求每轮至少聚合两个客户端。LoRA 使用一个全局共享的冻结 CLIP 主干，但每个客户端模型独立持有自己的 `lora_A/lora_B`；下一轮 ICLR 在全局参数覆盖之前直接读取该客户端模型中的上次上传状态。这些因子不会形成服务器端客户端状态映射，也不会写入结果目录。
 
 BERT Adapter 使用 `iclr_analysis_timing: post_round`：在每个配置的分析轮完成聚合后，
-直接对该轮真实 one-batch FedSGD 样本比较客户端自身上传模型与其他客户端聚合模型。
+由真实 one-batch 上传梯度构造对应客户端 step state，再与其他客户端梯度形成的聚合
+step state 比较。
 默认 `iclr_analysis_interval: 50`，因此 500 轮任务分析第 50、100、…、500 轮，并将
 逐客户端统计写入 `iclr_round_metrics.csv`，逐样本分数写入 `iclr_round_samples.csv`，
 轮次索引写入 `iclr_series.json`。这个后聚合模式不需要 CLIP 辅助特征统计，

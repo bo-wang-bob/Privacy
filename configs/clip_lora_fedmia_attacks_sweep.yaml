@@ -77,7 +77,6 @@ common:
       - grad_cosine
       - avg_cosine
       - fedmia_loss
-      - fedmia_cosine
     candidate_sampling: balanced_holdout
     low_fpr_max_members: 5000
     low_fpr_max_nonmembers: 5000
@@ -87,7 +86,6 @@ common:
       loss_series: 10
       avg_cosine: 10
       fedmia_loss: 10
-      fedmia_cosine: 10
     low_fpr_gradient_batch_size: 1
     signal_storage: compact
     fedmia_tail: upper
@@ -97,7 +95,8 @@ common:
 projres:
   enabled: true
   evaluation_round: last
-  threshold: 0.01
+  decision_mode: ranking
+  threshold: null
   max_candidates: 32
   min_nonmembers: 1000
   max_nonmembers: 20000
