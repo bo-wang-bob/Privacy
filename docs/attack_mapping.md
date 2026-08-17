@@ -1,5 +1,9 @@
 # Paper-to-code mapping
 
+当前公共审计器只注册 FedMIA 四个基线、FedMIA-I/II、Gradient-Diff、
+Score-Diff、Score-Ratio、FTA 和 ProjRes。下文其他攻击的研究实现仍保留在仓库中，
+但已从配置、命令行和公共审计器注册表移除，不能作为新实验攻击启用。
+
 ## 1. Comprehensive Privacy Analysis (Nasr, Shokri, Houmansadr)
 
 论文同时提出被动与主动白盒成员推理。原方法将梯度、隐藏层输出、模型输出、标签和损失交给分组件攻击网络。
@@ -57,8 +61,8 @@ Deng 等人的 FedLLM ProjRes 实验还比较 Gradient-Diff、Score-Diff、Score
 | 运行名 | 原始信号 | 当前 FedLLM 实现 |
 |---|---|---|
 | `gradient_diff` | `||g_client||² - ||g_client - sum_y grad L(x,y)||²` | 对 vanilla SGD 上传除以该轮学习率，恢复 one-batch 梯度；逐候选流式计算对全部标签求和的梯度 |
-| `score_diff` | `L_post(x)-L_pre(x)` | 同轮客户端更新前后各前向一次；输出其相反数 `L_pre-L_post` |
-| `score_ratio` | `(L_post(x)+c)/(L_pre(x)+c)` | 默认 `c=1e-6`；输出负比值，避免改变全仓库“高分为成员”的 ROC 约定 |
+| `score_diff` | `L_post(x)-L_pre(x)` | 同轮客户端更新前后各前向一次；FedSGD post-state 由目标客户端上传增量重建；输出其相反数 `L_pre-L_post` |
+| `score_ratio` | `(L_post(x)+c)/(L_pre(x)+c)` | FedSGD post-state 由目标客户端上传增量重建；默认 `c=1e-6`；输出负比值，避免改变全仓库“高分为成员”的 ROC 约定 |
 | `fta` | 多个 FL 模型快照上性能指标的变化斜率 | 默认对真实标签置信度使用实际通信轮编号做 OLS；首个检查点使用该轮更新前/后两个快照，也可设置 `audit.fta_measurement: loss` |
 
 Gradient-Diff 来源于 [Li、Li 与 Ribeiro，ICLR 2023](https://openreview.net/forum?id=QsCSLPP55Ku)；

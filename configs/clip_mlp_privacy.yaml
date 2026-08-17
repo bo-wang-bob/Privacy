@@ -42,20 +42,12 @@ audit:
     - loss_series
     - grad_cosine
     - avg_cosine
-    - nasr_passive
-    - nasr_active
     - fedmia_loss
     - fedmia_cosine
-    - transfer_representation
-    - codepoison
-    - pipra
-    - rmia
-    - imia
-    - quantile_mia
-    - yoqo
-    - canary
-    - promptmia
-    - promptres
+    - gradient_diff
+    - score_diff
+    - score_ratio
+    - fta
   max_samples_per_group: 32
   audit_batch_size: 512
   calibration_fraction: 0.5

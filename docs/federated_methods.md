@@ -109,4 +109,9 @@ down-projection 权重更新构造子空间，并在同一全局模型下提取�
 - `released_prompt`：不使用通信更新，只审计公开 prompt；
 - `full_whitebox`：允许完整内部客户端状态，用作强攻击上界。
 
+在 FedSGD 的默认 `protocol_plus_released_prompts` 视图中，服务器由每个客户端上传的
+完整可训练参数增量与该轮 base state 重建对应 client post-step state。Blackbox-Loss、
+Score-Diff、Score-Ratio 以及基于 loss/confidence 的时序攻击使用这个可观测客户端状态，
+而不是各客户端聚合后的 global post-state；审计器不会读取模拟器内部未上传的状态。
+
 审计摘要会保存实际使用的视图和威胁模型。

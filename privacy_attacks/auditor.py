@@ -49,8 +49,6 @@ SUPPORTED_ATTACKS = {
     "loss_series",
     "grad_cosine",
     "avg_cosine",
-    "nasr_passive",
-    "nasr_active",
     "fedmia_loss",
     "fedmia_cosine",
     "gradient_diff",
@@ -58,16 +56,6 @@ SUPPORTED_ATTACKS = {
     "score_ratio",
     "fta",
     "projres",
-    "transfer_representation",
-    "codepoison",
-    "pipra",
-    "rmia",
-    "imia",
-    "quantile_mia",
-    "yoqo",
-    "canary",
-    "promptmia",
-    "promptres",
 }
 
 # These attacks can be evaluated client by client from one shared observation
@@ -79,17 +67,12 @@ POOLED_CLIENT_ATTACKS = {
     "loss_series",
     "grad_cosine",
     "avg_cosine",
-    "nasr_passive",
     "fedmia_loss",
     "fedmia_cosine",
     "gradient_diff",
     "score_diff",
     "score_ratio",
     "fta",
-    "transfer_representation",
-    "rmia",
-    "quantile_mia",
-    "promptres",
 }
 
 _CLIENT_CANDIDATE_FIELDS = {
@@ -218,19 +201,12 @@ class MembershipAuditor:
                     "loss_series",
                     "grad_cosine",
                     "avg_cosine",
-                    "nasr_passive",
-                    "nasr_active",
                     "fedmia_loss",
                     "fedmia_cosine",
-                    "transfer_representation",
-                    "codepoison",
-                    "pipra",
-                    "rmia",
-                    "imia",
-                    "quantile_mia",
-                    "yoqo",
-                    "canary",
-                    "promptmia",
+                    "gradient_diff",
+                    "score_diff",
+                    "score_ratio",
+                    "fta",
                 ],
             )
         )
@@ -3041,9 +3017,42 @@ class MembershipAuditor:
         user_id: int,
         updated_state: dict[str, torch.Tensor],
         released_states: dict[int, dict[str, torch.Tensor]] | None,
+        *,
+        base_state: dict[str, torch.Tensor] | None = None,
+        protocol_message: dict | None = None,
     ) -> dict[str, torch.Tensor]:
         if self.audit_view == "full_whitebox":
             return updated_state
+        if (
+            self.audit_view == "protocol_plus_released_prompts"
+            and self.federated_method == "fedsgd"
+        ):
+            if base_state is None or protocol_message is None:
+                raise ValueError(
+                    "FedSGD client post-step auditing requires the observable "
+                    "base state and target-client protocol message."
+                )
+            if protocol_message.get("kind") != "model_update":
+                raise ValueError(
+                    "FedSGD client post-step auditing requires a model_update "
+                    "protocol message."
+                )
+            tensors = protocol_message.get("tensors", {})
+            if set(tensors) != set(base_state):
+                raise ValueError(
+                    "FedSGD model_update tensors must exactly match the "
+                    "observable trainable base-state parameters."
+                )
+            # Reconstruct only what the server can infer from the uploaded
+            # parameter delta. Do not read the simulator's raw client state.
+            return {
+                name: base_tensor.detach()
+                + tensors[name].detach().to(
+                    device=base_tensor.device,
+                    dtype=base_tensor.dtype,
+                )
+                for name, base_tensor in base_state.items()
+            }
         if (
             self.audit_view == "protocol_plus_released_prompts"
             and self.federated_method in {"fedavg", "promptfl"}
@@ -3086,7 +3095,15 @@ class MembershipAuditor:
         client_base = base_state if base_states is None else base_states[target_id]
         observable_base = self._observable_base_state(client_base)
         observable_state = self._observable_client_state(
-            target_id, updated_states[target_id], released_states
+            target_id,
+            updated_states[target_id],
+            released_states,
+            base_state=client_base,
+            protocol_message=(
+                None
+                if protocol_messages is None
+                else protocol_messages.get(target_id)
+            ),
         )
         observation = {
             "round": int(round_index),
@@ -3312,15 +3329,23 @@ class MembershipAuditor:
         ]
         observable_states = {}
         for user_id in selected_ids:
+            client_base = (
+                base_state if base_states is None else base_states[user_id]
+            )
             state = self._observable_client_state(
-                user_id, updated_states[user_id], released_states
+                user_id,
+                updated_states[user_id],
+                released_states,
+                base_state=client_base,
+                protocol_message=(
+                    None
+                    if protocol_messages is None
+                    else protocol_messages.get(user_id)
+                ),
             )
             if needs["client_states"]:
                 observable_states[user_id] = state
             if needs_gradients:
-                client_base = (
-                    base_state if base_states is None else base_states[user_id]
-                )
                 if streaming_text_gradients and (
                     self.audit_view == "protocol_plus_released_prompts"
                     and protocol_messages is not None
@@ -4779,6 +4804,13 @@ class MembershipAuditor:
                     "threat_model": {
                         "protocol_messages": self.audit_view
                         in {"protocol_plus_released_prompts", "full_whitebox"},
+                        "fedsgd_client_post_state_source": (
+                            "base_plus_observed_model_update"
+                            if self.audit_view
+                            == "protocol_plus_released_prompts"
+                            and self.federated_method == "fedsgd"
+                            else None
+                        ),
                         "released_prompt_checkpoints": self.audit_view
                         in {
                             "protocol_plus_released_prompts",
