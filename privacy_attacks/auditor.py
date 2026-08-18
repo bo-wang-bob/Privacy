@@ -19,7 +19,7 @@ from privacy_attacks.features import (
     per_sample_prompt_gradients,
     trainable_names,
 )
-from privacy_attacks.fedmia import run_fedmia
+from privacy_attacks.fedmia import FEDMIA_MEASUREMENT_NAMES, run_fedmia
 from privacy_attacks.fedmia_baselines import run_fedmia_baseline
 from privacy_attacks.imia import run_imia
 from privacy_attacks.model_utils import last_client_states, trainable_scope_name
@@ -50,6 +50,7 @@ SUPPORTED_ATTACKS = {
     "grad_cosine",
     "avg_cosine",
     "fedmia_loss",
+    "fedmia_cosine",
     "gradient_diff",
     "score_diff",
     "score_ratio",
@@ -67,6 +68,7 @@ POOLED_CLIENT_ATTACKS = {
     "grad_cosine",
     "avg_cosine",
     "fedmia_loss",
+    "fedmia_cosine",
     "gradient_diff",
     "score_diff",
     "score_ratio",
@@ -109,6 +111,7 @@ _TARGET_ONLY_SIGNAL_ATTACKS = _FEDMIA_BASELINE_ATTACKS | _UPDATE_ATTACKS
 _SINGLE_ROUND_ATTACKS = {"blackbox_loss", "grad_cosine", "projres"}
 _PERIODIC_METRIC_ATTACKS = _FEDMIA_BASELINE_ATTACKS | {
     "fedmia_loss",
+    "fedmia_cosine",
 } | _UPDATE_ATTACKS | {"projres"}
 _EXACT_BATCH_REPORTED_FPR_TARGETS = (0.1, 0.01)
 
@@ -136,7 +139,7 @@ def _signal_needs(attacks: set[str], full_signals: bool = False) -> dict[str, bo
         "cosine": full_signals
         or bool(
             attacks
-            & {"grad_cosine", "avg_cosine", "nasr_passive"}
+            & {"grad_cosine", "avg_cosine", "nasr_passive", "fedmia_cosine"}
         ),
         "promptres": full_signals or "promptres" in attacks,
         "gradient_diff_score": full_signals or "gradient_diff" in attacks,
@@ -199,6 +202,7 @@ class MembershipAuditor:
                     "grad_cosine",
                     "avg_cosine",
                     "fedmia_loss",
+                    "fedmia_cosine",
                     "gradient_diff",
                     "score_diff",
                     "score_ratio",
@@ -373,6 +377,17 @@ class MembershipAuditor:
             "balanced_global_holdout",
         }:
             self.match_candidate_labels = True
+        self.require_full_target_train_members = bool(
+            self.config.get("require_full_target_train_members", False)
+        )
+        if (
+            self.require_full_target_train_members
+            and self.candidate_sampling_mode != "balanced_global_holdout"
+        ):
+            raise ValueError(
+                "require_full_target_train_members requires "
+                "candidate_sampling=balanced_global_holdout."
+            )
         self.nonmember_to_member_ratio = float(
             self.config.get("nonmember_to_member_ratio", 1.0)
         )
@@ -936,6 +951,7 @@ class MembershipAuditor:
             "grad_cosine",
             "avg_cosine",
             "fedmia_loss",
+            "fedmia_cosine",
             "gradient_diff",
             "score_diff",
             "score_ratio",
@@ -1207,7 +1223,13 @@ class MembershipAuditor:
         torch.Tensor,
         dict,
     ]:
-        """Sample exact-ratio label-matched train/global-test candidates."""
+        """Sample fixed-ratio train/global-test candidates.
+
+        The default path preserves exact class proportions. When the complete
+        target training set is required, every member is retained and class
+        matching becomes best effort: per-class shortages are filled from
+        other evaluation classes without replacement.
+        """
         if len(nonmember_datasets) != len(nonmember_source_names):
             raise ValueError("Global holdout datasets and sources must be aligned.")
         if not nonmember_datasets:
@@ -1227,30 +1249,80 @@ class MembershipAuditor:
             )
             for class_id in range(self.num_classes)
         ]
-        maximum_members = (
-            len(member_dataset) if member_limit <= 0 else member_limit
+        maximum_members = min(
+            len(member_dataset),
+            len(member_dataset) if member_limit <= 0 else member_limit,
         )
-        maximum_nonmembers = (
+        maximum_nonmembers = min(
+            len(nonmember_dataset),
             len(nonmember_dataset)
             if nonmember_limit <= 0
-            else nonmember_limit
+            else nonmember_limit,
         )
-        member_budget = min(
-            maximum_members,
-            maximum_nonmembers // ratio,
-            sum(member_capacities),
-        )
-        if member_budget < 2:
-            raise ValueError(
-                f"Client {client_id} cannot construct two exact-ratio "
-                "label-matched member candidates."
+        if self.require_full_target_train_members:
+            member_budget = len(member_dataset)
+            if maximum_members < member_budget:
+                raise ValueError(
+                    f"Client {client_id} requires all {member_budget} training "
+                    f"members, but low_fpr_max_members={member_limit} truncates "
+                    "that pool. Set low_fpr_max_members=0."
+                )
+            nonmember_budget = member_budget * ratio
+            if maximum_nonmembers < nonmember_budget:
+                raise ValueError(
+                    f"Client {client_id} requires {nonmember_budget} independent "
+                    "nonmembers for the configured ratio, but only "
+                    f"{maximum_nonmembers} are available under the current cap."
+                )
+            member_quotas = list(member_pool_histogram)
+            desired_nonmember_quotas = [
+                quota * ratio for quota in member_quotas
+            ]
+            nonmember_quotas = [
+                min(desired, available)
+                for desired, available in zip(
+                    desired_nonmember_quotas, nonmember_pool_histogram
+                )
+            ]
+            shortage = nonmember_budget - sum(nonmember_quotas)
+            if shortage:
+                spare_capacities = [
+                    available - selected
+                    for available, selected in zip(
+                        nonmember_pool_histogram, nonmember_quotas
+                    )
+                ]
+                redistribution = self._allocate_proportional_with_capacities(
+                    desired_nonmember_quotas,
+                    spare_capacities,
+                    shortage,
+                )
+                nonmember_quotas = [
+                    selected + extra
+                    for selected, extra in zip(
+                        nonmember_quotas, redistribution
+                    )
+                ]
+        else:
+            member_budget = min(
+                maximum_members,
+                maximum_nonmembers // ratio,
+                sum(member_capacities),
             )
-        member_quotas = self._allocate_proportional_with_capacities(
-            member_pool_histogram,
-            member_capacities,
-            member_budget,
-        )
-        nonmember_quotas = [quota * ratio for quota in member_quotas]
+            if member_budget < 2:
+                raise ValueError(
+                    f"Client {client_id} cannot construct two exact-ratio "
+                    "label-matched member candidates."
+                )
+            member_quotas = self._allocate_proportional_with_capacities(
+                member_pool_histogram,
+                member_capacities,
+                member_budget,
+            )
+            desired_nonmember_quotas = [
+                quota * ratio for quota in member_quotas
+            ]
+            nonmember_quotas = list(desired_nonmember_quotas)
 
         def select_indices(
             groups: list[list[int]], quotas: list[int], salt: int
@@ -1294,10 +1366,25 @@ class MembershipAuditor:
         nonmember_histogram = torch.bincount(
             nonmember_labels, minlength=self.num_classes
         )
-        if not torch.equal(nonmember_histogram, member_histogram * ratio):
+        label_histograms_matched = torch.equal(
+            nonmember_histogram, member_histogram * ratio
+        )
+        if (
+            not self.require_full_target_train_members
+            and not label_histograms_matched
+        ):
             raise AssertionError(
                 "Global holdout candidate label distributions drifted."
             )
+        label_tv_distance = 0.5 * sum(
+            abs(
+                int(member_histogram[class_id])
+                / int(member_histogram.sum())
+                - int(nonmember_histogram[class_id])
+                / int(nonmember_histogram.sum())
+            )
+            for class_id in range(self.num_classes)
+        )
         nonmember_pool_source_counts = {
             source: len(dataset)
             for source, dataset in zip(
@@ -1319,6 +1406,16 @@ class MembershipAuditor:
                 "nonmember_count": int(nonmember_labels.numel()),
                 "member_label_histogram": member_histogram.tolist(),
                 "nonmember_label_histogram": nonmember_histogram.tolist(),
+                "desired_nonmember_label_histogram": (
+                    desired_nonmember_quotas
+                ),
+                "label_histograms_matched": label_histograms_matched,
+                "label_matching_mode": (
+                    "best_effort_full_target_train_global_test"
+                    if self.require_full_target_train_members
+                    else "exact_proportional_target_train_global_test"
+                ),
+                "label_total_variation_distance": label_tv_distance,
                 "member_pool_label_histogram": member_pool_histogram,
                 "nonmember_pool_label_histogram": nonmember_pool_histogram,
                 "member_capacity_by_label": member_capacities,
@@ -1353,6 +1450,7 @@ class MembershipAuditor:
             "grad_cosine",
             "avg_cosine",
             "fedmia_loss",
+            "fedmia_cosine",
             "gradient_diff",
             "score_diff",
             "score_ratio",
@@ -1425,6 +1523,16 @@ class MembershipAuditor:
                         f"{self.low_fpr_min_nonmembers} non-members, but "
                         f"only constructed {nonmember_labels.numel()}."
                     )
+                if (
+                    self.require_full_target_train_members
+                    and member_labels.numel() != len(target.train_data)
+                ):
+                    raise ValueError(
+                        f"Client {client_id} requested its complete training "
+                        f"set as members, but candidate sampling retained "
+                        f"only {member_labels.numel()}/"
+                        f"{len(target.train_data)} samples."
+                    )
             except ValueError as error:
                 if not self.allow_partial_client_audit:
                     raise
@@ -1485,6 +1593,22 @@ class MembershipAuditor:
                 "nonmember_pool_source_counts": sampling[
                     "nonmember_pool_source_counts"
                 ],
+                "member_label_histogram": sampling[
+                    "member_label_histogram"
+                ],
+                "nonmember_label_histogram": sampling[
+                    "nonmember_label_histogram"
+                ],
+                "desired_nonmember_label_histogram": sampling[
+                    "desired_nonmember_label_histogram"
+                ],
+                "label_histograms_matched": sampling[
+                    "label_histograms_matched"
+                ],
+                "label_matching_mode": sampling["label_matching_mode"],
+                "label_total_variation_distance": sampling[
+                    "label_total_variation_distance"
+                ],
                 "index_convention": sampling["index_convention"],
             }
             candidate_sampling_by_client[str(client_id)] = {
@@ -1500,10 +1624,18 @@ class MembershipAuditor:
                 "maximum_members": self.low_fpr_max_members,
                 "maximum_nonmembers": self.low_fpr_max_nonmembers,
                 "selection_method": (
-                    "exact_proportional_class_stratified_without_replacement"
+                    "best_effort_class_stratified_without_replacement"
+                    if self.require_full_target_train_members
+                    else "exact_proportional_class_stratified_without_replacement"
                 ),
                 "selection_artifact": "candidate_selection.pt",
                 "membership_definition": "global_model_record_membership",
+                "full_target_train_members_required": (
+                    self.require_full_target_train_members
+                ),
+                "member_pool_fully_selected": (
+                    member_count == len(target.train_data)
+                ),
                 "nonmember_training_exposure": "never_trained",
                 "requested_nonmember_to_member_ratio": (
                     self.nonmember_to_member_ratio
@@ -1521,19 +1653,21 @@ class MembershipAuditor:
             ]
             logger.info(
                 "Balanced global holdout client %d candidates selected: "
-                "members=%d/%d, non-members=%d/%d, ratio=1:%d",
+                "members=%d/%d, non-members=%d/%d, ratio=1:%d, "
+                "label_tv=%.6f",
                 client_id,
                 member_count,
                 len(target.train_data),
                 nonmember_count,
                 sum(len(dataset) for dataset in nonmember_datasets),
                 int(self.nonmember_to_member_ratio),
+                sampling["label_total_variation_distance"],
             )
 
         if not eligible_client_ids:
             raise ValueError(
                 "Balanced global holdout audit found no client with enough "
-                "label-matched train/evaluation candidates."
+                "train/evaluation candidates."
             )
         self.audit_client_ids = eligible_client_ids
         self.pooled_client_audit = len(eligible_client_ids) > 1
@@ -1575,7 +1709,7 @@ class MembershipAuditor:
         self._initialize_paper_balanced_evaluation_view()
 
     def _initialize_paper_balanced_evaluation_view(self) -> None:
-        """Select one fixed, exactly class-matched balanced evaluation view."""
+        """Select one fixed balanced view with best-effort class matching."""
         size = self.paper_balanced_evaluation_size
         if size == 0:
             return
@@ -1591,46 +1725,91 @@ class MembershipAuditor:
         nonmember_positions = torch.nonzero(
             client_mask & (self.membership == 0), as_tuple=False
         ).flatten()
-        if member_positions.numel() != size:
+        if member_positions.numel() < size:
             raise ValueError(
-                "Paper-balanced evaluation requires exactly "
+                "Paper-balanced evaluation requires at least "
                 f"{size} selected members, but found "
                 f"{member_positions.numel()}."
             )
 
-        selected_nonmembers = []
-        member_histogram = torch.bincount(
-            self.labels[member_positions], minlength=self.num_classes
-        )
-        for class_id, required in enumerate(member_histogram.tolist()):
-            if required == 0:
-                continue
-            class_positions = nonmember_positions[
-                self.labels[nonmember_positions] == class_id
-            ]
-            if class_positions.numel() < required:
-                raise ValueError(
-                    "Paper-balanced evaluation lacks class-matched "
-                    f"nonmembers for class {class_id}: "
-                    f"required={required}, available={class_positions.numel()}."
+        def select_positions(
+            positions: torch.Tensor,
+            quotas: list[int],
+            salt: int,
+        ) -> torch.Tensor:
+            selected = []
+            for class_id, count in enumerate(quotas):
+                if count == 0:
+                    continue
+                class_positions = positions[
+                    self.labels[positions] == class_id
+                ]
+                generator = torch.Generator().manual_seed(
+                    self.seed
+                    + 15485863 * (client_id + 1)
+                    + salt
+                    + 2 * class_id
                 )
-            generator = torch.Generator().manual_seed(
-                self.seed + 15485863 * (client_id + 1) + 2 * class_id
+                order = torch.randperm(
+                    class_positions.numel(), generator=generator
+                )[:count]
+                selected.append(class_positions[order])
+            return torch.cat(selected)
+
+        member_capacities = torch.bincount(
+            self.labels[member_positions], minlength=self.num_classes
+        ).tolist()
+        member_quotas = self._allocate_proportional_with_capacities(
+            member_capacities, member_capacities, size
+        )
+        selected_members = select_positions(member_positions, member_quotas, 31)
+        member_histogram = torch.bincount(
+            self.labels[selected_members], minlength=self.num_classes
+        )
+        nonmember_capacities = torch.bincount(
+            self.labels[nonmember_positions], minlength=self.num_classes
+        ).tolist()
+        nonmember_quotas = [
+            min(required, available)
+            for required, available in zip(
+                member_histogram.tolist(), nonmember_capacities
             )
-            order = torch.randperm(
-                class_positions.numel(), generator=generator
-            )[:required]
-            selected_nonmembers.append(class_positions[order])
-        selected_nonmembers = torch.cat(selected_nonmembers)
+        ]
+        shortage = size - sum(nonmember_quotas)
+        if shortage:
+            spare_capacities = [
+                available - selected
+                for available, selected in zip(
+                    nonmember_capacities, nonmember_quotas
+                )
+            ]
+            redistribution = self._allocate_proportional_with_capacities(
+                member_histogram.tolist(), spare_capacities, shortage
+            )
+            nonmember_quotas = [
+                selected + extra
+                for selected, extra in zip(
+                    nonmember_quotas, redistribution
+                )
+            ]
+        selected_nonmembers = select_positions(
+            nonmember_positions, nonmember_quotas, 47
+        )
         selected_histogram = torch.bincount(
             self.labels[selected_nonmembers], minlength=self.num_classes
         )
-        if not torch.equal(selected_histogram, member_histogram):
-            raise AssertionError(
-                "Paper-balanced evaluation label matching drifted."
+        label_histograms_matched = torch.equal(
+            selected_histogram, member_histogram
+        )
+        label_tv_distance = 0.5 * sum(
+            abs(
+                int(member_histogram[class_id]) / size
+                - int(selected_histogram[class_id]) / size
             )
+            for class_id in range(self.num_classes)
+        )
         self.paper_balanced_candidate_indices = torch.cat(
-            (member_positions, selected_nonmembers)
+            (selected_members, selected_nonmembers)
         )
         self.paper_balanced_evaluation = {
             "name": f"paper_{size}_{size}",
@@ -1641,8 +1820,10 @@ class MembershipAuditor:
             "candidate_indices": self.paper_balanced_candidate_indices,
             "member_label_histogram": member_histogram.tolist(),
             "nonmember_label_histogram": selected_histogram.tolist(),
+            "label_histograms_matched": label_histograms_matched,
+            "label_total_variation_distance": label_tv_distance,
             "selection_method": (
-                "fixed_class_matched_subset_of_low_fpr_candidates"
+                "fixed_best_effort_class_matched_subset_of_candidates"
             ),
             "shared_across_attacks_and_rounds": True,
         }
@@ -1669,6 +1850,7 @@ class MembershipAuditor:
             "grad_cosine",
             "avg_cosine",
             "fedmia_loss",
+            "fedmia_cosine",
             "gradient_diff",
             "score_diff",
             "score_ratio",
@@ -3717,19 +3899,20 @@ class MembershipAuditor:
         logger.debug("Collected privacy signals for round %s", round_index)
         return exact_batch_payload
 
-    def _run_fedmia_loss(
+    def _run_fedmia_signal(
         self,
+        measurement: str,
         aggregation: str,
         tail: str,
     ) -> AttackResult:
-        attack = "fedmia_loss"
+        attack = FEDMIA_MEASUREMENT_NAMES[measurement]
         observations = self._observations_for_attack(attack)
         if not self.pooled_client_audit:
             return run_fedmia(
                 observations,
                 self.membership,
                 self.target_client_id,
-                "confidence",
+                measurement,
                 aggregation,
                 tail,
                 float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
@@ -3757,7 +3940,7 @@ class MembershipAuditor:
                 logger.warning(
                     "Skipping client %d in pooled %s attack: %s",
                     client_id,
-                    attack,
+                    measurement,
                     error,
                 )
                 continue
@@ -3765,7 +3948,7 @@ class MembershipAuditor:
                 observations,
                 self.membership[indices],
                 client_id,
-                "confidence",
+                measurement,
                 aggregation,
                 tail,
                 float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
@@ -3797,7 +3980,7 @@ class MembershipAuditor:
                 "skipped_audit_clients": skipped_clients,
                 "few_shot": self.few_shot,
                 "fpl_shots": self.fpl_shots,
-                "measurement": "confidence",
+                "measurement": measurement,
                 "round_aggregation": aggregation,
                 "tail_policy": tail,
                 "score_pooling": "native_fedmia_null_cdf",
@@ -4101,11 +4284,23 @@ class MembershipAuditor:
             return self._run_exact_batch_attack(attack, observations[-1])
         if self.pooled_client_audit and attack in POOLED_CLIENT_ATTACKS:
             if attack == "fedmia_loss":
-                return self._run_fedmia_loss(
+                return self._run_fedmia_signal(
+                    "confidence",
                     str(self.config.get("fedmia_loss_aggregation", "mean")),
                     str(
                         self.config.get(
                             "fedmia_loss_tail",
+                            self.config.get("fedmia_tail", "upper"),
+                        )
+                    ),
+                )
+            if attack == "fedmia_cosine":
+                return self._run_fedmia_signal(
+                    "cosine",
+                    str(self.config.get("fedmia_cosine_aggregation", "mean")),
+                    str(
+                        self.config.get(
+                            "fedmia_cosine_tail",
                             self.config.get("fedmia_tail", "upper"),
                         )
                     ),
@@ -4146,11 +4341,22 @@ class MembershipAuditor:
                 str(self.config.get("promptres_aggregation", "mean")),
             )
         if attack == "fedmia_loss":
-            return self._run_fedmia_loss(
+            return self._run_fedmia_signal(
+                "confidence",
                 str(self.config.get("fedmia_loss_aggregation", "mean")),
                 str(
                     self.config.get(
                         "fedmia_loss_tail", self.config.get("fedmia_tail", "upper")
+                    )
+                ),
+            )
+        if attack == "fedmia_cosine":
+            return self._run_fedmia_signal(
+                "cosine",
+                str(self.config.get("fedmia_cosine_aggregation", "mean")),
+                str(
+                    self.config.get(
+                        "fedmia_cosine_tail", self.config.get("fedmia_tail", "upper")
                     )
                 ),
             )
@@ -4348,8 +4554,7 @@ class MembershipAuditor:
                     self.config.get("fta_measurement", "confidence")
                 ),
             )
-        if attack != "fedmia_loss":
-            raise AssertionError(f"Unhandled periodic attack {attack}")
+        measurement = "confidence" if attack == "fedmia_loss" else "cosine"
         aggregation = str(
             self.config.get(f"{attack}_aggregation", "mean")
         )
@@ -4362,7 +4567,7 @@ class MembershipAuditor:
             observations,
             self.membership,
             self.target_client_id,
-            "confidence",
+            measurement,
             aggregation,
             tail,
             float(self.config.get("fedmia_tail_calibration_fraction", 0.25)),
@@ -4633,7 +4838,11 @@ class MembershipAuditor:
         degenerate_fedmia = [
             item["attack"]
             for item in summaries
-            if item["attack"] == "fedmia_loss"
+            if item["attack"]
+            in {
+                "fedmia_loss",
+                "fedmia_cosine",
+            }
             and item["score_degenerate"]
         ]
         if signal_health_enabled:
@@ -4839,6 +5048,9 @@ class MembershipAuditor:
                     },
                     "candidate_sampling": {
                         "mode": self.candidate_sampling_mode,
+                        "full_target_train_members_required": (
+                            self.require_full_target_train_members
+                        ),
                         "membership_definition": (
                             "global_model_record_membership"
                             if self.candidate_sampling_mode
@@ -4875,6 +5087,10 @@ class MembershipAuditor:
                             if self.candidate_sampling_mode
                             == "balanced_holdout"
                             else "exact_proportional_target_train_global_test"
+                            if self.candidate_sampling_mode
+                            == "balanced_global_holdout"
+                            and not self.require_full_target_train_members
+                            else "best_effort_full_target_train_global_test"
                             if self.candidate_sampling_mode
                             == "balanced_global_holdout"
                             else "fedmia_mix_unmatched"

@@ -77,6 +77,7 @@ common:
       - grad_cosine
       - avg_cosine
       - fedmia_loss
+      - fedmia_cosine
     candidate_sampling: balanced_holdout
     low_fpr_max_members: 5000
     low_fpr_max_nonmembers: 5000
@@ -86,6 +87,7 @@ common:
       loss_series: 10
       avg_cosine: 10
       fedmia_loss: 10
+      fedmia_cosine: 10
     low_fpr_gradient_batch_size: 1
     signal_storage: compact
     fedmia_tail: upper

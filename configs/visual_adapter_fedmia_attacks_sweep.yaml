@@ -83,6 +83,7 @@ common:
       - grad_cosine
       - avg_cosine
       - fedmia_loss
+      - fedmia_cosine
       - gradient_diff
       - score_diff
       - score_ratio
@@ -110,6 +111,7 @@ common:
       grad_cosine: 10
       avg_cosine: 10
       fedmia_loss: 10
+      fedmia_cosine: 10
       gradient_diff: 10
       score_diff: 10
       score_ratio: 10

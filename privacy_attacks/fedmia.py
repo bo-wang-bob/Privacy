@@ -10,8 +10,6 @@ from privacy_attacks.metrics import membership_metrics, stratified_split
 
 FEDMIA_MEASUREMENT_NAMES = {
     "confidence": "fedmia_loss",
-    # Legacy-only: keep historical signal replay working. The public auditor
-    # no longer registers or schedules this attack.
     "cosine": "fedmia_cosine",
 }
 

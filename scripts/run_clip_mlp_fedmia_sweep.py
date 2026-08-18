@@ -551,7 +551,7 @@ def summarize(
 
 DEFAULT_ATTACKS = (
     "blackbox_loss,loss_series,grad_cosine,avg_cosine,"
-    "fedmia_loss"
+    "fedmia_loss,fedmia_cosine"
 )
 
 

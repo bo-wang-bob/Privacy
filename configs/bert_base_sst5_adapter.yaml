@@ -45,8 +45,8 @@ seed: 42
 save_models: false
 results_dir: ./results
 
-# Use 100 target-client train members and 1,000 never-trained evaluation
-# non-members with an exact 1:10 per-class histogram ratio.
+# The five fixed-candidate attacks use the complete target-client training set
+# as members and an equal-sized, best-effort label-matched evaluation holdout.
 audit:
   enabled: true
   strict: true
@@ -56,6 +56,7 @@ audit:
     - grad_cosine
     - avg_cosine
     - fedmia_loss
+    - fedmia_cosine
     - gradient_diff
     - score_diff
     - score_ratio
@@ -64,7 +65,8 @@ audit:
   target_client_id: 0
   audit_client_ids: [0]
   candidate_sampling: balanced_global_holdout
-  nonmember_to_member_ratio: 10
+  require_full_target_train_members: true
+  nonmember_to_member_ratio: 1
   # These six update-sensitive attacks use the target client's exact upload
   # batch as members at every audit round. Formulas remain unchanged.
   exact_batch_membership_attacks:
@@ -75,28 +77,30 @@ audit:
     - score_diff
     - score_ratio
   exact_batch_nonmember_to_member_ratio: 10
-  # Also report a fixed class-matched 100-member/100-nonmember paper view.
+  # Also report a fixed best-effort class-matched 100/100 paper view.
   paper_balanced_evaluation_size: 100
   audit_batch_size: 16
-  # Collect every configured attack after 50, 100, ..., 500 completed rounds.
+  # Fixed-candidate attacks run every 10 rounds; exact-batch attacks remain
+  # every 50 rounds so their real-batch protocol and cost are unchanged.
   audit_interval: 50
   attack_audit_intervals:
     blackbox_loss: 50
-    loss_series: 50
+    loss_series: 10
     grad_cosine: 50
-    avg_cosine: 50
-    fedmia_loss: 50
+    avg_cosine: 10
+    fedmia_loss: 10
+    fedmia_cosine: 10
     gradient_diff: 50
     score_diff: 50
     score_ratio: 50
-    fta: 50
+    fta: 10
     projres: 50
   score_ratio_damping: 1.0e-6
   fta_measurement: confidence
   signal_storage: compact
-  low_fpr_min_nonmembers: 1000
-  low_fpr_max_members: 100
-  low_fpr_max_nonmembers: 1000
+  low_fpr_min_nonmembers: 2
+  low_fpr_max_members: 0
+  low_fpr_max_nonmembers: 0
 
 # Rank each client's exact upload batch after rounds 50, 100, ..., 500.
 # This analysis is observational and does not filter samples or alter training.

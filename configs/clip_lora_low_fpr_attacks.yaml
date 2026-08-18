@@ -47,6 +47,7 @@ audit:
     - grad_cosine
     - avg_cosine
     - fedmia_loss
+    - fedmia_cosine
   # Vision-side LoRA needs raw pixels, so the frozen-feature low_fpr_full pool
   # is not applicable. This protocol gives every client exact 1:1, same-class
   # train-member and never-trained test-nonmember candidates.
@@ -59,6 +60,7 @@ audit:
     loss_series: 10
     avg_cosine: 10
     fedmia_loss: 10
+    fedmia_cosine: 10
   low_fpr_gradient_batch_size: 1
   signal_storage: compact
   fedmia_tail: upper

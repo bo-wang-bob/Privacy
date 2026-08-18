@@ -26,7 +26,8 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 - FedSGD 客户端上传各自的可训练参数梯度；服务器先等权聚合梯度，再执行一次
   `global = base - learning_rate * mean_gradient` 并下发新的全局模型。
 - CLIP 普通任务每 5 个已完成通信轮评估一次；多轮攻击通常每 10 轮审计。
-- BERT/GPT2 普通任务与攻击每 50 轮评估，并始终包含最后一轮。
+- BERT 普通任务、六种真实 Batch 攻击与 ICLR 每 50 轮评估，五种固定候选攻击每
+  10 轮评估；GPT2 普通任务与全部攻击每 50 轮评估。调度始终包含最后一轮。
 - 所有聚合和保存操作只处理 `requires_grad=True` 的参数，冻结主干不上传。
 
 `main.py` 仍保留通用 CLIP prompt 和 PromptFL 兼容入口，但当前重点维护和批量
@@ -44,6 +45,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 | `grad_cosine` | 候选梯度与客户端上传更新的余弦相似度 | 单轮、目标客户端 |
 | `avg_cosine` | 梯度余弦 | 多轮时间平均、目标客户端 |
 | `fedmia_loss` | 损失/置信度的单尾 CDF 分数 | 多轮、其他客户端构成 null 分布 |
+| `fedmia_cosine` | 梯度余弦的单尾 CDF 分数 | 多轮、其他客户端构成 null 分布 |
 | `gradient_diff` | 客户端梯度与候选梯度的差异 | 更新敏感攻击 |
 | `score_diff` | 客户端更新前后的损失差 | 更新敏感攻击 |
 | `score_ratio` | 客户端更新前后的损失比 | 更新敏感攻击 |
@@ -55,7 +57,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 
 ### 各模型的实际支持范围
 
-| 模型 | 五种 FedMIA/基线攻击 | `gradient_diff` / `score_diff` / `score_ratio` / `fta` | ProjRes |
+| 模型 | 六种 FedMIA 系列攻击 | `gradient_diff` / `score_diff` / `score_ratio` / `fta` | ProjRes |
 | --- | --- | --- | --- |
 | CLIP-MLP | 默认启用 | 默认启用 | 不进入统一 sweep；保留独立严格入口 |
 | Visual Adapter | 默认启用 | 默认启用 | 统一 exact-batch 审计器，默认启用 |
@@ -63,8 +65,8 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 | BERT-Base Adapter | 默认启用 | 默认启用 | 统一 exact-batch 审计器，默认启用 |
 | GPT2-Large Adapter | 默认启用 | 默认启用 | 统一 exact-batch 审计器，默认启用 |
 
-这里的“五种 FedMIA/基线攻击”指四个 FedMIA 对照基线加
-`fedmia_loss`。CLIP-LoRA 的四种更新攻击虽然可以通过共享配置
+这里的“六种 FedMIA 系列攻击”指四个 FedMIA 对照基线加
+`fedmia_loss`、`fedmia_cosine`。CLIP-LoRA 的四种更新攻击虽然可以通过共享配置
 路径启用，但当前缺少与 MLP/Adapter 同等级的默认 sweep 和专项回归覆盖，不应与
 正式默认集合混为一谈。
 
@@ -79,7 +81,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 | Visual Adapter 其余五种攻击 | 固定历史训练成员 | 固定、从未训练的全局非成员 | 100/1000 |
 | CLIP-LoRA 通用攻击 | 目标客户端历史训练集样本 | 该客户端独立测试样本 | 按类别精确 1:1，最多 5000/5000 |
 | BERT/GPT2 六种 exact-batch 攻击 | 当轮真实 FedSGD batch | 按该 batch 标签直方图抽取的独立 evaluation 样本 | 16/160 |
-| BERT/GPT2 其余五种攻击 | 固定历史训练成员 | 固定、从未训练的全局非成员 | 100/1000 |
+| BERT/GPT2 其余五种攻击 | 目标客户端完整训练集 | 从未训练的全局非成员，按类别尽力匹配并补足 | `M/M`，`M` 为目标客户端训练集大小 |
 
 六种 exact-batch 攻击为 `blackbox_loss`、`grad_cosine`、`gradient_diff`、
 `score_diff`、`score_ratio` 和 `projres`。它们在每个审计轮独立使用真实上传
@@ -88,8 +90,9 @@ batch，不跨轮拼接不同成员集合。
 ProjRes 只输出连续的负 L1 投影残差并按分数排序，通过 ROC/AUC 或指定 FPR 的
 TPR 评价；不再使用跨模型、跨轮次不可校准的固定残差阈值生成成员判断。
 
-固定 1000 个非成员的经验 FPR 分辨率为 0.001；32/320 或 16/160 的真实 batch
-视图只正式报告可由样本量解析的低 FPR 指标。`summary.json` 会保存成员/非成员
+BERT/GPT2 固定候选攻击的经验 FPR 分辨率由目标客户端训练集大小决定；其他模型
+仍按各自配置预算构造候选池。32/320 或 16/160 的真实 batch 视图只正式报告
+可由样本量解析的低 FPR 指标。`summary.json` 会保存成员/非成员
 数量、实际 FPR 分辨率、标签匹配方式和候选来源，不应在样本量不足时把插值得到的
 极低 FPR 数值当作稳定结论。
 
@@ -188,10 +191,10 @@ bash scripts/run_all_clip_fedmia_attacks.sh \
   --models visual_adapter \
   --datasets caltech101,flowers
 
-# 只运行 FedMIA-Loss
+# 只运行两种 FedMIA 攻击
 bash scripts/run_all_clip_fedmia_attacks.sh \
   --datasets cifar100 \
-  --attacks fedmia_loss
+  --attacks fedmia_loss,fedmia_cosine
 
 # 两张 GPU 并行调度不同任务
 bash scripts/run_all_clip_fedmia_attacks.sh --gpus 0,1 --jobs 2
@@ -292,11 +295,12 @@ bash scripts/run_projres_mlp_real.sh
 审计器按攻击所需信号调度计算，不会无条件生成全部梯度和前向结果：
 
 - CLIP-MLP/LoRA 的 `blackbox_loss`、`grad_cosine` 默认使用预先固定的最后审计轮。
-- `loss_series`、`avg_cosine`、`fedmia_loss` 使用多轮轨迹。
+- `loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine` 使用多轮轨迹。
 - CLIP-MLP 的四种更新攻击每 10 个已完成通信轮统计一次。
 - Visual Adapter 的六种 exact-batch 攻击每 10 轮使用该轮真实上传 batch 独立评估。
-- BERT/GPT2 的全部配置攻击每 50 轮统计一次；最终汇总使用最后一个审计轮，逐轮
-  结果保存在 `attack_round_metrics.csv`。
+- BERT 的 `loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine` 和 `fta`
+  每 10 轮统计一次，六种真实 Batch 攻击每 50 轮统计一次；GPT2 的全部配置攻击
+  仍每 50 轮统计一次。逐轮结果保存在 `attack_round_metrics.csv`。
 
 只选择部分攻击时，调度器会跳过其他信号族。余弦和 Gradient-Diff 的逐样本梯度
 通常是主要耗时来源；大幅缩小非成员池虽然能加速，但会直接降低低 FPR 的统计
@@ -314,7 +318,7 @@ bash scripts/run_projres_mlp_real.sh
 - `fedmia_mix`：目标客户端训练成员与独立测试/其他客户端训练来源混合；
 - `low_fpr_full`：冻结 CLIP 特征模型的低 FPR 完整候选池；
 - `balanced_holdout`：目标客户端训练集与其独立测试集按类别精确 1:1；
-- `balanced_global_holdout`：目标训练成员与全局独立 evaluation 非成员按固定比例匹配。
+- `balanced_global_holdout`：目标训练成员与全局独立 evaluation 非成员按固定比例抽样；要求完整成员池时，类别不足会由其他类别确定性补足，并记录实际标签 TV 距离。
 
 当前统一 CLIP-MLP 和 CLIP-LoRA sweep 使用 `balanced_holdout`；Visual Adapter、
 BERT 和 GPT2 的 exact-batch 任务使用 `balanced_global_holdout`。

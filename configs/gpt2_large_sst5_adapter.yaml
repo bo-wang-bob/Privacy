@@ -51,6 +51,7 @@ audit:
     - grad_cosine
     - avg_cosine
     - fedmia_loss
+    - fedmia_cosine
     - gradient_diff
     - score_diff
     - score_ratio
@@ -59,7 +60,10 @@ audit:
   target_client_id: 0
   audit_client_ids: [0]
   candidate_sampling: balanced_global_holdout
-  nonmember_to_member_ratio: 10
+  require_full_target_train_members: true
+  # Full target-client training set versus an equal-sized evaluation holdout
+  # for loss_series, avg_cosine, both FedMIA variants, and FTA.
+  nonmember_to_member_ratio: 1
   # Use the same real one-batch membership view as BERT.
   exact_batch_membership_attacks:
     - blackbox_loss
@@ -81,6 +85,7 @@ audit:
     grad_cosine: 50
     avg_cosine: 50
     fedmia_loss: 50
+    fedmia_cosine: 50
     gradient_diff: 50
     score_diff: 50
     score_ratio: 50
@@ -89,9 +94,9 @@ audit:
   score_ratio_damping: 1.0e-6
   fta_measurement: confidence
   signal_storage: compact
-  low_fpr_min_nonmembers: 1000
-  low_fpr_max_members: 100
-  low_fpr_max_nonmembers: 1000
+  low_fpr_min_nonmembers: 2
+  low_fpr_max_members: 0
+  low_fpr_max_nonmembers: 0
 
 projres:
   enabled: true

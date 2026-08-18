@@ -49,6 +49,7 @@ audit:
     - grad_cosine
     - avg_cosine
     - fedmia_loss
+    - fedmia_cosine
     - gradient_diff
     - score_diff
     - score_ratio
@@ -57,7 +58,10 @@ audit:
   target_client_id: 0
   audit_client_ids: [0]
   candidate_sampling: balanced_global_holdout
-  nonmember_to_member_ratio: 10
+  require_full_target_train_members: true
+  # Full target-client training set versus an equal-sized evaluation holdout
+  # for loss_series, avg_cosine, both FedMIA variants, and FTA.
+  nonmember_to_member_ratio: 1
   # These six update-sensitive attacks use the target client's exact upload
   # batch as members at every audit round. Formulas remain unchanged.
   exact_batch_membership_attacks:
@@ -73,21 +77,22 @@ audit:
   audit_interval: 50
   attack_audit_intervals:
     blackbox_loss: 50
-    loss_series: 50
+    loss_series: 10
     grad_cosine: 50
-    avg_cosine: 50
-    fedmia_loss: 50
+    avg_cosine: 10
+    fedmia_loss: 10
+    fedmia_cosine: 10
     gradient_diff: 50
     score_diff: 50
     score_ratio: 50
-    fta: 50
+    fta: 10
     projres: 50
   score_ratio_damping: 1.0e-6
   fta_measurement: confidence
   signal_storage: compact
-  low_fpr_min_nonmembers: 1000
-  low_fpr_max_members: 100
-  low_fpr_max_nonmembers: 1000
+  low_fpr_min_nonmembers: 2
+  low_fpr_max_members: 0
+  low_fpr_max_nonmembers: 0
 
 # Rank each client's exact upload batch after rounds 50, 100, ..., 500.
 # This analysis is observational and does not filter samples or alter training.

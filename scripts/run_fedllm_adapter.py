@@ -178,6 +178,7 @@ def validate_config(config: dict) -> None:
         "grad_cosine",
         "avg_cosine",
         "fedmia_loss",
+        "fedmia_cosine",
         "gradient_diff",
         "score_diff",
         "score_ratio",
@@ -265,6 +266,13 @@ def validate_config(config: dict) -> None:
             "Exact-batch membership requires "
             "candidate_sampling=balanced_global_holdout."
         )
+    if bool(audit.get("require_full_target_train_members", False)) and (
+        candidate_sampling != "balanced_global_holdout"
+    ):
+        raise ValueError(
+            "require_full_target_train_members requires "
+            "candidate_sampling=balanced_global_holdout."
+        )
     if candidate_sampling == "balanced_global_holdout":
         ratio = float(audit.get("nonmember_to_member_ratio", 1.0))
         minimum_nonmembers = int(
@@ -279,20 +287,30 @@ def validate_config(config: dict) -> None:
                 "balanced_global_holdout requires a positive integer "
                 "nonmember_to_member_ratio."
             )
-        if maximum_members < 2:
+        if maximum_members < 0 or maximum_members == 1:
             raise ValueError(
-                "balanced_global_holdout requires low_fpr_max_members >= 2."
+                "balanced_global_holdout requires low_fpr_max_members to be "
+                "0 (unlimited) or at least 2."
             )
         if minimum_nonmembers < 2:
             raise ValueError(
                 "balanced_global_holdout requires low_fpr_min_nonmembers >= 2."
             )
-        if maximum_nonmembers < minimum_nonmembers:
+        if maximum_nonmembers < 0 or maximum_nonmembers == 1:
+            raise ValueError(
+                "balanced_global_holdout requires low_fpr_max_nonmembers to "
+                "be 0 (unlimited) or at least 2."
+            )
+        if 0 < maximum_nonmembers < minimum_nonmembers:
             raise ValueError(
                 "balanced_global_holdout requires low_fpr_max_nonmembers >= "
                 "low_fpr_min_nonmembers."
             )
-        if maximum_nonmembers < maximum_members * ratio:
+        if (
+            maximum_members > 0
+            and maximum_nonmembers > 0
+            and maximum_nonmembers < maximum_members * ratio
+        ):
             raise ValueError(
                 "balanced_global_holdout requires enough non-member capacity "
                 "for the configured member cap and ratio."

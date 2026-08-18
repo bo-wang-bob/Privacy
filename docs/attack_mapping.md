@@ -1,6 +1,6 @@
 # Paper-to-code mapping
 
-当前公共审计器只注册 FedMIA 四个基线、FedMIA-I、Gradient-Diff、
+当前公共审计器只注册 FedMIA 四个基线、FedMIA-I/II、Gradient-Diff、
 Score-Diff、Score-Ratio、FTA 和 ProjRes。下文其他攻击的研究实现仍保留在仓库中，
 但已从配置、命令行和公共审计器注册表移除，不能作为新实验攻击启用。
 
@@ -22,6 +22,7 @@ Score-Diff、Score-Ratio、FTA 和 ProjRes。下文其他攻击的研究实现�
 `privacy_attacks/fedmia.py` 重新实现论文的 all-for-one 单尾检验：
 
 - FedMIA-I 使用负交叉熵（置信度）；
+- FedMIA-II 使用候选样本梯度与客户端上传梯度的余弦相似度；
 - 同一轮其他客户端构成 non-target/null 分布；
 - 对多个通信轮的单尾 CDF 分数支持 `mean`、`max`、`last` 与 `late3` 聚合。
 
@@ -43,14 +44,14 @@ FedMIA 官方仓库将四个相关基线按“度量、时间信息、空间信�
 | `avg_cosine` | 同上 | 多轮 | 仅目标客户端 | 对逐轮余弦取均值 |
 
 默认 sweep 使用按需审计调度：两个单轮基线只在固定轮次使用信号；两个时序
-基线每轮只需要目标客户端；FedMIA-I 根据公式 (5) 和 Algorithm 1
+基线每轮只需要目标客户端；FedMIA-I/II 根据公式 (5)、公式 (12) 和 Algorithm 1
 对所有通信轮、所有当轮客户端构造跨客户端 null 分布，因此也显式配置为每轮
 采集。若任务没有选择 FedMIA，调度器不会为它计算跨客户端信号。
 
 官方绘图代码还会查看每一轮的攻击效果并报告其中的最大 TPR。那种选择依赖
 真实成员标签，不能作为部署时可实现的攻击规则，因此本仓库的单轮基线使用预先
 固定的轮次，而不实现 oracle best-round。四个基线都只使用目标客户端，不使用
-FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I 的对照意义。
+FedMIA 的跨客户端 null 分布；这正是它们与 FedMIA-I/II 的对照意义。
 
 ### ProjRes 论文采用的四个传统基线
 
@@ -67,10 +68,14 @@ Deng 等人的 FedLLM ProjRes 实验还比较 Gradient-Diff、Score-Diff、Score
 Gradient-Diff 来源于 [Li、Li 与 Ribeiro，ICLR 2023](https://openreview.net/forum?id=QsCSLPP55Ku)；
 Score-Diff/Score-Ratio 来源于 [Jagielski 等，PoPETs 2023](https://petsymposium.org/popets/2023/popets-2023-0078.php)；
 FTA（free training attack）来源于 [Chang 等，USENIX Security 2024](https://www.usenix.org/conference/usenixsecurity24/presentation/chang)。
-四者在 `scripts/run_all_fedllm_attacks.sh` 的默认任务中每 50 个已完成通信轮采集一次。
+在 `scripts/run_all_fedllm_attacks.sh` 的 BERT 默认任务中，FTA 每 10 个已完成通信轮
+采集一次，Gradient-Diff、Score-Diff 和 Score-Ratio 仍每 50 轮采集一次；GPT2
+默认任务中的四者仍统一每 50 轮采集。
 BERT、GPT2-Large 与 Visual Adapter 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
 作为成员，并按标签从从未训练的全局 evaluation 池抽取 10 倍非成员；每轮独立评估，
-不改变攻击分数公式。FTA 与其他攻击继续使用固定的 100/1000 历史成员候选池。
+不改变攻击分数公式。BERT/GPT2 的 FTA、Loss-Series、Avg-Cosine 和两个 FedMIA
+变体使用目标客户端完整训练集作为成员，并抽取类别尽力匹配的等量非成员；Visual
+Adapter 的这些固定候选攻击仍使用 100/1000。
 
 ## 3. Rethinking Membership Inference Attacks Against Transfer Learning
 
@@ -140,7 +145,7 @@ BERT、GPT2-Large 与 Visual Adapter 的 Blackbox-Loss、Gradient-Diff、Score-D
 
 ## Shared evaluation
 
-所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。固定 100/1000 候选池仍可另外报告 TPR@0.1% FPR，并派生一个类别严格匹配的 100/100 论文对照视图。BERT 与 GPT2-Large 的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员，完整 Batch 时为 16/160；Visual Adapter 同样使用 `N/10N`，完整 Batch 时为 32/320。这些攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。CLIP-MLP 运行全部九种通用攻击，但继续使用原有固定候选协议，不启用真实 Batch 成员定义。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
+所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。BERT/GPT2 的五种固定攻击使用目标客户端完整训练集中的 `M` 个成员，以及类别尽力匹配的 `M` 个全局独立 evaluation 非成员；单类非成员不足时从其他仍有容量的类别确定性补足，并记录实际标签直方图与 TV 距离。仍可从中派生固定 100/100 论文对照视图，该视图也采用相同的尽力匹配规则。BERT 与 GPT2-Large 的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员，完整 Batch 时为 16/160；Visual Adapter 同样使用 `N/10N`，完整 Batch 时为 32/320。这些真实 Batch 攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。CLIP-MLP 运行全部十种通用攻击，但继续使用原有固定候选协议，不启用真实 Batch 成员定义。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
 
 ## CLIP 图像编码器 + 两层 MLP 场景
 

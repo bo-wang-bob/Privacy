@@ -404,6 +404,13 @@ def validate_config(config: dict) -> None:
             "audit.candidate_sampling must be legacy, fedmia_mix, "
             "low_fpr_full, balanced_holdout, or balanced_global_holdout."
         )
+    if bool(audit.get("require_full_target_train_members", False)) and (
+        candidate_sampling != "balanced_global_holdout"
+    ):
+        raise ValueError(
+            "audit.require_full_target_train_members requires "
+            "candidate_sampling=balanced_global_holdout."
+        )
     nonmember_ratio = float(audit.get("nonmember_to_member_ratio", 1.0))
     if nonmember_ratio <= 0:
         raise ValueError(
@@ -450,6 +457,7 @@ def validate_config(config: dict) -> None:
             "grad_cosine",
             "avg_cosine",
             "fedmia_loss",
+            "fedmia_cosine",
             "gradient_diff",
             "score_diff",
             "score_ratio",
@@ -577,6 +585,7 @@ def validate_config(config: dict) -> None:
     for key in (
         "fedmia_tail",
         "fedmia_loss_tail",
+        "fedmia_cosine_tail",
     ):
         if key in audit and str(audit[key]).lower() not in {
             "upper",
@@ -615,13 +624,14 @@ def validate_config(config: dict) -> None:
         audit.get("audit_view", "protocol_plus_released_prompts")
     ).lower() == "released_prompt" and attacks & {
         "nasr_passive",
+        "fedmia_cosine",
         "grad_cosine",
         "avg_cosine",
         "promptres",
     }:
         raise ValueError(
             "released_prompt audit view cannot run update-dependent attacks "
-            "nasr_passive, grad_cosine, avg_cosine, or promptres."
+            "nasr_passive, fedmia_cosine, grad_cosine, avg_cosine, or promptres."
         )
     projres = config.get("projres", {})
     unified_projres = "projres" in exact_batch_attacks
@@ -903,6 +913,7 @@ def validate_config(config: dict) -> None:
         raise ValueError("defense.local_ggeur_original_mode is invalid.")
     spatial = {
         "fedmia_loss",
+        "fedmia_cosine",
         "transfer_representation",
         "rmia",
         "yoqo",
@@ -1252,6 +1263,7 @@ def default_config() -> dict:
                 "grad_cosine",
                 "avg_cosine",
                 "fedmia_loss",
+                "fedmia_cosine",
                 "gradient_diff",
                 "score_diff",
                 "score_ratio",
