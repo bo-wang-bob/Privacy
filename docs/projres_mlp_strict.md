@@ -87,10 +87,10 @@ Adapter sweep 已将 ProjRes 接入共享多轮审计器，但不改变这里的
 第 3.1 节要求的是目标客户端单个通信轮的上传梯度，而不是训练初始化时额外构造
 一次更新。论文第 4.1 节的默认实验通常在第 50 个通信轮评估。
 
-Visual Adapter 的统一 sweep 因此每 10 轮直接观察实际 one-batch FedSGD 上传，
-ProjRes 与另外五种真实 Batch 攻击共享当轮 `N` 个成员和按标签匹配的 `10N` 个
-非成员，并由共享审计器统一保存结果。CLIP-LoRA 仍使用独立 ProjRes 路径，默认
-观察最后一轮，可用 `--projres-round 50` 选择第 50 轮。若独立入口观察的是包含
+Visual Adapter 与 CLIP-LoRA 的统一 sweep 因此每 10 轮直接观察实际 one-batch
+FedSGD 上传，ProjRes 与另外五种真实 Batch 攻击共享当轮 `N` 个成员和按标签匹配
+的 `10N` 个非成员，并由共享审计器统一保存结果。独立诊断入口仍可显式选择观察
+轮次。若独立入口观察的是包含
 多个本地 batch 的 FedAvg 参数差，它是多步更新的累积，不再与论文的单-batch
 FedSGD 梯度完全等价；结果元数据会明确记录这一差异。
 
@@ -130,8 +130,9 @@ python scripts/validate_projres_mlp_real.py \
 （所有客户端测试集和其他客户端训练集）中最多选取 20,000 个样本。非成员不得
 少于 1000 个，因而 `TPR@0.1%FPR` 的经验 FPR 步长不大于 `1/1000`。可显式使用
 `--max-nonmembers 0` 改为完整非成员池，或指定另一个不小于 1000 的上限。
-Visual Adapter 正式统一 sweep 改为按真实 Batch 标签匹配的 `N/10N` 候选视图，
-不报告 `TPR@0.1%FPR`。无论哪条入口，目标客户端不在当前 batch 中的其他训练样本
+Visual Adapter 与 CLIP-LoRA 正式统一 sweep 使用按真实 Batch 标签匹配的
+`N/10N` 候选视图，不报告 `TPR@0.1%FPR`。无论哪条入口，目标客户端不在当前
+batch 中的其他训练样本
 都不能算作严格威胁模型下的成员。
 
 ## 适用边界

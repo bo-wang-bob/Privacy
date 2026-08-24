@@ -857,7 +857,7 @@ def parse_args() -> argparse.Namespace:
         "--projres-round",
         help=(
             "One-based communication round for standalone ProjRes, or "
-            "'last'; unavailable to unified Visual Adapter ProjRes."
+            "'last'; unavailable to unified exact-batch ProjRes."
         ),
     )
     parser.add_argument("--projres-max-candidates", type=int)
@@ -950,7 +950,7 @@ def main() -> int:
             attacks.append("projres")
     if unified_projres and args.projres_round is not None:
         raise ValueError(
-            "Unified Visual Adapter ProjRes uses the shared attack interval; "
+            "Unified exact-batch ProjRes uses the shared attack interval; "
             "--projres-round is only available to standalone ProjRes."
         )
     if projres_enabled:
@@ -970,7 +970,7 @@ def main() -> int:
                 != expected_nonmembers
             ):
                 raise ValueError(
-                    "Unified Visual Adapter ProjRes must use the shared full "
+                    "Unified exact-batch ProjRes must use the shared full "
                     "batch and exact 1:N nonmember count."
                 )
         else:

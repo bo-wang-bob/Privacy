@@ -465,10 +465,11 @@ class MembershipAuditor:
                 "bert_adapter",
                 "gpt2_adapter",
                 "visual_adapter",
+                "clip_lora",
             }:
                 raise ValueError(
-                    "Unified exact-batch ProjRes requires a Transformer or "
-                    "visual Adapter model."
+                    "Unified exact-batch ProjRes requires a Transformer "
+                    "Adapter, Visual Adapter, or CLIP-LoRA model."
                 )
             if self.exact_batch_projres_config.get("threshold") is not None:
                 raise ValueError(
@@ -2353,15 +2354,20 @@ class MembershipAuditor:
         )
         paper_fedsgd_exact = (
             getattr(self, "federated_method", "fedsgd") == "fedsgd"
-        ) and (
-            self.model_type == "visual_adapter" or member_count == 16
         )
-        sample_representation = (
-            "clip_image_feature_input_to_adapter_down_projection"
-            if self.model_type == "visual_adapter"
-            else f"{token_reduction}_sample_embedding_input_to_"
-            "adapter_down_projection"
-        )
+        if self.model_type == "visual_adapter":
+            sample_representation = (
+                "clip_image_feature_input_to_adapter_down_projection"
+            )
+        elif self.model_type == "clip_lora":
+            sample_representation = (
+                f"{token_reduction}_token_input_to_lora_down_projection"
+            )
+        else:
+            sample_representation = (
+                f"{token_reduction}_sample_embedding_input_to_"
+                "adapter_down_projection"
+            )
         metadata = {
             **attack.metadata,
             "attacked_parameter": parameter_name,

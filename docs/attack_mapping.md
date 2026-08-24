@@ -71,11 +71,11 @@ FTA（free training attack）来源于 [Chang 等，USENIX Security 2024](https:
 在 `scripts/run_all_fedllm_attacks.sh` 的 BERT 默认任务中，FTA 每 10 个已完成通信轮
 采集一次，Gradient-Diff、Score-Diff 和 Score-Ratio 仍每 50 轮采集一次；GPT2
 默认任务中的四者仍统一每 50 轮采集。
-BERT、GPT2-Large 与 Visual Adapter 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
+BERT、GPT2-Large、Visual Adapter 与 CLIP-LoRA 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
 作为成员，并按标签从从未训练的全局 evaluation 池抽取 10 倍非成员；每轮独立评估，
-不改变攻击分数公式。BERT/GPT2 的 FTA、Loss-Series、Avg-Cosine 和两个 FedMIA
-变体使用目标客户端完整训练集作为成员，并抽取类别尽力匹配的等量非成员；Visual
-Adapter 的这些固定候选攻击仍使用 100/1000。
+不改变攻击分数公式。四类模型的 FTA、Loss-Series、Avg-Cosine 和两个 FedMIA
+变体均使用目标客户端完整训练集作为成员，并抽取类别尽力匹配的等量全局独立
+evaluation 非成员。
 
 ## 3. Rethinking Membership Inference Attacks Against Transfer Learning
 
@@ -145,7 +145,7 @@ Adapter 的这些固定候选攻击仍使用 100/1000。
 
 ## Shared evaluation
 
-所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。BERT/GPT2 的五种固定攻击使用目标客户端完整训练集中的 `M` 个成员，以及类别尽力匹配的 `M` 个全局独立 evaluation 非成员；单类非成员不足时从其他仍有容量的类别确定性补足，并记录实际标签直方图与 TV 距离。仍可从中派生固定 100/100 论文对照视图，该视图也采用相同的尽力匹配规则。BERT 与 GPT2-Large 的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员，完整 Batch 时为 16/160；Visual Adapter 同样使用 `N/10N`，完整 Batch 时为 32/320。这些真实 Batch 攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。CLIP-MLP 运行全部十种通用攻击，但继续使用原有固定候选协议，不启用真实 Batch 成员定义。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
+所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。BERT、GPT2、Visual Adapter 与 CLIP-LoRA 的五种固定攻击使用目标客户端完整训练集中的 `M` 个成员，以及类别尽力匹配的 `M` 个全局独立 evaluation 非成员；单类非成员不足时从其他仍有容量的类别确定性补足，并记录实际标签直方图与 TV 距离。仍可从中派生固定 100/100 论文对照视图，该视图也采用相同的尽力匹配规则。四类模型的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员；BERT/GPT2 完整 Batch 为 16/160，Visual Adapter/CLIP-LoRA 为 32/320。这些真实 Batch 攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。CLIP-MLP 运行全部十种通用攻击，但继续使用原有固定候选协议，不启用真实 Batch 成员定义。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
 
 ## CLIP 图像编码器 + 两层 MLP 场景
 
@@ -192,10 +192,10 @@ batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。�
 边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
 余弦相似度的 `promptres`。
 
-统一 sweep 对 Visual Adapter 和 CLIP-LoRA 提供进程内 ProjRes：FedSGD 路径直接读取
-客户端上传梯度，不再从参数差反推。Visual Adapter 每 10 轮
-在共享 exact-batch 审计器中攻击第一层 down-projection；LoRA 在独立配置轮攻击视觉 Q 投影的
-`lora_A` 下投影因子，并使用该层输入的 CLIP class-token 隐藏表示。两者真实
+统一 sweep 对 Visual Adapter 和 CLIP-LoRA 提供共享 exact-batch ProjRes：FedSGD
+路径直接读取客户端上传梯度，不再从参数差反推。两者均每 10 轮运行；Visual
+Adapter 攻击第一层 down-projection，LoRA 攻击视觉 Q 投影的 `lora_A` 下投影因子，
+并使用该层输入的 CLIP class-token 隐藏表示。两者真实
 上传均只来自一个 batch，因此与论文 FedSGD 观测一致。ProjRes 以负 L1 残差做
 ranking-only 评价，不再使用固定残差阈值。CLIP-MLP 的统一攻击任务
 不执行 ProjRes；其独立严格验证入口仍然保留。

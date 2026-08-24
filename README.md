@@ -15,7 +15,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 | --- | --- | --- | --- | ---: | ---: | --- |
 | CLIP-MLP | 冻结 CLIP 图像编码器后的两层 MLP | FedAvg | 1 个完整 local epoch | 150 | 0.1 | 10 种通用攻击 |
 | Visual Adapter | 图像、文本两侧瓶颈 Adapter | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.001 | 10 种通用攻击 + ProjRes |
-| CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.0002 | 6 种 FedMIA 系列攻击 + 独立 ProjRes |
+| CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.0002 | 10 种通用攻击 + ProjRes |
 | BERT-Base Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.005 | 10 种通用攻击 + ProjRes |
 | GPT2-Large Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.001 | 10 种通用攻击 + ProjRes |
 
@@ -55,43 +55,69 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 所有输出分数统一为“越大越像成员”。完整论文与公式映射见
 [`docs/attack_mapping.md`](docs/attack_mapping.md)。
 
-### 各模型的实际支持范围
+### 各模型的攻击支持范围
 
-| 模型 | 六种 FedMIA 系列攻击 | `gradient_diff` / `score_diff` / `score_ratio` / `fta` | ProjRes |
+| 模型 | 默认通用攻击 | ProjRes | 说明 |
 | --- | --- | --- | --- |
-| CLIP-MLP | 默认启用 | 默认启用 | 不进入统一 sweep；保留独立严格入口 |
-| Visual Adapter | 默认启用 | 默认启用 | 统一 exact-batch 审计器，默认启用 |
-| CLIP-LoRA | 默认启用 | 共享审计器可配置，但当前 sweep 不默认启用 | 在同一训练任务内独立运行 |
-| BERT-Base Adapter | 默认启用 | 默认启用 | 统一 exact-batch 审计器，默认启用 |
-| GPT2-Large Adapter | 默认启用 | 默认启用 | 统一 exact-batch 审计器，默认启用 |
+| CLIP-MLP | 除 `projres` 外的 10 种 | 独立严格入口 | 统一 sweep 不运行 ProjRes |
+| Visual Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
+| CLIP-LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
+| BERT-Base Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种 |
+| GPT2-Large Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种 |
 
-这里的“六种 FedMIA 系列攻击”指四个 FedMIA 对照基线加
-`fedmia_loss`、`fedmia_cosine`。CLIP-LoRA 的四种更新攻击虽然可以通过共享配置
-路径启用，但当前缺少与 MLP/Adapter 同等级的默认 sweep 和专项回归覆盖，不应与
-正式默认集合混为一谈。
+“代码已注册/可配置”和“正式 sweep 默认启用”是两个不同概念。当前 11 个注册名
+均列在上一表；批量复现实验应以上表的默认集合为准。Visual Adapter、CLIP-LoRA、
+BERT 和 GPT2 现使用相同的攻击分组与候选定义；CLIP-MLP 的独立 ProjRes 用于严格
+复现，不应误写成统一 MLP sweep 的第 11 种攻击。
 
-## 候选集与成员定义
+## 各攻击的成员与非成员定义
 
-不同协议回答的成员问题不同，不能只按攻击名称合并比较。
+仓库存在两种成员问题：
 
-| 模型/视图 | 成员 | 非成员 | 默认规模 |
-| --- | --- | --- | --- |
-| CLIP-MLP 通用攻击 | 目标客户端历史训练集样本 | 该客户端从未训练的独立测试样本 | 每客户端按类别精确 1:1，最多 5000/5000 |
-| Visual Adapter 六种 exact-batch 攻击 | 当轮目标客户端真实 FedSGD batch | 全局独立 evaluation 池中按标签匹配样本 | 完整 batch 时 32/320 |
-| Visual Adapter 其余五种攻击 | 固定历史训练成员 | 固定、从未训练的全局非成员 | 100/1000 |
-| CLIP-LoRA 通用攻击 | 目标客户端历史训练集样本 | 该客户端独立测试样本 | 按类别精确 1:1，最多 5000/5000 |
-| BERT/GPT2 六种 exact-batch 攻击 | 当轮真实 FedSGD batch | 按该 batch 标签直方图抽取的独立 evaluation 样本 | 16/160 |
-| BERT/GPT2 其余五种攻击 | 目标客户端完整训练集 | 从未训练的全局非成员，按类别尽力匹配并补足 | `M/M`，`M` 为目标客户端训练集大小 |
+- **真实 Batch（exact-batch）**：判断样本是否出现在目标客户端产生当轮上传的
+  真实 mini-batch 中。每个审计轮重新构造候选集，不跨轮拼接成员。
+- **固定候选（fixed-candidate）**：判断样本是否属于目标客户端历史训练集。训练
+  开始前固定成员/非成员候选，所有审计轮复用同一集合。
 
-六种 exact-batch 攻击为 `blackbox_loss`、`grad_cosine`、`gradient_diff`、
-`score_diff`、`score_ratio` 和 `projres`。它们在每个审计轮独立使用真实上传
-batch，不跨轮拼接不同成员集合。
+同一个攻击名在不同模型上可能使用不同成员问题。逐攻击的当前划分如下：
+
+| 攻击 | CLIP-MLP | Visual Adapter / CLIP-LoRA / BERT / GPT2 | 成员 | 非成员 |
+| --- | --- | --- | --- | --- |
+| `blackbox_loss` | 固定候选 | 真实 Batch | 固定时为目标客户端训练样本；真实 Batch 时为当轮上传 batch | 固定时为从未训练的独立测试/evaluation 样本；真实 Batch 时为按当轮成员标签直方图抽取的独立 evaluation 样本 |
+| `loss_series` | 固定候选 | 固定候选 | 目标客户端历史训练样本 | 从未训练的独立测试/evaluation 样本 |
+| `grad_cosine` | 固定候选 | 真实 Batch | 同 `blackbox_loss` | 同 `blackbox_loss` |
+| `avg_cosine` | 固定候选 | 固定候选 | 目标客户端历史训练样本 | 从未训练的独立测试/evaluation 样本 |
+| `fedmia_loss` | 固定候选 | 固定候选 | 目标客户端历史训练样本 | 从未训练的独立测试/evaluation 样本；其他客户端只用于构造 FedMIA null 分布，不会自动成为目标客户端的成员 |
+| `fedmia_cosine` | 固定候选 | 固定候选 | 目标客户端历史训练样本 | 从未训练的独立测试/evaluation 样本；其他客户端只用于构造 FedMIA null 分布，不会自动成为目标客户端的成员 |
+| `gradient_diff` | 固定候选 | 真实 Batch | 固定时为目标客户端训练样本；真实 Batch 时为当轮上传 batch | 固定时为独立测试样本；真实 Batch 时为标签匹配的独立 evaluation 样本 |
+| `score_diff` | 固定候选 | 真实 Batch | 同 `gradient_diff` | 同 `gradient_diff` |
+| `score_ratio` | 固定候选 | 真实 Batch | 同 `gradient_diff` | 同 `gradient_diff` |
+| `fta` | 固定候选 | 固定候选 | 目标客户端历史训练样本 | 从未训练的独立测试/evaluation 样本 |
+| `projres` | 仅独立严格路径；成员是产生所观察上传的真实 batch | 统一真实 Batch | 产生被观察更新的当轮真实 batch | 与该 batch 互斥、从未用于该目标上传的非成员；统一路径从独立 evaluation 池按标签抽取 |
+
+### 各模型的候选规模与抽样方式
+
+| 模型/视图 | 成员与非成员来源 | 默认规模 |
+| --- | --- | --- |
+| CLIP-MLP 10 种通用攻击 | 每个目标客户端的训练样本，对该客户端从未训练的独立测试样本；按类别精确配对 | 1:1，最多 5000/5000 |
+| Visual Adapter / CLIP-LoRA 的 5 种固定候选攻击 | 目标客户端完整训练集，对全局独立 evaluation 样本；按类别尽力匹配，不足类别由其他类别确定性补足 | `M/M`，`M` 为目标客户端训练集大小 |
+| Visual Adapter / CLIP-LoRA 的 6 种真实 Batch 攻击 | 当轮真实 batch，对严格按其标签直方图抽取的独立 evaluation 非成员 | `N/10N`；完整 batch 为 32/320 |
+| BERT/GPT2 的 5 种固定候选攻击 | 目标客户端完整训练集，对全局独立 evaluation 样本；按类别尽力匹配，不足类别由其他类别确定性补足 | `M/M`，`M` 为目标客户端训练集大小 |
+| BERT/GPT2 的 6 种真实 Batch 攻击 | 当轮真实 batch，对严格按其标签直方图抽取的独立 evaluation 非成员 | `N/10N`；完整 batch 为 16/160 |
+| CLIP-MLP 独立 ProjRes | 所观察上传对应的真实 batch，对互斥非成员池 | 成员不超过配置的 batch/候选上限；非成员默认 1,000--20,000 |
+
+这里的 6 种真实 Batch 攻击是 `blackbox_loss`、`grad_cosine`、
+`gradient_diff`、`score_diff`、`score_ratio` 和 `projres`；5 种固定候选攻击是
+`loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine` 和 `fta`。
+CLIP-MLP 独立 ProjRes 的互斥非成员池可包含所有客户端测试样本和其他客户端训练样本；
+“非成员”在这里严格指未参与所观察的目标客户端上传，并不等价于从未参与过全局
+训练。统一 exact-batch 路径则只从从未训练的独立 evaluation 池抽取非成员。
 
 ProjRes 只输出连续的负 L1 投影残差并按分数排序，通过 ROC/AUC 或指定 FPR 的
 TPR 评价；不再使用跨模型、跨轮次不可校准的固定残差阈值生成成员判断。
 
-BERT/GPT2 固定候选攻击的经验 FPR 分辨率由目标客户端训练集大小决定；其他模型
-仍按各自配置预算构造候选池。32/320 或 16/160 的真实 batch 视图只正式报告
+Visual Adapter、CLIP-LoRA、BERT 和 GPT2 固定候选攻击的经验 FPR 分辨率由目标
+客户端训练集大小决定。32/320 或 16/160 的真实 batch 视图只正式报告
 可由样本量解析的低 FPR 指标。`summary.json` 会保存成员/非成员
 数量、实际 FPR 分辨率、标签匹配方式和候选来源，不应在样本量不足时把插值得到的
 极低 FPR 数值当作稳定结论。
@@ -294,10 +320,11 @@ bash scripts/run_projres_mlp_real.sh
 
 审计器按攻击所需信号调度计算，不会无条件生成全部梯度和前向结果：
 
-- CLIP-MLP/LoRA 的 `blackbox_loss`、`grad_cosine` 默认使用预先固定的最后审计轮。
+- CLIP-MLP 的 `blackbox_loss`、`grad_cosine` 默认使用预先固定的最后审计轮。
 - `loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine` 使用多轮轨迹。
 - CLIP-MLP 的四种更新攻击每 10 个已完成通信轮统计一次。
-- Visual Adapter 的六种 exact-batch 攻击每 10 轮使用该轮真实上传 batch 独立评估。
+- Visual Adapter 和 CLIP-LoRA 的六种 exact-batch 攻击每 10 轮使用该轮真实上传
+  batch 独立评估；五种固定候选攻击也每 10 轮统计一次。
 - BERT 的 `loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine` 和 `fta`
   每 10 轮统计一次，六种真实 Batch 攻击每 50 轮统计一次；GPT2 的全部配置攻击
   仍每 50 轮统计一次。逐轮结果保存在 `attack_round_metrics.csv`。
@@ -320,8 +347,8 @@ bash scripts/run_projres_mlp_real.sh
 - `balanced_holdout`：目标客户端训练集与其独立测试集按类别精确 1:1；
 - `balanced_global_holdout`：目标训练成员与全局独立 evaluation 非成员按固定比例抽样；要求完整成员池时，类别不足会由其他类别确定性补足，并记录实际标签 TV 距离。
 
-当前统一 CLIP-MLP 和 CLIP-LoRA sweep 使用 `balanced_holdout`；Visual Adapter、
-BERT 和 GPT2 的 exact-batch 任务使用 `balanced_global_holdout`。
+当前只有统一 CLIP-MLP sweep 使用 `balanced_holdout`；Visual Adapter、CLIP-LoRA、
+BERT 和 GPT2 使用 `balanced_global_holdout`。
 
 ## 隐私防御与 ICLR 分析
 
@@ -367,8 +394,8 @@ results/
 - `candidate_selection.pt` 固定历史候选池；`exact_batch_candidate_selection.pt`
   保存每个真实 batch 审计轮的成员/非成员索引。
 - `attack_round_metrics.csv` 保存周期攻击结果。
-- Visual Adapter、BERT 和 GPT2 的统一 ProjRes 与其他攻击共享上述输出，不生成
-  独立 ProjRes 目录。
+- Visual Adapter、CLIP-LoRA、BERT 和 GPT2 的统一 ProjRes 与其他攻击共享上述
+  输出，不生成独立 ProjRes 目录。
 
 CLIP sweep 还在 `results/` 根目录生成实验组汇总：
 

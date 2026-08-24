@@ -362,19 +362,27 @@ def validate_config(config: dict) -> None:
             "Exact-batch attacks must also appear in audit.attacks: "
             + ", ".join(missing_exact_batch_attacks)
         )
-    if exact_batch_attacks and model_type != "visual_adapter":
+    if exact_batch_attacks and model_type not in {
+        "visual_adapter",
+        "clip_lora",
+    }:
         raise ValueError(
-            "CLIP exact-batch membership is enabled only for Visual Adapter; "
-            "CLIP-MLP keeps its original fixed-candidate protocol."
+            "CLIP exact-batch membership is enabled only for Visual Adapter "
+            "and CLIP-LoRA; CLIP-MLP keeps its original fixed-candidate "
+            "protocol."
         )
     if "projres" in attacks and "projres" not in exact_batch_attacks:
         raise ValueError(
-            "Visual Adapter ProjRes must use the shared exact-batch "
-            "membership protocol."
+            "Visual Adapter and CLIP-LoRA ProjRes must use the shared "
+            "exact-batch membership protocol."
         )
-    if "projres" in exact_batch_attacks and model_type != "visual_adapter":
+    if "projres" in exact_batch_attacks and model_type not in {
+        "visual_adapter",
+        "clip_lora",
+    }:
         raise ValueError(
-            "Unified CLIP ProjRes is supported only for Visual Adapter."
+            "Unified CLIP ProjRes is supported only for Visual Adapter and "
+            "CLIP-LoRA."
         )
     pooled_audit = audit_client_ids == "all" or (
         isinstance(audit_client_ids, list) and len(audit_client_ids) > 1

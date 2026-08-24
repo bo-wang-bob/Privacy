@@ -61,7 +61,10 @@ audit:
     - fta
     - projres
   candidate_sampling: balanced_global_holdout
-  nonmember_to_member_ratio: 10
+  # Match BERT/GPT2 for the five fixed-candidate attacks: retain the complete
+  # target-client training set and pair it with an equal-sized global holdout.
+  require_full_target_train_members: true
+  nonmember_to_member_ratio: 1
   exact_batch_membership_attacks:
     - blackbox_loss
     - grad_cosine
@@ -71,9 +74,9 @@ audit:
     - score_ratio
   exact_batch_nonmember_to_member_ratio: 10
   paper_balanced_evaluation_size: 100
-  low_fpr_min_nonmembers: 1000
-  low_fpr_max_members: 100
-  low_fpr_max_nonmembers: 1000
+  low_fpr_min_nonmembers: 2
+  low_fpr_max_members: 0
+  low_fpr_max_nonmembers: 0
   match_candidate_labels: true
   audit_batch_size: 512
   attack_audit_intervals:
