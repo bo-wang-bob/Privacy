@@ -1,7 +1,7 @@
 # Federated PEFT Membership-Inference Benchmark
 
-本仓库用于研究联邦参数高效微调（PEFT）中的成员隐私泄漏。当前维护的实验覆盖
-CLIP-MLP、双侧 CLIP Adapter、CLIP-LoRA、BERT-Base Adapter 和
+本仓库用于研究联邦学习与参数高效微调（PEFT）中的成员隐私泄漏。当前维护的实验
+覆盖 ResNet18、CLIP-MLP、双侧 CLIP Adapter、CLIP-LoRA、BERT-Base Adapter 和
 GPT2-Large Adapter，并在统一训练任务中完成模型训练、成员推理审计、低 FPR
 指标计算、候选集留档和结果汇总。
 
@@ -13,6 +13,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 
 | 模型 | 可训练部分 | 联邦方法 | 每轮客户端训练 | 默认轮数 | 默认学习率 | 默认攻击 |
 | --- | --- | --- | --- | ---: | ---: | --- |
+| ResNet18 / CIFAR100 | 完整 CIFAR ResNet18（GroupNorm） | FedAvg | 1 个完整 local epoch | 300 | 0.1，逐轮乘 0.99 | FedMIA-Loss |
 | CLIP-MLP | 冻结 CLIP 图像编码器后的两层 MLP | FedAvg | 1 个完整 local epoch | 150 | 0.1 | 10 种通用攻击 |
 | Visual Adapter | 图像、文本两侧瓶颈 Adapter | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.001 | 10 种通用攻击 + ProjRes |
 | CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.0002 | 10 种通用攻击 + ProjRes |
@@ -31,7 +32,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 - 所有聚合和保存操作只处理 `requires_grad=True` 的参数，冻结主干不上传。
 
 `main.py` 仍保留通用 CLIP prompt 和 PromptFL 兼容入口，但当前重点维护和批量
-复现的是上表中的五类模型。
+复现的是上表中的六类模型。
 
 ## 成员推理攻击
 
@@ -59,6 +60,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 
 | 模型 | 默认通用攻击 | ProjRes | 说明 |
 | --- | --- | --- | --- |
+| ResNet18 / CIFAR100 | `fedmia_loss` | 不支持 | 论文复现入口；同时输出同一固定候选的逐样本 ICLR 评分 |
 | CLIP-MLP | 除 `projres` 外的 10 种 | 独立严格入口 | 统一 sweep 不运行 ProjRes |
 | Visual Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
 | CLIP-LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
@@ -99,6 +101,7 @@ BERT 和 GPT2 现使用相同的攻击分组与候选定义；CLIP-MLP 的独立
 
 | 模型/视图 | 成员与非成员来源 | 默认规模 |
 | --- | --- | --- |
+| ResNet18 / CIFAR100 FedMIA-Loss | 目标客户端 0 的完整训练集；非成员由完整独立测试集和其余 9 个客户端训练集等来源构成 | 5000/10000；10 个非成员来源各 1000 |
 | CLIP-MLP 10 种通用攻击 | 每个目标客户端的训练样本，对该客户端从未训练的独立测试样本；按类别精确配对 | 1:1，最多 5000/5000 |
 | Visual Adapter / CLIP-LoRA 的 5 种固定候选攻击 | 目标客户端完整训练集，对全局独立 evaluation 样本；按类别尽力匹配，不足类别由其他类别确定性补足 | `M/M`，`M` 为目标客户端训练集大小 |
 | Visual Adapter / CLIP-LoRA 的 6 种真实 Batch 攻击 | 当轮真实 batch，对严格按其标签直方图抽取的独立 evaluation 非成员 | `N/10N`；完整 batch 为 32/320 |
@@ -174,6 +177,8 @@ cache_dir: ./checkpoints/clip-vit-base-patch32
 
 图像数据使用本地 `data_root` 且 `download=False`。其他已接入图像数据集及目录
 约定见 [`utils/data_loader.py`](utils/data_loader.py)。
+默认 `data_root: ./data` 时，CIFAR100 文件应位于
+`./data/CIFAR100/data/cifar-100-python/`；运行脚本不会覆盖或自动下载数据。
 
 文本任务支持 SST-5、CoLA 和 IMDB。准备 Hugging Face 模型和 SST-5 的辅助脚本：
 
@@ -185,6 +190,41 @@ CoLA 和 IMDB 分别从 `data/huggingface/cola`、`data/huggingface/imdb` 等本
 读取；evaluation split 从不参与任何客户端训练。
 
 ## 快速开始
+
+### ResNet18 / CIFAR100 FedMIA-Loss 论文配置
+
+稳定参数集中在
+[`configs/resnet18_cifar100_fedmia_loss.yaml`](configs/resnet18_cifar100_fedmia_loss.yaml)：
+完整 CIFAR100、随机等量 IID、10 个客户端全参与、每客户端 5000 个训练样本、
+batch size 100、1 个本地 epoch、300 个通信轮、SGD momentum 0.9、weight decay
+0.0005。模型使用 CIFAR 3x3 stem 和 32 组 GroupNorm，不使用数据增强。
+
+FedMIA-Loss 每 10 个已完成通信轮审计一次。成员为目标客户端 0 的全部 5000 个
+训练样本；10000 个非成员由完整独立测试集抽 1000 个，再从其余 9 个客户端的
+训练集各抽 1000 个。每轮以其余客户端的负交叉熵构造三西格玛过滤后的高斯 null，
+计算目标客户端单尾 CDF，最后对 30 个审计轮的 CDF 分数取均值。
+
+同一审计轮还对全部 15000 个候选逐样本计算只读 ICLR 分数
+`L(x; theta_-k) - L(x; theta_k)`：`theta_k` 是目标客户端该轮上传的 post-local
+模型，`theta_-k` 由服务器发布的聚合模型按目标客户端实际 FedAvg 权重反解得到。
+分数越大，表示该样本越特异于目标客户端。该逻辑不筛除样本，不启用 ICLR 防御，
+也不改变 FedMIA 论文训练配置中的 SGD、momentum、weight decay 或学习率日程。
+
+```bash
+# 只检查命令
+bash scripts/run_resnet18_cifar100_fedmia_loss.sh --dry-run
+
+# 正式运行（默认 GPU 0、seed 1）
+bash scripts/run_resnet18_cifar100_fedmia_loss.sh
+
+# 指定设备和数据目录
+bash scripts/run_resnet18_cifar100_fedmia_loss.sh \
+  --gpu 1 --data_root /path/to/data
+```
+
+论文附录 Table 3 写明学习率每轮乘 `0.99`，因此本配置以该表为准。作者公开
+`run.sh` 使用 cosine schedule；若要对齐公开脚本而非论文表格，应另建配置，不能
+把两种学习率日程的结果直接合并。
 
 ### 1. 先检查最终参数
 
@@ -383,6 +423,9 @@ results/
         ├── candidate_selection.pt
         ├── exact_batch_candidate_selection.pt
         ├── attack_round_metrics.csv
+        ├── iclr_candidate_round_scores.csv
+        ├── iclr_candidate_scores.csv
+        ├── iclr_candidate_relationship.json
         └── projres_strict.json       # 仅独立 ProjRes 路径
 ```
 
@@ -394,6 +437,10 @@ results/
 - `candidate_selection.pt` 固定历史候选池；`exact_batch_candidate_selection.pt`
   保存每个真实 batch 审计轮的成员/非成员索引。
 - `attack_round_metrics.csv` 保存周期攻击结果。
+- ResNet18/CIFAR100 FedMIA 任务的 `iclr_candidate_round_scores.csv` 保存每个审计轮、
+  每个候选的目标/其余客户端损失及 ICLR 分数；`iclr_candidate_scores.csv` 保存
+  跨轮均值、方差、末轮分数并按 `sample_index` 连接最终 FedMIA-Loss 分数；关系
+  与成员推理指标汇总在 `iclr_candidate_relationship.json`。
 - Visual Adapter、CLIP-LoRA、BERT 和 GPT2 的统一 ProjRes 与其他攻击共享上述
   输出，不生成独立 ProjRes 目录。
 

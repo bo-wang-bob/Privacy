@@ -685,10 +685,11 @@ class ServerBase:
             if str(getattr(self.model, "model_type", "")).lower() in {
                 "bert_adapter",
                 "gpt2_adapter",
+                "resnet18",
             }:
-                # Every synchronous client starts from the same global PEFT
-                # state. Sharing this immutable snapshot avoids 30 redundant
-                # copies of a large ratio-2 Adapter state.
+                # Every synchronous client starts from the same global state.
+                # Sharing this immutable snapshot avoids redundant copies for
+                # large Transformer Adapters and full ResNet18 parameters.
                 shared_base_state = self._clone_state(
                     self.ctx.get_base_model_state()
                 )
@@ -891,6 +892,7 @@ class ServerBase:
                 base_states=base_states,
                 protocol_messages=self.ctx.protocol_messages,
                 released_states=self.ctx.new_model_state,
+                aggregation_weights=self.ctx.aggregation_weights,
                 learning_rate=self.current_learning_rate,
             )
             if unified_projres_payload is not None:
@@ -971,6 +973,15 @@ class ServerBase:
                     getattr(self.aggregator, "aggregation_weighting", "uniform")
                 ),
                 "frozen_backbone": True,
+            }
+        if str(getattr(self.model, "model_type", "")).lower() == "resnet18":
+            method_summary["resnet18"] = {
+                "architecture": "cifar_resnet18_groupnorm32",
+                "trainable_scope": "full_model",
+                "client_upload": "post_local_epoch_model_state",
+                "data_augmentation": False,
+                "local_training_samples_per_client": list(self.ctx.samples_num),
+                "paper_alignment": "FedMIA_ResNet18_CIFAR100",
             }
         if str(getattr(self.model, "model_type", "")).lower() in {
             "bert_adapter",

@@ -37,7 +37,10 @@ from privacy_defenses import (
     attach_hamp_output_transform,
     attach_output_temperature_transform,
 )
+from privacy_defenses.iclr import infer_other_clients_state
 from privacy_defenses.iclr_validation import (
+    _pearson,
+    _spearman,
     validate_iclr_attack_relationships,
 )
 from utils.data_loader import group_idx_by_class
@@ -565,6 +568,31 @@ class MembershipAuditor:
         self.candidate_local_indices: torch.Tensor | None = None
         self.paper_balanced_candidate_indices: torch.Tensor | None = None
         self.paper_balanced_evaluation: dict | None = None
+        self.iclr_candidate_scoring = bool(
+            self.config.get("iclr_candidate_scoring", False)
+        )
+        self.candidate_source_names: list[str] | None = None
+        if self.iclr_candidate_scoring:
+            if self.federated_method != "fedavg":
+                raise ValueError(
+                    "ICLR candidate scoring requires linear FedAvg aggregation."
+                )
+            if self.candidate_sampling_mode != "fedmia_mix" or set(
+                self.attacks
+            ) != {"fedmia_loss"}:
+                raise ValueError(
+                    "ICLR candidate scoring requires the fixed fedmia_mix view "
+                    "with FedMIA-Loss."
+                )
+            if self.pooled_client_audit:
+                raise ValueError(
+                    "ICLR candidate scoring currently supports one target client."
+                )
+            if self.defense_name != "none":
+                raise ValueError(
+                    "ICLR candidate scoring is observational and requires "
+                    "defense.name=none."
+                )
 
         if self.enabled:
             if self.candidate_sampling_mode == "balanced_global_holdout":
@@ -748,6 +776,18 @@ class MembershipAuditor:
                     self.candidate_sampling_by_client = {
                         str(target_client_id): sampling
                     }
+                    source_names = ["target_client_train"] * int(
+                        member_labels.numel()
+                    )
+                    for source_name, source_count in sampling[
+                        "nonmember_source_counts"
+                    ].items():
+                        source_names.extend([source_name] * int(source_count))
+                    if len(source_names) != int(self.labels.numel()):
+                        raise AssertionError(
+                            "FedMIA candidate-source metadata is not sample-aligned."
+                        )
+                    self.candidate_source_names = source_names
                     candidate_support = set(member_labels.unique().tolist())
                     other_training_support = set()
                     for user in users:
@@ -3269,6 +3309,90 @@ class MembershipAuditor:
             raise ValueError(f"No released prompt is available for client {user_id}.")
         return released
 
+    def _attach_iclr_candidate_scores(
+        self,
+        observation: dict,
+        *,
+        base_state: dict[str, torch.Tensor],
+        updated_states: dict[int, dict[str, torch.Tensor]],
+        base_states: dict[int, dict[str, torch.Tensor]] | None,
+        protocol_messages: dict[int, dict] | None,
+        released_states: dict[int, dict[str, torch.Tensor]] | None,
+        aggregation_weights: dict[int, float] | None,
+        learning_rate: float | None,
+    ) -> None:
+        """Attach sample-aligned observational ICLR scores to one audit round.
+
+        For every fixed FedMIA candidate this computes
+        ``L(x; theta_-k) - L(x; theta_k)``. ``theta_k`` is the target client's
+        observable post-local-epoch upload and ``theta_-k`` is reconstructed
+        from the released FedAvg state after removing that client's configured
+        aggregation contribution. No sample is filtered and training is not
+        changed.
+        """
+        if not self.iclr_candidate_scoring:
+            return
+        client_ids = observation["client_ids"].tolist()
+        if self.target_client_id not in client_ids:
+            raise ValueError(
+                "ICLR candidate scoring requires the target client in the "
+                "observed FedAvg round."
+            )
+        if "confidence" not in observation:
+            raise ValueError(
+                "ICLR candidate scoring requires per-client candidate losses."
+            )
+        if not released_states or 0 not in released_states:
+            raise ValueError(
+                "ICLR candidate scoring requires the released aggregated state."
+            )
+        if (
+            not aggregation_weights
+            or self.target_client_id not in aggregation_weights
+        ):
+            raise ValueError(
+                "ICLR candidate scoring requires the target aggregation weight."
+            )
+
+        target_position = client_ids.index(self.target_client_id)
+        target_base = (
+            base_state
+            if base_states is None
+            else base_states[self.target_client_id]
+        )
+        target_message = (
+            None
+            if protocol_messages is None
+            else protocol_messages.get(self.target_client_id)
+        )
+        own_state = self._observable_client_state(
+            self.target_client_id,
+            updated_states[self.target_client_id],
+            released_states,
+            base_state=target_base,
+            protocol_message=target_message,
+            learning_rate=learning_rate,
+        )
+        own_weight = float(aggregation_weights[self.target_client_id])
+        other_state = infer_other_clients_state(
+            global_state=released_states[0],
+            own_state=own_state,
+            own_weight=own_weight,
+        )
+        own_losses = -observation["confidence"][target_position]
+        self.model.load_state_dict(other_state, strict=False)
+        _, _, other_losses = self._candidate_outputs(
+            self.model,
+            require_representation=False,
+        )
+        scores = other_losses - own_losses
+        if scores.numel() != self.labels.numel():
+            raise AssertionError("ICLR candidate scores lost sample alignment.")
+        observation["iclr_candidate_own_loss"] = own_losses.detach().cpu()
+        observation["iclr_candidate_other_loss"] = other_losses.detach().cpu()
+        observation["iclr_candidate_score"] = scores.detach().cpu()
+        observation["iclr_candidate_aggregation_weight"] = own_weight
+
     def _observe_exact_batch_round(
         self,
         *,
@@ -3451,6 +3575,7 @@ class MembershipAuditor:
         base_states: dict[int, dict[str, torch.Tensor]] | None = None,
         protocol_messages: dict[int, dict] | None = None,
         released_states: dict[int, dict[str, torch.Tensor]] | None = None,
+        aggregation_weights: dict[int, float] | None = None,
         learning_rate: float | None = None,
     ) -> dict | None:
         active_attacks = self._attacks_for_round(round_index)
@@ -3901,6 +4026,16 @@ class MembershipAuditor:
                 if protocol_messages is not None and user_id in protocol_messages
             }
             observation["audit_view"] = self.audit_view
+        self._attach_iclr_candidate_scores(
+            observation,
+            base_state=base_state,
+            updated_states=updated_states,
+            base_states=base_states,
+            protocol_messages=protocol_messages,
+            released_states=released_states,
+            aggregation_weights=aggregation_weights,
+            learning_rate=learning_rate,
+        )
         self.observations.append(observation)
         logger.debug("Collected privacy signals for round %s", round_index)
         return exact_batch_payload
@@ -4729,6 +4864,245 @@ class MembershipAuditor:
         logger.info("Saved %d periodic attack metric rows to %s", len(rows), path)
         return len(rows)
 
+    def _write_iclr_candidate_artifacts(self) -> dict | None:
+        """Persist sample-aligned ICLR scores for the fixed FedMIA candidates.
+
+        The raw artifact keeps one score per candidate and audit round.  The
+        compact artifact aggregates those scores by sample and joins the final
+        FedMIA-Loss score, so downstream analysis never has to infer candidate
+        alignment from row order.
+        """
+        if not self.iclr_candidate_scoring:
+            return None
+        observations = [
+            observation
+            for observation in self.observations
+            if "iclr_candidate_score" in observation
+        ]
+        if not observations:
+            raise ValueError(
+                "ICLR candidate scoring was enabled but no scored audit round "
+                "was collected."
+            )
+
+        candidate_count = int(self.labels.numel())
+        rounds = [int(observation["round"]) + 1 for observation in observations]
+
+        def stacked_field(name: str) -> torch.Tensor:
+            parts = [
+                observation[name].detach().cpu().to(torch.float64).flatten()
+                for observation in observations
+            ]
+            if any(part.numel() != candidate_count for part in parts):
+                raise ValueError(
+                    f"ICLR field {name!r} is not aligned with all candidates."
+                )
+            return torch.stack(parts)
+
+        scores = stacked_field("iclr_candidate_score")
+        own_losses = stacked_field("iclr_candidate_own_loss")
+        other_losses = stacked_field("iclr_candidate_other_loss")
+        weights = [
+            float(observation["iclr_candidate_aggregation_weight"])
+            for observation in observations
+        ]
+        if not torch.isfinite(scores).all():
+            raise ValueError("ICLR candidate scores contain non-finite values.")
+
+        membership = self.membership.detach().cpu().long().flatten()
+        class_labels = self.labels.detach().cpu().long().flatten()
+        sources = self.candidate_source_names
+        if sources is None:
+            sources = ["unknown"] * candidate_count
+        if len(sources) != candidate_count:
+            raise ValueError("ICLR candidate-source metadata is not sample-aligned.")
+
+        fedmia_result = next(
+            (result for result in self.results if result.name == "fedmia_loss"),
+            None,
+        )
+        if fedmia_result is None:
+            raise ValueError(
+                "ICLR candidate scoring requires a completed FedMIA-Loss result."
+            )
+        fedmia_scores = torch.full(
+            (candidate_count,), float("nan"), dtype=torch.float64
+        )
+        fedmia_indices = fedmia_result.sample_indices.detach().cpu().long()
+        fedmia_scores[fedmia_indices] = (
+            fedmia_result.scores.detach().cpu().to(torch.float64)
+        )
+        if not torch.isfinite(fedmia_scores).all():
+            raise ValueError(
+                "FedMIA-Loss did not return one finite score for every ICLR candidate."
+            )
+
+        round_path = os.path.join(
+            self.results_dir, "iclr_candidate_round_scores.csv"
+        )
+        with open(round_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                (
+                    "communication_round",
+                    "sample_index",
+                    "candidate_source",
+                    "membership",
+                    "class_label",
+                    "own_loss",
+                    "other_loss",
+                    "iclr_score",
+                    "target_aggregation_weight",
+                )
+            )
+            membership_values = membership.tolist()
+            class_values = class_labels.tolist()
+            for round_position, communication_round in enumerate(rounds):
+                for sample_index, (own_loss, other_loss, score) in enumerate(
+                    zip(
+                        own_losses[round_position].tolist(),
+                        other_losses[round_position].tolist(),
+                        scores[round_position].tolist(),
+                    )
+                ):
+                    writer.writerow(
+                        (
+                            communication_round,
+                            sample_index,
+                            sources[sample_index],
+                            membership_values[sample_index],
+                            class_values[sample_index],
+                            own_loss,
+                            other_loss,
+                            score,
+                            weights[round_position],
+                        )
+                    )
+
+        score_mean = scores.mean(dim=0)
+        score_std = scores.std(dim=0, unbiased=False)
+        score_min = scores.min(dim=0).values
+        score_max = scores.max(dim=0).values
+        own_loss_mean = own_losses.mean(dim=0)
+        other_loss_mean = other_losses.mean(dim=0)
+        sample_path = os.path.join(
+            self.results_dir, "iclr_candidate_scores.csv"
+        )
+        with open(sample_path, "w", newline="", encoding="utf-8") as file:
+            writer = csv.writer(file)
+            writer.writerow(
+                (
+                    "sample_index",
+                    "candidate_source",
+                    "membership",
+                    "class_label",
+                    "observation_count",
+                    "iclr_score_mean",
+                    "iclr_score_std",
+                    "iclr_score_min",
+                    "iclr_score_max",
+                    "iclr_score_last",
+                    "iclr_score_last_round",
+                    "own_loss_mean",
+                    "other_loss_mean",
+                    "fedmia_loss_score",
+                )
+            )
+            for sample_index in range(candidate_count):
+                writer.writerow(
+                    (
+                        sample_index,
+                        sources[sample_index],
+                        membership_values[sample_index],
+                        class_values[sample_index],
+                        len(rounds),
+                        float(score_mean[sample_index]),
+                        float(score_std[sample_index]),
+                        float(score_min[sample_index]),
+                        float(score_max[sample_index]),
+                        float(scores[-1, sample_index]),
+                        rounds[-1],
+                        float(own_loss_mean[sample_index]),
+                        float(other_loss_mean[sample_index]),
+                        float(fedmia_scores[sample_index]),
+                    )
+                )
+
+        iclr_result = AttackResult(
+            name="iclr_candidate_score",
+            scores=score_mean.to(torch.float32),
+            labels=membership,
+            sample_indices=torch.arange(candidate_count, dtype=torch.long),
+            metadata={
+                "score_formula": "loss_other_clients_minus_loss_target_client",
+                "round_aggregation": "mean",
+                "rounds": rounds,
+                "target_client_id": int(self.target_client_id),
+            },
+        )
+        iclr_metrics = iclr_result.to_summary()
+
+        def relationship(mask: torch.Tensor) -> dict:
+            count = int(mask.sum())
+            return {
+                "samples": count,
+                "pearson": _pearson(score_mean[mask], fedmia_scores[mask]),
+                "spearman": _spearman(score_mean[mask], fedmia_scores[mask]),
+                "mean_iclr_score": (
+                    float(score_mean[mask].mean()) if count else None
+                ),
+                "mean_fedmia_loss_score": (
+                    float(fedmia_scores[mask].mean()) if count else None
+                ),
+            }
+
+        relationships = {
+            "all": relationship(torch.ones(candidate_count, dtype=torch.bool)),
+            "members": relationship(membership == 1),
+            "nonmembers": relationship(membership == 0),
+            "by_candidate_source": {},
+        }
+        for source in dict.fromkeys(sources):
+            source_mask = torch.tensor(
+                [candidate_source == source for candidate_source in sources],
+                dtype=torch.bool,
+            )
+            relationships["by_candidate_source"][source] = relationship(
+                source_mask
+            )
+
+        payload = {
+            "status": "ok",
+            "score_formula": "L(x; theta_-k) - L(x; theta_k)",
+            "score_direction": "higher_means_more_target_client_specific",
+            "training_effect": "observational_only",
+            "target_client_id": int(self.target_client_id),
+            "candidate_count": candidate_count,
+            "member_count": int((membership == 1).sum()),
+            "nonmember_count": int((membership == 0).sum()),
+            "audit_rounds": rounds,
+            "round_aggregation": "mean",
+            "iclr_membership_metrics": iclr_metrics,
+            "relationship_with_fedmia_loss": relationships,
+            "artifacts": {
+                "per_round_scores": os.path.basename(round_path),
+                "per_sample_scores": os.path.basename(sample_path),
+                "relationship_summary": "iclr_candidate_relationship.json",
+            },
+        }
+        relationship_path = os.path.join(
+            self.results_dir, "iclr_candidate_relationship.json"
+        )
+        with open(relationship_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, indent=2, allow_nan=False)
+            file.write("\n")
+        logger.info(
+            "Saved sample-aligned ICLR scores for %d candidates across %d rounds",
+            candidate_count,
+            len(rounds),
+        )
+        return payload
+
     def finalize(
         self,
         final_model: torch.nn.Module,
@@ -4838,6 +5212,19 @@ class MembershipAuditor:
                 summary["paper_balanced_evaluation"] = paper_balanced
             summaries.append(summary)
         periodic_metric_rows = self._write_periodic_attack_metrics()
+        iclr_candidate_summary = None
+        if self.iclr_candidate_scoring:
+            try:
+                iclr_candidate_summary = self._write_iclr_candidate_artifacts()
+            except Exception as error:
+                logger.exception("ICLR candidate scoring finalization failed")
+                self.errors["iclr_candidate_scoring"] = (
+                    f"{type(error).__name__}: {error}"
+                )
+                iclr_candidate_summary = {
+                    "status": "error",
+                    "error": self.errors["iclr_candidate_scoring"],
+                }
         signal_health_enabled = bool(
             self.config.get("fedmia_signal_health_check", False)
         )
@@ -5132,6 +5519,7 @@ class MembershipAuditor:
                         "per_client": self.candidate_sampling_by_client,
                     },
                     "audit_health": audit_health,
+                    "iclr_candidate_scoring": iclr_candidate_summary,
                     "iclr_validation": iclr_validation,
                     "attacks": summaries,
                     "errors": self.errors,

@@ -20,6 +20,7 @@ from utils.data_loader import (
     generate_dirichlet_split,
     generate_iid_split,
     generate_pathological_split,
+    generate_random_equal_iid_split,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,9 +105,12 @@ def _result_directory(config: dict) -> str:
     else:
         attack_label = "multi_attack"
     defense_label = str(config.get("defense", {}).get("name", "none")).lower()
+    dataset_label = str(config["dataset_name"])
+    if str(config.get("model_type", "prompt")).lower() == "resnet18":
+        dataset_label += "_resnet18"
     return os.path.join(
         config["results_dir"],
-        f"{config['dataset_name']}_{config['aggregator']}_{attack_label}_{defense_label}_{timestamp}",
+        f"{dataset_label}_{config['aggregator']}_{attack_label}_{defense_label}_{timestamp}",
     )
 
 
@@ -149,9 +153,11 @@ def validate_config(config: dict) -> None:
         "clip_mlp",
         "visual_adapter",
         "clip_lora",
+        "resnet18",
     }:
         raise ValueError(
-            "model_type must be prompt, clip_mlp, visual_adapter, or clip_lora."
+            "model_type must be prompt, clip_mlp, visual_adapter, clip_lora, "
+            "or resnet18."
         )
     method = config["aggregator"].lower()
     supported_methods = {"fedavg", "fedsgd", "promptfl"}
@@ -294,6 +300,65 @@ def validate_config(config: dict) -> None:
             "last_half",
         }:
             raise ValueError("clip_lora.layers must be all, last_half, or a list.")
+    if model_type == "resnet18":
+        resnet_config = dict(config.get("resnet18", {}))
+        if str(config.get("dataset_name", "")).lower() != "cifar100":
+            raise ValueError("resnet18 currently reproduces FedMIA on CIFAR-100 only.")
+        if method != "fedavg":
+            raise ValueError("FedMIA ResNet18 requires aggregator=fedavg.")
+        if partition_mode != "iid":
+            raise ValueError("FedMIA ResNet18 requires partition_mode=iid.")
+        if not bool(config.get("use_full_dataset", False)) or fpl_shots is not None:
+            raise ValueError(
+                "FedMIA ResNet18 requires the full CIFAR-100 split: "
+                "use_full_dataset=true and fpl_shots=null."
+            )
+        if str(resnet_config.get("iid_split", "random_equal")).lower() != (
+            "random_equal"
+        ):
+            raise ValueError("resnet18.iid_split must be random_equal.")
+        if bool(resnet_config.get("paper_protocol", False)):
+            expected = {
+                "total_users": 10,
+                "sample_users": 10,
+                "num_global_iters": 300,
+                "local_epochs": 1,
+                "batch_size": 100,
+            }
+            mismatches = {
+                key: (config.get(key), value)
+                for key, value in expected.items()
+                if int(config.get(key)) != value
+            }
+            if mismatches:
+                raise ValueError(
+                    "FedMIA paper_protocol requires exact training sizes; "
+                    f"mismatches={mismatches}."
+                )
+            if float(config.get("learning_rate")) != 0.1:
+                raise ValueError("FedMIA paper_protocol requires learning_rate=0.1.")
+            if float(config.get("learning_rate_decay", 1.0)) != 0.99:
+                raise ValueError(
+                    "FedMIA paper_protocol follows Appendix Table 3 and requires "
+                    "learning_rate_decay=0.99."
+                )
+            fedavg = dict(config.get("fedavg", {}))
+            optimizer_values = {
+                "client_optimizer": str(
+                    fedavg.get("client_optimizer", "sgd")
+                ).lower(),
+                "momentum": float(fedavg.get("momentum", 0.0)),
+                "weight_decay": float(fedavg.get("weight_decay", 0.0)),
+            }
+            if optimizer_values != {
+                "client_optimizer": "sgd",
+                "momentum": 0.9,
+                "weight_decay": 0.0005,
+            }:
+                raise ValueError(
+                    "FedMIA paper_protocol requires SGD with momentum=0.9 and "
+                    f"weight_decay=0.0005; got {optimizer_values}."
+                )
     if float(config.get("dirichlet_alpha", 0.1)) <= 0:
         raise ValueError("dirichlet_alpha must be positive.")
     audit = config.get("audit", {})
@@ -328,6 +393,40 @@ def validate_config(config: dict) -> None:
     unknown = sorted(attacks - SUPPORTED_ATTACKS)
     if unknown:
         raise ValueError(f"Unknown membership attacks: {', '.join(unknown)}")
+    if model_type == "resnet18" and bool(
+        config.get("resnet18", {}).get("paper_protocol", False)
+    ):
+        required_audit = {
+            "enabled": True,
+            "target_client_id": 0,
+            "candidate_sampling": "fedmia_mix",
+            "nonmember_to_member_ratio": 2.0,
+            "max_member_samples": 5000,
+            "max_nonmember_samples": 10000,
+            "match_candidate_labels": False,
+            "fedmia_loss_aggregation": "mean",
+            "fedmia_loss_tail": "upper",
+            "iclr_candidate_scoring": True,
+        }
+        mismatches = {
+            key: (audit.get(key), value)
+            for key, value in required_audit.items()
+            if audit.get(key) != value
+        }
+        if attacks != {"fedmia_loss"}:
+            mismatches["attacks"] = (sorted(attacks), ["fedmia_loss"])
+        interval = int(
+            audit.get("attack_audit_intervals", {}).get(
+                "fedmia_loss", audit.get("audit_interval", 1)
+            )
+        )
+        if interval != 10:
+            mismatches["fedmia_loss_interval"] = (interval, 10)
+        if mismatches:
+            raise ValueError(
+                "FedMIA paper_protocol requires the reference FedMIA-Loss "
+                f"candidate and audit settings; mismatches={mismatches}."
+            )
     if audit.get("enabled", True) and not attacks:
         raise ValueError("audit.enabled=true requires at least one membership attack.")
     configured_exact_batch_attacks = audit.get(
@@ -449,6 +548,28 @@ def validate_config(config: dict) -> None:
             "audit.candidate_sampling=fedmia_mix requires "
             "match_candidate_labels=false to reproduce the reference protocol."
         )
+    iclr_candidate_scoring = bool(audit.get("iclr_candidate_scoring", False))
+    if iclr_candidate_scoring:
+        if model_type != "resnet18" or not bool(
+            config.get("resnet18", {}).get("paper_protocol", False)
+        ):
+            raise ValueError(
+                "audit.iclr_candidate_scoring currently requires the ResNet18/"
+                "CIFAR100 FedMIA paper protocol."
+            )
+        if method != "fedavg":
+            raise ValueError(
+                "audit.iclr_candidate_scoring requires linear FedAvg aggregation."
+            )
+        if attacks != {"fedmia_loss"} or candidate_sampling != "fedmia_mix":
+            raise ValueError(
+                "audit.iclr_candidate_scoring must use the fixed fedmia_mix "
+                "candidate view with only fedmia_loss enabled."
+            )
+        if pooled_audit:
+            raise ValueError(
+                "audit.iclr_candidate_scoring currently requires one target client."
+            )
     if model_type == "clip_lora" and candidate_sampling == "low_fpr_full":
         raise ValueError(
             "clip_lora cannot use low_fpr_full because vision LoRA makes "
@@ -789,6 +910,11 @@ def validate_config(config: dict) -> None:
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
+    if iclr_candidate_scoring and defense_name != "none":
+        raise ValueError(
+            "Candidate-level ICLR scoring is observational; use defense.name=none "
+            "so the FedMIA paper training protocol is not modified."
+        )
     if model_type in {
         "clip_mlp",
         "visual_adapter",
@@ -946,6 +1072,10 @@ def run(config: dict) -> list[dict]:
         collate_clip_features,
         precompute_federated_clip_features,
     )
+    from trainmodel.resnet18_cifar100 import (
+        FedMIAResNet18,
+        collate_fedmia_cifar100,
+    )
 
     config = copy.deepcopy(config)
     if str(config.get("model_type", "prompt")).lower() in {
@@ -995,6 +1125,7 @@ def run(config: dict) -> list[dict]:
         bool(config.get("require_cuda", False)),
     )
 
+    model_type = str(config.get("model_type", "prompt")).lower()
     partition_mode = str(config.get("partition_mode", "auto")).lower()
     split_arguments = {
         "root_dir": config.get("data_root", "./data"),
@@ -1002,7 +1133,14 @@ def run(config: dict) -> list[dict]:
         "fpl_shots": config.get("fpl_shots"),
         "use_full_dataset": bool(config.get("use_full_dataset", False)),
     }
-    if partition_mode == "pathological":
+    if model_type == "resnet18":
+        train_sets, test_sets, class_names = generate_random_equal_iid_split(
+            config["dataset_name"],
+            num_users=config["total_users"],
+            seed=seed,
+            **split_arguments,
+        )
+    elif partition_mode == "pathological":
         train_sets, test_sets, class_names = generate_pathological_split(
             config["dataset_name"],
             num_users=config["total_users"],
@@ -1025,9 +1163,13 @@ def run(config: dict) -> list[dict]:
             **split_arguments,
         )
 
-    processor, clip_model = _load_local_clip(config["cache_dir"], device)
-    model_type = str(config.get("model_type", "prompt")).lower()
-    if model_type == "clip_mlp":
+    processor = None
+    clip_model = None
+    if model_type != "resnet18":
+        processor, clip_model = _load_local_clip(config["cache_dir"], device)
+    if model_type == "resnet18":
+        model = FedMIAResNet18(num_classes=len(class_names)).to(device)
+    elif model_type == "clip_mlp":
         mlp_config = dict(config.get("clip_mlp", {}))
         model = CLIPImageMLP(
             clip_model=clip_model,
@@ -1115,10 +1257,15 @@ def run(config: dict) -> list[dict]:
             method_config=method_config,
         )
 
-    def collate_fn(batch):
-        images, labels = zip(*batch)
-        processed = processor(images=list(images), return_tensors="pt")
-        return processed["pixel_values"], torch.as_tensor(labels, dtype=torch.long)
+    if model_type == "resnet18":
+        collate_fn = collate_fedmia_cifar100
+    else:
+        def collate_fn(batch):
+            images, labels = zip(*batch)
+            processed = processor(images=list(images), return_tensors="pt")
+            return processed["pixel_values"], torch.as_tensor(
+                labels, dtype=torch.long
+            )
 
     if (
         model_type in {"clip_mlp", "visual_adapter"}
@@ -1243,6 +1390,17 @@ def default_config() -> dict:
             "scaling": "sqrt_rank",
             "template": None,
         },
+        "resnet18": {
+            "paper_protocol": False,
+            "iid_split": "random_equal",
+            "normalization": "fedmia_cifar100",
+            "normalization_layer": "groupnorm_32",
+        },
+        "fedavg": {
+            "client_optimizer": "sgd",
+            "momentum": 0.0,
+            "weight_decay": 0.0,
+        },
         "promptfl": {},
         "dirichlet_alpha": 0.1,
         "partition_mode": "auto",
@@ -1280,6 +1438,7 @@ def default_config() -> dict:
             "max_samples_per_group": 32,
             "calibration_fraction": 0.5,
             "candidate_sampling": "legacy",
+            "iclr_candidate_scoring": False,
             "nonmember_to_member_ratio": 1.0,
             "match_candidate_labels": False,
             "low_fpr_min_nonmembers": 1000,
@@ -1406,6 +1565,7 @@ def parse_args() -> dict:
     parser.add_argument("--dataset_name")
     parser.add_argument("--data_root")
     parser.add_argument("--cache_dir")
+    parser.add_argument("--results_dir")
     parser.add_argument("--gpu", type=int)
     parser.add_argument("--seed", type=int)
     parser.add_argument("--num_global_iters", type=int)
@@ -1426,6 +1586,19 @@ def parse_args() -> dict:
         default=None,
         help="Use complete official train/test splits; requires fpl_shots=null.",
     )
+    cuda_group = parser.add_mutually_exclusive_group()
+    cuda_group.add_argument(
+        "--require_cuda",
+        dest="require_cuda",
+        action="store_true",
+        default=None,
+    )
+    cuda_group.add_argument(
+        "--no_require_cuda",
+        "--no-require-cuda",
+        dest="require_cuda",
+        action="store_false",
+    )
     parser.add_argument("--learning_rate", type=float)
     parser.add_argument(
         "--learning_rate_decay",
@@ -1441,7 +1614,7 @@ def parse_args() -> dict:
     )
     parser.add_argument(
         "--model_type",
-        choices=["prompt", "clip_mlp", "visual_adapter", "clip_lora"],
+        choices=["prompt", "clip_mlp", "visual_adapter", "clip_lora", "resnet18"],
     )
     parser.add_argument("--mlp_hidden_dim", type=int)
     parser.add_argument("--mlp_dropout", type=float)
@@ -1516,7 +1689,9 @@ def parse_args() -> dict:
         "dataset_name",
         "data_root",
         "cache_dir",
+        "results_dir",
         "gpu",
+        "require_cuda",
         "seed",
         "num_global_iters",
         "total_users",

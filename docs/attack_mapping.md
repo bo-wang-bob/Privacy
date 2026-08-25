@@ -26,6 +26,27 @@ Score-Diff、Score-Ratio、FTA 和 ProjRes。下文其他攻击的研究实现�
 - 同一轮其他客户端构成 non-target/null 分布；
 - 对多个通信轮的单尾 CDF 分数支持 `mean`、`max`、`last` 与 `late3` 聚合。
 
+ResNet18/CIFAR100 论文复现配置使用 `fedmia_loss`、`mean` 和 `upper`：每轮先用
+其余 9 个客户端对同一候选样本的负交叉熵估计 null，按公式 (8)--(10) 去掉高于
+均值加三倍标准差的空间异常值，再计算目标客户端观测的高斯 CDF；最终对第
+10、20、…、300 轮的 30 个 CDF 取均值。候选协议为 `fedmia_mix`：目标客户端
+完整 5000 个训练成员，对 1000 个独立测试样本和其余 9 个客户端各 1000 个训练
+样本组成的 10000 个目标客户端非成员。
+
+该 ResNet18 复现入口还在完全相同的固定候选和审计轮上计算逐样本 ICLR 观测分数：
+
+\[
+s_{\mathrm{ICLR}}(x)=L(x;\theta_{-k})-L(x;\theta_k).
+\]
+
+其中 `theta_k` 是目标客户端本轮完成一个 local epoch 后上传的模型，`theta_-k`
+通过 `theta_global = w_k theta_k + (1-w_k) theta_-k` 使用服务器实际聚合权重反解。
+评分不参与客户端训练、候选过滤或聚合，因此 `defense.name` 仍为 `none`，论文的
+FedAvg 优化过程保持不变。每轮 15000 个原始评分和按样本跨轮聚合的评分分别写入
+`iclr_candidate_round_scores.csv` 与 `iclr_candidate_scores.csv`；后者使用稳定的
+`sample_index` 与最终 FedMIA-Loss 分数一一连接。由于非成员同时包含独立测试样本
+和其他客户端训练样本，结果还按候选来源报告均值及其与 FedMIA-Loss 的相关性。
+
 早期实验曾自行组合两类 FedMIA 证据；该分数并非论文定义的攻击，现已从
 执行入口、配置和测试中移除。结果分析器仅在读取旧目录时识别并丢弃对应字段，
 它不会进入新生成的证据或实验表格。

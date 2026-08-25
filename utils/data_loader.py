@@ -491,6 +491,67 @@ def generate_iid_split(
     return train_subsets, test_subsets, class_names
 
 
+def generate_random_equal_iid_split(
+    dataset_name: str,
+    num_users: int,
+    root_dir: str = "./data",
+    fpl: bool = True,
+    fpl_shots: Optional[int] = None,
+    use_full_dataset: bool = False,
+    seed: int = 1,
+) -> Tuple[List[Subset], List[Subset], List[str]]:
+    """Split shuffled train/test indices into equal IID client shards.
+
+    FedMIA's public CIFAR-100 implementation assigns a random, disjoint
+    1/K share of the training split to each client rather than enforcing an
+    exactly equal per-class histogram.  The test split is partitioned only so
+    the shared server evaluator can consume it once; concatenating all client
+    test subsets recovers the complete independent test pool used by the
+    attack.
+    """
+    if not fpl:
+        raise ValueError("This branch only supports FPL dataset loading.")
+    if num_users <= 0:
+        raise ValueError("num_users must be positive.")
+    trainset, testset, class_names = _load_dataset(
+        dataset_name,
+        root_dir,
+        fpl=fpl,
+        fpl_shots=fpl_shots,
+        use_full_dataset=use_full_dataset,
+    )
+    if len(trainset) % num_users or len(testset) % num_users:
+        raise ValueError(
+            "Random equal IID splitting requires train and test sizes to be "
+            f"divisible by num_users; got train={len(trainset)}, "
+            f"test={len(testset)}, users={num_users}."
+        )
+
+    generator = torch.Generator().manual_seed(int(seed))
+    train_order = torch.randperm(len(trainset), generator=generator).tolist()
+    test_order = torch.randperm(len(testset), generator=generator).tolist()
+    train_size = len(trainset) // num_users
+    test_size = len(testset) // num_users
+    train_subsets = [
+        Subset(trainset, train_order[user_id * train_size : (user_id + 1) * train_size])
+        for user_id in range(num_users)
+    ]
+    test_subsets = [
+        Subset(testset, test_order[user_id * test_size : (user_id + 1) * test_size])
+        for user_id in range(num_users)
+    ]
+    logger.info(
+        "Random equal IID split completed for %s: users=%d, train/client=%d, "
+        "test/client=%d, seed=%d",
+        dataset_name,
+        num_users,
+        train_size,
+        test_size,
+        seed,
+    )
+    return train_subsets, test_subsets, class_names
+
+
 def _load_dataset(
     dataset_name: str,
     root_dir: str = "./data",
