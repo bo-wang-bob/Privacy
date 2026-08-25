@@ -401,6 +401,31 @@ BERT 配置默认执行不修改训练的 ICLR 排名分析；GPT2 默认不执�
 同一任务目录的 `defense_summary.json` 及对应逐轮 CSV，不会额外创建训练任务。
 防御与威胁模型说明见 [`docs/defenses.md`](docs/defenses.md)。
 
+### 记录级 DP-SGD
+
+ResNet18/CIFAR-100 FedAvg 与 BERT-Base Adapter/SST-5 FedSGD 都提供客户端侧
+记录级 DP 配置。每条图像或完整文本序列的联合梯度先做 L2 裁剪，再对每个逻辑
+batch 的裁剪梯度和加入一次高斯噪声；客户端上传本身就是 DP 输出，因此适用于
+服务器能观察单客户端消息的当前威胁模型。
+
+```bash
+# 只打印最终命令
+bash scripts/run_record_dp_benchmarks.sh --model resnet --dry-run
+bash scripts/run_record_dp_benchmarks.sh --model bert --dry-run
+
+# 正式运行
+bash scripts/run_record_dp_benchmarks.sh --model resnet
+bash scripts/run_record_dp_benchmarks.sh --model bert
+```
+
+默认配置以 `target_epsilon: 3.0`、`delta: 1e-5` 为目标，根据每个客户端的
+Poisson 采样率和计划 DP 步数自动校准共享 noise multiplier。实际逐客户端步数、
+采样率、累计 epsilon 及其最大值写入 `defense_summary.json`。正式隐私运行必须保持
+`reproducible_noise: false`；确定性噪声只用于测试，且会被标记为不具备正式 DP。
+`privacy_audit/summary.json` 还会为每种攻击写入
+`TPR <= min(1, exp(epsilon) * FPR + delta)` 在已报告 FPR 点上的理论上界；这些攻击
+文件包含成员真值，只作为封闭实验审计数据，不属于 DP 发布物。
+
 ## 结果目录与文件
 
 `results/` 下每个一级目录就是一次独立训练任务：

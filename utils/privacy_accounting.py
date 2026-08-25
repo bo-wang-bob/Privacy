@@ -6,6 +6,20 @@ import secrets
 import torch
 
 
+DEFAULT_RDP_ORDERS = (
+    2,
+    3,
+    4,
+    5,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+)
+
+
 def planned_private_probe_steps(audit_config: dict | None) -> int:
     """Conservative count of isolated client-update queries made by active MIAs."""
     config = audit_config or {}
@@ -40,10 +54,139 @@ def gaussian_rdp_epsilon(
         return math.inf
     compositions = int(steps) * int(mechanisms_per_step)
     candidates = []
-    for order in (2, 3, 4, 5, 8, 16, 32, 64, 128, 256):
+    for order in DEFAULT_RDP_ORDERS:
         rdp = compositions * order / (2.0 * noise_multiplier**2)
         candidates.append(rdp + math.log(1.0 / delta) / (order - 1))
     return min(candidates)
+
+
+def _logsumexp(values: list[float]) -> float:
+    maximum = max(values)
+    if maximum == -math.inf:
+        return maximum
+    return maximum + math.log(sum(math.exp(value - maximum) for value in values))
+
+
+def poisson_sampled_gaussian_rdp(
+    noise_multiplier: float,
+    sample_rate: float,
+    order: int,
+) -> float:
+    """RDP of one Poisson-sampled Gaussian mechanism at an integer order.
+
+    The mechanism independently samples each record with probability ``q``,
+    clips each contribution to unit norm, sums the clipped contributions, and
+    adds Gaussian noise with standard deviation ``noise_multiplier``.  Scaling
+    both the clipped sum and noise by the same constant does not change RDP.
+    """
+    if not 0.0 <= sample_rate <= 1.0:
+        raise ValueError("sample_rate must be in [0, 1].")
+    if (
+        isinstance(order, bool)
+        or not isinstance(order, int)
+        or order < 2
+    ):
+        raise ValueError("RDP order must be an integer of at least two.")
+    if sample_rate == 0.0:
+        return 0.0
+    if noise_multiplier <= 0:
+        return math.inf
+    if sample_rate == 1.0:
+        return order / (2.0 * noise_multiplier**2)
+
+    log_q = math.log(sample_rate)
+    log_one_minus_q = math.log1p(-sample_rate)
+    log_terms = []
+    for index in range(order + 1):
+        log_binomial = (
+            math.lgamma(order + 1)
+            - math.lgamma(index + 1)
+            - math.lgamma(order - index + 1)
+        )
+        privacy_loss = (index * index - index) / (
+            2.0 * noise_multiplier**2
+        )
+        log_terms.append(
+            log_binomial
+            + index * log_q
+            + (order - index) * log_one_minus_q
+            + privacy_loss
+        )
+    return _logsumexp(log_terms) / (order - 1)
+
+
+def poisson_sampled_gaussian_epsilon(
+    noise_multiplier: float,
+    sample_rate: float,
+    steps: int,
+    delta: float,
+    orders: tuple[int, ...] = DEFAULT_RDP_ORDERS,
+) -> float:
+    """Compose Poisson-sampled Gaussian DP-SGD steps and return epsilon."""
+    if not 0 < delta < 1:
+        raise ValueError("delta must be in (0, 1).")
+    if steps < 0:
+        raise ValueError("steps must be non-negative.")
+    if steps == 0 or sample_rate == 0.0:
+        return 0.0
+    candidates = []
+    for order in orders:
+        rdp = steps * poisson_sampled_gaussian_rdp(
+            noise_multiplier=noise_multiplier,
+            sample_rate=sample_rate,
+            order=order,
+        )
+        candidates.append(rdp + math.log(1.0 / delta) / (order - 1))
+    return min(candidates)
+
+
+def max_poisson_sampled_gaussian_epsilon(
+    noise_multiplier: float,
+    schedules: list[tuple[float, int]],
+    delta: float,
+) -> float:
+    """Return the worst per-client epsilon for disjoint client datasets."""
+    if not schedules:
+        return 0.0
+    return max(
+        poisson_sampled_gaussian_epsilon(
+            noise_multiplier=noise_multiplier,
+            sample_rate=sample_rate,
+            steps=steps,
+            delta=delta,
+        )
+        for sample_rate, steps in schedules
+    )
+
+
+def calibrate_poisson_sampled_gaussian_noise(
+    target_epsilon: float,
+    schedules: list[tuple[float, int]],
+    delta: float,
+) -> float:
+    """Find one noise multiplier meeting every client's planned budget."""
+    if target_epsilon <= 0:
+        raise ValueError("target_epsilon must be positive.")
+    if not schedules or any(steps <= 0 for _, steps in schedules):
+        raise ValueError("At least one positive-step client schedule is required.")
+    low, high = 1e-4, 1.0
+    while (
+        max_poisson_sampled_gaussian_epsilon(high, schedules, delta)
+        > target_epsilon
+    ):
+        high *= 2.0
+        if high > 1e6:
+            raise ValueError("Could not calibrate a finite noise multiplier.")
+    for _ in range(80):
+        middle = (low + high) / 2.0
+        if (
+            max_poisson_sampled_gaussian_epsilon(middle, schedules, delta)
+            <= target_epsilon
+        ):
+            high = middle
+        else:
+            low = middle
+    return high
 
 
 def calibrate_gaussian_noise(

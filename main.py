@@ -966,6 +966,45 @@ def validate_config(config: dict) -> None:
             raise ValueError("defense.dp_max_grad_norm must be positive.")
         if float(defense.get("dp_noise_multiplier", 1.0)) <= 0:
             raise ValueError("defense.dp_noise_multiplier must be positive.")
+    if defense_name == "record_dp":
+        max_norm = float(
+            defense.get("max_grad_norm", defense.get("dp_max_grad_norm", 1.0))
+        )
+        delta = float(defense.get("delta", defense.get("dp_delta", 1e-5)))
+        if max_norm <= 0:
+            raise ValueError("defense.max_grad_norm must be positive.")
+        if not 0 < delta < 1:
+            raise ValueError("Record-DP delta must be in (0, 1).")
+        if str(defense.get("adjacency", "add_remove")).lower() != "add_remove":
+            raise ValueError("Record-DP currently requires add_remove adjacency.")
+        if str(defense.get("sampling", "poisson")).lower() != "poisson":
+            raise ValueError("Record-DP currently requires Poisson sampling.")
+        if str(defense.get("accountant", "rdp")).lower() != "rdp":
+            raise ValueError("Record-DP currently requires accountant=rdp.")
+        backend = str(defense.get("grad_sample_backend", "auto")).lower()
+        if backend not in {"auto", "loop", "vmap"}:
+            raise ValueError(
+                "Record-DP grad_sample_backend must be auto, loop, or vmap."
+            )
+        if int(defense.get("microbatch_size", 1)) <= 0:
+            raise ValueError("Record-DP microbatch_size must be positive.")
+        target_epsilon = defense.get("target_epsilon")
+        noise = defense.get(
+            "noise_multiplier", defense.get("dp_noise_multiplier")
+        )
+        if target_epsilon is None and noise in {None, "auto"}:
+            raise ValueError(
+                "Record-DP requires target_epsilon or a numeric noise_multiplier."
+            )
+        if target_epsilon is not None and float(target_epsilon) <= 0:
+            raise ValueError("Record-DP target_epsilon must be positive.")
+        if target_epsilon is not None and noise not in {None, "auto"}:
+            raise ValueError(
+                "Record-DP must configure target_epsilon or noise_multiplier, "
+                "not both."
+            )
+        if target_epsilon is None and float(noise) <= 0:
+            raise ValueError("Record-DP noise_multiplier must be positive.")
     if float(defense.get("perturb_clip_norm", 1.0)) <= 0:
         raise ValueError("defense.perturb_clip_norm must be positive.")
     if float(defense.get("perturb_noise_std", 0.05)) < 0:

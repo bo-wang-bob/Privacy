@@ -317,8 +317,10 @@ def validate_config(config: dict) -> None:
             )
     defense = dict(config.get("defense", {"name": "none"}))
     defense_name = str(defense.get("name", "none")).lower()
-    if defense_name not in {"none", "iclr"}:
-        raise ValueError("Text Adapter experiments support defense=none or iclr.")
+    if defense_name not in {"none", "iclr", "record_dp"}:
+        raise ValueError(
+            "Text Adapter experiments support defense=none, iclr, or record_dp."
+        )
     if defense_name == "iclr":
         if architecture != "bert":
             raise ValueError("Text Adapter ICLR currently supports BERT only.")
@@ -342,6 +344,45 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "defense.iclr_validation_top_fraction must be in (0, 0.5]."
             )
+    if defense_name == "record_dp":
+        max_norm = float(
+            defense.get("max_grad_norm", defense.get("dp_max_grad_norm", 1.0))
+        )
+        delta = float(defense.get("delta", defense.get("dp_delta", 1e-5)))
+        if max_norm <= 0:
+            raise ValueError("defense.max_grad_norm must be positive.")
+        if not 0 < delta < 1:
+            raise ValueError("Record-DP delta must be in (0, 1).")
+        if str(defense.get("adjacency", "add_remove")).lower() != "add_remove":
+            raise ValueError("Record-DP currently requires add_remove adjacency.")
+        if str(defense.get("sampling", "poisson")).lower() != "poisson":
+            raise ValueError("Record-DP currently requires Poisson sampling.")
+        if str(defense.get("accountant", "rdp")).lower() != "rdp":
+            raise ValueError("Record-DP currently requires accountant=rdp.")
+        backend = str(defense.get("grad_sample_backend", "auto")).lower()
+        if backend not in {"auto", "loop", "vmap"}:
+            raise ValueError(
+                "Record-DP grad_sample_backend must be auto, loop, or vmap."
+            )
+        if int(defense.get("microbatch_size", 1)) <= 0:
+            raise ValueError("Record-DP microbatch_size must be positive.")
+        target_epsilon = defense.get("target_epsilon")
+        noise = defense.get(
+            "noise_multiplier", defense.get("dp_noise_multiplier")
+        )
+        if target_epsilon is None and noise in {None, "auto"}:
+            raise ValueError(
+                "Record-DP requires target_epsilon or a numeric noise_multiplier."
+            )
+        if target_epsilon is not None and float(target_epsilon) <= 0:
+            raise ValueError("Record-DP target_epsilon must be positive.")
+        if target_epsilon is not None and noise not in {None, "auto"}:
+            raise ValueError(
+                "Record-DP must configure target_epsilon or noise_multiplier, "
+                "not both."
+            )
+        if target_epsilon is None and float(noise) <= 0:
+            raise ValueError("Record-DP noise_multiplier must be positive.")
     target_client_id = int(audit.get("target_client_id", 0))
     if not 0 <= target_client_id < int(config["total_users"]):
         raise ValueError("audit.target_client_id is outside the client range.")
@@ -356,22 +397,36 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "audit exact-batch ProjRes requires projres.enabled=true."
             )
-        expected_nonmembers = int(config["batch_size"]) * int(
-            exact_batch_ratio
-        )
-        if int(projres.get("max_candidates", 0)) != int(
-            config["batch_size"]
-        ):
-            raise ValueError(
-                "Unified ProjRes must audit the complete real training batch."
+        if defense_name == "record_dp":
+            if any(
+                int(projres.get(key, 0)) != 0
+                for key in (
+                    "max_candidates",
+                    "min_nonmembers",
+                    "max_nonmembers",
+                )
+            ):
+                raise ValueError(
+                    "Record-DP Poisson batches require dynamic unified ProjRes "
+                    "candidate bounds (all three bounds must be zero)."
+                )
+        else:
+            expected_nonmembers = int(config["batch_size"]) * int(
+                exact_batch_ratio
             )
-        if int(projres.get("min_nonmembers", 0)) != expected_nonmembers or int(
-            projres.get("max_nonmembers", 0)
-        ) != expected_nonmembers:
-            raise ValueError(
-                "Unified ProjRes min_nonmembers and max_nonmembers must equal "
-                "batch_size * exact_batch_nonmember_to_member_ratio."
-            )
+            if int(projres.get("max_candidates", 0)) != int(
+                config["batch_size"]
+            ):
+                raise ValueError(
+                    "Unified ProjRes must audit the complete real training batch."
+                )
+            if int(projres.get("min_nonmembers", 0)) != expected_nonmembers or int(
+                projres.get("max_nonmembers", 0)
+            ) != expected_nonmembers:
+                raise ValueError(
+                    "Unified ProjRes min_nonmembers and max_nonmembers must equal "
+                    "batch_size * exact_batch_nonmember_to_member_ratio."
+                )
     if "evaluation_interval" in projres and "evaluation_round" in projres:
         raise ValueError(
             "Configure only one of projres.evaluation_interval and "
@@ -431,9 +486,11 @@ def resolve_path(value: str) -> Path:
 def make_result_dir(config: dict) -> Path:
     root = resolve_path(str(config.get("results_dir", "./results")))
     timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    defense = str(config.get("defense", {}).get("name", "none")).lower()
+    target_client = int(config.get("audit", {}).get("target_client_id", 0))
     run_name = (
         f"{timestamp}_{config['model_type']}_{config['dataset_name']}_fedsgd_"
-        f"seed{int(config['seed'])}"
+        f"{defense}_seed{int(config['seed'])}_target{target_client}"
     )
     result_dir = root / run_name
     result_dir.mkdir(parents=True, exist_ok=False)
@@ -508,6 +565,22 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
             defense.get("iclr_analysis_interval"),
         ),
         ("iclr.analysis_timing", defense.get("iclr_analysis_timing")),
+        ("record_dp.enabled", defense.get("name", "none") == "record_dp"),
+        ("record_dp.target_epsilon", defense.get("target_epsilon")),
+        (
+            "record_dp.noise_multiplier",
+            defense.get("noise_multiplier", defense.get("dp_noise_multiplier")),
+        ),
+        (
+            "record_dp.max_grad_norm",
+            defense.get("max_grad_norm", defense.get("dp_max_grad_norm")),
+        ),
+        ("record_dp.delta", defense.get("delta", defense.get("dp_delta"))),
+        ("record_dp.sampling", defense.get("sampling")),
+        (
+            "record_dp.grad_sample_backend",
+            defense.get("grad_sample_backend"),
+        ),
         ("projres.enabled", projres.get("enabled", True)),
         (
             "projres.evaluation_interval",

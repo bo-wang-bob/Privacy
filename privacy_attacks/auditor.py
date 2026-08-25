@@ -5195,14 +5195,30 @@ class MembershipAuditor:
                 logger.exception("Membership attack %s failed", attack)
                 self.errors[attack] = f"{type(error).__name__}: {error}"
         summaries = []
+        record_dp_accounting = getattr(self, "record_dp_accounting", None)
         for result in self.results:
-            summary = result.to_summary(
-                fpr_targets=(
-                    _EXACT_BATCH_REPORTED_FPR_TARGETS
-                    if result.name in self.exact_batch_membership_attacks
-                    else (0.1, 0.01, 0.001)
-                )
+            fpr_targets = (
+                _EXACT_BATCH_REPORTED_FPR_TARGETS
+                if result.name in self.exact_batch_membership_attacks
+                else (0.1, 0.01, 0.001)
             )
+            summary = result.to_summary(fpr_targets=fpr_targets)
+            if record_dp_accounting is not None:
+                epsilon = float(
+                    record_dp_accounting["epsilon_upper_bound"]
+                )
+                delta = float(record_dp_accounting["delta"])
+                summary["record_dp_theoretical_tpr_upper_bounds"] = {
+                    str(target): min(
+                        1.0,
+                        (
+                            math.exp(epsilon) * float(target) + delta
+                            if epsilon < 700
+                            else math.inf
+                        ),
+                    )
+                    for target in fpr_targets
+                }
             paper_balanced = (
                 None
                 if result.name in self.exact_batch_membership_attacks
@@ -5521,6 +5537,27 @@ class MembershipAuditor:
                     "audit_health": audit_health,
                     "iclr_candidate_scoring": iclr_candidate_summary,
                     "iclr_validation": iclr_validation,
+                    "record_dp_verification": (
+                        None
+                        if record_dp_accounting is None
+                        else {
+                            "privacy_unit": record_dp_accounting[
+                                "privacy_unit"
+                            ],
+                            "epsilon": record_dp_accounting[
+                                "epsilon_upper_bound"
+                            ],
+                            "delta": record_dp_accounting["delta"],
+                            "formal_dp_enabled": record_dp_accounting[
+                                "formal_dp_enabled"
+                            ],
+                            "roc_constraint": (
+                                "TPR <= min(1, exp(epsilon) * FPR + delta)"
+                            ),
+                            "scope": "released_model_and_client_uploads",
+                            "audit_artifacts_are_private_research_data": True,
+                        }
+                    ),
                     "attacks": summaries,
                     "errors": self.errors,
                 },

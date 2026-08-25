@@ -1,8 +1,9 @@
 """Training and update hooks for independent membership defenses.
 
-The implementations retain the defining mechanism of each paper while adapting
-it to a frozen backbone whose only trainable tensors are soft prompts.  A run
-selects exactly one controller, so the methods are never silently combined.
+Most paper defenses target a frozen backbone with trainable soft prompts.
+Record-DP additionally supports full ResNet and Transformer Adapter parameter
+scopes. A run selects exactly one controller, so methods are never combined
+silently.
 """
 
 from __future__ import annotations
@@ -18,7 +19,11 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
-from utils.privacy_accounting import private_generator
+from utils.privacy_accounting import (
+    calibrate_poisson_sampled_gaussian_noise,
+    poisson_sampled_gaussian_epsilon,
+    private_generator,
+)
 
 from privacy_attacks.code_poison import (
     compromised_prompt_loss,
@@ -49,6 +54,7 @@ SUPPORTED_DEFENSES = {
     "data_aug_sampling",
     "cofedmid",
     "prompt_dp",
+    "record_dp",
     "mist",
     "soft",
     "hamp",
@@ -74,7 +80,7 @@ def _trainable_parameters(model: torch.nn.Module) -> list[torch.nn.Parameter]:
     ]
     if not parameters:
         raise ValueError(
-            "A privacy defense requires at least one trainable prompt tensor."
+            "A privacy defense requires at least one trainable parameter."
         )
     return parameters
 
@@ -109,7 +115,7 @@ def _assign_flat_gradient(
         )
         offset += count
     if offset != flat_gradient.numel():
-        raise ValueError("Processed gradient does not match trainable prompt size.")
+        raise ValueError("Processed gradient does not match trainable parameter size.")
 
 
 def _per_sample_gradients(
@@ -125,6 +131,77 @@ def _per_sample_gradients(
         )
         rows.append(torch.cat([gradient.reshape(-1) for gradient in gradients]))
     return torch.stack(rows)
+
+
+def _loop_clipped_gradient_sum(
+    losses: torch.Tensor,
+    parameters: list[torch.nn.Parameter],
+    max_norm: float,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Reference per-record clipping without materializing a [B, P] matrix."""
+    accumulated = [torch.zeros_like(parameter) for parameter in parameters]
+    factors = []
+    for index in range(losses.numel()):
+        gradients = torch.autograd.grad(
+            losses[index],
+            parameters,
+            retain_graph=index + 1 < losses.numel(),
+            allow_unused=False,
+        )
+        norm = torch.sqrt(
+            sum(gradient.detach().float().square().sum() for gradient in gradients)
+        ).clamp_min(1e-12)
+        factor = (max_norm / norm).clamp(max=1.0)
+        with torch.no_grad():
+            for destination, gradient in zip(accumulated, gradients):
+                destination.add_(gradient, alpha=float(factor))
+        factors.append(factor.detach())
+    return accumulated, torch.stack(factors)
+
+
+def _vmap_clipped_gradient_sum(
+    model: torch.nn.Module,
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    max_norm: float,
+) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Vectorized per-record clipping for ordinary registered PyTorch models."""
+    named_parameters = {
+        name: parameter
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    if not named_parameters:
+        raise ValueError("Record-DP requires trainable parameters.")
+
+    def sample_loss(parameters, image, label):
+        logits = torch.func.functional_call(
+            model,
+            parameters,
+            (image.unsqueeze(0),),
+            strict=False,
+        )
+        return F.cross_entropy(logits, label.unsqueeze(0))
+
+    gradient_function = torch.func.grad(sample_loss)
+    per_sample = torch.func.vmap(
+        gradient_function,
+        in_dims=(None, 0, 0),
+        randomness="different",
+    )(named_parameters, images, labels)
+    norm_squared = torch.zeros(
+        labels.numel(), device=labels.device, dtype=torch.float32
+    )
+    for gradient in per_sample.values():
+        norm_squared.add_(gradient.detach().float().flatten(1).square().sum(dim=1))
+    factors = (max_norm / norm_squared.sqrt().clamp_min(1e-12)).clamp(max=1.0)
+    accumulated = []
+    for gradient in per_sample.values():
+        factor_shape = (labels.numel(),) + (1,) * (gradient.ndim - 1)
+        accumulated.append(
+            (gradient * factors.to(gradient.dtype).view(factor_shape)).sum(dim=0)
+        )
+    return accumulated, factors
 
 
 def _mean_loader_loss(model: torch.nn.Module, loader, device: torch.device) -> float:
@@ -277,9 +354,100 @@ class DefenseController:
                 raise ValueError(
                     "iclr_analysis_timing must be pre_update or post_round."
                 )
+        if self.name == "record_dp":
+            adjacency = str(self.config.get("adjacency", "add_remove")).lower()
+            sampling = str(self.config.get("sampling", "poisson")).lower()
+            if adjacency != "add_remove":
+                raise ValueError("Record-DP currently requires add_remove adjacency.")
+            if sampling != "poisson":
+                raise ValueError("Record-DP currently requires Poisson sampling.")
+            if str(self.config.get("accountant", "rdp")).lower() != "rdp":
+                raise ValueError("Record-DP currently requires accountant=rdp.")
+            if self._record_dp_max_norm() <= 0:
+                raise ValueError("Record-DP max_grad_norm must be positive.")
+            if not 0 < self._record_dp_delta() < 1:
+                raise ValueError("Record-DP delta must be in (0, 1).")
+            backend = str(
+                self.config.get("grad_sample_backend", "auto")
+            ).lower()
+            if backend not in {"auto", "loop", "vmap"}:
+                raise ValueError(
+                    "Record-DP grad_sample_backend must be auto, loop, or vmap."
+                )
+            if int(self.config.get("microbatch_size", 1)) <= 0:
+                raise ValueError("Record-DP microbatch_size must be positive.")
         self.federated_method = "fedavg"
         self.method_config: dict = {}
         self.additional_private_steps = 0
+        self.record_dp_noise_multiplier: float | None = None
+        self.record_dp_sample_rates: dict[int, float] = {}
+        self.record_dp_planned_steps: dict[int, int] = {}
+
+    def _record_dp_max_norm(self) -> float:
+        return float(
+            self.config.get(
+                "max_grad_norm", self.config.get("dp_max_grad_norm", 1.0)
+            )
+        )
+
+    def _record_dp_delta(self) -> float:
+        return float(
+            self.config.get("delta", self.config.get("dp_delta", 1e-5))
+        )
+
+    def _record_dp_reproducible(self) -> bool:
+        return bool(
+            self.config.get(
+                "reproducible_noise",
+                self.config.get("reproducible_dp_noise", False),
+            )
+        )
+
+    def configure_record_dp(self, users) -> None:
+        """Resolve per-client sampling schedules and a shared noise multiplier."""
+        if self.name != "record_dp":
+            return
+        self.record_dp_sample_rates = {
+            int(user.id): float(user.record_dp_sample_rate) for user in users
+        }
+        self.record_dp_planned_steps = {
+            int(user.id): int(self.total_rounds * user.record_dp_steps_per_update)
+            + int(self.additional_private_steps)
+            for user in users
+        }
+        schedules = [
+            (
+                self.record_dp_sample_rates[user_id],
+                self.record_dp_planned_steps[user_id],
+            )
+            for user_id in sorted(self.record_dp_sample_rates)
+        ]
+        configured_noise = self.config.get(
+            "noise_multiplier", self.config.get("dp_noise_multiplier")
+        )
+        target_epsilon = self.config.get("target_epsilon")
+        if target_epsilon is not None and configured_noise not in {None, "auto"}:
+            raise ValueError(
+                "Record-DP must configure either target_epsilon or a numeric "
+                "noise_multiplier, not both."
+            )
+        if target_epsilon is not None:
+            self.record_dp_noise_multiplier = (
+                calibrate_poisson_sampled_gaussian_noise(
+                    target_epsilon=float(target_epsilon),
+                    schedules=schedules,
+                    delta=self._record_dp_delta(),
+                )
+            )
+        else:
+            if configured_noise in {None, "auto"}:
+                raise ValueError(
+                    "Record-DP requires target_epsilon or a numeric "
+                    "noise_multiplier."
+                )
+            self.record_dp_noise_multiplier = float(configured_noise)
+            if self.record_dp_noise_multiplier <= 0:
+                raise ValueError("Record-DP noise_multiplier must be positive.")
 
     @property
     def enabled(self) -> bool:
@@ -381,7 +549,31 @@ class DefenseController:
         model.to(self.device)
         model.train()
         parameters = _trainable_parameters(model)
-        optimizer = torch.optim.SGD(parameters, lr=user.learning_rate)
+        if self.name == "record_dp":
+            optimizer_name = str(
+                self.method_config.get("client_optimizer", "sgd")
+            ).lower()
+            if optimizer_name == "sgd":
+                optimizer = torch.optim.SGD(
+                    parameters,
+                    lr=user.learning_rate,
+                    momentum=float(self.method_config.get("momentum", 0.0)),
+                    weight_decay=float(
+                        self.method_config.get("weight_decay", 0.0)
+                    ),
+                )
+            elif optimizer_name == "adamw":
+                optimizer = torch.optim.AdamW(
+                    parameters,
+                    lr=user.learning_rate,
+                    weight_decay=float(
+                        self.method_config.get("weight_decay", 0.01)
+                    ),
+                )
+            else:
+                raise ValueError("Record-DP client_optimizer must be sgd or adamw.")
+        else:
+            optimizer = torch.optim.SGD(parameters, lr=user.learning_rate)
         if user.federated_method == "fedsgd":
             optimizer.register_step_pre_hook(
                 lambda _optimizer, _args, _kwargs: (
@@ -394,6 +586,10 @@ class DefenseController:
             )
         elif self.name == "prompt_dp":
             self._prompt_dp_training(
+                user, model, optimizer, parameters, round_index, code_poison
+            )
+        elif self.name == "record_dp":
+            self._record_dp_training(
                 user, model, optimizer, parameters, round_index, code_poison
             )
         elif self.name == "hamp":
@@ -1042,6 +1238,104 @@ class DefenseController:
                 optimizer.step()
                 self.steps[user.id] += 1
                 self._record("dp_clip_fraction", float((factors < 1).float().mean()))
+
+    def _record_dp_training(
+        self,
+        user,
+        model,
+        optimizer,
+        parameters,
+        round_index: int,
+        code_poison: bool,
+    ) -> None:
+        """Run protocol-preserving, client-side record-level DP-SGD."""
+        if self.record_dp_noise_multiplier is None:
+            raise RuntimeError("Record-DP must be configured before training.")
+        max_norm = self._record_dp_max_norm()
+        expected_batch_size = int(user.record_dp_expected_batch_size)
+        if expected_batch_size <= 0:
+            raise ValueError("Record-DP expected batch size must be positive.")
+        reproducible = self._record_dp_reproducible()
+        sampling_generator = private_generator(
+            torch.device("cpu"),
+            reproducible,
+            self.seed + 1000003 * user.id + 1009 * round_index + 17011,
+        )
+        noise_generator = private_generator(
+            self.device,
+            reproducible,
+            self.seed + 1000003 * user.id + 1009 * round_index + 29009,
+        )
+        configured_backend = str(
+            self.config.get("grad_sample_backend", "auto")
+        ).lower()
+        model_type = str(getattr(model, "model_type", "")).lower()
+        backend = configured_backend
+        if backend == "auto":
+            backend = "vmap" if model_type == "resnet18" else "loop"
+        microbatch_size = int(self.config.get("microbatch_size", 1))
+
+        for images, labels in user.iter_record_dp_batches(sampling_generator):
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+            optimizer.zero_grad(set_to_none=True)
+            clipped_sum = [torch.zeros_like(parameter) for parameter in parameters]
+            all_factors = []
+            for start in range(0, labels.numel(), microbatch_size):
+                stop = min(labels.numel(), start + microbatch_size)
+                batch_images = images[start:stop]
+                batch_labels = labels[start:stop]
+                if backend == "vmap" and not code_poison:
+                    partial_sum, factors = _vmap_clipped_gradient_sum(
+                        model,
+                        batch_images,
+                        batch_labels,
+                        max_norm,
+                    )
+                else:
+                    losses = F.cross_entropy(
+                        model(batch_images), batch_labels, reduction="none"
+                    )
+                    if code_poison:
+                        losses = losses + self._secret_losses(
+                            user, model, batch_images, batch_labels
+                        )
+                    partial_sum, factors = _loop_clipped_gradient_sum(
+                        losses,
+                        parameters,
+                        max_norm,
+                    )
+                with torch.no_grad():
+                    for destination, partial in zip(clipped_sum, partial_sum):
+                        destination.add_(partial)
+                all_factors.append(factors)
+
+            with torch.no_grad():
+                for parameter, gradient_sum in zip(parameters, clipped_sum):
+                    noise = torch.randn(
+                        parameter.shape,
+                        generator=noise_generator,
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    )
+                    parameter.grad = (
+                        gradient_sum
+                        + noise
+                        * (self.record_dp_noise_multiplier * max_norm)
+                    ) / expected_batch_size
+            optimizer.step()
+            self.steps[user.id] += 1
+            if bool(self.config.get("release_private_diagnostics", False)):
+                self._record("record_dp_batch_size", float(labels.numel()))
+                self._record("record_dp_empty_batch", float(labels.numel() == 0))
+            if all_factors and bool(
+                self.config.get("release_private_diagnostics", False)
+            ):
+                factors = torch.cat(all_factors)
+                self._record(
+                    "record_dp_clip_fraction",
+                    float((factors < 1).float().mean()),
+                )
 
     def _hamp_training(
         self, user, model, optimizer, round_index: int, code_poison: bool
@@ -1919,6 +2213,9 @@ class DefenseController:
                 updated_states[user_id][name] = flat.view(shape)
 
     def conservative_dp_epsilon(self) -> float | None:
+        if self.name == "record_dp":
+            epsilons = self.record_dp_epsilons()
+            return max(epsilons.values()) if epsilons else None
         if self.name != "prompt_dp" or not self.steps:
             return None
         noise = float(self.config.get("dp_noise_multiplier", 1.0))
@@ -1934,6 +2231,23 @@ class DefenseController:
             rdp = mechanisms * steps * order / (2.0 * noise * noise)
             candidates.append(rdp + math.log(1.0 / delta) / (order - 1))
         return min(candidates)
+
+    def record_dp_epsilons(self) -> dict[int, float]:
+        if self.name != "record_dp" or self.record_dp_noise_multiplier is None:
+            return {}
+        delta = self._record_dp_delta()
+        return {
+            client_id: poisson_sampled_gaussian_epsilon(
+                noise_multiplier=self.record_dp_noise_multiplier,
+                sample_rate=sample_rate,
+                steps=int(self.steps.get(client_id, 0))
+                + int(self.additional_private_steps),
+                delta=delta,
+            )
+            for client_id, sample_rate in sorted(
+                self.record_dp_sample_rates.items()
+            )
+        }
 
     def summary(self) -> dict:
         averaged = {
@@ -2005,18 +2319,64 @@ class DefenseController:
             }
         epsilon = self.conservative_dp_epsilon()
         if epsilon is not None:
-            summary["privacy_accounting"] = {
-                "epsilon_upper_bound": epsilon,
-                "delta": float(
-                    self.method_config.get("delta", self.config.get("dp_delta", 1e-5))
-                ),
-                "note": "Conservative full-participation Gaussian composition; no subsampling amplification claimed.",
-                "federated_method": self.federated_method,
-                "formal_dp_enabled": not bool(
-                    self.config.get("reproducible_dp_noise", False)
-                )
-                and not bool(self.method_config.get("reproducible_dp_noise", False)),
-            }
+            if self.name == "record_dp":
+                epsilons = self.record_dp_epsilons()
+                summary["privacy_accounting"] = {
+                    "privacy_unit": "record",
+                    "adjacency": "add_remove",
+                    "accountant": "poisson_sampled_gaussian_rdp",
+                    "sampling": "poisson",
+                    "epsilon_upper_bound": epsilon,
+                    "target_epsilon": self.config.get("target_epsilon"),
+                    "delta": self._record_dp_delta(),
+                    "noise_multiplier": self.record_dp_noise_multiplier,
+                    "max_grad_norm": self._record_dp_max_norm(),
+                    "normalization": "fixed_expected_batch_size",
+                    "per_client": {
+                        str(client_id): {
+                            "sample_count": int(self.samples_num[client_id]),
+                            "sample_rate": self.record_dp_sample_rates[client_id],
+                            "actual_steps": int(self.steps.get(client_id, 0)),
+                            "accounted_additional_private_steps": int(
+                                self.additional_private_steps
+                            ),
+                            "planned_steps": self.record_dp_planned_steps[client_id],
+                            "epsilon": epsilons[client_id],
+                        }
+                        for client_id in sorted(epsilons)
+                    },
+                    "federated_method": self.federated_method,
+                    "client_upload_is_private": True,
+                    "formal_dp_enabled": not self._record_dp_reproducible()
+                    and not bool(
+                        self.config.get("release_private_diagnostics", False)
+                    ),
+                    "private_diagnostics_released": bool(
+                        self.config.get("release_private_diagnostics", False)
+                    ),
+                    "note": (
+                        "Per-client sampled-Gaussian RDP composition; disjoint "
+                        "client datasets compose in parallel, so the released "
+                        "record-level epsilon is the client maximum."
+                    ),
+                }
+            else:
+                summary["privacy_accounting"] = {
+                    "epsilon_upper_bound": epsilon,
+                    "delta": float(
+                        self.method_config.get(
+                            "delta", self.config.get("dp_delta", 1e-5)
+                        )
+                    ),
+                    "note": "Conservative full-participation Gaussian composition; no subsampling amplification claimed.",
+                    "federated_method": self.federated_method,
+                    "formal_dp_enabled": not bool(
+                        self.config.get("reproducible_dp_noise", False)
+                    )
+                    and not bool(
+                        self.method_config.get("reproducible_dp_noise", False)
+                    ),
+                }
         return summary
 
     def save_summary(self, results_dir: str) -> dict:

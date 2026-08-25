@@ -424,6 +424,7 @@ class ServerBase:
         self.defense.additional_private_steps = (
             self.private_probe_steps * local_steps_per_probe
         )
+        self.defense.configure_record_dp(self.ctx.users)
 
     @staticmethod
     def _clone_state(state: dict[str, torch.Tensor], cpu: bool = False):
@@ -723,12 +724,17 @@ class ServerBase:
                     round_index=round_index,
                 )
                 if self.federated_method == "fedsgd":
-                    if user.last_update_sample_count <= 0:
+                    if (
+                        user.last_update_sample_count <= 0
+                        and self.defense.name != "record_dp"
+                    ):
                         raise RuntimeError(
                             f"FedSGD client {user_id} did not consume a mini-batch."
                         )
                     self.ctx.update_sample_counts[user_id] = (
-                        user.last_update_sample_count
+                        user.record_dp_expected_batch_size
+                        if self.defense.name == "record_dp"
+                        else user.last_update_sample_count
                     )
                     if (
                         user.last_update_gradients is None
@@ -1002,4 +1008,11 @@ class ServerBase:
             encoding="utf-8",
         ) as file:
             json.dump(method_summary, file, indent=2, allow_nan=False)
+        privacy_accounting = defense_summary.get("privacy_accounting")
+        self.auditor.record_dp_accounting = (
+            privacy_accounting
+            if isinstance(privacy_accounting, dict)
+            and privacy_accounting.get("privacy_unit") == "record"
+            else None
+        )
         return self.auditor.finalize(self.model, final_state)

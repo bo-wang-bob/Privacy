@@ -1,4 +1,4 @@
-# 联邦 soft-prompt 成员隐私防御
+# 联邦成员隐私防御
 
 仓库支持多种彼此独立的防御。一次实验只能选择一个 `defense.name`，不会在后台组合其他防御。
 
@@ -6,6 +6,7 @@
 |---|---|---|
 | `cofedmid` | [CoFedMID](https://www.usenix.org/conference/usenixsecurity26/presentation/bai)，USENIX Security 2026 | 覆盖全类别且平衡两两重叠的动态类别子集、EXP3 样本回收、回收样本置信度正则、加权聚合中性 prompt 噪声 |
 | `prompt_dp` | [Differentially Private Prompt Learning](https://proceedings.neurips.cc/paper_files/paper/2023/hash/f26119b4ffe38c24d97e4c49d334b99e-Abstract-Conference.html)，NeurIPS 2023 | 逐样本 prompt 梯度裁剪和高斯噪声，冻结 CLIP 参数不参与隐私优化 |
+| `record_dp` | 客户端侧记录级 DP-SGD | Poisson 记录采样、完整可训练参数联合梯度裁剪、sampled-Gaussian RDP 会计；支持 ResNet18 FedAvg 与 BERT Adapter one-batch FedSGD |
 | `mist` | [MIST](https://www.usenix.org/conference/usenixsecurity24/presentation/li-jiacheng)，USENIX Security 2024 | 将客户端数据分区视为 MIST 子空间，先本地训练，再以其他客户端预测作为反事实目标做 cross-difference 更新 |
 | `soft` | [SOFT](https://www.usenix.org/conference/usenixsecurity25/presentation/zhang-kaiyuan)，USENIX Security 2025 | 第一轮 warm-up；随后用客户端验证损失均值选择低损失高风险样本，并以视觉翻转和噪声替代文本 paraphrase |
 | `hamp` | [HAMP](https://www.ndss-symposium.org/wp-content/uploads/2024-14-paper.pdf)，NDSS 2024 | 高熵软标签、预测熵正则，以及可微且保持 `argmax` 的温度输出映射 |
@@ -102,6 +103,34 @@ ICLR 记录做四键严格连接。`privacy_audit/iclr_projres_samples.csv` 保�
 - `dp_delta`：隐私会计中的 δ。
 
 `defense_summary.json` 中的 `epsilon_upper_bound` 使用不声明子采样放大的保守高斯组合上界。它适合比较配置，但不会虚报更小的抽样 DP 预算；主动攻击对客户端发起的额外私有更新查询也计入组合次数。
+
+### Record-DP
+
+`record_dp` 保护客户端训练集中的单条记录。图像任务的一条记录是一张图像，文本
+任务的一条记录是一条完整序列，而不是 token。每一步独立以 `q=B/n_i` 对客户端
+`i` 的本地记录做 Poisson 采样，对每条记录在全部可训练参数上的联合梯度裁剪到
+`max_grad_norm`，对裁剪梯度和加入标准差为
+`noise_multiplier * max_grad_norm` 的高斯噪声，再除以固定 expected batch size。
+microbatch 只改变计算方式；所有 microbatch 累加后仅添加一次噪声。
+
+主要参数：
+
+- `target_epsilon` 与数值 `noise_multiplier` 二选一。选择目标 epsilon 时，运行前按
+  最坏客户端计划自动反推一个共享 noise multiplier。
+- `delta`：目标近似 DP 参数。
+- `grad_sample_backend`：`vmap`、`loop` 或 `auto`。ResNet18 默认使用分块
+  `vmap`；共享 Transformer Adapter 使用通用逐记录参考实现。
+- `microbatch_size`：一次保留的逐记录计算块大小，不是新的 DP batch。
+- `reproducible_noise`：仅测试可设为 `true`；此时输出会明确标记
+  `formal_dp_enabled: false`。
+
+每个客户端跨轮顺序组合；不同客户端数据互不相交，因此发布的记录级预算取逐客户端
+epsilon 最大值，而不是把所有客户端相加。会计结果、实际/计划步数和公开采样率
+写入 `defense_summary.json`。默认不发布真实 Poisson batch 大小、空 batch 比例或
+裁剪比例，因为这些数据相关诊断量本身没有加噪。显式设置
+`release_private_diagnostics: true` 可用于封闭研究环境，但会令
+`formal_dp_enabled` 变为 `false`。成员推理审计文件包含实验真值，不属于可公开的
+DP 机制输出。
 
 ### MIST
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from contextlib import nullcontext
 
 import torch
@@ -71,6 +72,28 @@ class UserBase:
             str(getattr(self.defense_controller, "name", "none")).lower()
             == "iclr"
         )
+        self._record_dp_enabled = (
+            str(getattr(self.defense_controller, "name", "none")).lower()
+            == "record_dp"
+        )
+        self.record_dp_expected_batch_size = min(
+            int(self.batch_size), int(self.train_samples)
+        )
+        self.record_dp_sample_rate = (
+            self.record_dp_expected_batch_size / self.train_samples
+            if self.train_samples > 0
+            else 0.0
+        )
+        self.record_dp_steps_per_update = (
+            1
+            if self.federated_method == "fedsgd"
+            else self.local_epochs
+            * math.ceil(
+                self.train_samples
+                / max(1, self.record_dp_expected_batch_size)
+            )
+        )
+        self._record_dp_empty_batch: tuple[torch.Tensor, torch.Tensor] | None = None
         self.trainloader = DataLoader(
             train_data,
             batch_size=batch_size,
@@ -257,6 +280,55 @@ class UserBase:
             for images, labels in self.trainloader:
                 self._record_train_batch(images, labels)
                 yield images, labels
+
+    def _collate_train_samples(
+        self, samples: list
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.collate_fn is None:
+            images, labels = default_collate(samples)
+        else:
+            images, labels = self.collate_fn(samples)
+        return images, labels
+
+    def _empty_record_dp_batch_tensors(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._record_dp_empty_batch is None:
+            if self.train_samples <= 0:
+                raise ValueError(f"Client {self.id} has no local training records.")
+            images, labels = self._collate_train_samples([self.train_data[0]])
+            self._record_dp_empty_batch = (
+                images[:0].detach().cpu(),
+                labels[:0].detach().cpu().long(),
+            )
+        return tuple(tensor.clone() for tensor in self._record_dp_empty_batch)
+
+    def iter_record_dp_batches(self, generator: torch.Generator):
+        """Yield fixed-count Poisson batches for one private local update.
+
+        Every local record is sampled independently with probability ``q``.
+        Empty draws are retained because conditioning on a non-empty draw would
+        not match the sampled-Gaussian privacy accountant.
+        """
+        if not self._record_dp_enabled:
+            raise RuntimeError("Record-DP batches require defense.name=record_dp.")
+        if self.train_samples <= 0 or self.record_dp_sample_rate <= 0:
+            raise ValueError(f"Client {self.id} has no local training records.")
+        for _ in range(self.record_dp_steps_per_update):
+            selected = torch.rand(
+                self.train_samples,
+                generator=generator,
+                device="cpu",
+            ) < self.record_dp_sample_rate
+            indices = selected.nonzero(as_tuple=False).flatten().tolist()
+            if indices:
+                images, labels = self._collate_train_samples(
+                    [self.train_data[index] for index in indices]
+                )
+            else:
+                images, labels = self._empty_record_dp_batch_tensors()
+            self._record_train_batch(images, labels)
+            yield images, labels
 
     def set_parameters(self, state: dict[str, torch.Tensor]) -> None:
         loader = getattr(self.model, "load_trainable_state", None)
