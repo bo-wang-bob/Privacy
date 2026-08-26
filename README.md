@@ -426,6 +426,38 @@ Poisson 采样率和计划 DP 步数自动校准共享 noise multiplier。实际
 `TPR <= min(1, exp(epsilon) * FPR + delta)` 在已报告 FPR 点上的理论上界；这些攻击
 文件包含成员真值，只作为封闭实验审计数据，不属于 DP 发布物。
 
+#### BERT Record-DP × ProjRes 隐私预算 sweep
+
+专用入口固定 BERT-Base Adapter、SST-5、500 轮训练、目标客户端 0、
+`delta=1e-5`、裁剪阈值 1.0，以及每 50 轮一次的 exact-batch ProjRes；同一 seed
+下只有目标 epsilon 及由此自动校准的噪声强度发生变化。默认还会为每个 seed
+运行一个无 DP 的 ProjRes 参考基线。
+
+```bash
+# 先核对最终展开的命令，不启动训练
+bash scripts/run_bert_record_dp_projres_sweep.sh \
+  --epsilons 1,3,5,8 --seeds 42 --dry-run
+
+# 单 seed 正式 sweep：1 个无 DP 基线 + 4 个隐私预算
+bash scripts/run_bert_record_dp_projres_sweep.sh \
+  --epsilons 1,3,5,8 --seeds 42 --jobs 1
+
+# 三个独立 seed、两张 GPU；每张 GPU 同时只安排一个任务
+bash scripts/run_bert_record_dp_projres_sweep.sh \
+  --epsilons 1,3,5,8 --seeds 42,43,44 --gpus 0,1 --jobs 2
+
+# 快速检查 100 轮配置的命令展开，不重复无 DP 基线
+bash scripts/run_bert_record_dp_projres_sweep.sh \
+  --epsilons 1,3 --seeds 42 --no-nondp --rounds 100 --dry-run
+```
+
+正式实验默认要求 CUDA，额外参数会原样转发给 `run_fedllm_adapter.py`。
+Record-DP 结果目录包含 `record_dp_eps<预算>`，实际 epsilon 和噪声强度记录在
+`defense_summary.json`，ProjRes 指标记录在 `privacy_audit/summary.json` 和
+`attack_round_metrics.csv`。对每个预算应同时比较下游准确率、AUC、
+`TPR@0.1FPR` 和 `TPR@0.01FPR`；真实 batch 只有约 10 倍非成员，不适合把
+`TPR@0.001FPR` 当作主要结论。
+
 ## 结果目录与文件
 
 `results/` 下每个一级目录就是一次独立训练任务：

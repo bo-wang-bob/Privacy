@@ -46,6 +46,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--results-dir")
     parser.add_argument(
+        "--defense",
+        choices=("none", "iclr", "record_dp"),
+        help="Override defense.name from the YAML configuration.",
+    )
+    parser.add_argument(
+        "--target-epsilon",
+        type=float,
+        help=(
+            "Override Record-DP target_epsilon and automatically calibrate "
+            "its noise multiplier."
+        ),
+    )
+    parser.add_argument(
         "--dataset",
         choices=("sst5", "cola", "imdb"),
         help=(
@@ -95,6 +108,16 @@ def load_config(args: argparse.Namespace) -> dict:
         config["seed"] = args.seed
     if args.results_dir is not None:
         config["results_dir"] = args.results_dir
+    if args.defense is not None:
+        config.setdefault("defense", {})["name"] = args.defense
+    if args.target_epsilon is not None:
+        defense = config.setdefault("defense", {})
+        if str(defense.get("name", "none")).lower() != "record_dp":
+            raise ValueError(
+                "--target-epsilon requires defense.name=record_dp."
+            )
+        defense["target_epsilon"] = float(args.target_epsilon)
+        defense["noise_multiplier"] = "auto"
     if args.dataset is not None:
         configured_path = Path(str(config["dataset_path"]))
         config["dataset_name"] = args.dataset
@@ -488,9 +511,15 @@ def make_result_dir(config: dict) -> Path:
     timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     defense = str(config.get("defense", {}).get("name", "none")).lower()
     target_client = int(config.get("audit", {}).get("target_client_id", 0))
+    epsilon_suffix = ""
+    if defense == "record_dp":
+        target_epsilon = config.get("defense", {}).get("target_epsilon")
+        if target_epsilon is not None:
+            epsilon_suffix = f"_eps{float(target_epsilon):g}"
     run_name = (
         f"{timestamp}_{config['model_type']}_{config['dataset_name']}_fedsgd_"
-        f"{defense}_seed{int(config['seed'])}_target{target_client}"
+        f"{defense}{epsilon_suffix}_seed{int(config['seed'])}_"
+        f"target{target_client}"
     )
     result_dir = root / run_name
     result_dir.mkdir(parents=True, exist_ok=False)

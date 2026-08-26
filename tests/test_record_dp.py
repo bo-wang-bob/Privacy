@@ -1,4 +1,5 @@
 import json
+from argparse import Namespace
 
 import pytest
 import torch
@@ -14,7 +15,11 @@ from privacy_defenses.controller import (
     _loop_clipped_gradient_sum,
     _vmap_clipped_gradient_sum,
 )
-from scripts.run_fedllm_adapter import validate_config as validate_text_config
+from scripts.run_fedllm_adapter import (
+    load_config as load_text_config,
+    make_result_dir,
+    validate_config as validate_text_config,
+)
 from servers.serverbase import ServerBase
 from users.user import UserBase
 from utils.privacy_accounting import (
@@ -71,6 +76,32 @@ def test_poisson_sampled_rdp_matches_full_gaussian_and_amplifies_privacy():
     )
     assert 0 < sampled < full
     assert poisson_sampled_gaussian_rdp(1.3, 0.0, 8) == 0.0
+
+
+def test_text_runner_overrides_record_dp_epsilon_and_projres_only(tmp_path):
+    config = load_text_config(
+        Namespace(
+            config="configs/bert_base_sst5_adapter_record_dp.yaml",
+            gpu=None,
+            rounds=100,
+            seed=43,
+            results_dir=str(tmp_path),
+            defense="record_dp",
+            target_epsilon=5.0,
+            dataset=None,
+            attacks="projres",
+            target_client_id=None,
+            projres=True,
+            require_cuda=None,
+        )
+    )
+
+    assert config["defense"]["target_epsilon"] == 5.0
+    assert config["defense"]["noise_multiplier"] == "auto"
+    assert config["audit"]["attacks"] == ["projres"]
+    assert config["audit"]["exact_batch_membership_attacks"] == ["projres"]
+    result_dir = make_result_dir(config)
+    assert "_record_dp_eps5_seed43_target0" in result_dir.name
 
 
 def test_poisson_noise_calibration_meets_every_client_budget():
