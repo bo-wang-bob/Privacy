@@ -59,6 +59,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--max-grad-norm",
+        type=float,
+        help="Override the Record-DP per-sequence clipping threshold C.",
+    )
+    parser.add_argument(
         "--dataset",
         choices=("sst5", "cola", "imdb"),
         help=(
@@ -118,6 +123,14 @@ def load_config(args: argparse.Namespace) -> dict:
             )
         defense["target_epsilon"] = float(args.target_epsilon)
         defense["noise_multiplier"] = "auto"
+    max_grad_norm = getattr(args, "max_grad_norm", None)
+    if max_grad_norm is not None:
+        defense = config.setdefault("defense", {})
+        if str(defense.get("name", "none")).lower() != "record_dp":
+            raise ValueError(
+                "--max-grad-norm requires defense.name=record_dp."
+            )
+        defense["max_grad_norm"] = float(max_grad_norm)
     if args.dataset is not None:
         configured_path = Path(str(config["dataset_path"]))
         config["dataset_name"] = args.dataset
@@ -512,14 +525,21 @@ def make_result_dir(config: dict) -> Path:
     defense = str(config.get("defense", {}).get("name", "none")).lower()
     target_client = int(config.get("audit", {}).get("target_client_id", 0))
     epsilon_suffix = ""
+    clipping_suffix = ""
     if defense == "record_dp":
-        target_epsilon = config.get("defense", {}).get("target_epsilon")
+        defense_config = config.get("defense", {})
+        target_epsilon = defense_config.get("target_epsilon")
         if target_epsilon is not None:
             epsilon_suffix = f"_eps{float(target_epsilon):g}"
+        max_grad_norm = defense_config.get(
+            "max_grad_norm", defense_config.get("dp_max_grad_norm")
+        )
+        if max_grad_norm is not None:
+            clipping_suffix = f"_c{float(max_grad_norm):g}"
     run_name = (
         f"{timestamp}_{config['model_type']}_{config['dataset_name']}_fedsgd_"
         f"{defense}{epsilon_suffix}_seed{int(config['seed'])}_"
-        f"target{target_client}"
+        f"target{target_client}{clipping_suffix}"
     )
     result_dir = root / run_name
     result_dir.mkdir(parents=True, exist_ok=False)

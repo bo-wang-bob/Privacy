@@ -1,6 +1,7 @@
 import json
 from argparse import Namespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
@@ -14,6 +15,13 @@ from privacy_defenses.controller import (
     DefenseController,
     _loop_clipped_gradient_sum,
     _vmap_clipped_gradient_sum,
+)
+from scripts.calibrate_bert_record_dp_clipping import (
+    candidate_shortlist,
+    clipping_grid,
+    sampling_diagnostics,
+    select_sample_references,
+    summarize_checkpoints,
 )
 from scripts.run_fedllm_adapter import (
     load_config as load_text_config,
@@ -39,6 +47,86 @@ class TinyRecordModel(nn.Module):
 
     def forward(self, inputs):
         return self.linear(inputs)
+
+
+class CalibrationIndexedToyDataset:
+    def __init__(self, size: int, offset: int):
+        self.indices = tuple(range(offset, offset + size))
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, index):
+        return f"sample-{self.indices[index]}", self.indices[index] % 2
+
+
+def _calibration_rows(checkpoint: str, norms: list[float]) -> list[dict]:
+    return [
+        {
+            "checkpoint": checkpoint,
+            "communication_round": 0 if checkpoint == "initial" else 10,
+            "client_id": index // 2,
+            "joint_grad_norm": norm,
+        }
+        for index, norm in enumerate(norms)
+    ]
+
+
+def test_clipping_calibration_sampling_is_fixed_and_preserves_global_ids():
+    datasets = [
+        CalibrationIndexedToyDataset(8, 0),
+        CalibrationIndexedToyDataset(8, 100),
+    ]
+    first = select_sample_references(datasets, [0, 1], 3, seed=7)
+    second = select_sample_references(datasets, [0, 1], 3, seed=7)
+
+    assert first == second
+    assert len(first) == 6
+    assert len({(item.client_id, item.local_index) for item in first}) == 6
+    assert all(
+        item.global_index == datasets[item.client_id].indices[item.local_index]
+        for item in first
+    )
+
+
+def test_clipping_calibration_summary_matches_exact_counterfactuals():
+    rows = _calibration_rows("initial", [0.5, 1.0, 2.0, 4.0])
+    summary = summarize_checkpoints(rows, bootstrap_replicates=0, seed=3)[0]
+    grid = clipping_grid(rows, [1.0, 2.0])
+
+    assert summary["p50"] == pytest.approx(1.5)
+    assert summary["current_c_clip_fraction"] == pytest.approx(0.5)
+    assert grid[0]["clip_fraction"] == pytest.approx(0.5)
+    assert grid[0]["mean_clip_factor"] == pytest.approx(
+        np.mean([1.0, 1.0, 0.5, 0.25])
+    )
+    assert grid[0]["mean_clipped_norm"] == pytest.approx(0.875)
+    assert grid[1]["clip_fraction"] == pytest.approx(0.25)
+
+
+def test_clipping_calibration_bootstrap_and_geometric_grid_are_finite():
+    rows = _calibration_rows("initial", [0.5, 1.0, 2.0, 4.0])
+    rows += _calibration_rows("round10", [1.0, 2.0, 4.0, 8.0])
+    summaries = summarize_checkpoints(rows, bootstrap_replicates=50, seed=11)
+    shortlist = candidate_shortlist(summaries)
+
+    assert summaries[0]["p75_ci95_low"] <= summaries[0]["p75_ci95_high"]
+    assert [row["max_grad_norm"] for row in shortlist] == [1.0, 2.0, 4.0, 8.0]
+    assert shortlist[0]["basis"] == "current_baseline"
+
+
+def test_clipping_calibration_sampling_diagnostics_check_balance_and_uniqueness():
+    datasets = [
+        CalibrationIndexedToyDataset(4, 0),
+        CalibrationIndexedToyDataset(4, 4),
+    ]
+    references = select_sample_references(datasets, [0, 1], 4, seed=9)
+    diagnostics = sampling_diagnostics(datasets, references)
+
+    assert diagnostics["source_records"] == 8
+    assert diagnostics["sample_records"] == 8
+    assert diagnostics["unique_global_indices"] == 8
+    assert diagnostics["label_total_variation"] == pytest.approx(0.0)
 
 
 def test_record_dp_resnet_and_bert_configs_validate():
@@ -88,6 +176,7 @@ def test_text_runner_overrides_record_dp_epsilon_and_projres_only(tmp_path):
             results_dir=str(tmp_path),
             defense="record_dp",
             target_epsilon=5.0,
+            max_grad_norm=8.0,
             dataset=None,
             attacks="projres",
             target_client_id=None,
@@ -98,10 +187,12 @@ def test_text_runner_overrides_record_dp_epsilon_and_projres_only(tmp_path):
 
     assert config["defense"]["target_epsilon"] == 5.0
     assert config["defense"]["noise_multiplier"] == "auto"
+    assert config["defense"]["max_grad_norm"] == pytest.approx(8.0)
     assert config["audit"]["attacks"] == ["projres"]
     assert config["audit"]["exact_batch_membership_attacks"] == ["projres"]
     result_dir = make_result_dir(config)
     assert "_record_dp_eps5_seed43_target0" in result_dir.name
+    assert result_dir.name.endswith("_c8")
 
 
 def test_poisson_noise_calibration_meets_every_client_budget():

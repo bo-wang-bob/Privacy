@@ -3,6 +3,7 @@ set -euo pipefail
 
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 epsilons="${BERT_DP_EPSILONS:-1,3,5,8}"
+max_grad_norms="${BERT_DP_MAX_GRAD_NORMS:-1}"
 seeds="${BERT_DP_SEEDS:-42}"
 gpus="${BERT_DP_GPUS:-0}"
 jobs="${BERT_DP_JOBS:-1}"
@@ -29,6 +30,14 @@ while (($#)); do
       ;;
     --epsilons=*)
       epsilons="${1#*=}"
+      shift
+      ;;
+    --max-grad-norms)
+      max_grad_norms="$2"
+      shift 2
+      ;;
+    --max-grad-norms=*)
+      max_grad_norms="${1#*=}"
       shift
       ;;
     --seeds)
@@ -81,6 +90,7 @@ Sweep BERT-Base/SST-5 ProjRes over Record-DP privacy budgets.
 
 Options:
   --epsilons 1,3,5,8    Positive epsilon values (default: 1,3,5,8)
+  --max-grad-norms 1,2  Record-DP clipping thresholds C (default: 1)
   --seeds 42,43,44      Independent training seeds (default: 42)
   --gpus 0,1            GPU ids assigned round-robin (default: 0)
   --jobs N              Maximum concurrent runs (default: 1)
@@ -106,16 +116,24 @@ if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 IFS=',' read -r -a epsilon_values <<< "$epsilons"
+IFS=',' read -r -a max_grad_norm_values <<< "$max_grad_norms"
 IFS=',' read -r -a seed_values <<< "$seeds"
 IFS=',' read -r -a gpu_values <<< "$gpus"
-if ((${#epsilon_values[@]} == 0 || ${#seed_values[@]} == 0 || ${#gpu_values[@]} == 0)); then
-  echo "epsilon, seed, and GPU lists must be non-empty." >&2
+if ((${#epsilon_values[@]} == 0 || ${#max_grad_norm_values[@]} == 0 || ${#seed_values[@]} == 0 || ${#gpu_values[@]} == 0)); then
+  echo "epsilon, max-grad-norm, seed, and GPU lists must be non-empty." >&2
   exit 2
 fi
 for epsilon in "${epsilon_values[@]}"; do
   if ! [[ "$epsilon" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
     || ! awk -v value="$epsilon" 'BEGIN { exit !(value > 0) }'; then
     echo "Invalid positive epsilon: $epsilon" >&2
+    exit 2
+  fi
+done
+for max_grad_norm in "${max_grad_norm_values[@]}"; do
+  if ! [[ "$max_grad_norm" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
+    || ! awk -v value="$max_grad_norm" 'BEGIN { exit !(value > 0) }'; then
+    echo "Invalid positive max-grad-norm: $max_grad_norm" >&2
     exit 2
   fi
 done
@@ -134,6 +152,7 @@ done
 
 task_kinds=()
 task_epsilons=()
+task_max_grad_norms=()
 task_seeds=()
 task_gpus=()
 task_index=0
@@ -141,24 +160,29 @@ for seed in "${seed_values[@]}"; do
   if [[ "$include_nondp" == true ]]; then
     task_kinds+=("nondp")
     task_epsilons+=("none")
+    task_max_grad_norms+=("none")
     task_seeds+=("$seed")
     task_gpus+=("${gpu_values[$((task_index % ${#gpu_values[@]}))]}")
     ((task_index += 1))
   fi
   for epsilon in "${epsilon_values[@]}"; do
-    task_kinds+=("record_dp")
-    task_epsilons+=("$epsilon")
-    task_seeds+=("$seed")
-    task_gpus+=("${gpu_values[$((task_index % ${#gpu_values[@]}))]}")
-    ((task_index += 1))
+    for max_grad_norm in "${max_grad_norm_values[@]}"; do
+      task_kinds+=("record_dp")
+      task_epsilons+=("$epsilon")
+      task_max_grad_norms+=("$max_grad_norm")
+      task_seeds+=("$seed")
+      task_gpus+=("${gpu_values[$((task_index % ${#gpu_values[@]}))]}")
+      ((task_index += 1))
+    done
   done
 done
 
 build_command() {
   local kind="$1"
   local epsilon="$2"
-  local seed="$3"
-  local gpu="$4"
+  local max_grad_norm="$3"
+  local seed="$4"
+  local gpu="$5"
   if [[ "$kind" == "nondp" ]]; then
     command=(
       "$python_bin" scripts/run_fedllm_adapter.py
@@ -177,6 +201,7 @@ build_command() {
       --config configs/bert_base_sst5_adapter_record_dp.yaml
       --defense record_dp
       --target-epsilon "$epsilon"
+      --max-grad-norm "$max_grad_norm"
       --attacks projres
       --projres
       --seed "$seed"
@@ -187,13 +212,14 @@ build_command() {
   fi
 }
 
-echo "Expanded ${#task_kinds[@]} BERT ProjRes tasks | epsilons=$epsilons | seeds=$seeds | jobs=$jobs | gpus=$gpus | nondp=$include_nondp"
+echo "Expanded ${#task_kinds[@]} BERT ProjRes tasks | epsilons=$epsilons | max_grad_norms=$max_grad_norms | seeds=$seeds | jobs=$jobs | gpus=$gpus | nondp=$include_nondp"
 
 if [[ "$dry_run" == true ]]; then
   for index in "${!task_kinds[@]}"; do
     build_command \
       "${task_kinds[$index]}" \
       "${task_epsilons[$index]}" \
+      "${task_max_grad_norms[$index]}" \
       "${task_seeds[$index]}" \
       "${task_gpus[$index]}"
     printf 'COMMAND'
@@ -228,9 +254,10 @@ for index in "${!task_kinds[@]}"; do
   build_command \
     "${task_kinds[$index]}" \
     "${task_epsilons[$index]}" \
+    "${task_max_grad_norms[$index]}" \
     "${task_seeds[$index]}" \
     "${task_gpus[$index]}"
-  label="${task_kinds[$index]}/eps${task_epsilons[$index]}/seed${task_seeds[$index]}@gpu${task_gpus[$index]}"
+  label="${task_kinds[$index]}/eps${task_epsilons[$index]}/c${task_max_grad_norms[$index]}/seed${task_seeds[$index]}@gpu${task_gpus[$index]}"
   echo "START BERT ProjRes task | $label"
   "${command[@]}" &
   pids+=("$!")
