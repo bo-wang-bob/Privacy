@@ -10,7 +10,6 @@
 | `mist` | [MIST](https://www.usenix.org/conference/usenixsecurity24/presentation/li-jiacheng)，USENIX Security 2024 | 将客户端数据分区视为 MIST 子空间，先本地训练，再以其他客户端预测作为反事实目标做 cross-difference 更新 |
 | `soft` | [SOFT](https://www.usenix.org/conference/usenixsecurity25/presentation/zhang-kaiyuan)，USENIX Security 2025 | 第一轮 warm-up；随后用客户端验证损失均值选择低损失高风险样本，并以视觉翻转和噪声替代文本 paraphrase |
 | `hamp` | [HAMP](https://www.ndss-symposium.org/wp-content/uploads/2024-14-paper.pdf)，NDSS 2024 | 高熵软标签、预测熵正则，以及可微且保持 `argmax` 的温度输出映射 |
-| `veil`（兼容旧名 `local_ggeur`、`mirage`） | VEIL，本仓库防御方案 | 客户端不共享统计量；只在本地 CLIP embedding 空间估计类均值/协方差，用几何回声替代个体锚点后训练 prompt |
 | `perturb` | FedMIA Perturb 基线 | 裁剪客户端可训练 prompt delta，并在上传前加入高斯噪声 |
 | `sparse` | FedMIA Sparse 基线 | 上传前按绝对值保留最大的 prompt delta 元素，其余置零 |
 | `mixup` | FedMIA Mixup 基线 | 本地 prompt 训练使用 Beta 系数混合图像和标签损失 |
@@ -149,67 +148,6 @@ MIST 至少需要每轮选择两个客户端。
 - `hamp_true_probability`：高熵软标签分配给真实类别的概率。
 - `hamp_entropy_weight`：训练阶段熵正则强度。
 - `hamp_output_temperature`：审计和部署查询的低置信度温度，必须不小于 1。
-
-### VEIL（原 Local-GGEUR）
-
-VEIL（Variance-Echoed Instance-Less Prompt Learning）是面向联邦提示学习成员推理防御的本地数据替代训练方案。旧实验名 `local_ggeur`、`mirage` 与正式名称 `veil` 使用同一实现。它不上传客户端类均值或协方差：每个客户端只在本地冻结 CLIP image encoder 后，按类别构建 feature bank。对类别 `c`，设本地特征均值为 `μ_c`，中心化特征矩阵为 `Z_c`。实现中使用低秩协方差因子生成扰动：
-
-```text
-β = ε Z_c / sqrt(n_c - 1),  ε ~ N(0, I)
-```
-
-这等价于从本地经验协方差采样，避免显式求高维协方差特征分解。默认增强样本为 `normalize(μ_c + scale · β)`，即分布级样本参与训练，单个原始样本不作为训练锚点。实现的后备默认将原样本分支替换为 `normalize(μ_c + noise)`；VEIL 论文正式配置使用无噪声的 `normalize(μ_c)`，带噪原型作为独立消融。
-
-- `local_ggeur_augments`：每个 batch 样本标签生成多少个本地几何增强特征。设为 0 可做“仅原样本私有化”消融。
-- `local_ggeur_geometry_scale`：几何扰动强度。
-- `local_ggeur_anchor_mode`：`class_mean` 或 `sample`。默认 `class_mean`，避免单个原样本直接作为增强锚点；`sample` 用于论文消融。
-- `local_ggeur_original_mode`：`drop`、`class_mean`、`class_mean_noise`、`mean_mix`、`blur` 或 `noise`。默认 `class_mean_noise`。
-- `local_ggeur_original_noise`：原样本私有化分支的 feature 噪声标准差。
-- `local_ggeur_mean_noise_std`：每个客户端、每轮对各类别几何均值锚点加入一次的本地 feature 噪声；默认 0，实验调优时用于削弱单个成员对类别中心的影响。
-- `local_ggeur_mean_mix`：`mean_mix`/`blur` 模式下向类均值收缩的比例。
-- `local_ggeur_fallback_std`：单样本类别无法估计协方差时的各向同性 fallback 噪声。
-- `local_ggeur_entropy_weight`：可选预测熵正则；默认 0，避免无必要地牺牲任务效用。
-- `local_ggeur_entropy_rounds`：可选早期熵正则轮数；为 `null` 时只由 `local_ggeur_entropy_weight` 决定是否全程启用。
-- `local_ggeur_late_start_round`、`local_ggeur_late_augments`：可选后期几何增强退火；例如 `7/0` 表示第 7 轮起关闭几何增强。当前实验显示该策略会显著伤害效用，不作为推荐默认值。
-- `local_ggeur_output_temperature`：最终发布/部署模型的查询温度，必须不小于 1。该校准只作用于最终查询输出，不改变本地训练、联邦聚合或轮次协议观察。
-- `local_ggeur_output_margin`：可选 top-1/top-2 logit 间隔上限；默认关闭。
-- `local_ggeur_calibrate_observations`：是否把输出校准也作用到轮次审计观察；默认关闭。
-- `local_ggeur_class_balanced`：是否按本地类别均匀采样类代表特征；实验中会放大更新侧攻击信号，默认关闭。
-- `local_ggeur_upload_clip_norm`：对本地训练后的 prompt delta 做 L2 裁剪。默认 `0.5`。
-- `local_ggeur_upload_noise_std`：对裁剪后的 prompt delta 加高斯噪声，噪声标准差为该值乘以裁剪阈值。VEIL 论文正式配置使用 `0.11`；早期 Local-GGEUR 配置使用 `0.07`。
-
-当前推荐的跨攻击默认值是：
-
-```yaml
-local_ggeur_augments: 3
-local_ggeur_geometry_scale: 0.6
-local_ggeur_anchor_mode: class_mean
-local_ggeur_original_mode: class_mean
-local_ggeur_original_noise: 0.0
-local_ggeur_entropy_weight: 0.0
-local_ggeur_output_temperature: 4.0
-local_ggeur_upload_clip_norm: 0.5
-local_ggeur_upload_noise_std: 0.11
-```
-
-如果只关注 FedMIA confidence/loss 侧信号，可使用更强的熵正则配置：
-
-```yaml
-local_ggeur_augments: 2
-local_ggeur_geometry_scale: 0.45
-local_ggeur_original_noise: 0.05
-local_ggeur_entropy_weight: 0.05
-```
-
-该配置对 FedMIA loss 更强，但会使 Nasr/RMIA/YOQO 反弹，因此不是默认跨攻击配置。
-
-推荐消融：
-
-- 完整 VEIL：`anchor_mode=class_mean`，`original_mode=class_mean`，`augments=3`，并使用上传平滑和最终输出温度 4。
-- 无几何增强：`local_ggeur_augments=0`。
-- 无原样本私有化分支：`local_ggeur_original_mode=drop`。
-- 个体锚点消融：`local_ggeur_anchor_mode=sample`。
-- 无输出温度消融：`local_ggeur_output_temperature=1.0`。
 
 ## 输出
 

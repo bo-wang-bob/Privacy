@@ -92,8 +92,6 @@ def validate_fair_configs(
 def _method_name(config: dict[str, Any]) -> str:
     aggregator = str(config["aggregator"]).lower()
     defense = str(config.get("defense", {}).get("name", "none")).lower()
-    if aggregator == "fedavg" and defense in {"local_ggeur", "mirage", "veil"}:
-        return "VEIL"
     if defense == "none":
         return {
             "promptfl": "PromptFL",

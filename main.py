@@ -1049,55 +1049,6 @@ def validate_config(config: dict) -> None:
         raise ValueError("defense.hamp_output_temperature must be at least one.")
     if not 0 < float(defense.get("hamp_true_probability", 0.6)) < 1:
         raise ValueError("defense.hamp_true_probability must be in (0, 1).")
-    if int(defense.get("local_ggeur_augments", 2)) < 0:
-        raise ValueError("defense.local_ggeur_augments must be non-negative.")
-    if float(defense.get("local_ggeur_geometry_scale", 0.45)) < 0:
-        raise ValueError("defense.local_ggeur_geometry_scale must be non-negative.")
-    if float(defense.get("local_ggeur_original_noise", 0.03)) < 0:
-        raise ValueError("defense.local_ggeur_original_noise must be non-negative.")
-    if float(defense.get("local_ggeur_mean_noise_std", 0.0)) < 0:
-        raise ValueError("defense.local_ggeur_mean_noise_std must be non-negative.")
-    if float(defense.get("local_ggeur_output_temperature", 4.0)) < 1:
-        raise ValueError(
-            "defense.local_ggeur_output_temperature must be at least one."
-        )
-    output_margin = defense.get("local_ggeur_output_margin")
-    if output_margin is not None and float(output_margin) < 0:
-        raise ValueError("defense.local_ggeur_output_margin must be non-negative.")
-    entropy_rounds = defense.get("local_ggeur_entropy_rounds")
-    if entropy_rounds is not None and int(entropy_rounds) < 0:
-        raise ValueError("defense.local_ggeur_entropy_rounds must be non-negative.")
-    late_start = defense.get("local_ggeur_late_start_round")
-    if late_start is not None and int(late_start) < 0:
-        raise ValueError("defense.local_ggeur_late_start_round must be non-negative.")
-    late_augments = defense.get("local_ggeur_late_augments")
-    if late_augments is not None and int(late_augments) < 0:
-        raise ValueError("defense.local_ggeur_late_augments must be non-negative.")
-    upload_clip = defense.get("local_ggeur_upload_clip_norm")
-    if upload_clip is not None and float(upload_clip) < 0:
-        raise ValueError("defense.local_ggeur_upload_clip_norm must be non-negative.")
-    if float(defense.get("local_ggeur_upload_noise_std", 0.0)) < 0:
-        raise ValueError("defense.local_ggeur_upload_noise_std must be non-negative.")
-    if not 0 <= float(defense.get("local_ggeur_mean_mix", 0.8)) <= 1:
-        raise ValueError("defense.local_ggeur_mean_mix must be in [0, 1].")
-    if str(defense.get("local_ggeur_anchor_mode", "class_mean")).lower() not in {
-        "class_mean",
-        "sample",
-    }:
-        raise ValueError(
-            "defense.local_ggeur_anchor_mode must be 'class_mean' or 'sample'."
-        )
-    if str(
-        defense.get("local_ggeur_original_mode", "class_mean_noise")
-    ).lower() not in {
-        "drop",
-        "class_mean",
-        "class_mean_noise",
-        "mean_mix",
-        "blur",
-        "noise",
-    }:
-        raise ValueError("defense.local_ggeur_original_mode is invalid.")
     spatial = {
         "fedmia_loss",
         "fedmia_cosine",
@@ -1588,24 +1539,6 @@ def default_config() -> dict:
             "hamp_true_probability": 0.6,
             "hamp_entropy_weight": 0.05,
             "hamp_output_temperature": 4.0,
-            "local_ggeur_augments": 3,
-            "local_ggeur_geometry_scale": 0.6,
-            "local_ggeur_anchor_mode": "class_mean",
-            "local_ggeur_original_mode": "class_mean_noise",
-            "local_ggeur_original_noise": 0.08,
-            "local_ggeur_mean_noise_std": 0.0,
-            "local_ggeur_mean_mix": 0.8,
-            "local_ggeur_fallback_std": 0.02,
-            "local_ggeur_entropy_weight": 0.0,
-            "local_ggeur_entropy_rounds": None,
-            "local_ggeur_late_start_round": None,
-            "local_ggeur_late_augments": None,
-            "local_ggeur_output_temperature": 4.0,
-            "local_ggeur_output_margin": None,
-            "local_ggeur_calibrate_observations": False,
-            "local_ggeur_class_balanced": False,
-            "local_ggeur_upload_clip_norm": 0.5,
-            "local_ggeur_upload_noise_std": 0.07,
             "iclr_validation_top_fraction": 0.2,
         },
     }
@@ -1615,7 +1548,7 @@ def parse_args() -> dict:
     parser = argparse.ArgumentParser(
         description="Federated prompt tuning membership-privacy benchmark"
     )
-    parser.add_argument("--config", default="configs/clip_mlp_privacy.yaml")
+    parser.add_argument("--config", default="configs/models/clip_mlp.yaml")
     parser.add_argument("--dataset_name")
     parser.add_argument("--data_root")
     parser.add_argument("--cache_dir")
@@ -1710,32 +1643,6 @@ def parse_args() -> dict:
     parser.add_argument("--data_aug_strength", type=float)
     parser.add_argument("--data_aug_flip_probability", type=float)
     parser.add_argument("--data_aug_color_jitter", type=float)
-    parser.add_argument("--local_ggeur_augments", type=int)
-    parser.add_argument("--local_ggeur_geometry_scale", type=float)
-    parser.add_argument("--local_ggeur_anchor_mode")
-    parser.add_argument("--local_ggeur_original_mode")
-    parser.add_argument("--local_ggeur_original_noise", type=float)
-    parser.add_argument("--local_ggeur_mean_noise_std", type=float)
-    parser.add_argument("--local_ggeur_mean_mix", type=float)
-    parser.add_argument("--local_ggeur_fallback_std", type=float)
-    parser.add_argument("--local_ggeur_entropy_weight", type=float)
-    parser.add_argument("--local_ggeur_entropy_rounds", type=int)
-    parser.add_argument("--local_ggeur_late_start_round", type=int)
-    parser.add_argument("--local_ggeur_late_augments", type=int)
-    parser.add_argument("--local_ggeur_output_temperature", type=float)
-    parser.add_argument("--local_ggeur_output_margin", type=float)
-    parser.add_argument("--local_ggeur_upload_clip_norm", type=float)
-    parser.add_argument("--local_ggeur_upload_noise_std", type=float)
-    parser.add_argument(
-        "--local_ggeur_calibrate_observations",
-        action="store_true",
-        help="Apply Local-GGEUR output calibration to round-level audit observations.",
-    )
-    parser.add_argument(
-        "--local_ggeur_class_balanced",
-        action="store_true",
-        help="Uniformly sample local classes for Local-GGEUR feature training.",
-    )
     args = parser.parse_args()
     config = default_config()
     if args.config:
@@ -1831,30 +1738,10 @@ def parse_args() -> dict:
         "data_aug_strength",
         "data_aug_flip_probability",
         "data_aug_color_jitter",
-        "local_ggeur_augments",
-        "local_ggeur_geometry_scale",
-        "local_ggeur_anchor_mode",
-        "local_ggeur_original_mode",
-        "local_ggeur_original_noise",
-        "local_ggeur_mean_noise_std",
-        "local_ggeur_mean_mix",
-        "local_ggeur_fallback_std",
-        "local_ggeur_entropy_weight",
-        "local_ggeur_entropy_rounds",
-        "local_ggeur_late_start_round",
-        "local_ggeur_late_augments",
-        "local_ggeur_output_temperature",
-        "local_ggeur_output_margin",
-        "local_ggeur_upload_clip_norm",
-        "local_ggeur_upload_noise_std",
     ):
         value = getattr(args, key)
         if value is not None:
             config["defense"][key] = value
-    if args.local_ggeur_calibrate_observations:
-        config["defense"]["local_ggeur_calibrate_observations"] = True
-    if args.local_ggeur_class_balanced:
-        config["defense"]["local_ggeur_class_balanced"] = True
     return config
 
 

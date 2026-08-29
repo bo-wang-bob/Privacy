@@ -33,10 +33,7 @@ from privacy_attacks.rmia import run_rmia
 from privacy_attacks.transfer import run_transfer_representation_attack
 from privacy_attacks.update_attacks import run_update_attack
 from privacy_attacks.whitebox import run_active_whitebox, run_passive_whitebox
-from privacy_defenses import (
-    attach_hamp_output_transform,
-    attach_output_temperature_transform,
-)
+from privacy_defenses import attach_hamp_output_transform
 from privacy_defenses.iclr import infer_other_clients_state
 from privacy_defenses.iclr_validation import (
     _pearson,
@@ -300,15 +297,6 @@ class MembershipAuditor:
             attach_hamp_output_transform(
                 self.model,
                 float(self.defense_config.get("hamp_output_temperature", 4.0)),
-            )
-        elif self.defense_name in {"local_ggeur", "mirage", "veil"} and bool(
-            self.defense_config.get("local_ggeur_calibrate_observations", False)
-        ):
-            margin = self.defense_config.get("local_ggeur_output_margin")
-            attach_output_temperature_transform(
-                self.model,
-                float(self.defense_config.get("local_ggeur_output_temperature", 4.0)),
-                margin=None if margin is None else float(margin),
             )
         self.users = users
         self.target_client_id = target_client_id
@@ -5157,13 +5145,6 @@ class MembershipAuditor:
             attach_hamp_output_transform(
                 final_model,
                 float(self.defense_config.get("hamp_output_temperature", 4.0)),
-            )
-        elif self.defense_name in {"local_ggeur", "mirage", "veil"}:
-            margin = self.defense_config.get("local_ggeur_output_margin")
-            attach_output_temperature_transform(
-                final_model,
-                float(self.defense_config.get("local_ggeur_output_temperature", 4.0)),
-                margin=None if margin is None else float(margin),
             )
         for attack in self.attacks:
             try:

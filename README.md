@@ -135,8 +135,8 @@ CLIP-MLP、CLIP-Adapter、CLIP-LoRA、BERT 和 GPT2 固定候选攻击的经验 
 ├── servers/                # 联邦训练循环
 ├── privacy_attacks/        # 统一审计器、攻击与 ProjRes
 ├── privacy_defenses/       # 隐私防御和 ICLR 分析
-├── configs/                # 单任务配置与 sweep 配置
-├── scripts/                # CLIP/FedLLM 启动脚本
+├── configs/                # 统一能力目录与 7 份模型基线
+├── scripts/                # 唯一批量入口及专项校准/诊断工具
 ├── analysis_scripts/       # CSV/Markdown/PNG 等结果分析工具
 ├── docs/                   # 协议、公式和实现说明
 └── tests/                  # 轻量与完整回归测试
@@ -190,179 +190,67 @@ CoLA 和 IMDB 分别从 `data/huggingface/cola`、`data/huggingface/imdb` 等本
 
 ## 快速开始
 
-### ResNet18 / CIFAR100 FedMIA-Loss 论文配置
+唯一批量入口是 [`scripts/run_privacy_experiments.py`](scripts/run_privacy_experiments.py)。
+它按“模型 × 数据集 × 防御 × seed × 目标客户端”展开训练任务；同一命令选择的
+多种攻击保留在一个任务中，共享一次训练，不会为每种攻击重复训练。
 
-稳定参数集中在
-[`configs/resnet18_cifar100_fedmia_loss.yaml`](configs/resnet18_cifar100_fedmia_loss.yaml)：
-完整 CIFAR100、随机等量 IID、10 个客户端全参与、每客户端 5000 个训练样本、
-batch size 100、1 个本地 epoch、300 个通信轮、SGD momentum 0.9、weight decay
-0.0005。模型使用 CIFAR 3x3 stem 和 32 组 GroupNorm，不使用数据增强。
-
-FedMIA-Loss 每 10 个已完成通信轮审计一次。成员为目标客户端 0 的全部 5000 个
-训练样本；10000 个非成员由完整独立测试集抽 1000 个，再从其余 9 个客户端的
-训练集各抽 1000 个。每轮以其余客户端的负交叉熵构造三西格玛过滤后的高斯 null，
-计算目标客户端单尾 CDF，最后对 30 个审计轮的 CDF 分数取均值。
-
-同一审计轮还对全部 15000 个候选逐样本计算只读 ICLR 分数
-`L(x; theta_-k) - L(x; theta_k)`：`theta_k` 是目标客户端该轮上传的 post-local
-模型，`theta_-k` 由服务器发布的聚合模型按目标客户端实际 FedAvg 权重反解得到。
-分数越大，表示该样本越特异于目标客户端。该逻辑不筛除样本，不启用 ICLR 防御，
-也不改变 FedMIA 论文训练配置中的 SGD、momentum、weight decay 或学习率日程。
+先查看完整兼容矩阵，再 dry-run：
 
 ```bash
-# 只检查命令
-bash scripts/run_resnet18_cifar100_fedmia_loss.sh --dry-run
-
-# 正式运行（默认 GPU 0、seed 1）
-bash scripts/run_resnet18_cifar100_fedmia_loss.sh
-
-# 指定设备和数据目录
-bash scripts/run_resnet18_cifar100_fedmia_loss.sh \
-  --gpu 1 --data_root /path/to/data
+python scripts/run_privacy_experiments.py --list
+python scripts/run_privacy_experiments.py --dry-run --max-runs 1
 ```
 
-论文附录 Table 3 写明学习率每轮乘 `0.99`，因此本配置以该表为准。作者公开
-`run.sh` 使用 cosine schedule；若要对齐公开脚本而非论文表格，应另建配置，不能
-把两种学习率日程的结果直接合并。
-
-### 1. 先检查最终参数
-
-修改配置或正式启动前，优先使用 dry-run。CLIP 入口会打印每个任务合并后的最终
-参数，包括联邦方法、聚合权重、学习率、候选协议和攻击列表：
+不指定模型时保持原 CLIP 统一入口的默认范围：CLIP-MLP、CLIP-Adapter、
+CLIP-LoRA 和五个图像数据集。常用组合如下：
 
 ```bash
-bash scripts/run_all_clip_fedmia_attacks.sh --dry-run --max-runs 1
+# 单模型、单数据集、多个攻击
+python scripts/run_privacy_experiments.py \
+  --models clip_adapter --datasets caltech101 \
+  --attacks blackbox_loss,projres --defenses none
+
+# 多模型、多数据集、多防御；每种防御生成独立训练任务
+python scripts/run_privacy_experiments.py \
+  --models bert_adapter,bert_lora --datasets sst5,cola \
+  --attacks all --defenses none,iclr
+
+# 运行仓库全部模型以及每个模型正式支持的全部攻击/防御
+python scripts/run_privacy_experiments.py \
+  --models all --attacks all --defenses all --gpus 0,1 --jobs 2
+
+# 纯训练，不执行成员推理审计
+python scripts/run_privacy_experiments.py \
+  --models clip_mlp --datasets flowers --attacks none
+
+# Dirichlet 非 IID；只传 alpha 时自动切换到 dirichlet
+python scripts/run_privacy_experiments.py \
+  --models clip_lora --dirichlet-alpha 0.1 --dry-run
 ```
 
-当前输出应显示：CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 均为 FedSGD 和
-`aggregation_weighting: uniform`；MLP/Adapter 为每类 16-shot，LoRA 为完整训练集。
+`--attacks all` 会按模型解析支持集：ResNet18 只选择 `fedmia_loss`，六种 PEFT
+模型选择全部 11 种攻击。显式指定不兼容攻击时，该模型不会生成任务并打印原因；
+`--defenses all` 同样只展开模型正式支持的防御。可用 `--seeds 1,2,3`、
+`--target-clients 0,1` 和可重复的 `--set path=value` 扩展或覆盖最终配置。
 
-### 2. CLIP 三模型统一 sweep
+配置分为两层：[`configs/experiment_catalog.yaml`](configs/experiment_catalog.yaml)
+维护能力矩阵、防御覆盖和别名；[`configs/models/`](configs/models/) 下 7 个 YAML
+维护模型训练与默认候选协议。每个实际任务仍会把完整解析结果保存为自己的
+`run_config.yaml`。
 
-无参数调用默认依次运行三种模型和五个图像数据集：
+ResNet18 基线保持完整 CIFAR100、随机等量 IID、10 客户端全参与、300 轮
+FedAvg 和每轮 `0.99` 学习率衰减。CLIP-MLP/Adapter 为 16-shot one-batch 等权
+FedSGD，CLIP-LoRA 使用完整训练集；BERT Adapter/LoRA 与 GPT2 Adapter 使用文本
+one-batch 等权 FedSGD。
+
+独立严格 ProjRes 诊断仍可直接调用分析工具：
 
 ```bash
-bash scripts/run_all_clip_fedmia_attacks.sh
+python scripts/validate_projres_mlp_real.py \
+  --config configs/models/clip_mlp.yaml --output /tmp/projres_strict.json
 ```
 
-常用筛选方式：
-
-```bash
-# 只运行 CLIP-MLP
-bash scripts/run_all_clip_fedmia_attacks.sh --models clip_mlp
-
-# 只运行 CLIP-Adapter 的两个数据集
-bash scripts/run_all_clip_fedmia_attacks.sh \
-  --models clip_adapter \
-  --datasets caltech101,flowers
-
-# 只运行两种 FedMIA 攻击
-bash scripts/run_all_clip_fedmia_attacks.sh \
-  --datasets cifar100 \
-  --attacks fedmia_loss,fedmia_cosine
-
-# 两张 GPU 并行调度不同任务
-bash scripts/run_all_clip_fedmia_attacks.sh --gpus 0,1 --jobs 2
-
-# Dirichlet 非 IID；仅传 alpha 时会自动切换为 dirichlet
-bash scripts/run_all_clip_fedmia_attacks.sh --dirichlet-alpha 0.1
-```
-
-也可显式使用 `--partition-mode iid|dirichlet`。若同时传
-`--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha
-只作为未使用配置保留。
-
-仓库保留模型专用 wrapper，但当前协议以统一入口打印的最终参数为准。直接调用
-wrapper 时必须自行核对其 spec 默认值和命令行覆盖，尤其不要跳过 CLIP-MLP
-学习率 `0.1` 的最终参数检查。
-
-### 3. 单个 CLIP 任务与短程调试
-
-正式协议只运行一个任务时，仍建议通过统一入口展开：
-
-```bash
-bash scripts/run_all_clip_fedmia_attacks.sh \
-  --models clip_mlp \
-  --datasets caltech101 \
-  --max-runs 1
-```
-
-以下单次 YAML 主要用于短程开发和功能调试，其轮数、学习率与数据划分不等同于
-上文正式 sweep；运行前应直接检查文件或生成的 `run_config.yaml`：
-
-```bash
-python main.py --config configs/clip_mlp_privacy.yaml
-python main.py --config configs/clip_adapter_privacy.yaml
-```
-
-纯训练配置可关闭审计，例如：
-
-```bash
-python main.py --config configs/clip_mlp_fedsgd.yaml
-```
-
-### 4. BERT/GPT2 PEFT sweep
-
-先检查 2 个模型 × 3 个数据集的任务展开：
-
-```bash
-bash scripts/run_all_fedllm_attacks.sh --dry-run
-```
-
-正式运行：
-
-```bash
-bash scripts/run_all_fedllm_attacks.sh
-```
-
-常用筛选方式：
-
-```bash
-# 只运行 BERT 的 CoLA 和 IMDB
-bash scripts/run_all_fedllm_attacks.sh \
-  --models bert \
-  --datasets cola,imdb
-
-# 运行 BERT-LoRA；同一 SST-5 基础配置可用 --dataset 切换数据集
-bash scripts/run_all_fedllm_attacks.sh \
-  --models bert_lora \
-  --datasets sst5
-
-# 只运行一种攻击，并关闭 ProjRes
-bash scripts/run_all_fedllm_attacks.sh \
-  --attacks blackbox_loss \
-  --skip-projres
-
-# 两张 GPU 并行执行两个任务
-bash scripts/run_all_fedllm_attacks.sh --gpus 0,1 --jobs 2
-```
-
-单任务入口：
-
-```bash
-python scripts/run_fedllm_adapter.py \
-  --config configs/bert_base_sst5_adapter.yaml \
-  --dataset sst5
-
-python scripts/run_fedllm_adapter.py \
-  --config configs/bert_base_sst5_lora.yaml \
-  --dataset sst5
-
-python scripts/run_fedllm_adapter.py \
-  --config configs/gpt2_large_sst5_adapter.yaml \
-  --dataset sst5
-```
-
-### 5. CLIP-MLP ProjRes 独立诊断入口
-
-统一 MLP sweep 已包含 ProjRes；以下入口用于独立检查单轮严格 ProjRes：
-
-```bash
-bash scripts/run_projres_mlp_real.sh
-```
-
-默认配置见 [`configs/clip_mlp_projres.yaml`](configs/clip_mlp_projres.yaml)，威胁
-模型和公式边界见 [`docs/projres_mlp_strict.md`](docs/projres_mlp_strict.md)。
+公式和威胁模型边界见 [`docs/projres_mlp_strict.md`](docs/projres_mlp_strict.md)。
 
 ## 审计调度
 
@@ -398,7 +286,7 @@ bash scripts/run_projres_mlp_real.sh
 ## 隐私防御与 ICLR 分析
 
 仓库保留更新扰动、稀疏化、Mixup、采样、数据增强、CoFedMID、Prompt-DP、
-MIST、SOFT、HAMP、Local-GGEUR/MIRAGE/VEIL 和 ICLR 等实现。当前 CLIP 三模型
+MIST、SOFT、HAMP 和 ICLR 等实现。当前 CLIP 三模型
 sweep 只把 `none` 与观测型 `iclr` 作为正式可选项；不要把通用 prompt 防御配置
 直接套到 MLP、Adapter 或 LoRA。
 
@@ -414,13 +302,13 @@ batch 的裁剪梯度和加入一次高斯噪声；客户端上传本身就是 D
 服务器能观察单客户端消息的当前威胁模型。
 
 ```bash
-# 只打印最终命令
-bash scripts/run_record_dp_benchmarks.sh --model resnet --dry-run
-bash scripts/run_record_dp_benchmarks.sh --model bert --dry-run
+# 只打印最终任务
+python scripts/run_privacy_experiments.py \
+  --models resnet18,bert_adapter --defenses record_dp --dry-run
 
 # 正式运行
-bash scripts/run_record_dp_benchmarks.sh --model resnet
-bash scripts/run_record_dp_benchmarks.sh --model bert
+python scripts/run_privacy_experiments.py \
+  --models resnet18,bert_adapter --defenses record_dp
 ```
 
 默认配置以 `target_epsilon: 3.0`、`delta: 1e-5` 为目标，根据每个客户端的
@@ -433,30 +321,27 @@ Poisson 采样率和计划 DP 步数自动校准共享 noise multiplier。实际
 
 #### BERT Record-DP × ProjRes 隐私预算 sweep
 
-专用入口固定 BERT-Base Adapter、SST-5、500 轮训练、目标客户端 0、
+统一入口可固定 BERT-Base Adapter、SST-5、500 轮训练、目标客户端 0、
 `delta=1e-5`、裁剪阈值 1.0，以及每 50 轮一次的 exact-batch ProjRes；同一 seed
-下只有目标 epsilon 及由此自动校准的噪声强度发生变化。默认还会为每个 seed
-运行一个无 DP 的 ProjRes 参考基线。
+下可只改变目标 epsilon 及由此自动校准的噪声强度。无 DP 基线需显式选择
+`--defenses none`，避免把不同防御意外混在一个任务中。
 
 ```bash
-# 先核对最终展开的命令，不启动训练
-bash scripts/run_bert_record_dp_projres_sweep.sh \
-  --epsilons 1,3,5,8 --seeds 42 --dry-run
+# 核对一个预算；移除 --dry-run 后正式执行
+python scripts/run_privacy_experiments.py \
+  --models bert_adapter --datasets sst5 --attacks projres \
+  --defenses record_dp --seeds 42,43,44 \
+  --set defense.target_epsilon=3 --dry-run
 
-# 单 seed 正式 sweep：1 个无 DP 基线 + 4 个隐私预算
-bash scripts/run_bert_record_dp_projres_sweep.sh \
-  --epsilons 1,3,5,8 --seeds 42 --jobs 1
-
-# 三个独立 seed、两张 GPU；每张 GPU 同时只安排一个任务
-bash scripts/run_bert_record_dp_projres_sweep.sh \
-  --epsilons 1,3,5,8 --seeds 42,43,44 --gpus 0,1 --jobs 2
-
-# 快速检查 100 轮配置的命令展开，不重复无 DP 基线
-bash scripts/run_bert_record_dp_projres_sweep.sh \
-  --epsilons 1,3 --seeds 42 --no-nondp --rounds 100 --dry-run
+# 多预算使用同一个终极入口逐次生成互相独立的任务
+for epsilon in 1 3 5 8; do
+  python scripts/run_privacy_experiments.py \
+    --models bert_adapter --datasets sst5 --attacks projres \
+    --defenses record_dp --seeds 42 --set defense.target_epsilon=$epsilon
+done
 ```
 
-正式实验默认要求 CUDA，额外参数会原样转发给 `run_fedllm_adapter.py`。
+正式实验可用 `--require-cuda` 强制检查 CUDA。
 Record-DP 结果目录包含 `record_dp_eps<预算>`，实际 epsilon 和噪声强度记录在
 `defense_summary.json`，ProjRes 指标记录在 `privacy_audit/summary.json` 和
 `attack_round_metrics.csv`。对每个预算应同时比较下游准确率、AUC、
@@ -472,13 +357,11 @@ ProjRes 看到的都是这条已加噪上传。当前正式实现限定为 30 �
 每轮一个 batch 的 FedSGD，并按 500 次完整高斯机制进行 RDP 组合。
 
 ```bash
-# 先核对 1 个无 DP 基线和各客户端级预算的命令
-bash scripts/run_bert_local_client_dp_projres_sweep.sh \
-  --epsilons 1,3,5,8 --max-client-update-norms 1 --dry-run
-
-# 正式运行；可用 --gpus 0,1 --jobs 2 分配多张 GPU
-bash scripts/run_bert_local_client_dp_projres_sweep.sh \
-  --epsilons 1,3,5,8 --max-client-update-norms 1 --seeds 42 --jobs 1
+# 核对客户端级预算与裁剪阈值；移除 --dry-run 后正式运行
+python scripts/run_privacy_experiments.py \
+  --models bert_adapter --datasets sst5 --attacks projres \
+  --defenses local_client_dp --seeds 42 \
+  --set defense.target_epsilon=3 --set defense.max_update_norm=1 --dry-run
 ```
 
 这里的邻接关系是“一个固定客户端槽位的数据贡献存在或不存在”；没有数据时该槽位
@@ -495,13 +378,14 @@ batch-mean 联合梯度范数；观察过程不修改训练。输出明确标记
 
 ```bash
 # 只验证完整 500 轮实验计划，不加载模型
-bash scripts/run_bert_local_client_dp_clipping_calibration.sh --dry-run
+python scripts/calibrate_bert_local_client_dp_clipping.py --dry-run
 
 # 两轮流程检查；仍训练全部 30 个客户端，只汇总其中 6 个
-bash scripts/run_bert_local_client_dp_clipping_calibration.sh --pilot
+python scripts/calibrate_bert_local_client_dp_clipping.py \
+  --rounds 2 --client-ids 0,1,2,3,4,5
 
 # 完整校准：500 轮 × 30 个客户端
-bash scripts/run_bert_local_client_dp_clipping_calibration.sh --gpu 0
+python scripts/calibrate_bert_local_client_dp_clipping.py --gpu 0
 ```
 
 主要产物为 `client_batch_gradient_norms.csv`、`summary_by_round.csv`、
@@ -517,7 +401,7 @@ aggressive、balanced、conservative，默认建议先以 `P75` 为中心做正�
 
 ```text
 results/
-└── <时间>_<模型>_<数据集>_<方法>_seed<种子>_target<客户端>_<hash>/
+└── <时间>_<模型>_<数据集>_<方法>_<防御>_seed<种子>_target<客户端>_<hash>/
     ├── run_config.yaml
     ├── run.log
     ├── training_metrics.csv
@@ -555,12 +439,8 @@ results/
 - CLIP-MLP、CLIP-Adapter、CLIP-LoRA、BERT 和 GPT2 的统一 ProjRes 与其他攻击共享上述
   输出，不生成独立 ProjRes 目录。
 
-CLIP sweep 还在 `results/` 根目录生成实验组汇总：
-
-- `<实验组>_summary_by_run.csv`
-- `<实验组>_summary_by_client.csv`
-- `<实验组>_summary_aggregate.csv`
-- `<实验组>_summary_projres.csv`（仅独立 ProjRes）
+统一入口还会在 `results/` 根目录生成本次调用的
+`experiment_manifest_<时间>.json` 与 `experiment_summary_<时间>.csv`。
 
 仓库不会为数据分析生成 HTML。已有 `results/` 内容属于实验数据；重新运行会创建
 新的时间戳目录，不会复用或覆盖旧任务。
@@ -596,7 +476,7 @@ python -m pytest -q tests
 配置或 sweep 修改后至少执行：
 
 ```bash
-bash scripts/run_all_clip_fedmia_attacks.sh --dry-run --max-runs 1
+python scripts/run_privacy_experiments.py --dry-run --max-runs 1
 git diff --check
 ```
 

@@ -7,6 +7,7 @@ import argparse
 import copy
 import datetime as dt
 import logging
+import os
 from pathlib import Path
 import random
 import sys
@@ -17,6 +18,7 @@ import yaml
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER_LOG_CAPTURE_ENV = "FEDMIA_LAUNCHER_LOG_CAPTURE"
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="configs/bert_base_sst5_adapter.yaml",
+        default="configs/models/bert_adapter.yaml",
         help="YAML configuration for this single training task.",
     )
     parser.add_argument("--gpu", type=int)
@@ -618,6 +620,9 @@ def resolve_path(value: str) -> Path:
 
 def make_result_dir(config: dict) -> Path:
     root = resolve_path(str(config.get("results_dir", "./results")))
+    if bool(config.get("results_dir_is_run_dir", False)):
+        root.mkdir(parents=True, exist_ok=True)
+        return root
     timestamp = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     defense = str(config.get("defense", {}).get("name", "none")).lower()
     target_client = int(config.get("audit", {}).get("target_client_id", 0))
@@ -654,11 +659,16 @@ def configure_logging(result_dir: Path) -> None:
     )
     stream = logging.StreamHandler()
     stream.setFormatter(formatter)
-    file_handler = logging.FileHandler(result_dir / "run.log", encoding="utf-8")
-    file_handler.setFormatter(formatter)
+    handlers: list[logging.Handler] = [stream]
+    if os.environ.get(LAUNCHER_LOG_CAPTURE_ENV) != "1":
+        file_handler = logging.FileHandler(
+            result_dir / "run.log", encoding="utf-8"
+        )
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
     logging.basicConfig(
         level=logging.INFO,
-        handlers=[stream, file_handler],
+        handlers=handlers,
         force=True,
     )
 

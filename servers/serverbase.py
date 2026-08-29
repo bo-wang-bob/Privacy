@@ -298,9 +298,6 @@ class ServerBase:
         ).lower() in {
             "mist",
             "cofedmid",
-            "local_ggeur",
-            "mirage",
-            "veil",
             "perturb",
             "sparse",
         }:

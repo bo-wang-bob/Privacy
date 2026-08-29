@@ -197,8 +197,8 @@ def test_clip_peft_runs_all_attacks_with_exact_batch_fedsgd(
 @pytest.mark.parametrize(
     "path",
     [
-        "configs/clip_mlp_low_fpr_attacks.yaml",
-        "configs/clip_adapter_low_fpr_attacks.yaml",
+        "configs/models/clip_mlp.yaml",
+        "configs/models/clip_adapter.yaml",
     ],
 )
 def test_clip_peft_configs_enforce_fedsgd_fewshot_and_bert_candidates(path):

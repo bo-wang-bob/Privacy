@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="configs/bert_base_sst5_adapter.yaml",
+        default="configs/models/bert_adapter.yaml",
         help="Base BERT configuration; defense and audit are forced off.",
     )
     parser.add_argument(
@@ -562,17 +562,20 @@ def write_report(
                 **row
             )
         )
-    grid_values = ",".join(f"{float(row['max_update_norm']):g}" for row in grid_rows)
+    grid_values = " ".join(f"{float(row['max_update_norm']):g}" for row in grid_rows)
     lines.extend(
         [
             "",
             "## 下一步命令",
             "",
             "```bash",
-            "bash scripts/run_bert_local_client_dp_projres_sweep.sh \\",
-            f"  --epsilons {float(recommendations[0]['target_epsilon']):g} \\",
-            f"  --max-client-update-norms {grid_values} \\",
-            "  --seeds 42 --no-nondp --dry-run",
+            f"for max_norm in {grid_values}; do",
+            "  python scripts/run_privacy_experiments.py \\",
+            "    --models bert_adapter --datasets sst5 --attacks projres \\",
+            "    --defenses local_client_dp --seeds 42 \\",
+            f"    --set defense.target_epsilon={float(recommendations[0]['target_epsilon']):g} \\",
+            "    --set defense.max_update_norm=$max_norm --dry-run",
+            "done",
             "```",
             "",
             "## 限制",

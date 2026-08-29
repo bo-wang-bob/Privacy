@@ -1,0 +1,213 @@
+version: 1
+
+# Running without selectors keeps the former unified CLIP entry's scope.
+defaults:
+  models: [clip_mlp, clip_adapter, clip_lora]
+
+attacks:
+  all: &all_attacks
+    - blackbox_loss
+    - loss_series
+    - grad_cosine
+    - avg_cosine
+    - fedmia_loss
+    - fedmia_cosine
+    - gradient_diff
+    - score_diff
+    - score_ratio
+    - fta
+    - projres
+  exact_batch: &exact_batch_attacks
+    - blackbox_loss
+    - grad_cosine
+    - gradient_diff
+    - score_diff
+    - score_ratio
+    - projres
+
+aliases:
+  models:
+    resnet: resnet18
+    mlp: clip_mlp
+    adapter: clip_adapter
+    visual_adapter: clip_adapter
+    visual-adapter: clip_adapter
+    clip-adapter: clip_adapter
+    lora: clip_lora
+    clip-lora: clip_lora
+    bert: bert_adapter
+    bert-base: bert_adapter
+    bert-lora: bert_lora
+    gpt2: gpt2_adapter
+    gpt: gpt2_adapter
+  datasets:
+    flowers102: flowers
+    food: food101
+    sst-5: sst5
+  defenses:
+    off: none
+    local_dp: local_client_dp
+    client_dp: local_client_dp
+
+models:
+  resnet18:
+    config: configs/models/resnet18.yaml
+    runner: vision
+    datasets: [cifar100]
+    default_datasets: [cifar100]
+    supported_attacks: [fedmia_loss]
+    default_attacks: [fedmia_loss]
+    supported_defenses: [none, record_dp]
+    default_defenses: [none]
+    default_seeds: [1]
+
+  clip_mlp:
+    config: configs/models/clip_mlp.yaml
+    runner: vision
+    datasets: &clip_datasets [caltech101, oxfordpets, flowers, food101, cifar100]
+    default_datasets: *clip_datasets
+    supported_attacks: *all_attacks
+    default_attacks: *all_attacks
+    supported_defenses: &clip_defenses [none, iclr]
+    default_defenses: [none]
+    default_seeds: [42]
+
+  clip_adapter:
+    config: configs/models/clip_adapter.yaml
+    runner: vision
+    datasets: *clip_datasets
+    default_datasets: *clip_datasets
+    supported_attacks: *all_attacks
+    default_attacks: *all_attacks
+    supported_defenses: *clip_defenses
+    default_defenses: [none]
+    default_seeds: [42]
+
+  clip_lora:
+    config: configs/models/clip_lora.yaml
+    runner: vision
+    datasets: *clip_datasets
+    default_datasets: *clip_datasets
+    supported_attacks: *all_attacks
+    default_attacks: *all_attacks
+    supported_defenses: *clip_defenses
+    default_defenses: [none]
+    default_seeds: [42]
+
+  bert_adapter:
+    config: configs/models/bert_adapter.yaml
+    runner: text
+    datasets: &text_datasets [sst5, cola, imdb]
+    default_datasets: *text_datasets
+    supported_attacks: *all_attacks
+    default_attacks: *all_attacks
+    supported_defenses: [none, iclr, record_dp, local_client_dp]
+    default_defenses: [iclr]
+    default_seeds: [42]
+
+  bert_lora:
+    config: configs/models/bert_lora.yaml
+    runner: text
+    datasets: *text_datasets
+    default_datasets: *text_datasets
+    supported_attacks: *all_attacks
+    default_attacks: *all_attacks
+    supported_defenses: [none, iclr]
+    default_defenses: [none]
+    default_seeds: [42]
+
+  gpt2_adapter:
+    config: configs/models/gpt2_adapter.yaml
+    runner: text
+    datasets: *text_datasets
+    default_datasets: *text_datasets
+    supported_attacks: *all_attacks
+    default_attacks: *all_attacks
+    supported_defenses: [none]
+    default_defenses: [none]
+    default_seeds: [42]
+
+# These are deep-merged after the model baseline. Model-specific branches take
+# precedence over the common branch. Only combinations listed under each
+# model's supported_defenses are expanded by the ultimate runner.
+defense_overrides:
+  none:
+    common:
+      defense:
+        name: none
+
+  iclr:
+    common:
+      defense:
+        name: iclr
+        iclr_validation_top_fraction: 0.2
+    models:
+      bert_adapter:
+        defense:
+          name: iclr
+          iclr_analysis_interval: 50
+          iclr_analysis_timing: post_round
+          iclr_feature_statistics: false
+          iclr_validation_top_fraction: 0.2
+      bert_lora:
+        defense:
+          name: iclr
+          iclr_analysis_interval: 50
+          iclr_analysis_timing: post_round
+          iclr_feature_statistics: false
+          iclr_validation_top_fraction: 0.2
+
+  record_dp:
+    models:
+      resnet18:
+        resnet18:
+          paper_protocol: false
+        audit:
+          iclr_candidate_scoring: false
+        defense:
+          name: record_dp
+          adjacency: add_remove
+          sampling: poisson
+          accountant: rdp
+          max_grad_norm: 1.0
+          target_epsilon: 3.0
+          delta: 1.0e-5
+          noise_multiplier: auto
+          grad_sample_backend: vmap
+          microbatch_size: 4
+          reproducible_noise: false
+          release_private_diagnostics: false
+      bert_adapter:
+        defense:
+          name: record_dp
+          adjacency: add_remove
+          sampling: poisson
+          accountant: rdp
+          max_grad_norm: 1.0
+          target_epsilon: 3.0
+          delta: 1.0e-5
+          noise_multiplier: auto
+          grad_sample_backend: loop
+          microbatch_size: 16
+          reproducible_noise: false
+          release_private_diagnostics: false
+        projres:
+          max_candidates: 0
+          min_nonmembers: 0
+          max_nonmembers: 0
+
+  local_client_dp:
+    models:
+      bert_adapter:
+        defense:
+          name: local_client_dp
+          privacy_unit: client
+          adjacency: add_remove
+          sampling: full_participation
+          accountant: rdp
+          max_update_norm: 1.0
+          target_epsilon: 3.0
+          delta: 1.0e-5
+          noise_multiplier: auto
+          reproducible_noise: false
+          release_private_diagnostics: false

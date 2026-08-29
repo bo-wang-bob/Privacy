@@ -357,7 +357,7 @@ def test_bert_lora_runs_all_eleven_attacks_with_exact_batch_projres(
 
 def test_bert_lora_default_config_is_valid():
     with open(
-        "configs/bert_base_sst5_lora.yaml", "r", encoding="utf-8"
+        "configs/models/bert_lora.yaml", "r", encoding="utf-8"
     ) as file:
         config = yaml.safe_load(file)
 

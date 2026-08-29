@@ -89,7 +89,7 @@ Deng 等人的 FedLLM ProjRes 实验还比较 Gradient-Diff、Score-Diff、Score
 Gradient-Diff 来源于 [Li、Li 与 Ribeiro，ICLR 2023](https://openreview.net/forum?id=QsCSLPP55Ku)；
 Score-Diff/Score-Ratio 来源于 [Jagielski 等，PoPETs 2023](https://petsymposium.org/popets/2023/popets-2023-0078.php)；
 FTA（free training attack）来源于 [Chang 等，USENIX Security 2024](https://www.usenix.org/conference/usenixsecurity24/presentation/chang)。
-在 `scripts/run_all_fedllm_attacks.sh` 的 BERT 默认任务中，FTA 每 10 个已完成通信轮
+在 `scripts/run_privacy_experiments.py` 生成的 BERT 默认任务中，FTA 每 10 个已完成通信轮
 采集一次，Gradient-Diff、Score-Diff 和 Score-Ratio 仍每 50 轮采集一次；GPT2
 默认任务中的四者仍统一每 50 轮采集。
 BERT、GPT2-Large、CLIP-Adapter 与 CLIP-LoRA 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
@@ -189,7 +189,7 @@ evaluation 非成员。
 - IMIA、RMIA、CodePoison 和主动 Nasr 复用仅训练 MLP 的影子模型或隔离 probe。
 
 这些映射保留每种攻击的观测权限和 FedSGD 协议边界，但不把 MLP 类别向量称为
-文本 prompt。完整入口见 `configs/clip_mlp_privacy.yaml`。
+文本 prompt。模型基线见 `configs/models/clip_mlp.yaml`，任务由统一入口生成。
 
 ## Few-shot CLIP-Adapter 场景
 
@@ -201,7 +201,7 @@ Nasr、PromptRes、PIPRA、RMIA、IMIA、YOQO、Canary 和 CodePoison 均复用�
 
 PromptMIA 使用 adapter 第一层的输入投影向量作为 key-like vectors。普通训练时
 冻结 CLIP 不保留反向图；YOQO 与 Canary 优化输入时会临时保留输入到冻结 CLIP
-的梯度。完整入口见 `configs/clip_adapter_privacy.yaml`。
+的梯度。模型基线见 `configs/models/clip_adapter.yaml`，任务由统一入口生成。
 
 ### ProjRes 严格单轮入口
 
@@ -209,7 +209,7 @@ PromptMIA 使用 adapter 第一层的输入投影向量作为 key-like vectors�
 它攻击第一层 `classifier.0.weight`：从一次 vanilla FedSGD 更新的行空间恢复训练
 batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。成员集合严格等于
 产生该更新的实际 batch，不使用客户端的整个历史训练集代替。真实数据入口是
-`scripts/validate_projres_mlp_real.py`，配置是 `configs/clip_mlp_projres.yaml`；完整
+`scripts/validate_projres_mlp_real.py`，配置是 `configs/models/clip_mlp.yaml`；完整
 边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
 余弦相似度的 `promptres`。
 

@@ -9,15 +9,16 @@
 - 工作区可能包含用户自己的未提交修改；只处理当前任务涉及的文件。
 - Git 提交信息和提交日志应在合理范围内尽量详细准确：标题概括核心协议或功能变化，正文列出训练协议、候选定义、兼容性影响和验证结果；避免只写笼统的 `update`、`fix` 或 `changes`。
 
-## 当前 CLIP 成员推理实验入口
+## 当前统一实验入口
 
-- 统一入口是 `scripts/run_all_clip_fedmia_attacks.sh`，默认依次运行 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA。
-- 只运行单个模型时使用：
-  - `bash scripts/run_all_clip_fedmia_attacks.sh --models clip_mlp`
-  - `bash scripts/run_all_clip_fedmia_attacks.sh --models adapter`
-  - `bash scripts/run_all_clip_fedmia_attacks.sh --models clip_lora`
-- 默认学习率由统一脚本设置：CLIP-MLP 为 `0.1`，CLIP-Adapter 为 `0.001`，CLIP-LoRA 为 `0.0002`。应以统一脚本干运行打印的最终参数为准。
-- 统一脚本显式默认传递 `--partition-mode iid`，因此三个模型默认都是 IID，而不只依赖 sweep YAML。不要在正常 IID 实验中传 `--dirichlet-alpha`；仅传该参数会自动切换为 `dirichlet`。如同时显式传 `--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha 仅作为未使用的配置值保留。
+- 唯一批量入口是 `scripts/run_privacy_experiments.py`。它支持单个或多个模型、数据集、攻击、防御、seed 和目标客户端；模型 × 数据集 × 防御 × seed × 目标客户端展开为独立任务，同一组多攻击共享一次训练。
+- 不传 `--models` 时保持原 CLIP 入口范围，依次运行 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA；`--models all` 覆盖 7 个正式模型。
+- 只运行单个模型时使用 `python scripts/run_privacy_experiments.py --models clip_mlp`；多模型用逗号分隔。
+- `--attacks all` 按模型解析能力集：ResNet18 只有 `fedmia_loss`，PEFT 模型为全部 11 种；`--attacks none` 是纯训练。
+- `--defenses all` 只展开模型正式支持的防御。显式攻击与模型不兼容时跳过该模型并打印原因；显式防御或数据集不兼容时跳过对应组合。
+- `configs/experiment_catalog.yaml` 维护能力矩阵、防御深度覆盖和别名；`configs/models/` 下 7 个基线维护模型训练与默认候选协议。不要重新为数据集、攻击或防御复制整份模型 YAML。
+- CLIP 默认学习率由模型基线设置：CLIP-MLP 为 `0.1`，CLIP-Adapter 为 `0.001`，CLIP-LoRA 为 `0.0002`。应以统一脚本干运行打印的最终参数为准。
+- 三个 CLIP 基线均显式使用 IID。不要在正常 IID 实验中传 `--dirichlet-alpha`；仅传该参数会自动切换为 `dirichlet`。如同时显式传 `--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha 仅作为未使用的配置值保留。
 - CLIP-MLP 和 CLIP-Adapter 使用每类 16 张训练图像的 Few-shot 训练集；CLIP-LoRA 使用完整训练集。Few-shot 先在全局训练分区内按类确定性抽取，再进行客户端划分；独立 evaluation/test 分区不截断。
 - 默认数据集为 Caltech101、OxfordPets、Flowers102、Food101 和 CIFAR100。
 - 三个模型在全部默认数据集上统一使用 10 个客户端和 batch size 32；CLIP-MLP 使用 150 个通信轮次，CLIP-Adapter/CLIP-LoRA 使用 300 个通信轮次。三者均使用 FedSGD，每个客户端每轮只执行 1 个 mini-batch/1 次 optimizer step；`local_epochs: 1` 是协议校验值，不表示遍历完整本地数据集。
@@ -37,7 +38,7 @@
 - BERT-Base Adapter 与 BERT-Base LoRA 均使用 30 个 IID 客户端、batch size 16、500 轮、one-batch 等权 FedSGD；默认学习率均为 `0.005`。
 - BERT-LoRA 默认在全部 12 层自注意力 Query/Value 投影中训练 `rank=8`、`alpha=16`、dropout `0.1` 的 LoRA 因子，并同时训练分类头；冻结 BERT 主干不上传。服务器与 CLIP-LoRA 一样分别聚合同名 `lora_A`、`lora_B`，不先合成稠密 `BA` 更新。
 - BERT Adapter/LoRA 均支持全部 11 种注册攻击，并使用上述 5 种固定候选攻击与 6 种真实 Batch 攻击划分；完整真实 Batch 候选为 16/160。
-- BERT-LoRA 默认配置为 `configs/bert_base_sst5_lora.yaml`，可由 `scripts/run_all_fedllm_attacks.sh --models bert_lora` 启动；ProjRes 观察首层 Query 的 `lora_A` 上传。
+- BERT-LoRA 默认配置为 `configs/models/bert_lora.yaml`，可由 `scripts/run_privacy_experiments.py --models bert_lora` 启动；ProjRes 观察首层 Query 的 `lora_A` 上传。
 
 ## 按需审计频次
 
@@ -80,7 +81,7 @@
 
 - 主要耗时来自余弦类攻击的逐样本梯度计算；候选样本数和逐轮攻击数量决定大部分审计时间。若继续优化，优先考虑 CLIP-MLP/Adapter 可解析或向量化的梯度余弦、批量客户端前向和在线聚合，且必须保持攻击定义不变。
 - 修改实验配置后先干运行核对最终参数：
-  - `bash scripts/run_all_clip_fedmia_attacks.sh --dry-run --max-runs 1`
+  - `python scripts/run_privacy_experiments.py --dry-run --max-runs 1`
 - 当前干运行应看到：MLP/Adapter/LoRA 均为 `federated.aggregator: fedsgd` 和 `federated.aggregation_weighting: uniform`；MLP/Adapter 为每类 16-shot，LoRA 使用完整训练集；三者均启用统一 ProjRes。
 - 测试环境使用 `/root/.local/share/mamba/envs/pfedba/bin/python`。小范围修改优先只运行直接相关的测试文件和 `git diff --check`；不要习惯性执行完整套件。
 - `/root/.local/share/mamba/envs/pfedba/bin/python -m pytest -q` 是日常快速核心回归；完整本地套件必须显式使用 `python -m pytest -q tests`，仅在修改共享审计器、聚合核心、候选池协议或准备高风险发布时运行。

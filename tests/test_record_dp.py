@@ -36,6 +36,10 @@ from scripts.run_fedllm_adapter import (
     make_result_dir,
     validate_config as validate_text_config,
 )
+from scripts.run_privacy_experiments import (
+    load_yaml,
+    resolve_model_config,
+)
 from servers.serverbase import ServerBase
 from users.user import UserBase
 from utils.privacy_accounting import (
@@ -139,18 +143,23 @@ def test_clipping_calibration_sampling_diagnostics_check_balance_and_uniqueness(
 
 
 def test_record_and_local_client_dp_configs_validate():
-    with open(
-        "configs/resnet18_cifar100_record_dp.yaml", encoding="utf-8"
-    ) as file:
-        resnet = yaml.safe_load(file)
-    with open(
-        "configs/bert_base_sst5_adapter_record_dp.yaml", encoding="utf-8"
-    ) as file:
-        bert = yaml.safe_load(file)
-    with open(
-        "configs/bert_base_sst5_adapter_local_client_dp.yaml", encoding="utf-8"
-    ) as file:
-        client_dp = yaml.safe_load(file)
+    catalog = load_yaml("configs/experiment_catalog.yaml")
+    attacks = catalog["models"]["bert_adapter"]["supported_attacks"]
+    resnet = resolve_model_config(
+        catalog, model="resnet18", dataset="cifar100",
+        attacks=["fedmia_loss"], defense="record_dp", seed=42,
+        target_client_id=0, results_dir="results/test-resnet-record-dp",
+    )
+    bert = resolve_model_config(
+        catalog, model="bert_adapter", dataset="sst5", attacks=attacks,
+        defense="record_dp", seed=42, target_client_id=0,
+        results_dir="results/test-bert-record-dp",
+    )
+    client_dp = resolve_model_config(
+        catalog, model="bert_adapter", dataset="sst5", attacks=attacks,
+        defense="local_client_dp", seed=42, target_client_id=0,
+        results_dir="results/test-bert-client-dp",
+    )
 
     validate_image_config(resnet)
     validate_text_config(bert)
@@ -183,9 +192,18 @@ def test_poisson_sampled_rdp_matches_full_gaussian_and_amplifies_privacy():
 
 
 def test_text_runner_overrides_record_dp_epsilon_and_projres_only(tmp_path):
+    catalog = load_yaml("configs/experiment_catalog.yaml")
+    resolved = resolve_model_config(
+        catalog, model="bert_adapter", dataset="sst5", attacks=["projres"],
+        defense="record_dp", seed=42, target_client_id=0,
+        results_dir=tmp_path / "resolved",
+    )
+    resolved.pop("results_dir_is_run_dir", None)
+    config_path = tmp_path / "record_dp.yaml"
+    config_path.write_text(yaml.safe_dump(resolved), encoding="utf-8")
     config = load_text_config(
         Namespace(
-            config="configs/bert_base_sst5_adapter_record_dp.yaml",
+            config=str(config_path),
             gpu=None,
             rounds=100,
             seed=43,
@@ -212,9 +230,18 @@ def test_text_runner_overrides_record_dp_epsilon_and_projres_only(tmp_path):
 
 
 def test_text_runner_overrides_local_client_dp_budget_and_norm(tmp_path):
+    catalog = load_yaml("configs/experiment_catalog.yaml")
+    resolved = resolve_model_config(
+        catalog, model="bert_adapter", dataset="sst5", attacks=["projres"],
+        defense="local_client_dp", seed=42, target_client_id=0,
+        results_dir=tmp_path / "resolved",
+    )
+    resolved.pop("results_dir_is_run_dir", None)
+    config_path = tmp_path / "local_client_dp.yaml"
+    config_path.write_text(yaml.safe_dump(resolved), encoding="utf-8")
     config = load_text_config(
         Namespace(
-            config="configs/bert_base_sst5_adapter_local_client_dp.yaml",
+            config=str(config_path),
             gpu=None,
             rounds=100,
             seed=44,

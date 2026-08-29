@@ -100,15 +100,13 @@ FedSGD 梯度完全等价；结果元数据会明确记录这一差异。
 
 ## 运行
 
-```bash
-bash scripts/run_projres_mlp_real.sh
-```
+独立严格诊断直接调用 `scripts/validate_projres_mlp_real.py`。
 
 单客户端示例：
 
 ```bash
 python scripts/validate_projres_mlp_real.py \
-  --config configs/clip_mlp_projres.yaml \
+  --config configs/models/clip_mlp.yaml \
   --target-client 0 \
   --output results/projres_mlp_client0.json
 ```
@@ -117,7 +115,7 @@ CLIP-Adapter 单客户端示例：
 
 ```bash
 python scripts/validate_projres_mlp_real.py \
-  --config configs/clip_adapter_low_fpr_attacks.yaml \
+  --config configs/models/clip_adapter.yaml \
   --target-client 0 \
   --output results/projres_clip_adapter_client0.json
 ```

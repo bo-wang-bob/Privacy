@@ -1,8 +1,8 @@
 # Method
 
-> Historical development draft. Its tables include a retired, unpublished
-> composite diagnostic and must not be used as current paper evidence. The
-> former VEIL manuscript artifacts have been removed from this repository.
+> Historical development draft. The Local-GGEUR/VEIL implementation and its
+> runtime aliases have been removed from the repository. This file is retained
+> only as an archival research note and must not be used as current paper evidence.
 
 ## Problem Setting
 

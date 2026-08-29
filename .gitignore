@@ -10,6 +10,8 @@ tests/
 tests/*
 !tests/test_transformer_lora.py
 !tests/test_clip_peft_fedsgd.py
+!tests/test_privacy_experiment_runner.py
+!tests/test_gpt2_adapter_schedule.py
 paper/
 
 # Local model weights and experiment artifacts

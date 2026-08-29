@@ -70,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="configs/bert_base_sst5_adapter_record_dp.yaml",
+        default="configs/models/bert_adapter.yaml",
         help="Configuration used when --run-dir is omitted.",
     )
     parser.add_argument(

@@ -72,14 +72,13 @@ checkpoint 均不包含冻结的 BERT/GPT2 参数。
 聚合与 CLIP-LoRA 一致：服务器分别线性平均每个同名 `lora_A`、`lora_B`，不会先
 合成为稠密的 `BA` 更新；分类头参数也按相同客户端权重线性聚合。FedSGD 下等价于
 分别平均各可训练张量的真实 batch-mean 梯度，再执行一次全局 SGD step。默认配置为
-`configs/bert_base_sst5_lora.yaml`，ProjRes 观察首个 Query 投影的 `lora_A` 上传。
+`configs/models/bert_lora.yaml`，ProjRes 观察首个 Query 投影的 `lora_A` 上传。
 
-`scripts/run_all_fedllm_attacks.sh` 是统一 sweep 入口，不带参数时按
-`BERT/GPT2 Adapter × SST-5/CoLA/IMDB` 展开 6 个独立进程；显式传入
-`--models bert_lora` 或 `--models all` 时会加入 BERT-LoRA；
-`scripts/run_fedllm_adapter.py` 只执行 Shell 入口传入的单个任务。统一 Shell 模式
-支持 `--models`、`--datasets`、`--gpus`、`--jobs`、`--dry-run`、
-`--max-runs` 和 `--skip-projres`，默认单 GPU 串行调度。dry-run 只打印命令；
+`scripts/run_privacy_experiments.py` 是全仓库统一入口，可按模型、数据集、防御、
+seed 和目标客户端展开独立进程；同一任务所选的多种攻击共享训练。
+`scripts/run_fedllm_adapter.py` 只执行统一入口传入的单个文本任务。统一模式支持
+`--models`、`--datasets`、`--attacks`、`--defenses`、`--gpus`、`--jobs`、
+`--dry-run` 和 `--max-runs`，默认单 GPU 串行调度。dry-run 只打印命令；
 完整解析配置仅在对应任务实际启动后写入终端和该任务的 `run.log`。
 
 这些文本模型复用通用审计器的 Blackbox/Fed-loss、Loss-Series、Grad-Cosine、

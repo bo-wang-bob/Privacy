@@ -548,7 +548,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--config", type=Path, default=Path("configs/clip_mlp_projres.yaml")
+        "--config", type=Path, default=Path("configs/models/clip_mlp.yaml")
     )
     parser.add_argument("--dataset-name")
     parser.add_argument("--data-root")
