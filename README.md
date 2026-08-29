@@ -458,6 +458,54 @@ Record-DP 结果目录包含 `record_dp_eps<预算>`，实际 epsilon 和噪声�
 `TPR@0.1FPR` 和 `TPR@0.01FPR`；真实 batch 只有约 10 倍非成员，不适合把
 `TPR@0.001FPR` 当作主要结论。
 
+#### BERT 本地客户端级 DP × ProjRes
+
+`local_client_dp` 是与 Record-DP 分开的基准：每个客户端先计算普通 batch-mean
+梯度，再把 Adapter 和分类头的完整联合梯度裁剪到 `max_update_norm=S`，最后在
+客户端本地给每个坐标加入标准差 `noise_multiplier * S` 的高斯噪声。服务器和
+ProjRes 看到的都是这条已加噪上传。当前正式实现限定为 30 个固定客户端全部参与、
+每轮一个 batch 的 FedSGD，并按 500 次完整高斯机制进行 RDP 组合。
+
+```bash
+# 先核对 1 个无 DP 基线和各客户端级预算的命令
+bash scripts/run_bert_local_client_dp_projres_sweep.sh \
+  --epsilons 1,3,5,8 --max-client-update-norms 1 --dry-run
+
+# 正式运行；可用 --gpus 0,1 --jobs 2 分配多张 GPU
+bash scripts/run_bert_local_client_dp_projres_sweep.sh \
+  --epsilons 1,3,5,8 --max-client-update-norms 1 --seeds 42 --jobs 1
+```
+
+这里的邻接关系是“一个固定客户端槽位的数据贡献存在或不存在”；没有数据时该槽位
+仍须发送零贡献加同分布噪声。因此保证覆盖客户端数据贡献和最终模型，但不隐藏网络
+参与元数据。同一个数值的客户端级 epsilon 与记录级 epsilon 不是同一个隐私单位，
+不应解释成同等强度；客户端级机制在当前 500 轮全参与设置下通常需要大得多的
+noise multiplier。实际校准值、每坐标噪声标准差和逐客户端累计 epsilon 写入
+`defense_summary.json`。
+
+正式选择 `max_update_norm=S` 前，可以运行无隐私校准。它使用相同的 30 客户端、
+IID 划分、batch size 16、学习率和 one-batch FedSGD，逐轮读取聚合前真实上传的
+batch-mean 联合梯度范数；观察过程不修改训练。输出明确标记为非隐私分析数据，并
+保存到 `analysis_scripts/`，不会写入或覆盖 `results/`。
+
+```bash
+# 只验证完整 500 轮实验计划，不加载模型
+bash scripts/run_bert_local_client_dp_clipping_calibration.sh --dry-run
+
+# 两轮流程检查；仍训练全部 30 个客户端，只汇总其中 6 个
+bash scripts/run_bert_local_client_dp_clipping_calibration.sh --pilot
+
+# 完整校准：500 轮 × 30 个客户端
+bash scripts/run_bert_local_client_dp_clipping_calibration.sh --gpu 0
+```
+
+主要产物为 `client_batch_gradient_norms.csv`、`summary_by_round.csv`、
+`summary_by_phase.csv`、`recommended_s.csv`、`clipping_grid.csv`、PNG 图和
+中文 `report.md`。`recommended_s.csv` 分别将总体 `P50/P75/P90` 标成
+aggressive、balanced、conservative，默认建议先以 `P75` 为中心做正式固定预算
+消融。若统计使用的是敏感训练集，公开这些阈值本身不能宣称零隐私成本；正式论文
+应优先使用公开代理数据或预注册候选网格。
+
 ## 结果目录与文件
 
 `results/` 下每个一级目录就是一次独立训练任务：

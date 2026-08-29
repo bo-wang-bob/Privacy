@@ -187,6 +187,7 @@ class ServerBase:
         projres_config: dict | None = None,
         defense_config: dict | None = None,
         method_config: dict | None = None,
+        client_gradient_observer=None,
     ):
         if total_users <= 1:
             raise ValueError("total_users must be greater than one.")
@@ -219,6 +220,11 @@ class ServerBase:
             self.aggregator.aggregation_weighting = "uniform"
         self.federated_method = aggregator.name
         self.method_config = dict(method_config or {})
+        if client_gradient_observer is not None and not callable(
+            client_gradient_observer
+        ):
+            raise TypeError("client_gradient_observer must be callable.")
+        self.client_gradient_observer = client_gradient_observer
         self.results_dir = results_dir
         self.save_models_enabled = save_models
         self.eval_interval = eval_interval
@@ -343,6 +349,14 @@ class ServerBase:
         )
         self.defense.federated_method = self.federated_method
         self.defense.method_config = self.method_config
+        if self.defense.name == "local_client_dp" and (
+            self.federated_method != "fedsgd"
+            or self.user_per_round != self.total_users_num
+        ):
+            raise ValueError(
+                "Local client-DP currently requires full-participation, "
+                "one-batch FedSGD."
+            )
         if (
             self.defense.name in FEDMIA_BASELINE_DEFENSES
             and self.federated_method not in {"fedavg", "promptfl"}
@@ -425,6 +439,20 @@ class ServerBase:
             self.private_probe_steps * local_steps_per_probe
         )
         self.defense.configure_record_dp(self.ctx.users)
+        self.defense.configure_local_client_dp(self.ctx.users)
+        if self.defense.name == "local_client_dp":
+            logger.info(
+                "Local client-DP calibrated | epsilon=%s | delta=%g | "
+                "steps=%d | max_update_norm=%g | noise_multiplier=%g | "
+                "noise_std_per_coordinate=%g",
+                self.defense.config.get("target_epsilon"),
+                self.defense._local_client_dp_delta(),
+                max(self.defense.local_client_dp_planned_steps.values()),
+                self.defense._local_client_dp_max_norm(),
+                self.defense.local_client_dp_noise_multiplier,
+                self.defense.local_client_dp_noise_multiplier
+                * self.defense._local_client_dp_max_norm(),
+            )
 
     @staticmethod
     def _clone_state(state: dict[str, torch.Tensor], cpu: bool = False):
@@ -748,6 +776,14 @@ class ServerBase:
                     self.ctx.client_gradients[user_id] = self._clone_state(
                         user.last_update_gradients
                     )
+                    if self.client_gradient_observer is not None:
+                        self.client_gradient_observer(
+                            round_index=round_index,
+                            client_id=user_id,
+                            gradients=self.ctx.client_gradients[user_id],
+                            sample_count=user.last_update_sample_count,
+                            learning_rate=self.current_learning_rate,
+                        )
                 self.ctx.set_updated_model_state(
                     user_id, self._clone_state(user.get_parameters())
                 )

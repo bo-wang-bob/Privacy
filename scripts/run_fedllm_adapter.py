@@ -47,21 +47,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir")
     parser.add_argument(
         "--defense",
-        choices=("none", "iclr", "record_dp"),
+        choices=("none", "iclr", "record_dp", "local_client_dp"),
         help="Override defense.name from the YAML configuration.",
     )
     parser.add_argument(
         "--target-epsilon",
         type=float,
         help=(
-            "Override Record-DP target_epsilon and automatically calibrate "
-            "its noise multiplier."
+            "Override the selected DP defense target_epsilon and automatically "
+            "calibrate its noise multiplier."
         ),
     )
     parser.add_argument(
         "--max-grad-norm",
         type=float,
         help="Override the Record-DP per-sequence clipping threshold C.",
+    )
+    parser.add_argument(
+        "--max-client-update-norm",
+        type=float,
+        help=(
+            "Override the local client-DP joint client-gradient clipping "
+            "threshold S."
+        ),
     )
     parser.add_argument(
         "--dataset",
@@ -117,9 +125,12 @@ def load_config(args: argparse.Namespace) -> dict:
         config.setdefault("defense", {})["name"] = args.defense
     if args.target_epsilon is not None:
         defense = config.setdefault("defense", {})
-        if str(defense.get("name", "none")).lower() != "record_dp":
+        if str(defense.get("name", "none")).lower() not in {
+            "record_dp",
+            "local_client_dp",
+        }:
             raise ValueError(
-                "--target-epsilon requires defense.name=record_dp."
+                "--target-epsilon requires a DP defense."
             )
         defense["target_epsilon"] = float(args.target_epsilon)
         defense["noise_multiplier"] = "auto"
@@ -131,6 +142,15 @@ def load_config(args: argparse.Namespace) -> dict:
                 "--max-grad-norm requires defense.name=record_dp."
             )
         defense["max_grad_norm"] = float(max_grad_norm)
+    max_client_update_norm = getattr(args, "max_client_update_norm", None)
+    if max_client_update_norm is not None:
+        defense = config.setdefault("defense", {})
+        if str(defense.get("name", "none")).lower() != "local_client_dp":
+            raise ValueError(
+                "--max-client-update-norm requires "
+                "defense.name=local_client_dp."
+            )
+        defense["max_update_norm"] = float(max_client_update_norm)
     if args.dataset is not None:
         configured_path = Path(str(config["dataset_path"]))
         config["dataset_name"] = args.dataset
@@ -353,9 +373,10 @@ def validate_config(config: dict) -> None:
             )
     defense = dict(config.get("defense", {"name": "none"}))
     defense_name = str(defense.get("name", "none")).lower()
-    if defense_name not in {"none", "iclr", "record_dp"}:
+    if defense_name not in {"none", "iclr", "record_dp", "local_client_dp"}:
         raise ValueError(
-            "Text Adapter experiments support defense=none, iclr, or record_dp."
+            "Text Adapter experiments support defense=none, iclr, record_dp, "
+            "or local_client_dp."
         )
     if defense_name == "iclr":
         if architecture != "bert":
@@ -419,6 +440,47 @@ def validate_config(config: dict) -> None:
             )
         if target_epsilon is None and float(noise) <= 0:
             raise ValueError("Record-DP noise_multiplier must be positive.")
+    if defense_name == "local_client_dp":
+        max_norm = float(defense.get("max_update_norm", 1.0))
+        delta = float(defense.get("delta", defense.get("dp_delta", 1e-5)))
+        if str(defense.get("privacy_unit", "client")).lower() != "client":
+            raise ValueError("Local client-DP requires privacy_unit=client.")
+        if max_norm <= 0:
+            raise ValueError("defense.max_update_norm must be positive.")
+        if not 0 < delta < 1:
+            raise ValueError("Local client-DP delta must be in (0, 1).")
+        if str(defense.get("adjacency", "add_remove")).lower() != "add_remove":
+            raise ValueError(
+                "Local client-DP currently requires add_remove adjacency."
+            )
+        if str(
+            defense.get("sampling", "full_participation")
+        ).lower() != "full_participation":
+            raise ValueError(
+                "Local client-DP currently requires full_participation."
+            )
+        if str(defense.get("accountant", "rdp")).lower() != "rdp":
+            raise ValueError("Local client-DP currently requires accountant=rdp.")
+        target_epsilon = defense.get("target_epsilon")
+        noise = defense.get(
+            "noise_multiplier", defense.get("dp_noise_multiplier")
+        )
+        if target_epsilon is None and noise in {None, "auto"}:
+            raise ValueError(
+                "Local client-DP requires target_epsilon or a numeric "
+                "noise_multiplier."
+            )
+        if target_epsilon is not None and float(target_epsilon) <= 0:
+            raise ValueError("Local client-DP target_epsilon must be positive.")
+        if target_epsilon is not None and noise not in {None, "auto"}:
+            raise ValueError(
+                "Local client-DP must configure target_epsilon or "
+                "noise_multiplier, not both."
+            )
+        if target_epsilon is None and float(noise) <= 0:
+            raise ValueError(
+                "Local client-DP noise_multiplier must be positive."
+            )
     target_client_id = int(audit.get("target_client_id", 0))
     if not 0 <= target_client_id < int(config["total_users"]):
         raise ValueError("audit.target_client_id is outside the client range.")
@@ -526,16 +588,21 @@ def make_result_dir(config: dict) -> Path:
     target_client = int(config.get("audit", {}).get("target_client_id", 0))
     epsilon_suffix = ""
     clipping_suffix = ""
-    if defense == "record_dp":
+    if defense in {"record_dp", "local_client_dp"}:
         defense_config = config.get("defense", {})
         target_epsilon = defense_config.get("target_epsilon")
         if target_epsilon is not None:
             epsilon_suffix = f"_eps{float(target_epsilon):g}"
-        max_grad_norm = defense_config.get(
-            "max_grad_norm", defense_config.get("dp_max_grad_norm")
-        )
-        if max_grad_norm is not None:
-            clipping_suffix = f"_c{float(max_grad_norm):g}"
+        if defense == "record_dp":
+            max_grad_norm = defense_config.get(
+                "max_grad_norm", defense_config.get("dp_max_grad_norm")
+            )
+            if max_grad_norm is not None:
+                clipping_suffix = f"_c{float(max_grad_norm):g}"
+        else:
+            max_update_norm = defense_config.get("max_update_norm")
+            if max_update_norm is not None:
+                clipping_suffix = f"_s{float(max_update_norm):g}"
     run_name = (
         f"{timestamp}_{config['model_type']}_{config['dataset_name']}_fedsgd_"
         f"{defense}{epsilon_suffix}_seed{int(config['seed'])}_"
@@ -630,6 +697,21 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
             "record_dp.grad_sample_backend",
             defense.get("grad_sample_backend"),
         ),
+        (
+            "local_client_dp.enabled",
+            defense.get("name", "none") == "local_client_dp",
+        ),
+        ("local_client_dp.target_epsilon", defense.get("target_epsilon")),
+        (
+            "local_client_dp.noise_multiplier",
+            defense.get("noise_multiplier", defense.get("dp_noise_multiplier")),
+        ),
+        ("local_client_dp.max_update_norm", defense.get("max_update_norm")),
+        (
+            "local_client_dp.delta",
+            defense.get("delta", defense.get("dp_delta")),
+        ),
+        ("local_client_dp.sampling", defense.get("sampling")),
         ("projres.enabled", projres.get("enabled", True)),
         (
             "projres.evaluation_interval",

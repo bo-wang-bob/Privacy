@@ -20,7 +20,9 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 from utils.privacy_accounting import (
+    calibrate_gaussian_noise,
     calibrate_poisson_sampled_gaussian_noise,
+    gaussian_rdp_epsilon,
     poisson_sampled_gaussian_epsilon,
     private_generator,
 )
@@ -55,6 +57,7 @@ SUPPORTED_DEFENSES = {
     "cofedmid",
     "prompt_dp",
     "record_dp",
+    "local_client_dp",
     "mist",
     "soft",
     "hamp",
@@ -116,6 +119,48 @@ def _assign_flat_gradient(
         offset += count
     if offset != flat_gradient.numel():
         raise ValueError("Processed gradient does not match trainable parameter size.")
+
+
+def _clip_joint_gradient_and_add_noise(
+    parameters: list[torch.nn.Parameter],
+    max_norm: float,
+    noise_multiplier: float,
+    generator: torch.Generator,
+) -> tuple[float, float]:
+    """Privatize one complete client gradient in a single joint L2 space."""
+    if max_norm <= 0:
+        raise ValueError("Client gradient max_norm must be positive.")
+    if noise_multiplier < 0:
+        raise ValueError("Client gradient noise_multiplier cannot be negative.")
+    squared_norm = sum(
+        parameter.grad.detach().float().square().sum()
+        for parameter in parameters
+        if parameter.grad is not None
+    )
+    if not isinstance(squared_norm, torch.Tensor):
+        squared_norm = torch.zeros((), device=parameters[0].device)
+    raw_norm = torch.sqrt(squared_norm).item()
+    clip_factor = min(1.0, max_norm / max(raw_norm, 1e-12))
+    noise_std = noise_multiplier * max_norm
+    with torch.no_grad():
+        for parameter in parameters:
+            gradient = (
+                torch.zeros_like(parameter)
+                if parameter.grad is None
+                else parameter.grad.detach().mul(clip_factor)
+            )
+            if noise_std > 0:
+                gradient.add_(
+                    torch.randn(
+                        parameter.shape,
+                        generator=generator,
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    ),
+                    alpha=noise_std,
+                )
+            parameter.grad = gradient
+    return float(raw_norm), float(clip_factor)
 
 
 def _per_sample_gradients(
@@ -376,12 +421,38 @@ class DefenseController:
                 )
             if int(self.config.get("microbatch_size", 1)) <= 0:
                 raise ValueError("Record-DP microbatch_size must be positive.")
+        if self.name == "local_client_dp":
+            privacy_unit = str(self.config.get("privacy_unit", "client")).lower()
+            adjacency = str(self.config.get("adjacency", "add_remove")).lower()
+            sampling = str(
+                self.config.get("sampling", "full_participation")
+            ).lower()
+            if privacy_unit != "client":
+                raise ValueError("Local client-DP requires privacy_unit=client.")
+            if adjacency != "add_remove":
+                raise ValueError(
+                    "Local client-DP currently requires add_remove adjacency."
+                )
+            if sampling != "full_participation":
+                raise ValueError(
+                    "Local client-DP currently requires full_participation."
+                )
+            if str(self.config.get("accountant", "rdp")).lower() != "rdp":
+                raise ValueError("Local client-DP currently requires accountant=rdp.")
+            if self._local_client_dp_max_norm() <= 0:
+                raise ValueError(
+                    "Local client-DP max_update_norm must be positive."
+                )
+            if not 0 < self._local_client_dp_delta() < 1:
+                raise ValueError("Local client-DP delta must be in (0, 1).")
         self.federated_method = "fedavg"
         self.method_config: dict = {}
         self.additional_private_steps = 0
         self.record_dp_noise_multiplier: float | None = None
         self.record_dp_sample_rates: dict[int, float] = {}
         self.record_dp_planned_steps: dict[int, int] = {}
+        self.local_client_dp_noise_multiplier: float | None = None
+        self.local_client_dp_planned_steps: dict[int, int] = {}
 
     def _record_dp_max_norm(self) -> float:
         return float(
@@ -396,6 +467,22 @@ class DefenseController:
         )
 
     def _record_dp_reproducible(self) -> bool:
+        return bool(
+            self.config.get(
+                "reproducible_noise",
+                self.config.get("reproducible_dp_noise", False),
+            )
+        )
+
+    def _local_client_dp_max_norm(self) -> float:
+        return float(self.config.get("max_update_norm", 1.0))
+
+    def _local_client_dp_delta(self) -> float:
+        return float(
+            self.config.get("delta", self.config.get("dp_delta", 1e-5))
+        )
+
+    def _local_client_dp_reproducible(self) -> bool:
         return bool(
             self.config.get(
                 "reproducible_noise",
@@ -448,6 +535,42 @@ class DefenseController:
             self.record_dp_noise_multiplier = float(configured_noise)
             if self.record_dp_noise_multiplier <= 0:
                 raise ValueError("Record-DP noise_multiplier must be positive.")
+
+    def configure_local_client_dp(self, users) -> None:
+        """Calibrate one local Gaussian mechanism per client upload."""
+        if self.name != "local_client_dp":
+            return
+        self.local_client_dp_planned_steps = {
+            int(user.id): self.total_rounds + int(self.additional_private_steps)
+            for user in users
+        }
+        configured_noise = self.config.get(
+            "noise_multiplier", self.config.get("dp_noise_multiplier")
+        )
+        target_epsilon = self.config.get("target_epsilon")
+        if target_epsilon is not None and configured_noise not in {None, "auto"}:
+            raise ValueError(
+                "Local client-DP must configure either target_epsilon or a "
+                "numeric noise_multiplier, not both."
+            )
+        if target_epsilon is not None:
+            planned_steps = max(self.local_client_dp_planned_steps.values())
+            self.local_client_dp_noise_multiplier = calibrate_gaussian_noise(
+                target_epsilon=float(target_epsilon),
+                steps=planned_steps,
+                delta=self._local_client_dp_delta(),
+            )
+        else:
+            if configured_noise in {None, "auto"}:
+                raise ValueError(
+                    "Local client-DP requires target_epsilon or a numeric "
+                    "noise_multiplier."
+                )
+            self.local_client_dp_noise_multiplier = float(configured_noise)
+            if self.local_client_dp_noise_multiplier <= 0:
+                raise ValueError(
+                    "Local client-DP noise_multiplier must be positive."
+                )
 
     @property
     def enabled(self) -> bool:
@@ -549,7 +672,7 @@ class DefenseController:
         model.to(self.device)
         model.train()
         parameters = _trainable_parameters(model)
-        if self.name == "record_dp":
+        if self.name in {"record_dp", "local_client_dp"}:
             optimizer_name = str(
                 self.method_config.get("client_optimizer", "sgd")
             ).lower()
@@ -571,7 +694,7 @@ class DefenseController:
                     ),
                 )
             else:
-                raise ValueError("Record-DP client_optimizer must be sgd or adamw.")
+                raise ValueError("DP client_optimizer must be sgd or adamw.")
         else:
             optimizer = torch.optim.SGD(parameters, lr=user.learning_rate)
         if user.federated_method == "fedsgd":
@@ -590,6 +713,10 @@ class DefenseController:
             )
         elif self.name == "record_dp":
             self._record_dp_training(
+                user, model, optimizer, parameters, round_index, code_poison
+            )
+        elif self.name == "local_client_dp":
+            self._local_client_dp_training(
                 user, model, optimizer, parameters, round_index, code_poison
             )
         elif self.name == "hamp":
@@ -1336,6 +1463,58 @@ class DefenseController:
                     "record_dp_clip_fraction",
                     float((factors < 1).float().mean()),
                 )
+
+    def _local_client_dp_training(
+        self,
+        user,
+        model,
+        optimizer,
+        parameters,
+        round_index: int,
+        code_poison: bool,
+    ) -> None:
+        """Clip and locally privatize the complete one-batch FedSGD upload."""
+        if self.federated_method != "fedsgd":
+            raise ValueError("Local client-DP currently requires one-batch FedSGD.")
+        if self.local_client_dp_noise_multiplier is None:
+            raise RuntimeError("Local client-DP must be configured before training.")
+        noise_generator = private_generator(
+            self.device,
+            self._local_client_dp_reproducible(),
+            self.seed + 1000003 * user.id + 1009 * round_index + 41011,
+        )
+        batches = list(user.iter_local_batches())
+        if len(batches) != 1:
+            raise RuntimeError(
+                "Local client-DP requires exactly one client message per round."
+            )
+        images, labels = batches[0]
+        images = images.to(self.device)
+        labels = labels.to(self.device)
+        optimizer.zero_grad(set_to_none=True)
+        if code_poison:
+            loss = compromised_prompt_loss(
+                model,
+                images,
+                labels,
+                weight=float(user.code_poison_config.get("weight", 1.0)),
+                mean=float(user.code_poison_config.get("synthetic_mean", 0.0)),
+                std=float(user.code_poison_config.get("synthetic_std", 0.1)),
+            )
+        else:
+            loss = F.cross_entropy(model(images), labels)
+        loss.backward()
+        raw_norm, clip_factor = _clip_joint_gradient_and_add_noise(
+            parameters,
+            max_norm=self._local_client_dp_max_norm(),
+            noise_multiplier=self.local_client_dp_noise_multiplier,
+            generator=noise_generator,
+        )
+        optimizer.step()
+        self.steps[user.id] += 1
+        if bool(self.config.get("release_private_diagnostics", False)):
+            self._record("local_client_dp_raw_update_norm", raw_norm)
+            self._record("local_client_dp_clip_fraction", float(clip_factor < 1.0))
 
     def _hamp_training(
         self, user, model, optimizer, round_index: int, code_poison: bool
@@ -2216,6 +2395,9 @@ class DefenseController:
         if self.name == "record_dp":
             epsilons = self.record_dp_epsilons()
             return max(epsilons.values()) if epsilons else None
+        if self.name == "local_client_dp":
+            epsilons = self.local_client_dp_epsilons()
+            return max(epsilons.values()) if epsilons else None
         if self.name != "prompt_dp" or not self.steps:
             return None
         noise = float(self.config.get("dp_noise_multiplier", 1.0))
@@ -2247,6 +2429,22 @@ class DefenseController:
             for client_id, sample_rate in sorted(
                 self.record_dp_sample_rates.items()
             )
+        }
+
+    def local_client_dp_epsilons(self) -> dict[int, float]:
+        if (
+            self.name != "local_client_dp"
+            or self.local_client_dp_noise_multiplier is None
+        ):
+            return {}
+        return {
+            client_id: gaussian_rdp_epsilon(
+                noise_multiplier=self.local_client_dp_noise_multiplier,
+                steps=int(self.steps.get(client_id, 0))
+                + int(self.additional_private_steps),
+                delta=self._local_client_dp_delta(),
+            )
+            for client_id in sorted(self.local_client_dp_planned_steps)
         }
 
     def summary(self) -> dict:
@@ -2358,6 +2556,56 @@ class DefenseController:
                         "Per-client sampled-Gaussian RDP composition; disjoint "
                         "client datasets compose in parallel, so the released "
                         "record-level epsilon is the client maximum."
+                    ),
+                }
+            elif self.name == "local_client_dp":
+                epsilons = self.local_client_dp_epsilons()
+                summary["privacy_accounting"] = {
+                    "privacy_unit": "client",
+                    "adjacency": "add_remove",
+                    "accountant": "gaussian_rdp",
+                    "sampling": "full_participation",
+                    "epsilon_upper_bound": epsilon,
+                    "target_epsilon": self.config.get("target_epsilon"),
+                    "delta": self._local_client_dp_delta(),
+                    "noise_multiplier": self.local_client_dp_noise_multiplier,
+                    "max_update_norm": self._local_client_dp_max_norm(),
+                    "noise_std_per_upload_coordinate": (
+                        self.local_client_dp_noise_multiplier
+                        * self._local_client_dp_max_norm()
+                    ),
+                    "clipping_scope": "joint_trainable_client_gradient",
+                    "per_client": {
+                        str(client_id): {
+                            "sample_count": int(self.samples_num[client_id]),
+                            "sample_rate": 1.0,
+                            "actual_steps": int(self.steps.get(client_id, 0)),
+                            "accounted_additional_private_steps": int(
+                                self.additional_private_steps
+                            ),
+                            "planned_steps": self.local_client_dp_planned_steps[
+                                client_id
+                            ],
+                            "epsilon": epsilons[client_id],
+                        }
+                        for client_id in sorted(epsilons)
+                    },
+                    "federated_method": self.federated_method,
+                    "client_upload_is_private": True,
+                    "formal_dp_enabled": not self._local_client_dp_reproducible()
+                    and not bool(
+                        self.config.get("release_private_diagnostics", False)
+                    ),
+                    "private_diagnostics_released": bool(
+                        self.config.get("release_private_diagnostics", False)
+                    ),
+                    "participation_metadata_is_private": False,
+                    "note": (
+                        "Each fixed client slot clips its complete one-batch "
+                        "gradient and adds Gaussian noise before upload. Disjoint "
+                        "clients compose in parallel, so the released client-level "
+                        "epsilon is the client maximum. The guarantee hides a "
+                        "client's data contribution, not network participation."
                     ),
                 }
             else:

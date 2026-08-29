@@ -13,6 +13,7 @@ from aggregator.aggregator_builder import build_aggregator
 from main import validate_config as validate_image_config
 from privacy_defenses.controller import (
     DefenseController,
+    _clip_joint_gradient_and_add_noise,
     _loop_clipped_gradient_sum,
     _vmap_clipped_gradient_sum,
 )
@@ -23,6 +24,13 @@ from scripts.calibrate_bert_record_dp_clipping import (
     select_sample_references,
     summarize_checkpoints,
 )
+from scripts.calibrate_bert_local_client_dp_clipping import (
+    ClientGradientNormObserver,
+    client_gradient_norm_row,
+    phase_name,
+    recommend_thresholds,
+    summarize_by_phase,
+)
 from scripts.run_fedllm_adapter import (
     load_config as load_text_config,
     make_result_dir,
@@ -31,6 +39,7 @@ from scripts.run_fedllm_adapter import (
 from servers.serverbase import ServerBase
 from users.user import UserBase
 from utils.privacy_accounting import (
+    calibrate_gaussian_noise,
     calibrate_poisson_sampled_gaussian_noise,
     gaussian_rdp_epsilon,
     poisson_sampled_gaussian_epsilon,
@@ -129,7 +138,7 @@ def test_clipping_calibration_sampling_diagnostics_check_balance_and_uniqueness(
     assert diagnostics["label_total_variation"] == pytest.approx(0.0)
 
 
-def test_record_dp_resnet_and_bert_configs_validate():
+def test_record_and_local_client_dp_configs_validate():
     with open(
         "configs/resnet18_cifar100_record_dp.yaml", encoding="utf-8"
     ) as file:
@@ -138,12 +147,19 @@ def test_record_dp_resnet_and_bert_configs_validate():
         "configs/bert_base_sst5_adapter_record_dp.yaml", encoding="utf-8"
     ) as file:
         bert = yaml.safe_load(file)
+    with open(
+        "configs/bert_base_sst5_adapter_local_client_dp.yaml", encoding="utf-8"
+    ) as file:
+        client_dp = yaml.safe_load(file)
 
     validate_image_config(resnet)
     validate_text_config(bert)
+    validate_text_config(client_dp)
     assert resnet["defense"]["name"] == "record_dp"
     assert bert["defense"]["name"] == "record_dp"
     assert bert["projres"]["max_candidates"] == 0
+    assert client_dp["defense"]["name"] == "local_client_dp"
+    assert client_dp["projres"]["max_candidates"] == 16
 
 
 def test_poisson_sampled_rdp_matches_full_gaussian_and_amplifies_privacy():
@@ -195,6 +211,34 @@ def test_text_runner_overrides_record_dp_epsilon_and_projres_only(tmp_path):
     assert result_dir.name.endswith("_c8")
 
 
+def test_text_runner_overrides_local_client_dp_budget_and_norm(tmp_path):
+    config = load_text_config(
+        Namespace(
+            config="configs/bert_base_sst5_adapter_local_client_dp.yaml",
+            gpu=None,
+            rounds=100,
+            seed=44,
+            results_dir=str(tmp_path),
+            defense="local_client_dp",
+            target_epsilon=5.0,
+            max_grad_norm=None,
+            max_client_update_norm=2.0,
+            dataset=None,
+            attacks="projres",
+            target_client_id=None,
+            projres=True,
+            require_cuda=None,
+        )
+    )
+
+    assert config["defense"]["target_epsilon"] == 5.0
+    assert config["defense"]["noise_multiplier"] == "auto"
+    assert config["defense"]["max_update_norm"] == pytest.approx(2.0)
+    result_dir = make_result_dir(config)
+    assert "_local_client_dp_eps5_seed44_target0" in result_dir.name
+    assert result_dir.name.endswith("_s2")
+
+
 def test_poisson_noise_calibration_meets_every_client_budget():
     schedules = [(0.02, 150), (0.08, 40)]
     multiplier = calibrate_poisson_sampled_gaussian_noise(
@@ -210,6 +254,96 @@ def test_poisson_noise_calibration_meets_every_client_budget():
     ]
     assert max(epsilons) <= 3.0 + 1e-8
     assert max(epsilons) >= 3.0 - 1e-6
+
+
+def test_local_client_dp_calibration_composes_full_gaussian_releases():
+    multiplier = calibrate_gaussian_noise(
+        target_epsilon=3.0,
+        steps=500,
+        delta=1e-5,
+    )
+    epsilon = gaussian_rdp_epsilon(
+        noise_multiplier=multiplier,
+        steps=500,
+        delta=1e-5,
+    )
+
+    assert multiplier > 1.0
+    assert epsilon <= 3.0 + 1e-8
+    assert epsilon >= 3.0 - 1e-6
+
+
+def test_local_client_dp_clips_one_joint_gradient_vector():
+    parameter = nn.Parameter(torch.zeros(2))
+    unused = nn.Parameter(torch.zeros(1))
+    parameter.grad = torch.tensor([3.0, 4.0])
+    raw_norm, factor = _clip_joint_gradient_and_add_noise(
+        [parameter, unused],
+        max_norm=1.0,
+        noise_multiplier=0.0,
+        generator=torch.Generator().manual_seed(5),
+    )
+
+    assert raw_norm == pytest.approx(5.0)
+    assert factor == pytest.approx(0.2)
+    assert parameter.grad.norm().item() == pytest.approx(1.0)
+    assert torch.equal(unused.grad, torch.zeros_like(unused))
+
+
+def test_client_upload_calibration_measures_exact_joint_batch_gradient():
+    row = client_gradient_norm_row(
+        round_index=2,
+        client_id=4,
+        gradients={
+            "backbone.encoder.layer.0.adapter.up.weight": torch.tensor([3.0]),
+            "classifier.weight": torch.tensor([4.0]),
+        },
+        sample_count=16,
+        learning_rate=0.005,
+    )
+
+    assert row["communication_round"] == 3
+    assert row["batch_size"] == 16
+    assert row["joint_grad_norm"] == pytest.approx(5.0)
+    assert row["adapter_up_grad_norm"] == pytest.approx(3.0)
+    assert row["classifier_grad_norm"] == pytest.approx(4.0)
+
+
+def test_client_upload_calibration_recommends_p50_p75_p90_thresholds():
+    rows = [
+        {
+            "communication_round": round_id,
+            "client_id": client_id,
+            "joint_grad_norm": norm,
+        }
+        for round_id, client_id, norm in (
+            (1, 0, 1.0),
+            (1, 1, 2.0),
+            (2, 0, 3.0),
+            (2, 1, 4.0),
+            (3, 0, 5.0),
+            (3, 1, 6.0),
+        )
+    ]
+    recommendations, grid, multiplier = recommend_thresholds(
+        rows,
+        target_epsilon=3.0,
+        delta=1e-5,
+        accounting_rounds=10,
+        total_users=2,
+    )
+
+    assert [row["quantile"] for row in recommendations] == ["P50", "P75", "P90"]
+    assert recommendations[0]["recommended_s"] == pytest.approx(3.5)
+    assert recommendations[1]["recommended_s"] == pytest.approx(4.75)
+    assert recommendations[2]["recommended_s"] == pytest.approx(5.5)
+    assert recommendations[0]["clip_fraction"] == pytest.approx(0.5)
+    assert multiplier > 0
+    assert grid[0]["max_update_norm"] < recommendations[0]["recommended_s"]
+    assert grid[-1]["max_update_norm"] > recommendations[-1]["recommended_s"]
+    phases = summarize_by_phase(rows, total_rounds=3)
+    assert [row["phase"] for row in phases] == ["early", "middle", "late"]
+    assert phase_name(3, 3) == "late"
 
 
 def test_loop_and_vmap_apply_the_same_global_per_record_clipping():
@@ -307,6 +441,144 @@ def test_record_dp_fedsgd_uses_one_poisson_draw_and_uploads_one_noisy_gradient(
     assert json.loads((tmp_path / "defense_summary.json").read_text())[
         "defense"
     ] == "record_dp"
+
+
+def test_local_client_dp_fedsgd_upload_is_noised_before_capture(tmp_path):
+    data = TensorDataset(
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 1.0, 0.0],
+            ]
+        ),
+        torch.tensor([0, 1, 0, 1]),
+    )
+    controller = DefenseController(
+        {
+            "name": "local_client_dp",
+            "max_update_norm": 0.5,
+            "noise_multiplier": 1.0,
+            "delta": 1e-5,
+            "adjacency": "add_remove",
+            "sampling": "full_participation",
+            "accountant": "rdp",
+            "reproducible_noise": True,
+            "seed": 17,
+        },
+        device=torch.device("cpu"),
+        total_users=1,
+        num_classes=2,
+        total_rounds=1,
+    )
+    controller.federated_method = "fedsgd"
+    controller.method_config = {
+        "client_optimizer": "sgd",
+        "momentum": 0.0,
+        "weight_decay": 0.0,
+    }
+    user = UserBase(
+        device=torch.device("cpu"),
+        id=0,
+        dataset_name="toy",
+        train_data=data,
+        test_data=data,
+        model=TinyRecordModel(),
+        batch_size=4,
+        eval_batch_size=4,
+        learning_rate=0.1,
+        local_epochs=1,
+        defense_controller=controller,
+        federated_method="fedsgd",
+        method_config=controller.method_config,
+    )
+    controller.samples_num = [len(data)]
+    controller.configure_local_client_dp([user])
+
+    user.train(round_index=0)
+
+    assert controller.steps[0] == 1
+    assert user.last_update_sample_count == 4
+    assert user.last_gradient_capture_count == 1
+    assert user.last_update_gradients is not None
+    for name, parameter in user.model.named_parameters():
+        if parameter.requires_grad:
+            assert torch.equal(user.last_update_gradients[name], parameter.grad)
+    summary = controller.save_summary(str(tmp_path))
+    accounting = summary["privacy_accounting"]
+    assert accounting["privacy_unit"] == "client"
+    assert accounting["client_upload_is_private"]
+    assert accounting["per_client"]["0"]["actual_steps"] == 1
+    assert accounting["per_client"]["0"]["sample_rate"] == pytest.approx(1.0)
+    assert accounting["noise_std_per_upload_coordinate"] == pytest.approx(0.5)
+    assert not accounting["formal_dp_enabled"]
+
+
+def test_server_runs_full_participation_local_client_dp_fedsgd(tmp_path):
+    generator = torch.Generator().manual_seed(31)
+    train_sets = []
+    test_sets = []
+    for client_id in range(2):
+        inputs = torch.randn(8, 3, generator=generator) + client_id * 0.1
+        labels = torch.tensor([0, 1] * 4)
+        train_sets.append(TensorDataset(inputs, labels))
+        test_sets.append(TensorDataset(inputs.clone(), labels.clone()))
+    observer = ClientGradientNormObserver([0, 1], expected_messages=2)
+    server = ServerBase(
+        device=torch.device("cpu"),
+        dataset_name="toy",
+        train_sets=train_sets,
+        test_sets=test_sets,
+        class_names=["zero", "one"],
+        model=TinyRecordModel(),
+        batch_size=4,
+        eval_batch_size=8,
+        learning_rate=0.05,
+        num_glob_iters=1,
+        local_epochs=1,
+        total_users=2,
+        results_dir=str(tmp_path),
+        user_per_round=2,
+        aggregator=build_aggregator(
+            "fedsgd",
+            device=torch.device("cpu"),
+            aggregation_weighting="uniform",
+        ),
+        eval_interval=1,
+        audit_config={"enabled": False, "attacks": []},
+        projres_config={"enabled": False},
+        defense_config={
+            "name": "local_client_dp",
+            "max_update_norm": 0.5,
+            "noise_multiplier": 1.0,
+            "delta": 1e-5,
+            "adjacency": "add_remove",
+            "sampling": "full_participation",
+            "accountant": "rdp",
+            "reproducible_noise": True,
+            "seed": 37,
+        },
+        method_config={
+            "client_optimizer": "sgd",
+            "momentum": 0.0,
+            "weight_decay": 0.0,
+            "max_grad_norm": 0.0,
+        },
+        client_gradient_observer=observer,
+    )
+
+    server.train()
+
+    summary = json.loads((tmp_path / "defense_summary.json").read_text())
+    assert summary["privacy_accounting"]["privacy_unit"] == "client"
+    assert summary["privacy_accounting"]["epsilon_upper_bound"] > 0
+    assert all(
+        steps == 1 for steps in summary["steps_per_client"].values()
+    )
+    assert len(observer.rows) == 2
+    assert {row["client_id"] for row in observer.rows} == {0, 1}
+    assert all(row["joint_grad_norm"] > 0 for row in observer.rows)
 
 
 def test_record_dp_audit_reports_theoretical_roc_envelope(tmp_path):
