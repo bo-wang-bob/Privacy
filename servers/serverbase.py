@@ -214,8 +214,10 @@ class ServerBase:
         self.aggregator = aggregator
         if str(getattr(model, "model_type", "")).lower() in {
             "clip_mlp",
+            "clip_adapter",
             "visual_adapter",
             "clip_lora",
+            "bert_lora",
         } and hasattr(self.aggregator, "aggregation_weighting"):
             self.aggregator.aggregation_weighting = "uniform"
         self.federated_method = aggregator.name
@@ -713,6 +715,7 @@ class ServerBase:
 
             if str(getattr(self.model, "model_type", "")).lower() in {
                 "bert_adapter",
+                "bert_lora",
                 "gpt2_adapter",
                 "resnet18",
             }:
@@ -796,7 +799,10 @@ class ServerBase:
                 round_index=round_index,
             )
 
-            if str(getattr(self.model, "model_type", "")).lower() == "clip_lora":
+            if str(getattr(self.model, "model_type", "")).lower() in {
+                "clip_lora",
+                "bert_lora",
+            }:
                 for user_id in selected_ids:
                     self.ctx.users[user_id].set_parameters(
                         self.ctx.updated_model_state[user_id]
@@ -1003,11 +1009,19 @@ class ServerBase:
                 ),
                 "local_batches_per_client_round": 1,
             }
-        if str(getattr(self.model, "model_type", "")).lower() == "clip_lora":
+        if str(getattr(self.model, "model_type", "")).lower() in {
+            "clip_lora",
+            "bert_lora",
+        }:
+            model_type = str(getattr(self.model, "model_type", "")).lower()
             method_summary["lora"] = {
-                "trainable_scope": "attention_lora_A_and_lora_B_only",
-                "client_storage": "independent_lora_factors_only",
-                "shared_clip_backbone": True,
+                "trainable_scope": (
+                    "attention_lora_A_and_lora_B_only"
+                    if model_type == "clip_lora"
+                    else "attention_lora_A_and_lora_B_and_classification_head"
+                ),
+                "client_storage": "independent_peft_parameters_on_cpu",
+                "shared_backbone": "CLIP" if model_type == "clip_lora" else "BERT",
                 "aggregation": str(
                     f"factor_wise_{self.federated_method}"
                 ),

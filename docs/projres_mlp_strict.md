@@ -1,15 +1,15 @@
-# CLIP-MLP、Visual Adapter 与 CLIP-LoRA 上的 ProjRes 实现
+# CLIP-MLP、CLIP-Adapter 与 CLIP-LoRA 上的 ProjRes 实现
 
 本实现对应论文 *Toward Efficient Membership Inference Attacks against
 Federated Large Language Models: A Projection Residual Approach* 的 Algorithm
-1。论文中的 adapter down-projection 层在 Visual Adapter 中直接对应
+1。论文中的 adapter down-projection 层在 CLIP-Adapter 中直接对应
 `adapter.net.0.weight`；在 CLIP-MLP 对照模型中对应第一层分类 MLP
 `classifier.0.weight`。CLIP-LoRA 对应视觉编码器首个 Q 投影中的下投影因子
 `clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A`。
 
 ## 数学映射
 
-冻结 CLIP 产生批表示 `X ∈ R^(p×n)`，它就是 Visual Adapter 的输入隐藏
+冻结 CLIP 产生批表示 `X ∈ R^(p×n)`，它就是 CLIP-Adapter 的输入隐藏
 表示。被攻击的 down-projection 是 PyTorch
 `Linear(n, m)`，其权重梯度为：
 
@@ -71,15 +71,15 @@ rowspan(dL/dA) is a subspace of the attacked-layer token inputs
   客户端的数据集”；
 - 不使用其他客户端更新、代理梯度、shadow model、学习型攻击头或成员标签
   来构造攻击子空间；
-- CLIP 主干冻结；Visual Adapter 只读取首个 down-projection 权重更新，
+- CLIP 主干冻结；CLIP-Adapter 只读取首个 down-projection 权重更新，
   CLIP-MLP 对照模型只读取第一层分类 MLP 权重更新，CLIP-LoRA 只读取首个
   视觉 Q 投影的 `lora_A` 更新；
-- 数据协议与对应正常训练保持一致：CLIP-MLP、Visual Adapter 和 CLIP-LoRA
-  均使用完整训练集。
+- 数据协议与对应正常训练保持一致：CLIP-MLP、CLIP-Adapter 使用每类 16-shot，
+  CLIP-LoRA 使用完整训练集；三者均为 one-batch FedSGD。
 
-独立入口继续用于 CLIP-MLP 严格复现和 CLIP-LoRA/Visual Adapter 的单独诊断；
-通用 `promptres` 是余弦代理攻击，不等同于本文的投影残差算法。正式 Visual
-Adapter sweep 已将 ProjRes 接入共享多轮审计器，但不改变这里的投影残差公式。
+独立入口继续用于 CLIP-MLP 严格复现和 CLIP-LoRA/CLIP-Adapter 的单独诊断；
+通用 `promptres` 是余弦代理攻击，不等同于本文的投影残差算法。正式 CLIP 三模型
+sweep 均已将 ProjRes 接入共享多轮审计器，但不改变这里的投影残差公式。
 
 ## 统一训练入口中的真实轮次评估
 
@@ -87,7 +87,7 @@ Adapter sweep 已将 ProjRes 接入共享多轮审计器，但不改变这里的
 第 3.1 节要求的是目标客户端单个通信轮的上传梯度，而不是训练初始化时额外构造
 一次更新。论文第 4.1 节的默认实验通常在第 50 个通信轮评估。
 
-Visual Adapter 与 CLIP-LoRA 的统一 sweep 因此每 10 轮直接观察实际 one-batch
+CLIP-MLP、CLIP-Adapter 与 CLIP-LoRA 的统一 sweep 因此每 10 轮直接观察实际 one-batch
 FedSGD 上传，ProjRes 与另外五种真实 Batch 攻击共享当轮 `N` 个成员和按标签匹配
 的 `10N` 个非成员，并由共享审计器统一保存结果。独立诊断入口仍可显式选择观察
 轮次。若独立入口观察的是包含
@@ -113,13 +113,13 @@ python scripts/validate_projres_mlp_real.py \
   --output results/projres_mlp_client0.json
 ```
 
-Visual Adapter 单客户端示例：
+CLIP-Adapter 单客户端示例：
 
 ```bash
 python scripts/validate_projres_mlp_real.py \
-  --config configs/visual_adapter_low_fpr_attacks.yaml \
+  --config configs/clip_adapter_low_fpr_attacks.yaml \
   --target-client 0 \
-  --output results/projres_visual_adapter_client0.json
+  --output results/projres_clip_adapter_client0.json
 ```
 
 输出是 JSON，不生成 HTML。ProjRes 采用 ranking-only 判断：保存原始 L1 残差及其
@@ -130,7 +130,7 @@ python scripts/validate_projres_mlp_real.py \
 （所有客户端测试集和其他客户端训练集）中最多选取 20,000 个样本。非成员不得
 少于 1000 个，因而 `TPR@0.1%FPR` 的经验 FPR 步长不大于 `1/1000`。可显式使用
 `--max-nonmembers 0` 改为完整非成员池，或指定另一个不小于 1000 的上限。
-Visual Adapter 与 CLIP-LoRA 正式统一 sweep 使用按真实 Batch 标签匹配的
+CLIP-MLP、CLIP-Adapter 与 CLIP-LoRA 正式统一 sweep 使用按真实 Batch 标签匹配的
 `N/10N` 候选视图，不报告 `TPR@0.1%FPR`。无论哪条入口，目标客户端不在当前
 batch 中的其他训练样本
 都不能算作严格威胁模型下的成员。
@@ -138,7 +138,7 @@ batch 中的其他训练样本
 ## 适用边界
 
 论文给出的有利秩条件在这里是 `p <= m` 且 `p < n`：batch 大小 `p` 不超过
-第一层输出维度 `m`，并小于 CLIP 表示维度 `n`。Visual Adapter 的默认
+第一层输出维度 `m`，并小于 CLIP 表示维度 `n`。CLIP-Adapter 的默认
 down-projection 为 `n=512, m=128`，实际 `p` 是目标客户端首个 batch 的大小。
 若改成多 batch、本地多步、动量、裁剪、噪声或安全聚合，上传更新不再是单个
 batch 梯度的常数倍，就不再属于本入口声明的严格实验设置。

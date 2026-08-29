@@ -141,6 +141,31 @@ class CLIPImageMLP(nn.Module):
         """Expose class decision vectors for the PromptMIA-style active probe."""
         return cast(nn.Linear, self.classifier[3]).weight
 
+    def get_projres_attack_surface(
+        self, parameter_name: str | None = None
+    ) -> tuple[str, nn.Linear]:
+        """Expose the first MLP projection used by exact-batch ProjRes."""
+        name = "classifier.0.weight"
+        layer = cast(nn.Linear, self.classifier[0])
+        if parameter_name not in {None, name}:
+            raise ValueError(
+                f"ProjRes parameter {parameter_name!r} must be {name!r}."
+            )
+        return name, layer
+
+    @torch.no_grad()
+    def get_projres_representations(
+        self,
+        images: torch.Tensor,
+        parameter_name: str | None = None,
+        token_reduction: str = "none",
+    ) -> tuple[torch.Tensor, int]:
+        """Return CLIP image vectors entering the attacked MLP projection."""
+        del token_reduction
+        self.get_projres_attack_surface(parameter_name)
+        features = self.encode_images(images)
+        return features, int(features.shape[0])
+
     def clone_head_only(self) -> "CLIPImageMLP":
         """Clone trainable state while sharing the immutable CLIP backbone."""
         clone = CLIPImageMLP(

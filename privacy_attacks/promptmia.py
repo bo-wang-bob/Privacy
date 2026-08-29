@@ -112,8 +112,8 @@ def _adaptation_description(model: torch.nn.Module) -> str:
     model_type = str(getattr(model, "model_type", ""))
     if model_type == "clip_mlp":
         return "MLP class-decision-vector update response"
-    if model_type == "visual_adapter":
-        return "visual-adapter input-projection update response"
+    if model_type in {"clip_adapter", "visual_adapter"}:
+        return "CLIP-Adapter input-projection update response"
     return "shared CoOp text-prompt token update response"
 
 

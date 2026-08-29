@@ -9,12 +9,14 @@ def trainable_scope_name(model: torch.nn.Module) -> str:
     model_type = str(getattr(model, "model_type", "prompt"))
     if model_type == "clip_mlp":
         return "mlp_only"
-    if model_type == "visual_adapter":
+    if model_type in {"clip_adapter", "visual_adapter"}:
         if bool(getattr(model, "text_adapter_enabled", False)):
-            return "visual_and_text_adapters"
-        return "visual_adapter_only"
+            return "clip_image_and_text_adapters"
+        return "clip_image_adapter_only"
     if model_type == "clip_lora":
         return "clip_attention_lora_only"
+    if model_type == "bert_lora":
+        return "bert_attention_lora_and_classification_head"
     if model_type in {"bert_adapter", "gpt2_adapter"}:
         return "all_transformer_adapters_and_classification_head"
     return "prompt_only"

@@ -465,14 +465,17 @@ class MembershipAuditor:
         )
         if "projres" in self.exact_batch_membership_attacks:
             if self.model_type not in {
+                "clip_mlp",
                 "bert_adapter",
+                "bert_lora",
                 "gpt2_adapter",
+                "clip_adapter",
                 "visual_adapter",
                 "clip_lora",
             }:
                 raise ValueError(
                     "Unified exact-batch ProjRes requires a Transformer "
-                    "Adapter, Visual Adapter, or CLIP-LoRA model."
+                    "PEFT, CLIP-MLP, CLIP-Adapter, or CLIP-LoRA model."
                 )
             if self.exact_batch_projres_config.get("threshold") is not None:
                 raise ValueError(
@@ -1002,6 +1005,7 @@ class MembershipAuditor:
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
             "clip_mlp",
+            "clip_adapter",
             "visual_adapter",
         }:
             raise ValueError(
@@ -1501,9 +1505,11 @@ class MembershipAuditor:
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
             "clip_mlp",
+            "clip_adapter",
             "visual_adapter",
             "clip_lora",
             "bert_adapter",
+            "bert_lora",
             "gpt2_adapter",
         }:
             raise ValueError(
@@ -1901,9 +1907,11 @@ class MembershipAuditor:
         unsupported = sorted(set(self.attacks) - supported)
         if self.model_type not in {
             "clip_mlp",
+            "clip_adapter",
             "visual_adapter",
             "clip_lora",
             "bert_adapter",
+            "bert_lora",
             "gpt2_adapter",
         }:
             raise ValueError(
@@ -2328,7 +2336,11 @@ class MembershipAuditor:
             self.exact_batch_projres_config.get("token_reduction", "auto")
         ).lower()
         if token_reduction == "auto":
-            if self.model_type == "visual_adapter":
+            if self.model_type in {
+                "clip_mlp",
+                "clip_adapter",
+                "visual_adapter",
+            }:
                 token_reduction = "none"
             else:
                 token_reduction = (
@@ -2395,11 +2407,13 @@ class MembershipAuditor:
         paper_fedsgd_exact = (
             getattr(self, "federated_method", "fedsgd") == "fedsgd"
         )
-        if self.model_type == "visual_adapter":
+        if self.model_type == "clip_mlp":
+            sample_representation = "clip_image_feature_input_to_first_mlp_projection"
+        elif self.model_type in {"clip_adapter", "visual_adapter"}:
             sample_representation = (
                 "clip_image_feature_input_to_adapter_down_projection"
             )
-        elif self.model_type == "clip_lora":
+        elif self.model_type in {"clip_lora", "bert_lora"}:
             sample_representation = (
                 f"{token_reduction}_token_input_to_lora_down_projection"
             )
@@ -3616,7 +3630,7 @@ class MembershipAuditor:
         gradient_diff_gradients = None
         signatures = None
         streaming_text_gradients = bool(
-            self.model_type in {"bert_adapter", "gpt2_adapter"}
+            self.model_type in {"bert_adapter", "bert_lora", "gpt2_adapter"}
             and (needs["cosine"] or needs["gradient_diff_score"])
             and not needs["whitebox_features"]
             and not needs["promptres"]
@@ -5163,7 +5177,7 @@ class MembershipAuditor:
                         result.metadata.setdefault(
                             "signal_space", "class_decision_vectors"
                         )
-                elif self.model_type == "visual_adapter":
+                elif self.model_type in {"clip_adapter", "visual_adapter"}:
                     result.metadata.setdefault(
                         "trainable_scope", trainable_scope_name(final_model)
                     )
@@ -5171,7 +5185,7 @@ class MembershipAuditor:
                         result.metadata.setdefault(
                             "signal_space", "adapter_input_projection_vectors"
                         )
-                elif self.model_type == "clip_lora":
+                elif self.model_type in {"clip_lora", "bert_lora"}:
                     result.metadata.setdefault(
                         "trainable_scope", trainable_scope_name(final_model)
                     )
@@ -5179,7 +5193,16 @@ class MembershipAuditor:
                         "lora_aggregation",
                         f"factor_wise_{self.federated_method}",
                     )
-                elif self.model_type in {"bert_adapter", "gpt2_adapter"}:
+                    if self.model_type == "bert_lora":
+                        result.metadata.setdefault(
+                            "gradient_evaluation",
+                            "streamed_exact_full_peft_update",
+                        )
+                elif self.model_type in {
+                    "bert_adapter",
+                    "bert_lora",
+                    "gpt2_adapter",
+                }:
                     result.metadata.setdefault(
                         "trainable_scope", trainable_scope_name(final_model)
                     )

@@ -1,4 +1,4 @@
-model_type: visual_adapter
+model_type: clip_adapter
 dataset_name: caltech101
 data_root: ./data
 batch_size: 32
@@ -12,7 +12,7 @@ sample_users: 10
 aggregator: fedsgd
 aggregation_weighting: uniform
 
-visual_adapter:
+clip_adapter:
   feature_dim: 512
   reduction: 4
   alpha: 0.2
@@ -25,10 +25,10 @@ visual_adapter:
   precompute_batch_size: 64
   template: null
 
-partition_mode: dirichlet
+partition_mode: iid
 dirichlet_alpha: 0.1
-use_full_dataset: true
-fpl_shots: null
+use_full_dataset: false
+fpl_shots: 16
 gpu: 0
 seed: 42
 cache_dir: ./checkpoints/clip-vit-base-patch32
@@ -54,6 +54,34 @@ audit:
     - score_diff
     - score_ratio
     - fta
+    - projres
+  candidate_sampling: balanced_global_holdout
+  require_full_target_train_members: true
+  nonmember_to_member_ratio: 1
+  exact_batch_membership_attacks:
+    - blackbox_loss
+    - grad_cosine
+    - gradient_diff
+    - projres
+    - score_diff
+    - score_ratio
+  exact_batch_nonmember_to_member_ratio: 10
+  paper_balanced_evaluation_size: 100
+  low_fpr_min_nonmembers: 2
+  low_fpr_max_members: 0
+  low_fpr_max_nonmembers: 0
+  attack_audit_intervals:
+    blackbox_loss: 10
+    loss_series: 10
+    grad_cosine: 10
+    avg_cosine: 10
+    fedmia_loss: 10
+    fedmia_cosine: 10
+    gradient_diff: 10
+    score_diff: 10
+    score_ratio: 10
+    fta: 10
+    projres: 10
   max_samples_per_group: 32
   audit_batch_size: 512
   calibration_fraction: 0.5
@@ -62,3 +90,12 @@ audit:
 
 defense:
   name: none
+
+projres:
+  enabled: true
+  evaluation_interval: 10
+  decision_mode: ranking
+  threshold: null
+  max_candidates: 32
+  min_nonmembers: 320
+  max_nonmembers: 320

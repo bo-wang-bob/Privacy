@@ -1,5 +1,5 @@
-name: visual_adapter_fedmia_attacks
-base_config: configs/visual_adapter_low_fpr_attacks.yaml
+name: clip_adapter_fedmia_attacks
+base_config: configs/clip_adapter_low_fpr_attacks.yaml
 results_root: results
 
 gpus: [0]
@@ -8,8 +8,8 @@ seeds: [42]
 # One target-client audit job per dataset/seed.
 target_client_ids: [0]
 
-# Visual Adapter uses the complete training split while retaining one
-# mini-batch FedSGD update per client and communication round.
+# CLIP-Adapter uses 16 images per class and one mini-batch FedSGD update per
+# client and communication round.
 datasets:
   - name: caltech101
     overrides:
@@ -38,7 +38,7 @@ datasets:
       num_global_iters: 300
 
 common:
-  model_type: visual_adapter
+  model_type: clip_adapter
   aggregator: fedsgd
   aggregation_weighting: uniform
   data_root: ./data
@@ -49,8 +49,8 @@ common:
   partition_mode: iid
   # Retained for config/CLI compatibility; ignored when partition_mode=iid.
   dirichlet_alpha: 0.1
-  use_full_dataset: true
-  fpl_shots: null
+  use_full_dataset: false
+  fpl_shots: 16
   local_epochs: 1
   learning_rate: 0.001
   # Keep the client learning rate constant for all communication rounds.
@@ -59,7 +59,7 @@ common:
   eval_batch_size: 512
   eval_interval: 5
   save_models: false
-  visual_adapter:
+  clip_adapter:
     feature_dim: 512
     reduction: 4
     alpha: 0.2

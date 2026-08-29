@@ -1,4 +1,4 @@
-model_type: visual_adapter
+model_type: clip_adapter
 dataset_name: caltech101
 data_root: ./data
 batch_size: 32
@@ -12,7 +12,7 @@ sample_users: 10
 aggregator: fedsgd
 aggregation_weighting: uniform
 
-visual_adapter:
+clip_adapter:
   feature_dim: 512
   reduction: 4
   alpha: 0.2
@@ -30,8 +30,8 @@ visual_adapter:
 partition_mode: iid
 # Retained for config/CLI compatibility; ignored when partition_mode=iid.
 dirichlet_alpha: 0.1
-use_full_dataset: true
-fpl_shots: null
+use_full_dataset: false
+fpl_shots: 16
 gpu: 0
 seed: 42
 cache_dir: ./checkpoints/clip-vit-base-patch32

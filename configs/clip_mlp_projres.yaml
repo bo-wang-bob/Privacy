@@ -2,14 +2,14 @@
 model_type: clip_mlp
 dataset_name: caltech101
 data_root: ./data
-batch_size: 16
+batch_size: 32
 eval_batch_size: 64
-learning_rate: 0.001
+learning_rate: 0.1
 num_global_iters: 1
 local_epochs: 1
 total_users: 10
 sample_users: 10
-aggregator: fedavg
+aggregator: fedsgd
 aggregation_weighting: uniform
 
 clip_mlp:
@@ -21,8 +21,8 @@ clip_mlp:
 
 partition_mode: iid
 dirichlet_alpha: 0.1
-use_full_dataset: true
-fpl_shots: null
+use_full_dataset: false
+fpl_shots: 16
 gpu: 0
 seed: 42
 cache_dir: ./checkpoints/clip-vit-base-patch32

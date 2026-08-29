@@ -91,7 +91,7 @@ def _attacked_layer(
     model_type = str(getattr(model, "model_type", ""))
     if model_type == "clip_mlp":
         return "classifier.0.weight", model.classifier[0]
-    if model_type == "visual_adapter":
+    if model_type in {"clip_adapter", "visual_adapter"}:
         return "adapter.net.0.weight", model.adapter.net[0]
     raise ValueError(f"Unsupported ProjRes model type {model_type!r}.")
 
@@ -823,9 +823,11 @@ def run_integrated_projres(
         raise ValueError("Integrated ProjRes requires at least one client.")
     if str(getattr(model, "model_type", "")) not in {
         "clip_mlp",
+        "clip_adapter",
         "visual_adapter",
         "clip_lora",
         "bert_adapter",
+        "bert_lora",
         "gpt2_adapter",
     }:
         raise ValueError(
@@ -851,10 +853,10 @@ def run_integrated_projres(
                 "FedSGD ProjRes requires uploaded gradients for all audited "
                 f"clients; missing={missing_gradients}."
             )
-    if model_type in {"bert_adapter", "gpt2_adapter"}:
+    if model_type in {"bert_adapter", "bert_lora", "gpt2_adapter"}:
         if federated_method != "fedsgd" or int(local_epochs) != 1:
             raise ValueError(
-                "Paper-faithful text Adapter ProjRes requires one-batch FedSGD."
+                "Paper-faithful text PEFT ProjRes requires one-batch FedSGD."
             )
         attacked_parameter, _ = model.get_projres_attack_surface(
             config.get("attacked_parameter")

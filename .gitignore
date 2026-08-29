@@ -6,7 +6,10 @@ saved_models/
 analysis_reports/
 analysis_scripts/
 tests/
-AGENTS.md
+!tests/
+tests/*
+!tests/test_transformer_lora.py
+!tests/test_clip_peft_fedsgd.py
 paper/
 
 # Local model weights and experiment artifacts

@@ -10,12 +10,12 @@
 
 严格的 `promptfl` 入口使用论文式 `[SOS] [learned context] [class] [EOS]` 构造。论文：[arXiv](https://arxiv.org/abs/2208.11625)。
 
-## CLIP-LoRA 的基础 FedAvg
+## CLIP-LoRA 的因子级聚合
 
 `model_type: clip_lora` 冻结 CLIP 主干，在图像与文本编码器注意力投影中插入
 `W_eff = W_0 + (alpha/sqrt(r)) B A`。客户端只优化并上传 `lora_A`、`lora_B`，
-服务器分别线性聚合同名因子。普通配置使用 FedAvg；严格 ProjRes 配置使用
-one-batch FedSGD。两者默认均对本轮参与客户端等权：
+服务器分别线性聚合同名因子。当前正式 sweep 使用 one-batch FedSGD，并对本轮
+参与客户端的各同名因子梯度等权平均：
 
 ```text
 A_global = (1 / |S|) sum_k A_k
@@ -53,7 +53,7 @@ up-projection 与 bias 置零，使残差分支在初始化时严格保持主干
 无 weight decay 的梯度并上传，服务器等权聚合真实梯度后执行
 `theta_(t+1) = theta_t - learning_rate * mean(g_k)`，再下发新的全局模型。
 这些普通任务优化不关闭或绕过审计：上传仍是攻击器观察到的真实 one-batch 梯度，
-十种通用攻击与每 50 轮一次的 ProjRes 均保持启用。
+全部 11 种注册攻击均保持启用，ProjRes 每 50 轮运行一次。
 普通任务评估中，SST-5 与 IMDB 以 accuracy 为主；CoLA 以 MCC 为主，并继续记录
 accuracy 以兼容已有结果分析。
 
@@ -61,21 +61,35 @@ accuracy 以兼容已有结果分析。
 训练或评估时临时移动到主干设备并绑定，结束后立即卸载回 CPU；客户端上传和最终
 checkpoint 均不包含冻结的 BERT/GPT2 参数。
 
+### BERT-LoRA
+
+`bert_lora` 使用相同的 30 客户端、one-batch、等权 FedSGD 协议。BERT 主干冻结，
+默认在全部 12 层自注意力的 Query 和 Value 投影中加入
+`W_eff = W_0 + (alpha/r) B A`，使用 `rank=8`、`alpha=16`、LoRA dropout `0.1`，
+并同时训练任务分类头。每个客户端只在 CPU 保存自己的 LoRA 因子和分类头；执行时
+临时绑定到共享 BERT 主干。
+
+聚合与 CLIP-LoRA 一致：服务器分别线性平均每个同名 `lora_A`、`lora_B`，不会先
+合成为稠密的 `BA` 更新；分类头参数也按相同客户端权重线性聚合。FedSGD 下等价于
+分别平均各可训练张量的真实 batch-mean 梯度，再执行一次全局 SGD step。默认配置为
+`configs/bert_base_sst5_lora.yaml`，ProjRes 观察首个 Query 投影的 `lora_A` 上传。
+
 `scripts/run_all_fedllm_attacks.sh` 是统一 sweep 入口，不带参数时按
-`BERT/GPT2 × SST-5/CoLA/IMDB` 展开 6 个独立进程；
+`BERT/GPT2 Adapter × SST-5/CoLA/IMDB` 展开 6 个独立进程；显式传入
+`--models bert_lora` 或 `--models all` 时会加入 BERT-LoRA；
 `scripts/run_fedllm_adapter.py` 只执行 Shell 入口传入的单个任务。统一 Shell 模式
 支持 `--models`、`--datasets`、`--gpus`、`--jobs`、`--dry-run`、
 `--max-runs` 和 `--skip-projres`，默认单 GPU 串行调度。dry-run 只打印命令；
 完整解析配置仅在对应任务实际启动后写入终端和该任务的 `run.log`。
 
-这两个文本模型复用通用审计器的 Blackbox/Fed-loss、Loss-Series、Grad-Cosine、
+这些文本模型复用通用审计器的 Blackbox/Fed-loss、Loss-Series、Grad-Cosine、
 Avg-Cosine、两种 FedMIA 信号，以及 Gradient-Diff、Score-Diff、Score-Ratio 和
-FTA。默认只审计客户端 0。BERT 与 GPT2-Large 的 Blackbox-Loss、Grad-Cosine、Gradient-Diff、
+FTA。默认只审计客户端 0。BERT Adapter、BERT-LoRA 与 GPT2-Large 的 Blackbox-Loss、Grad-Cosine、Gradient-Diff、
 Score-Diff、Score-Ratio 和 ProjRes 将每轮真实上传 Batch 定义为成员，并从全部客户端的独立 evaluation 分区
 逐类别抽取 10 倍从未训练的非成员；每轮候选集独立构造和评估。其余攻击从目标客户端
 训练分区使用完整的 `M` 个历史成员，再从相同 evaluation 池抽取类别尽力匹配的
 等量 `M` 个非成员，并跨轮复用固定候选池。余弦攻击比较候选样本对全部可训练
-Adapter/分类头参数
+PEFT/分类头参数
 的精确梯度与服务器收到的真实 FedSGD 上传；GPT2-Large 使用逐样本流式点积控制内存。
 
 固定候选攻击的主视图为 `M/M`；另从中派生最多 100/100 的论文对照视图。后者复用
@@ -98,7 +112,7 @@ ICLR 组；ProjRes 采用 ranking-only 协议，不再产生固定残差阈值�
 
 严格 ProjRes 每 50 个已完成通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
 down-projection 权重更新构造子空间，并在同一全局模型下提取进入该层的样本级隐藏
-表示。BERT 与 GPT2-Large 的成员和非成员直接复用共享真实 Batch 候选视图，即当轮
+表示。BERT Adapter、BERT-LoRA 与 GPT2-Large 的成员和非成员直接复用共享真实 Batch 候选视图，即当轮
 `N` 个成员及按标签匹配的 `10N` 个从未训练 evaluation 样本；完整 Batch 时为
 16/160。结果与其他攻击统一写入审计器输出，`projres.max_candidates: 16` 不会截断
 实际上传 Batch；完整 16 条 Batch 的结果元数据会将 `paper_fedsgd_exact` 记为 `true`。

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run strict one-round ProjRes on a frozen-CLIP MLP or visual adapter."""
+"""Run strict one-round ProjRes on a frozen-CLIP MLP or CLIP-Adapter."""
 
 from __future__ import annotations
 
@@ -27,9 +27,9 @@ from privacy_attacks.projres_mlp import (
     strict_mlp_projres,
 )
 from trainmodel.clip_mlp import CLIPImageMLP
-from trainmodel.visual_adapter import (
-    VisualCLIPAdapter,
-    build_visual_adapter_text_features,
+from trainmodel.clip_adapter import (
+    CLIPAdapter,
+    build_clip_adapter_text_features,
 )
 from utils.data_loader import generate_dirichlet_split, generate_iid_split
 
@@ -41,7 +41,7 @@ def _load_config(path: Path) -> dict:
     config = default_config()
     with path.open("r", encoding="utf-8") as file:
         loaded = yaml.safe_load(file) or {}
-    for nested in ("clip_mlp", "visual_adapter", "audit", "defense"):
+    for nested in ("clip_mlp", "clip_adapter", "audit", "defense"):
         config[nested] = config.get(nested, {}) | loaded.pop(nested, {})
     config.update(loaded)
     return config
@@ -68,12 +68,12 @@ def _resolved_config(args: argparse.Namespace) -> dict:
 def _validate_strict_config(config: dict) -> None:
     validate_config(config)
     model_type = str(config.get("model_type", "")).lower()
-    if model_type not in {"clip_mlp", "visual_adapter"}:
+    if model_type not in {"clip_mlp", "clip_adapter"}:
         raise ValueError(
-            "Strict ProjRes requires model_type=clip_mlp or visual_adapter."
+            "Strict ProjRes requires model_type=clip_mlp or clip_adapter."
         )
-    if str(config.get("aggregator", "")).lower() != "fedavg":
-        raise ValueError("Strict ProjRes requires aggregator=fedavg.")
+    if str(config.get("aggregator", "")).lower() != "fedsgd":
+        raise ValueError("Strict ProjRes requires one-batch aggregator=fedsgd.")
     if (
         model_type == "clip_mlp"
         and float(config.get("clip_mlp", {}).get("dropout", 0.0)) != 0.0
@@ -216,7 +216,7 @@ def _clone_trainable_model(model: torch.nn.Module) -> torch.nn.Module:
     model_type = str(getattr(model, "model_type", ""))
     if model_type == "clip_mlp":
         return model.clone_head_only()
-    if model_type == "visual_adapter":
+    if model_type == "clip_adapter":
         return model.clone_adapter_only()
     raise ValueError(f"Unsupported ProjRes model type {model_type!r}.")
 
@@ -227,7 +227,7 @@ def _attacked_layer(
     model_type = str(getattr(model, "model_type", ""))
     if model_type == "clip_mlp":
         return "classifier.0.weight", model.classifier[0]
-    if model_type == "visual_adapter":
+    if model_type == "clip_adapter":
         # This is the Adapter downsampling layer used in the paper's
         # derivation: dW has the input hidden representations in its row span.
         return "adapter.net.0.weight", model.adapter.net[0]
@@ -461,8 +461,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             device=device,
         ).to(device)
     else:
-        adapter_config = config["visual_adapter"]
-        text_features = build_visual_adapter_text_features(
+        adapter_config = config["clip_adapter"]
+        text_features = build_clip_adapter_text_features(
             clip_model=clip_model,
             processor=processor,
             classnames=class_names,
@@ -470,7 +470,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             device=device,
             template=adapter_config.get("template"),
         )
-        global_model = VisualCLIPAdapter(
+        global_model = CLIPAdapter(
             clip_model=clip_model,
             text_features=text_features,
             classnames=class_names,

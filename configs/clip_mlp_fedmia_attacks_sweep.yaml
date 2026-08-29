@@ -5,10 +5,10 @@ results_root: results
 gpus: [0]
 jobs: 1
 seeds: [42]
-# One anchor job per dataset/seed; the audit itself targets every client.
+# One target-client audit job per dataset/seed, matching the BERT protocol.
 target_client_ids: [0]
 
-# Use one shared FedMIA training schedule across all full-data datasets.
+# Use one shared few-shot FedSGD schedule across all datasets.
 datasets:
   - name: caltech101
     overrides:
@@ -38,7 +38,7 @@ datasets:
 
 common:
   model_type: clip_mlp
-  aggregator: fedavg
+  aggregator: fedsgd
   aggregation_weighting: uniform
   data_root: ./data
   cache_dir: ./checkpoints/clip-vit-base-patch32
@@ -48,10 +48,10 @@ common:
   partition_mode: iid
   # Retained for config/CLI compatibility; ignored when partition_mode=iid.
   dirichlet_alpha: 0.1
-  use_full_dataset: true
-  fpl_shots: null
+  use_full_dataset: false
+  fpl_shots: 16
   local_epochs: 1
-  learning_rate: 0.001
+  learning_rate: 0.1
   # Keep the client learning rate constant for all communication rounds.
   learning_rate_decay: 1.0
   batch_size: 32
@@ -67,7 +67,7 @@ common:
   audit:
     enabled: true
     strict: true
-    audit_client_ids: all
+    audit_client_ids: [0]
     target_client_id: 0
     ensure_target_participation: true
     attacks:
@@ -81,16 +81,29 @@ common:
       - score_diff
       - score_ratio
       - fta
-    candidate_sampling: balanced_holdout
-    # Per client, pair target-train members with never-trained target-test
-    # non-members using identical class counts and a strict 1:1 ratio.
-    low_fpr_max_members: 5000
-    low_fpr_max_nonmembers: 5000
+      - projres
+    candidate_sampling: balanced_global_holdout
+    require_full_target_train_members: true
+    nonmember_to_member_ratio: 1
+    exact_batch_membership_attacks:
+      - blackbox_loss
+      - grad_cosine
+      - gradient_diff
+      - projres
+      - score_diff
+      - score_ratio
+    exact_batch_nonmember_to_member_ratio: 10
+    paper_balanced_evaluation_size: 100
+    low_fpr_min_nonmembers: 2
+    low_fpr_max_members: 0
+    low_fpr_max_nonmembers: 0
     match_candidate_labels: true
     audit_batch_size: 512
     attack_audit_intervals:
       # Measure every 10 completed rounds: rounds 10, 20, ..., 150.
+      blackbox_loss: 10
       loss_series: 10
+      grad_cosine: 10
       avg_cosine: 10
       fedmia_loss: 10
       fedmia_cosine: 10
@@ -98,6 +111,7 @@ common:
       score_diff: 10
       score_ratio: 10
       fta: 10
+      projres: 10
     score_ratio_damping: 1.0e-6
     fta_measurement: confidence
     low_fpr_gradient_batch_size: 16
@@ -106,16 +120,15 @@ common:
     fedmia_tail_calibration_fraction: 0.25
     training_health_check: true
 
-# ProjRes is reserved for the Visual Adapter FedSGD sweep. CLIP-MLP runs the
-# ten common attacks with its original fixed-candidate FedAvg protocol.
+# ProjRes shares the exact same 32/320 view as the other exact-batch attacks.
 projres:
-  enabled: false
-  evaluation_round: last
+  enabled: true
+  evaluation_interval: 10
   decision_mode: ranking
   threshold: null
   max_candidates: 32
-  min_nonmembers: 1000
-  max_nonmembers: 20000
+  min_nonmembers: 320
+  max_nonmembers: 320
 
 defenses:
   - name: none

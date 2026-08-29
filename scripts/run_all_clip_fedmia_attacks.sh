@@ -12,11 +12,11 @@ else
   python_bin="python3"
 fi
 
-models="${CLIP_MIA_MODELS:-clip_mlp,visual_adapter,clip_lora}"
+models="${CLIP_MIA_MODELS:-clip_mlp,clip_adapter,clip_lora}"
 gpus="${CLIP_MIA_GPUS:-${CLIP_MIA_GPU:-0}}"
 jobs="${CLIP_MIA_JOBS:-1}"
 clip_mlp_learning_rate="${CLIP_MLP_MIA_LR:-0.1}"
-visual_adapter_learning_rate="${CLIP_ADAPTER_MIA_LR:-0.001}"
+clip_adapter_learning_rate="${CLIP_ADAPTER_MIA_LR:-0.001}"
 clip_lora_learning_rate="${CLIP_LORA_MIA_LR:-0.0002}"
 partition_mode="${CLIP_MIA_PARTITION_MODE:-iid}"
 partition_mode_explicit=false
@@ -100,12 +100,12 @@ if [[ "$show_help" == true ]]; then
 Run all frozen-CLIP membership-inference sweeps.
 
 Unified options:
-  --models clip_mlp,visual_adapter,clip_lora
+  --models clip_mlp,clip_adapter,clip_lora
                                     Select models (default: all three).
   --partition-mode iid|dirichlet    Data partition (default: iid).
 
 Model-specific learning-rate defaults:
-  clip_mlp=0.1, visual_adapter=0.001, clip_lora=0.0002
+  clip_mlp=0.1, clip_adapter=0.001, clip_lora=0.0002
   --learning-rate RATE overrides the default for every selected model.
   All model specs keep the client learning rate constant (decay=1.0).
 
@@ -118,16 +118,15 @@ All options below are forwarded to each selected sweep, including:
   --rounds VALUE        --dirichlet-alpha VALUE (selects dirichlet unless
                          --partition-mode was explicitly provided)
   --projres-round N|last  Standalone ProjRes configurations only; unavailable
-                          for the default Adapter/LoRA unified protocol.
+                          for the default unified exact-batch protocol.
   --skip-projres        --force                --dry-run
   --summarize-only      --max-runs VALUE
 
-Visual Adapter and CLIP-LoRA run all eleven attacks. Their five fixed-candidate
+CLIP-MLP, CLIP-Adapter, and CLIP-LoRA run all eleven attacks. Their five fixed-candidate
 attacks use the complete target training set and an equal-sized global holdout;
 their six exact-batch attacks, including ProjRes, use N/10N candidates every
 10 rounds.
-CLIP-MLP runs all ten common attacks with its fixed-candidate protocol and no
-ProjRes or exact-batch membership.
+CLIP-MLP and CLIP-Adapter use 16 training images per class and one-batch FedSGD.
 EOF
   "$python_bin" scripts/run_clip_mlp_fedmia_sweep.py --help
   exit 0
@@ -139,14 +138,14 @@ for requested in "${requested_models[@]}"; do
   requested="${requested//[[:space:]]/}"
   case "${requested,,}" in
     all)
-      normalized_models=(clip_mlp visual_adapter clip_lora)
+      normalized_models=(clip_mlp clip_adapter clip_lora)
       break
       ;;
     clip_mlp|clip-mlp|mlp)
       normalized_models+=(clip_mlp)
       ;;
     visual_adapter|visual-adapter|clip_adapter|clip-adapter|adapter)
-      normalized_models+=(visual_adapter)
+      normalized_models+=(clip_adapter)
       ;;
     clip_lora|clip-lora|lora)
       normalized_models+=(clip_lora)
@@ -154,7 +153,7 @@ for requested in "${requested_models[@]}"; do
     "")
       ;;
     *)
-      echo "Unknown model '$requested'; use clip_mlp, visual_adapter, clip_lora, or all." >&2
+      echo "Unknown model '$requested'; use clip_mlp, clip_adapter, clip_lora, or all." >&2
       exit 2
       ;;
   esac
@@ -174,9 +173,9 @@ run_model() {
       spec="${CLIP_MLP_MIA_SPEC:-configs/clip_mlp_fedmia_attacks_sweep.yaml}"
       learning_rate="$clip_mlp_learning_rate"
       ;;
-    visual_adapter)
-      spec="${CLIP_ADAPTER_MIA_SPEC:-configs/visual_adapter_fedmia_attacks_sweep.yaml}"
-      learning_rate="$visual_adapter_learning_rate"
+    clip_adapter)
+      spec="${CLIP_ADAPTER_MIA_SPEC:-configs/clip_adapter_fedmia_attacks_sweep.yaml}"
+      learning_rate="$clip_adapter_learning_rate"
       ;;
     clip_lora)
       spec="${CLIP_LORA_MIA_SPEC:-configs/clip_lora_fedmia_attacks_sweep.yaml}"

@@ -146,17 +146,30 @@ def _load_local_clip(
     return processor, clip_model
 
 
+def normalize_clip_adapter_config(config: dict) -> None:
+    """Migrate the historical Visual Adapter spelling in memory."""
+    model_type = str(config.get("model_type", "prompt")).lower()
+    if model_type == "visual_adapter":
+        config["model_type"] = "clip_adapter"
+        migrated = copy.deepcopy(config.get("clip_adapter", {}))
+        migrated.update(copy.deepcopy(config.get("visual_adapter", {})))
+        config["clip_adapter"] = migrated
+    elif "visual_adapter" in config and "clip_adapter" not in config:
+        config["clip_adapter"] = copy.deepcopy(config["visual_adapter"])
+
+
 def validate_config(config: dict) -> None:
+    normalize_clip_adapter_config(config)
     model_type = str(config.get("model_type", "prompt")).lower()
     if model_type not in {
         "prompt",
         "clip_mlp",
-        "visual_adapter",
+        "clip_adapter",
         "clip_lora",
         "resnet18",
     }:
         raise ValueError(
-            "model_type must be prompt, clip_mlp, visual_adapter, clip_lora, "
+            "model_type must be prompt, clip_mlp, clip_adapter, clip_lora, "
             "or resnet18."
         )
     method = config["aggregator"].lower()
@@ -198,12 +211,14 @@ def validate_config(config: dict) -> None:
         )
     if model_type == "clip_mlp":
         mlp_config = dict(config.get("clip_mlp", {}))
-        if method != "fedavg":
-            raise ValueError("clip_mlp requires aggregator=fedavg.")
-        if not bool(config.get("use_full_dataset", False)) or fpl_shots is not None:
+        if method != "fedsgd":
+            raise ValueError("clip_mlp requires one-batch aggregator=fedsgd.")
+        if int(config.get("local_epochs", 1)) != 1:
+            raise ValueError("clip_mlp FedSGD requires local_epochs=1.")
+        if bool(config.get("use_full_dataset", False)) or int(fpl_shots or 0) != 16:
             raise ValueError(
-                "clip_mlp uses the full dataset and requires "
-                "use_full_dataset=true and fpl_shots=null."
+                "clip_mlp requires 16-shot training: "
+                "use_full_dataset=false and fpl_shots=16."
             )
         if int(mlp_config.get("hidden_dim", 512)) <= 0:
             raise ValueError("clip_mlp.hidden_dim must be positive.")
@@ -211,46 +226,44 @@ def validate_config(config: dict) -> None:
             raise ValueError("clip_mlp.dropout must be in [0, 1).")
         if int(mlp_config.get("precompute_batch_size", 64)) <= 0:
             raise ValueError("clip_mlp.precompute_batch_size must be positive.")
-    if model_type == "visual_adapter":
-        adapter_config = dict(config.get("visual_adapter", {}))
-        if method not in {"fedavg", "fedsgd"}:
+    if model_type == "clip_adapter":
+        adapter_config = dict(config.get("clip_adapter", {}))
+        if method != "fedsgd":
+            raise ValueError("clip_adapter requires one-batch aggregator=fedsgd.")
+        if int(config.get("local_epochs", 1)) != 1:
             raise ValueError(
-                "visual_adapter requires aggregator=fedavg or fedsgd."
-            )
-        if method == "fedsgd" and int(config.get("local_epochs", 1)) != 1:
-            raise ValueError(
-                "visual_adapter FedSGD requires local_epochs=1 because each "
+                "clip_adapter FedSGD requires local_epochs=1 because each "
                 "client performs exactly one mini-batch step per round."
             )
-        if not bool(config.get("use_full_dataset", False)) or fpl_shots is not None:
+        if bool(config.get("use_full_dataset", False)) or int(fpl_shots or 0) != 16:
             raise ValueError(
-                "visual_adapter uses the full dataset and requires "
-                "use_full_dataset=true and fpl_shots=null."
+                "clip_adapter requires 16-shot training: "
+                "use_full_dataset=false and fpl_shots=16."
             )
         reduction = int(adapter_config.get("reduction", 4))
         if reduction <= 0:
-            raise ValueError("visual_adapter.reduction must be positive.")
+            raise ValueError("clip_adapter.reduction must be positive.")
         feature_dim = int(adapter_config.get("feature_dim", 512))
         if feature_dim <= 0 or feature_dim % reduction != 0:
             raise ValueError(
-                "visual_adapter.feature_dim must be positive and divisible "
-                "by visual_adapter.reduction."
+                "clip_adapter.feature_dim must be positive and divisible "
+                "by clip_adapter.reduction."
             )
         alpha = float(adapter_config.get("alpha", 0.2))
         if not 0 <= alpha <= 1:
-            raise ValueError("visual_adapter.alpha must be in [0, 1].")
+            raise ValueError("clip_adapter.alpha must be in [0, 1].")
         text_reduction = int(adapter_config.get("text_reduction", reduction))
         if text_reduction <= 0 or feature_dim % text_reduction != 0:
             raise ValueError(
-                "visual_adapter.feature_dim must be divisible by "
-                "visual_adapter.text_reduction."
+                "clip_adapter.feature_dim must be divisible by "
+                "clip_adapter.text_reduction."
             )
         text_alpha = float(adapter_config.get("text_alpha", alpha))
         if not 0 <= text_alpha <= 1:
-            raise ValueError("visual_adapter.text_alpha must be in [0, 1].")
+            raise ValueError("clip_adapter.text_alpha must be in [0, 1].")
         if int(adapter_config.get("precompute_batch_size", 64)) <= 0:
             raise ValueError(
-                "visual_adapter.precompute_batch_size must be positive."
+                "clip_adapter.precompute_batch_size must be positive."
             )
     if model_type == "clip_lora":
         lora_config = dict(config.get("clip_lora", {}))
@@ -462,25 +475,26 @@ def validate_config(config: dict) -> None:
             + ", ".join(missing_exact_batch_attacks)
         )
     if exact_batch_attacks and model_type not in {
-        "visual_adapter",
+        "clip_mlp",
+        "clip_adapter",
         "clip_lora",
     }:
         raise ValueError(
-            "CLIP exact-batch membership is enabled only for Visual Adapter "
-            "and CLIP-LoRA; CLIP-MLP keeps its original fixed-candidate "
-            "protocol."
+            "CLIP exact-batch membership requires CLIP-MLP, CLIP-Adapter, "
+            "or CLIP-LoRA."
         )
     if "projres" in attacks and "projres" not in exact_batch_attacks:
         raise ValueError(
-            "Visual Adapter and CLIP-LoRA ProjRes must use the shared "
+            "CLIP-MLP, CLIP-Adapter, and CLIP-LoRA ProjRes must use the shared "
             "exact-batch membership protocol."
         )
     if "projres" in exact_batch_attacks and model_type not in {
-        "visual_adapter",
+        "clip_mlp",
+        "clip_adapter",
         "clip_lora",
     }:
         raise ValueError(
-            "Unified CLIP ProjRes is supported only for Visual Adapter and "
+            "Unified CLIP ProjRes requires CLIP-MLP, CLIP-Adapter, or "
             "CLIP-LoRA."
         )
     pooled_audit = audit_client_ids == "all" or (
@@ -593,7 +607,7 @@ def validate_config(config: dict) -> None:
             "fta",
             "projres",
         }
-        if model_type not in {"clip_mlp", "visual_adapter", "clip_lora"}:
+        if model_type not in {"clip_mlp", "clip_adapter", "clip_lora"}:
             raise ValueError(
                 f"audit.candidate_sampling={candidate_sampling} requires a "
                 "supported CLIP parameter-efficient model."
@@ -769,9 +783,9 @@ def validate_config(config: dict) -> None:
             "Exact-batch audit includes ProjRes but projres.enabled is false."
         )
     if bool(projres.get("enabled", False)):
-        if model_type not in {"clip_mlp", "visual_adapter", "clip_lora"}:
+        if model_type not in {"clip_mlp", "clip_adapter", "clip_lora"}:
             raise ValueError(
-                "Integrated ProjRes requires CLIP-MLP, Visual Adapter, or "
+                "Integrated ProjRes requires CLIP-MLP, CLIP-Adapter, or "
                 "CLIP-LoRA."
             )
         if method not in {"fedavg", "fedsgd"}:
@@ -917,7 +931,7 @@ def validate_config(config: dict) -> None:
         )
     if model_type in {
         "clip_mlp",
-        "visual_adapter",
+        "clip_adapter",
         "clip_lora",
     } and defense_name not in {
         "none",
@@ -928,9 +942,9 @@ def validate_config(config: dict) -> None:
             "to be none or iclr."
         )
     if defense_name == "iclr":
-        if model_type not in {"clip_mlp", "visual_adapter", "clip_lora"}:
+        if model_type not in {"clip_mlp", "clip_adapter", "clip_lora"}:
             raise ValueError(
-                "ICLR requires CLIP-MLP, Visual Adapter, or CLIP-LoRA."
+                "ICLR requires CLIP-MLP, CLIP-Adapter, or CLIP-LoRA."
             )
         if method not in {"fedavg", "fedsgd"}:
             raise ValueError("ICLR requires linear FedAvg or FedSGD aggregation.")
@@ -1103,9 +1117,9 @@ def run(config: dict) -> list[dict]:
         CLIPLoRA,
         build_clip_lora_text_inputs,
     )
-    from trainmodel.visual_adapter import (
-        VisualCLIPAdapter,
-        build_visual_adapter_text_features,
+    from trainmodel.clip_adapter import (
+        CLIPAdapter,
+        build_clip_adapter_text_features,
     )
     from trainmodel.clip_feature_cache import (
         collate_clip_features,
@@ -1117,9 +1131,10 @@ def run(config: dict) -> list[dict]:
     )
 
     config = copy.deepcopy(config)
+    normalize_clip_adapter_config(config)
     if str(config.get("model_type", "prompt")).lower() in {
         "clip_mlp",
-        "visual_adapter",
+        "clip_adapter",
         "clip_lora",
     }:
         config["aggregation_weighting"] = "uniform"
@@ -1218,9 +1233,9 @@ def run(config: dict) -> list[dict]:
             normalize_features=bool(mlp_config.get("normalize_features", False)),
             device=device,
         )
-    elif model_type == "visual_adapter":
-        adapter_config = dict(config.get("visual_adapter", {}))
-        text_features = build_visual_adapter_text_features(
+    elif model_type == "clip_adapter":
+        adapter_config = dict(config.get("clip_adapter", {}))
+        text_features = build_clip_adapter_text_features(
             clip_model=clip_model,
             processor=processor,
             classnames=class_names,
@@ -1228,7 +1243,7 @@ def run(config: dict) -> list[dict]:
             device=device,
             template=adapter_config.get("template"),
         )
-        model = VisualCLIPAdapter(
+        model = CLIPAdapter(
             clip_model=clip_model,
             text_features=text_features,
             classnames=class_names,
@@ -1307,7 +1322,7 @@ def run(config: dict) -> list[dict]:
             )
 
     if (
-        model_type in {"clip_mlp", "visual_adapter"}
+        model_type in {"clip_mlp", "clip_adapter"}
         and bool(config.get(model_type, {}).get("precompute_features", True))
     ):
         train_sets, test_sets, _feature_summary = (
@@ -1406,7 +1421,7 @@ def default_config() -> dict:
             "precompute_features": True,
             "precompute_batch_size": 64,
         },
-        "visual_adapter": {
+        "clip_adapter": {
             "feature_dim": 512,
             "reduction": 4,
             "alpha": 0.2,
@@ -1653,7 +1668,14 @@ def parse_args() -> dict:
     )
     parser.add_argument(
         "--model_type",
-        choices=["prompt", "clip_mlp", "visual_adapter", "clip_lora", "resnet18"],
+        choices=[
+            "prompt",
+            "clip_mlp",
+            "clip_adapter",
+            "visual_adapter",
+            "clip_lora",
+            "resnet18",
+        ],
     )
     parser.add_argument("--mlp_hidden_dim", type=int)
     parser.add_argument("--mlp_dropout", type=float)
@@ -1755,23 +1777,25 @@ def parse_args() -> dict:
     if args.mlp_dropout is not None:
         config["clip_mlp"]["dropout"] = args.mlp_dropout
     if args.adapter_reduction is not None:
-        config["visual_adapter"]["reduction"] = args.adapter_reduction
+        config["clip_adapter"]["reduction"] = args.adapter_reduction
     if args.adapter_alpha is not None:
-        config["visual_adapter"]["alpha"] = args.adapter_alpha
+        config["clip_adapter"]["alpha"] = args.adapter_alpha
     if args.model_type == "clip_mlp":
-        config["aggregator"] = "fedavg"
-        config["aggregation_weighting"] = "uniform"
-        config["fpl_shots"] = None
-        config["use_full_dataset"] = True
-        if args.attack is None and args.audit_attacks is None:
-            config["audit"]["enabled"] = False
-            config["audit"]["attacks"] = []
-    elif args.model_type == "visual_adapter":
         config["aggregator"] = "fedsgd"
         config["aggregation_weighting"] = "uniform"
         config["local_epochs"] = 1
-        config["fpl_shots"] = None
-        config["use_full_dataset"] = True
+        config["fpl_shots"] = 16
+        config["use_full_dataset"] = False
+        if args.attack is None and args.audit_attacks is None:
+            config["audit"]["enabled"] = False
+            config["audit"]["attacks"] = []
+    elif args.model_type in {"clip_adapter", "visual_adapter"}:
+        config["model_type"] = "clip_adapter"
+        config["aggregator"] = "fedsgd"
+        config["aggregation_weighting"] = "uniform"
+        config["local_epochs"] = 1
+        config["fpl_shots"] = 16
+        config["use_full_dataset"] = False
     elif args.model_type == "clip_lora":
         config["aggregator"] = "fedavg"
         config["aggregation_weighting"] = "uniform"

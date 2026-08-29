@@ -3,13 +3,13 @@ dataset_name: caltech101
 data_root: ./data
 batch_size: 32
 eval_batch_size: 512
-learning_rate: 0.001
+learning_rate: 0.1
 learning_rate_decay: 1.0
 num_global_iters: 20
-local_epochs: 2
+local_epochs: 1
 total_users: 10
 sample_users: 10
-aggregator: fedavg
+aggregator: fedsgd
 aggregation_weighting: uniform
 
 clip_mlp:
@@ -25,8 +25,8 @@ clip_mlp:
 partition_mode: iid
 # Retained for config/CLI compatibility; ignored when partition_mode=iid.
 dirichlet_alpha: 0.1
-use_full_dataset: true
-fpl_shots: null
+use_full_dataset: false
+fpl_shots: 16
 gpu: 0
 seed: 42
 cache_dir: ./checkpoints/clip-vit-base-patch32
@@ -39,9 +39,8 @@ audit:
   enabled: true
   strict: true
   audit_view: protocol_plus_released_prompts
-  # Audit every client from one shared training trajectory.
-  audit_client_ids: all
-  # Compatibility anchor for shared/global model state handling.
+  # Match BERT: one target client per training task.
+  audit_client_ids: [0]
   target_client_id: 0
   ensure_target_participation: true
   attacks:
@@ -55,18 +54,36 @@ audit:
     - score_diff
     - score_ratio
     - fta
-  # Build the candidate pool from every target-client member and every disjoint
-  # non-member, then apply deterministic class-stratified caps when needed.
-  candidate_sampling: balanced_holdout
-  low_fpr_max_members: 5000
-  low_fpr_max_nonmembers: 5000
+    - projres
+  candidate_sampling: balanced_global_holdout
+  require_full_target_train_members: true
+  nonmember_to_member_ratio: 1
+  exact_batch_membership_attacks:
+    - blackbox_loss
+    - grad_cosine
+    - gradient_diff
+    - projres
+    - score_diff
+    - score_ratio
+  exact_batch_nonmember_to_member_ratio: 10
+  paper_balanced_evaluation_size: 100
+  low_fpr_min_nonmembers: 2
+  low_fpr_max_members: 0
+  low_fpr_max_nonmembers: 0
   match_candidate_labels: true
   audit_batch_size: 512
   attack_audit_intervals:
+    blackbox_loss: 10
+    loss_series: 10
+    grad_cosine: 10
+    avg_cosine: 10
+    fedmia_loss: 10
+    fedmia_cosine: 10
     gradient_diff: 10
     score_diff: 10
     score_ratio: 10
     fta: 10
+    projres: 10
   score_ratio_damping: 1.0e-6
   fta_measurement: confidence
   low_fpr_gradient_batch_size: 16
@@ -77,3 +94,12 @@ audit:
 
 defense:
   name: none
+
+projres:
+  enabled: true
+  evaluation_interval: 10
+  decision_mode: ranking
+  threshold: null
+  max_candidates: 32
+  min_nonmembers: 320
+  max_nonmembers: 320

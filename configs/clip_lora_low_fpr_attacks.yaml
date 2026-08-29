@@ -39,7 +39,7 @@ audit:
   enabled: true
   strict: true
   # Exact-batch membership requires a single target client, matching the
-  # BERT/GPT2 and Visual Adapter protocol.
+  # BERT/GPT2 and CLIP-Adapter protocol.
   audit_client_ids: [0]
   target_client_id: 0
   ensure_target_participation: true

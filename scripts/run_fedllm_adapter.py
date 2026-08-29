@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Federated text Adapter fine-tuning for BERT-Base or GPT2-Large."""
+"""Federated Adapter/LoRA fine-tuning for BERT-Base or GPT2-Large."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from aggregator.aggregator_builder import build_aggregator
 from servers.serverbase import ServerBase
 from trainmodel.transformer_adapter import TransformerAdapterClassifier
+from trainmodel.transformer_lora import TransformerLoRAClassifier
 from utils.text_data_loader import (
     load_federated_text_classification,
     normalize_text_dataset_name,
@@ -33,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Fine-tune BERT-Base or GPT2-Large on federated SST-5, CoLA, "
-            "or IMDB using a ratio-2 Adapter after every Transformer layer."
+            "or IMDB using a Transformer Adapter or BERT attention LoRA."
         )
     )
     parser.add_argument(
@@ -195,11 +196,16 @@ def load_config(args: argparse.Namespace) -> dict:
 
 def validate_config(config: dict) -> None:
     architecture = str(config.get("architecture", "")).lower()
-    expected_type = f"{architecture}_adapter"
     if architecture not in {"bert", "gpt2"}:
         raise ValueError("architecture must be bert or gpt2.")
-    if str(config.get("model_type", "")).lower() != expected_type:
-        raise ValueError(f"model_type must be {expected_type}.")
+    model_type = str(config.get("model_type", "")).lower()
+    supported_types = {f"{architecture}_adapter"}
+    if architecture == "bert":
+        supported_types.add("bert_lora")
+    if model_type not in supported_types:
+        raise ValueError(
+            "model_type must be one of: " + ", ".join(sorted(supported_types))
+        )
     dataset_name = normalize_text_dataset_name(config.get("dataset_name", ""))
     config["dataset_name"] = dataset_name
     config["primary_metric"] = "mcc" if dataset_name == "cola" else "accuracy"
@@ -218,9 +224,38 @@ def validate_config(config: dict) -> None:
         raise ValueError("learning_rate must be positive.")
     if not 0 < float(config.get("learning_rate_decay", 1.0)) <= 1:
         raise ValueError("learning_rate_decay must be in (0, 1].")
-    adapter = dict(config.get("adapter", {}))
-    if int(adapter.get("reduction", 0)) != 2:
-        raise ValueError("The paper Adapter requires reduction=2.")
+    if model_type.endswith("_adapter"):
+        adapter = dict(config.get("adapter", {}))
+        if int(adapter.get("reduction", 0)) != 2:
+            raise ValueError("The paper Adapter requires reduction=2.")
+    else:
+        lora = dict(config.get("lora", {}))
+        targets = lora.get("target_modules", ["query", "value"])
+        if not isinstance(targets, list) or not targets:
+            raise ValueError("BERT-LoRA target_modules must be a non-empty list.")
+        if any(
+            str(target).lower() not in {"q", "query", "k", "key", "v", "value"}
+            for target in targets
+        ):
+            raise ValueError(
+                "BERT-LoRA target_modules must contain query, key, or value."
+            )
+        if int(lora.get("rank", 0)) <= 0:
+            raise ValueError("BERT-LoRA rank must be positive.")
+        if float(lora.get("alpha", 0.0)) <= 0:
+            raise ValueError("BERT-LoRA alpha must be positive.")
+        if not 0.0 <= float(lora.get("dropout", 0.0)) < 1.0:
+            raise ValueError("BERT-LoRA dropout must be in [0, 1).")
+        if str(lora.get("scaling", "rank")).lower() not in {"rank", "sqrt_rank"}:
+            raise ValueError("BERT-LoRA scaling must be rank or sqrt_rank.")
+        layers = lora.get("layers", "all")
+        if not (
+            isinstance(layers, list)
+            or str(layers).lower() in {"all", "last_half"}
+        ):
+            raise ValueError(
+                "BERT-LoRA layers must be all, last_half, or a list."
+            )
     if str(config.get("aggregation_weighting", "uniform")) != "uniform":
         raise ValueError("Paper FedSGD aggregates client updates uniformly.")
     optimization = dict(config.get("optimization", {}))
@@ -245,7 +280,7 @@ def validate_config(config: dict) -> None:
     unknown_attacks = sorted(set(audit.get("attacks", [])) - supported_attacks)
     if unknown_attacks:
         raise ValueError(
-            "Text Adapter experiments currently support these common attacks: "
+            "Text PEFT experiments currently support these common attacks: "
             + ", ".join(sorted(supported_attacks))
             + ". Unsupported: "
             + ", ".join(unknown_attacks)
@@ -283,7 +318,7 @@ def validate_config(config: dict) -> None:
         exact_batch_attacks
     ):
         raise ValueError(
-            "Text Adapter ProjRes must use the shared exact-batch membership "
+            "Text PEFT ProjRes must use the shared exact-batch membership "
             "protocol."
         )
     exact_batch_ratio = audit.get(
@@ -314,7 +349,7 @@ def validate_config(config: dict) -> None:
         "balanced_global_holdout",
     }:
         raise ValueError(
-            "Text Adapter experiments support candidate_sampling=legacy or "
+            "Text PEFT experiments support candidate_sampling=legacy or "
             "balanced_global_holdout."
         )
     if exact_batch_attacks and candidate_sampling != "balanced_global_holdout":
@@ -375,12 +410,12 @@ def validate_config(config: dict) -> None:
     defense_name = str(defense.get("name", "none")).lower()
     if defense_name not in {"none", "iclr", "record_dp", "local_client_dp"}:
         raise ValueError(
-            "Text Adapter experiments support defense=none, iclr, record_dp, "
+            "Text PEFT experiments support defense=none, iclr, record_dp, "
             "or local_client_dp."
         )
     if defense_name == "iclr":
         if architecture != "bert":
-            raise ValueError("Text Adapter ICLR currently supports BERT only.")
+            raise ValueError("Text PEFT ICLR currently supports BERT only.")
         interval = int(defense.get("iclr_analysis_interval", 50))
         if interval <= 0:
             raise ValueError("defense.iclr_analysis_interval must be positive.")
@@ -633,6 +668,24 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
     audit = dict(config.get("audit", {}))
     projres = dict(config.get("projres", {}))
     defense = dict(config.get("defense", {"name": "none"}))
+    model_type = str(config["model_type"]).lower()
+    peft_rows = (
+        (
+            "adapter.reduction",
+            config.get("adapter", {}).get("reduction"),
+        ),
+        (
+            "adapter.zero_init_up",
+            config.get("adapter", {}).get("zero_init_up"),
+        ),
+    ) if model_type.endswith("_adapter") else (
+        ("lora.target_modules", config.get("lora", {}).get("target_modules")),
+        ("lora.layers", config.get("lora", {}).get("layers")),
+        ("lora.rank", config.get("lora", {}).get("rank")),
+        ("lora.alpha", config.get("lora", {}).get("alpha")),
+        ("lora.dropout", config.get("lora", {}).get("dropout")),
+        ("lora.scaling", config.get("lora", {}).get("scaling")),
+    )
     rows = (
         ("model_type", config["model_type"]),
         ("dataset", config["dataset_name"]),
@@ -655,11 +708,7 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
             "optimization.learning_rate_decay_interval",
             config.get("learning_rate_decay_interval", 1),
         ),
-        ("adapter.reduction", config["adapter"]["reduction"]),
-        (
-            "adapter.zero_init_up",
-            config["adapter"].get("zero_init_up", True),
-        ),
+        *peft_rows,
         (
             "optimization.max_grad_norm",
             config.get("optimization", {}).get("max_grad_norm", 0.0),
@@ -775,20 +824,39 @@ def main() -> None:
         seed=seed,
         max_length=int(config.get("max_length", 128)),
     )
-    adapter = dict(config.get("adapter", {}))
-    model = TransformerAdapterClassifier(
-        model_path=resolved_config["model_path"],
-        architecture=str(config["architecture"]),
-        num_classes=len(data.class_names),
-        reduction=int(adapter.get("reduction", 2)),
-        activation=str(adapter.get("activation", "relu")),
-        classifier_dropout=float(adapter.get("classifier_dropout", 0.0)),
-        gradient_checkpointing=bool(
-            adapter.get("gradient_checkpointing", False)
-        ),
-        zero_init_up=bool(adapter.get("zero_init_up", True)),
-        device=device,
-    )
+    model_type = str(config["model_type"]).lower()
+    if model_type == "bert_lora":
+        lora = dict(config.get("lora", {}))
+        model = TransformerLoRAClassifier(
+            model_path=resolved_config["model_path"],
+            num_classes=len(data.class_names),
+            target_modules=lora.get("target_modules", ["query", "value"]),
+            layers=lora.get("layers", "all"),
+            rank=int(lora.get("rank", 8)),
+            alpha=float(lora.get("alpha", 16.0)),
+            dropout=float(lora.get("dropout", 0.1)),
+            scaling=str(lora.get("scaling", "rank")),
+            classifier_dropout=float(lora.get("classifier_dropout", 0.1)),
+            gradient_checkpointing=bool(
+                lora.get("gradient_checkpointing", False)
+            ),
+            device=device,
+        )
+    else:
+        adapter = dict(config.get("adapter", {}))
+        model = TransformerAdapterClassifier(
+            model_path=resolved_config["model_path"],
+            architecture=str(config["architecture"]),
+            num_classes=len(data.class_names),
+            reduction=int(adapter.get("reduction", 2)),
+            activation=str(adapter.get("activation", "relu")),
+            classifier_dropout=float(adapter.get("classifier_dropout", 0.0)),
+            gradient_checkpointing=bool(
+                adapter.get("gradient_checkpointing", False)
+            ),
+            zero_init_up=bool(adapter.get("zero_init_up", True)),
+            device=device,
+        )
     model.classnames = list(data.class_names)
     trainable_parameters = sum(
         parameter.numel()
@@ -800,13 +868,24 @@ def main() -> None:
         for parameter in model.parameters()
         if not parameter.requires_grad
     )
-    logger.info(
-        "Adapter ready | layers=%d | reduction=%d | trainable=%d | frozen=%d",
-        model.num_adapter_layers,
-        model.reduction,
-        trainable_parameters,
-        frozen_parameters,
-    )
+    if model_type == "bert_lora":
+        logger.info(
+            "BERT-LoRA ready | layers=%d | projections=%d | rank=%d | "
+            "trainable=%d | frozen=%d",
+            model.num_lora_layers,
+            len(model.injected_modules),
+            model.rank,
+            trainable_parameters,
+            frozen_parameters,
+        )
+    else:
+        logger.info(
+            "Adapter ready | layers=%d | reduction=%d | trainable=%d | frozen=%d",
+            model.num_adapter_layers,
+            model.reduction,
+            trainable_parameters,
+            frozen_parameters,
+        )
 
     optimization = dict(config.get("optimization", {}))
     method_config = {

@@ -92,7 +92,7 @@ FTA（free training attack）来源于 [Chang 等，USENIX Security 2024](https:
 在 `scripts/run_all_fedllm_attacks.sh` 的 BERT 默认任务中，FTA 每 10 个已完成通信轮
 采集一次，Gradient-Diff、Score-Diff 和 Score-Ratio 仍每 50 轮采集一次；GPT2
 默认任务中的四者仍统一每 50 轮采集。
-BERT、GPT2-Large、Visual Adapter 与 CLIP-LoRA 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
+BERT、GPT2-Large、CLIP-Adapter 与 CLIP-LoRA 的 Blackbox-Loss、Gradient-Diff、Score-Diff、Score-Ratio 与 Grad-Cosine 在每轮使用真实上传 Batch
 作为成员，并按标签从从未训练的全局 evaluation 池抽取 10 倍非成员；每轮独立评估，
 不改变攻击分数公式。四类模型的 FTA、Loss-Series、Avg-Cosine 和两个 FedMIA
 变体均使用目标客户端完整训练集作为成员，并抽取类别尽力匹配的等量全局独立
@@ -166,13 +166,13 @@ evaluation 非成员。
 
 ## Shared evaluation
 
-所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。BERT、GPT2、Visual Adapter 与 CLIP-LoRA 的五种固定攻击使用目标客户端完整训练集中的 `M` 个成员，以及类别尽力匹配的 `M` 个全局独立 evaluation 非成员；单类非成员不足时从其他仍有容量的类别确定性补足，并记录实际标签直方图与 TV 距离。仍可从中派生固定 100/100 论文对照视图，该视图也采用相同的尽力匹配规则。四类模型的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员；BERT/GPT2 完整 Batch 为 16/160，Visual Adapter/CLIP-LoRA 为 32/320。这些真实 Batch 攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。CLIP-MLP 运行全部十种通用攻击，但继续使用原有固定候选协议，不启用真实 Batch 成员定义。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
+所有攻击以 `TPR@1% FPR` 为主指标，并保留 ROC AUC 和 TPR@10% FPR。BERT、GPT2、CLIP-MLP、CLIP-Adapter 与 CLIP-LoRA 的五种固定攻击使用目标客户端完整训练集中的 `M` 个成员，以及类别尽力匹配的 `M` 个全局独立 evaluation 非成员；单类非成员不足时从其他仍有容量的类别确定性补足，并记录实际标签直方图与 TV 距离。仍可从中派生固定 100/100 论文对照视图，该视图也采用相同的尽力匹配规则。五类模型的六种真实 Batch 攻击使用当轮 `N` 个成员和 `10N` 个非成员；BERT/GPT2 完整 Batch 为 16/160，三种 CLIP 模型为 32/320。这些真实 Batch 攻击不使用固定历史成员或论文对照视图，也不计算 TPR@0.1% FPR。需要训练攻击头的方法使用分层校准/评估拆分；FedMIA 与 CodePoison 是直接打分方法。YOQO 只有二元硬标签分数，低 FPR 指标在有限样本下等价于观察零误报阈值，解释时需同时报告样本数。
 
 ## CLIP 图像编码器 + 两层 MLP 场景
 
-`model_type: clip_mlp` 冻结 CLIP，只训练两层 MLP 分类头。普通 FedAvg 上传并
-对参与客户端等权聚合 `classifier.0.{weight,bias}` 和
-`classifier.3.{weight,bias}`。攻击适配遵循以下映射：
+`model_type: clip_mlp` 冻结 CLIP，只训练两层 MLP 分类头。正式协议每类抽取 16 张
+训练图像；每个客户端每轮用一个真实 mini-batch 计算 FedSGD 梯度，服务器对
+`classifier.0.{weight,bias}` 和 `classifier.3.{weight,bias}` 等权聚合。攻击适配遵循以下映射：
 
 `clip_mlp.precompute_features: true`（默认）会在训练开始前把各客户端训练集和
 测试集完整编码成 CPU 上的 CLIP 向量。模型对二维输入走向量快路径，所以本地
@@ -188,20 +188,20 @@ evaluation 非成员。
 - YOQO 和 Canary 保留冻结 CLIP 参数，但允许梯度对输入传播，因此仍可优化查询；
 - IMIA、RMIA、CodePoison 和主动 Nasr 复用仅训练 MLP 的影子模型或隔离 probe。
 
-这些映射保留每种攻击的观测权限和 FedAvg 协议边界，但不把 MLP 类别向量称为
+这些映射保留每种攻击的观测权限和 FedSGD 协议边界，但不把 MLP 类别向量称为
 文本 prompt。完整入口见 `configs/clip_mlp_privacy.yaml`。
 
-## 全数据视觉 CLIP Adapter 场景
+## Few-shot CLIP-Adapter 场景
 
-`model_type: visual_adapter` 冻结 CLIP，只通过每客户端每轮一个 mini-batch 的
-FedSGD 训练视觉残差瓶颈，并与 CLIP-MLP 一样使用完整训练集，即
-`fpl_shots: null` 与 `use_full_dataset: true`；服务器对参与客户端更新直接等权平均。损失、概率、表示、更新余弦、
+`model_type: clip_adapter` 冻结 CLIP，只通过每客户端每轮一个 mini-batch 的
+FedSGD 训练图像、文本两侧残差瓶颈，并与 CLIP-MLP 一样使用每类 16 张训练图像，
+即 `fpl_shots: 16` 与 `use_full_dataset: false`；服务器对参与客户端梯度直接等权平均。损失、概率、表示、更新余弦、
 Nasr、PromptRes、PIPRA、RMIA、IMIA、YOQO、Canary 和 CodePoison 均复用其原有
 观测协议，但影子模型与 probe 只重置或更新 adapter 参数。
 
 PromptMIA 使用 adapter 第一层的输入投影向量作为 key-like vectors。普通训练时
 冻结 CLIP 不保留反向图；YOQO 与 Canary 优化输入时会临时保留输入到冻结 CLIP
-的梯度。完整入口见 `configs/visual_adapter_privacy.yaml`。
+的梯度。完整入口见 `configs/clip_adapter_privacy.yaml`。
 
 ### ProjRes 严格单轮入口
 
@@ -213,10 +213,10 @@ batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。�
 边界说明见 `docs/projres_mlp_strict.md`。该入口没有复用名称相近但采用候选梯度
 余弦相似度的 `promptres`。
 
-统一 sweep 对 Visual Adapter 和 CLIP-LoRA 提供共享 exact-batch ProjRes：FedSGD
-路径直接读取客户端上传梯度，不再从参数差反推。两者均每 10 轮运行；Visual
-Adapter 攻击第一层 down-projection，LoRA 攻击视觉 Q 投影的 `lora_A` 下投影因子，
-并使用该层输入的 CLIP class-token 隐藏表示。两者真实
+统一 sweep 对 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 提供共享 exact-batch ProjRes：
+FedSGD 路径直接读取客户端上传梯度，不再从参数差反推。三者均每 10 轮运行；
+CLIP-MLP 攻击 `classifier.0.weight`，CLIP-Adapter 攻击第一层 down-projection，
+LoRA 攻击视觉 Q 投影的 `lora_A` 下投影因子，并使用各层对应的候选表示。三者真实
 上传均只来自一个 batch，因此与论文 FedSGD 观测一致。ProjRes 以负 L1 残差做
-ranking-only 评价，不再使用固定残差阈值。CLIP-MLP 的统一攻击任务
-不执行 ProjRes；其独立严格验证入口仍然保留。
+ranking-only 评价，不再使用固定残差阈值。CLIP-MLP 的独立严格验证入口仍然保留，
+用于单轮诊断而不是替代统一攻击任务。

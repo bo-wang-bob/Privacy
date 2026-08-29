@@ -12,7 +12,7 @@ from torch.nn import functional as F
 from transformers import CLIPModel, CLIPProcessor
 
 from trainmodel.custom_clip import format_prompt_template, to_display_name
-from trainmodel.visual_adapter import get_visual_adapter_prompt_template
+from trainmodel.clip_adapter import get_clip_adapter_prompt_template
 
 
 class LoRALinear(nn.Module):
@@ -79,7 +79,7 @@ def build_clip_lora_text_inputs(
     template: str | None = None,
 ) -> dict[str, torch.Tensor]:
     """Tokenize the fixed class prompts once; text features remain dynamic."""
-    selected_template = template or get_visual_adapter_prompt_template(dataset_name)
+    selected_template = template or get_clip_adapter_prompt_template(dataset_name)
     prompts = [
         format_prompt_template(selected_template, to_display_name(name))
         for name in classnames

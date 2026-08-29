@@ -200,11 +200,12 @@ def build_jobs(
         config["aggregator"] = (
             "fedsgd"
             if str(config.get("model_type", "clip_mlp")).lower()
-            in {"visual_adapter", "clip_lora"}
+            in {"clip_mlp", "clip_adapter", "visual_adapter", "clip_lora"}
             else "fedavg"
         )
         if str(config.get("model_type", "clip_mlp")).lower() in {
             "clip_mlp",
+            "clip_adapter",
             "visual_adapter",
             "clip_lora",
         }:
@@ -365,6 +366,7 @@ def _job_hyperparameters_block(job: SweepJob) -> str:
             "partition_mode": config.get("partition_mode"),
             "dirichlet_alpha": config.get("dirichlet_alpha"),
             "use_full_dataset": config.get("use_full_dataset"),
+            "fpl_shots_per_class": config.get("fpl_shots"),
             "data_root": config.get("data_root"),
         },
         "federated": {
@@ -616,6 +618,7 @@ def _projres_parameters_block(job, projres: dict[str, Any]) -> str:
     model_type = str(job.config.get("model_type", "clip_mlp"))
     attacked_layer = {
         "clip_mlp": "classifier.0.weight",
+        "clip_adapter": "adapter.net.0.weight",
         "visual_adapter": "adapter.net.0.weight",
         "clip_lora": (
             "clip_model.vision_model.encoder.layers.0.self_attn."

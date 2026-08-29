@@ -125,10 +125,11 @@ cd "$repository_root"
 
 if [[ "$show_help" == true ]]; then
   cat <<'EOF'
-Run the unified federated-LLM Adapter membership-inference sweep.
+Run the unified federated-LLM PEFT membership-inference sweep.
 
 Unified options:
-  --models bert,gpt2       Select models (default: both).
+  --models bert,bert_lora,gpt2
+                            Select models (default: BERT/GPT2 Adapters).
   --datasets sst5,cola,imdb
                             Select datasets (default: all three).
   --gpus 0,1               Assign tasks to GPUs round-robin (default: 0).
@@ -147,7 +148,7 @@ ProjRes options:
   --skip-projres           Alias for --no-projres.
 
 Every real task prints its resolved configuration only when that task starts.
-Each task evaluates all ten common attacks and ProjRes. BERT runs its five
+Each task evaluates all 11 registered attacks. BERT Adapter and BERT-LoRA run their five
 fixed-candidate attacks every 10 rounds and its six exact-batch attacks every
 50 rounds. GPT2 keeps all attacks at 50-round intervals. BERT also runs
 observational ICLR every 50 rounds.
@@ -162,11 +163,14 @@ for requested in "${requested_models[@]}"; do
   requested="${requested//[[:space:]]/}"
   case "${requested,,}" in
     all)
-      normalized_models=(bert gpt2)
+      normalized_models=(bert bert_lora gpt2)
       break
       ;;
     bert|bert_base|bert-base|bert_adapter)
       normalized_models+=(bert)
+      ;;
+    bert_lora|bert-lora|lora)
+      normalized_models+=(bert_lora)
       ;;
     gpt|gpt2|gpt2_large|gpt2-large|gpt2_adapter)
       normalized_models+=(gpt2)
@@ -174,7 +178,7 @@ for requested in "${requested_models[@]}"; do
     "")
       ;;
     *)
-      echo "Unknown model '$requested'; use bert, gpt2, or all." >&2
+      echo "Unknown model '$requested'; use bert, bert_lora, gpt2, or all." >&2
       exit 2
       ;;
   esac
@@ -242,6 +246,9 @@ config_for_task() {
       ;;
     bert/imdb)
       echo "configs/bert_base_imdb_adapter.yaml"
+      ;;
+    bert_lora/*)
+      echo "configs/bert_base_sst5_lora.yaml"
       ;;
     gpt2/*)
       echo "configs/gpt2_large_sst5_adapter.yaml"

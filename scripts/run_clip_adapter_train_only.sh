@@ -3,8 +3,8 @@ set -euo pipefail
 
 repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-if [[ -n "${CLIP_MLP_TRAIN_PYTHON:-}" ]]; then
-  python_bin="$CLIP_MLP_TRAIN_PYTHON"
+if [[ -n "${CLIP_ADAPTER_TRAIN_PYTHON:-${VISUAL_ADAPTER_TRAIN_PYTHON:-}}" ]]; then
+  python_bin="${CLIP_ADAPTER_TRAIN_PYTHON:-$VISUAL_ADAPTER_TRAIN_PYTHON}"
 elif command -v python >/dev/null 2>&1; then
   python_bin="python"
 elif [[ -x /root/.local/share/mamba/envs/pfedba/bin/python ]]; then
@@ -13,8 +13,8 @@ else
   python_bin="python3"
 fi
 
-config_path="${CLIP_MLP_TRAIN_CONFIG:-configs/clip_mlp_fedsgd.yaml}"
-learning_rate="${CLIP_MLP_TRAIN_LR:-0.1}"
+config_path="${CLIP_ADAPTER_TRAIN_CONFIG:-${VISUAL_ADAPTER_TRAIN_CONFIG:-configs/clip_adapter_privacy.yaml}}"
+learning_rate="${CLIP_ADAPTER_TRAIN_LR:-${VISUAL_ADAPTER_TRAIN_LR:-0.001}}"
 dry_run=false
 forward_args=()
 
@@ -39,12 +39,12 @@ command=(
   --config "$config_path"
   --dataset_name caltech101
   --learning_rate "$learning_rate"
-  --num_global_iters 100
+  --num_global_iters 50
   --local_epochs 1
   --partition_mode iid
   --gpu 0
   "${forward_args[@]}"
-  --model_type clip_mlp
+  --model_type clip_adapter
   --attack none
   --defense none
 )
