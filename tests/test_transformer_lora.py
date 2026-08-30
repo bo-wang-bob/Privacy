@@ -185,14 +185,29 @@ def test_bert_lora_fedsgd_aggregates_every_factor_independently(monkeypatch):
 def test_bert_lora_exposes_lora_a_projres_surface(monkeypatch):
     model = _model(monkeypatch)
     name, layer = model.get_projres_attack_surface()
+    packed_inputs = torch.tensor(
+        [
+            [[1, 2, 0, 0], [1, 1, 0, 0]],
+            [[1, 4, 5, 0], [1, 1, 1, 0]],
+        ]
+    )
     representations, active_tokens = model.get_projres_representations(
-        _packed_inputs(), parameter_name=name, token_reduction="cls"
+        packed_inputs, parameter_name=name, token_reduction="auto"
+    )
+    mean_representations, _ = model.get_projres_representations(
+        packed_inputs, parameter_name=name, token_reduction="mean"
+    )
+    cls_representations, _ = model.get_projres_representations(
+        packed_inputs, parameter_name=name, token_reduction="cls"
     )
 
     assert name.endswith("query.lora_A")
     assert isinstance(layer, LoRALinear)
     assert representations.shape == (2, 6)
     assert active_tokens == 5
+    assert torch.allclose(representations, mean_representations)
+    assert not torch.allclose(representations[0], representations[1])
+    assert torch.allclose(cls_representations[0], cls_representations[1])
 
 
 def test_bert_lora_runs_one_real_federated_server_round(monkeypatch, tmp_path):
@@ -350,6 +365,13 @@ def test_bert_lora_runs_all_eleven_attacks_with_exact_batch_projres(
         summary["metadata"]["model_type"] == "bert_lora"
         for summary in summaries
     )
+    projres_summary = next(
+        summary for summary in summaries if summary["attack"] == "projres"
+    )
+    assert projres_summary["metadata"]["sample_representation"] == (
+        "mean_token_input_to_lora_down_projection"
+    )
+    assert projres_summary["score_degenerate"] is False
     assert (
         tmp_path / "privacy_audit" / "exact_batch_candidate_selection.pt"
     ).exists()
@@ -366,4 +388,6 @@ def test_bert_lora_default_config_is_valid():
     assert config["model_type"] == "bert_lora"
     assert config["lora"]["target_modules"] == ["query", "value"]
     assert config["lora"]["scaling"] == "rank"
+    assert config["learning_rate"] == 0.01
     assert config["aggregation_weighting"] == "uniform"
+    assert config["projres"]["token_reduction"] == "mean"

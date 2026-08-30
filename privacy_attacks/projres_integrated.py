@@ -863,9 +863,15 @@ def run_integrated_projres(
         )
         token_reduction = str(config.get("token_reduction", "auto")).lower()
         if token_reduction == "auto":
-            token_reduction = (
-                "cls" if str(getattr(model, "architecture", "")) == "bert" else "last"
-            )
+            resolver = getattr(model, "resolve_projres_token_reduction", None)
+            if callable(resolver):
+                token_reduction = resolver(token_reduction)
+            else:
+                token_reduction = (
+                    "cls"
+                    if str(getattr(model, "architecture", "")) == "bert"
+                    else "last"
+                )
         model.load_state_dict(base_states[client_ids[0]], strict=False)
         nonmember_datasets = [
             user.test_data for user in users if len(user.test_data)

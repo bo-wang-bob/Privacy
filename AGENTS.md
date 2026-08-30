@@ -35,10 +35,10 @@
 
 ## 当前 BERT PEFT 协议
 
-- BERT-Base Adapter 与 BERT-Base LoRA 均使用 30 个 IID 客户端、batch size 16、500 轮、one-batch 等权 FedSGD；默认学习率均为 `0.005`。
+- BERT-Base Adapter 与 BERT-Base LoRA 均使用 30 个 IID 客户端、batch size 16、500 轮、one-batch 等权 FedSGD；Adapter 默认学习率为 `0.005`，LoRA 默认学习率为 `0.01`。
 - BERT-LoRA 默认在全部 12 层自注意力 Query/Value 投影中训练 `rank=8`、`alpha=16`、dropout `0.1` 的 LoRA 因子，并同时训练分类头；冻结 BERT 主干不上传。服务器与 CLIP-LoRA 一样分别聚合同名 `lora_A`、`lora_B`，不先合成稠密 `BA` 更新。
 - BERT Adapter/LoRA 均支持全部 11 种注册攻击，并使用上述 5 种固定候选攻击与 6 种真实 Batch 攻击划分；完整真实 Batch 候选为 16/160。
-- BERT-LoRA 默认配置为 `configs/models/bert_lora.yaml`，可由 `scripts/run_privacy_experiments.py --models bert_lora` 启动；ProjRes 观察首层 Query 的 `lora_A` 上传。
+- BERT-LoRA 默认配置为 `configs/models/bert_lora.yaml`，可由 `scripts/run_privacy_experiments.py --models bert_lora` 启动；ProjRes 观察首层 Query 的 `lora_A` 上传，并以 attention-mask 加权的有效 token 输入均值作为每个样本的表示，避免首层 CLS 在不同文本间恒定导致分数退化。
 
 ## 按需审计频次
 

@@ -195,6 +195,27 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
             )
         return matches[0]
 
+    @staticmethod
+    def resolve_projres_token_reduction(token_reduction: str) -> str:
+        """Resolve the sample view used for a token-wise LoRA projection.
+
+        Query/Value LoRA is applied to every active BERT token. In
+        particular, the CLS input to the first attention layer is constant
+        across examples because it has not yet attended to the sentence.
+        The mask-weighted token mean remains in the span of the actual layer
+        inputs that form the uploaded gradient and yields a sample-specific
+        representation, so it is the BERT-LoRA automatic default.
+        """
+        reduction = str(token_reduction).lower()
+        if reduction == "auto":
+            reduction = "mean"
+        if reduction not in {"cls", "last", "mean"}:
+            raise ValueError(
+                "BERT-LoRA ProjRes token_reduction must be auto, cls, last, "
+                "or mean."
+            )
+        return reduction
+
     @torch.no_grad()
     def get_projres_representations(
         self,
@@ -202,6 +223,13 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
         parameter_name: str | None = None,
         token_reduction: str = "auto",
     ) -> tuple[torch.Tensor, int]:
+        """Capture a sample view of inputs to the attacked LoRA projection.
+
+        ``mean`` is attention-mask weighted and therefore excludes padding.
+        It represents all active token inputs that contribute to the
+        token-wise Query/Value LoRA gradient. ``auto`` resolves to ``mean``;
+        explicit ``cls`` and ``last`` remain available for diagnostics.
+        """
         _, attacked_layer = self.get_projres_attack_surface(parameter_name)
         captured: list[torch.Tensor] = []
 
@@ -225,9 +253,7 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
         hidden = captured[0]
         _, attention_mask = self.unpack_inputs(packed_inputs)
         attention_mask = attention_mask.to(hidden.device)
-        reduction = str(token_reduction).lower()
-        if reduction == "auto":
-            reduction = "cls"
+        reduction = self.resolve_projres_token_reduction(token_reduction)
         if reduction == "cls":
             representations = hidden[:, 0]
         elif reduction == "last":
@@ -239,8 +265,6 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
             representations = (hidden * weights).sum(dim=1) / weights.sum(
                 dim=1
             ).clamp_min(1)
-        else:
-            raise ValueError("token_reduction must be auto, cls, last, or mean.")
         return representations, int(attention_mask.sum().item())
 
 

@@ -18,7 +18,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 | CLIP-Adapter | 图像、文本两侧瓶颈 Adapter | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.001 | 11 种攻击 |
 | CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.0002 | 11 种攻击 |
 | BERT-Base Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.005 | 11 种攻击 |
-| BERT-Base LoRA | 各层注意力 Query/Value 的 LoRA 因子和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.005 | 11 种攻击 |
+| BERT-Base LoRA | 各层注意力 Query/Value 的 LoRA 因子和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.01 | 11 种攻击 |
 | GPT2-Large Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.001 | 11 种攻击 |
 
 当前正式 sweep 的共同约定：
@@ -66,7 +66,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 | CLIP-Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
 | CLIP-LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
 | BERT-Base Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种 |
-| BERT-Base LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种；ProjRes 攻击首个 Query `lora_A` |
+| BERT-Base LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种；ProjRes 攻击首个 Query `lora_A`，使用有效 token 均值表示 |
 | GPT2-Large Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种 |
 
 “代码已注册/可配置”和“正式 sweep 默认启用”是两个不同概念。当前 11 个注册名

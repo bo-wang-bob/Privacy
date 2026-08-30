@@ -45,7 +45,7 @@ down-projection ratio 为 2，即瓶颈宽度等于主干隐藏宽度的一半�
 数据入口支持 SST-5、CoLA 和 IMDB；前两者
 使用 `train/validation`，IMDB 使用 `train/test`，评估 split 从不参与训练。
 默认使用 30 个 IID 客户端，BERT 与 GPT2-Large 均使用 batch size 16。
-BERT 三个数据集均训练 500 轮并保持学习率 `0.005`；GPT2-Large 训练 500 轮并保持
+BERT Adapter 三个数据集均训练 500 轮并保持学习率 `0.005`；GPT2-Large 训练 500 轮并保持
 `0.001`。Adapter 的 down-projection 使用主干 initializer range 做小随机初始化，
 up-projection 与 bias 置零，使残差分支在初始化时严格保持主干隐藏表示；全部可训练参数
 使用同一个标量学习率，客户端梯度不执行 norm clipping。
@@ -72,7 +72,9 @@ checkpoint 均不包含冻结的 BERT/GPT2 参数。
 聚合与 CLIP-LoRA 一致：服务器分别线性平均每个同名 `lora_A`、`lora_B`，不会先
 合成为稠密的 `BA` 更新；分类头参数也按相同客户端权重线性聚合。FedSGD 下等价于
 分别平均各可训练张量的真实 batch-mean 梯度，再执行一次全局 SGD step。默认配置为
-`configs/models/bert_lora.yaml`，ProjRes 观察首个 Query 投影的 `lora_A` 上传。
+`configs/models/bert_lora.yaml`，默认恒定学习率为 `0.01`。ProjRes 观察首个 Query
+投影的 `lora_A` 上传，并使用 attention mask 覆盖的有效 token 输入均值作为样本表示；
+不再使用首层注意力前、对不同文本恒定的 CLS 输入。
 
 `scripts/run_privacy_experiments.py` 是全仓库统一入口，可按模型、数据集、防御、
 seed 和目标客户端展开独立进程；同一任务所选的多种攻击共享训练。

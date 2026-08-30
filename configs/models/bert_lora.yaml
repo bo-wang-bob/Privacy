@@ -9,7 +9,7 @@ sample_users: 30
 num_global_iters: 500
 batch_size: 16
 eval_batch_size: 32
-learning_rate: 0.005
+learning_rate: 0.01
 learning_rate_decay: 1.0
 learning_rate_decay_interval: 50
 eval_interval: 50
@@ -72,4 +72,4 @@ projres:
   max_candidates: 16
   min_nonmembers: 160
   max_nonmembers: 160
-  token_reduction: auto
+  token_reduction: mean

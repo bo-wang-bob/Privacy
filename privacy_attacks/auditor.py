@@ -2324,7 +2324,12 @@ class MembershipAuditor:
             self.exact_batch_projres_config.get("token_reduction", "auto")
         ).lower()
         if token_reduction == "auto":
-            if self.model_type in {
+            resolver = getattr(
+                self.model, "resolve_projres_token_reduction", None
+            )
+            if callable(resolver):
+                token_reduction = resolver(token_reduction)
+            elif self.model_type in {
                 "clip_mlp",
                 "clip_adapter",
                 "visual_adapter",
