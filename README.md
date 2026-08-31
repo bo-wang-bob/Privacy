@@ -18,7 +18,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 | CLIP-Adapter | 图像、文本两侧瓶颈 Adapter | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.001 | 11 种攻击 |
 | CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.0002 | 11 种攻击 |
 | BERT-Base Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.005 | 11 种攻击 |
-| BERT-Base LoRA | 各层注意力 Query/Value 的 LoRA 因子和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.01 | 11 种攻击 |
+| BERT-Base LoRA | 各层注意力 Query/Value 的 LoRA 因子和分类头 | FedSGD | 1 个 batch，batch size 16 | 750 | 0.01 | 11 种攻击 |
 | GPT2-Large Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.001 | 11 种攻击 |
 
 当前正式 sweep 的共同约定：

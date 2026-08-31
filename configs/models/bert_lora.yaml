@@ -6,7 +6,7 @@ dataset_path: ./data/huggingface/sst5
 
 total_users: 30
 sample_users: 30
-num_global_iters: 500
+num_global_iters: 750
 batch_size: 16
 eval_batch_size: 32
 learning_rate: 0.01
