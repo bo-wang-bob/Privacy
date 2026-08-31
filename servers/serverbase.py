@@ -127,6 +127,12 @@ def _matthews_correlation(confusion: torch.Tensor) -> float:
     return covariance / denominator if denominator > 0 else 0.0
 
 
+def _format_selected_clients(selected_ids: list[int], total_users: int) -> str:
+    if sorted(selected_ids) == list(range(total_users)):
+        return f"all({total_users})"
+    return "[" + ",".join(str(user_id) for user_id in selected_ids) + "]"
+
+
 def _format_round_progress(
     round_index: int,
     total_rounds: int,
@@ -138,10 +144,7 @@ def _format_round_progress(
     learning_rate: float | None = None,
     mcc: float | None = None,
 ) -> str:
-    if sorted(selected_ids) == list(range(total_users)):
-        selected = f"all({total_users})"
-    else:
-        selected = "[" + ",".join(str(user_id) for user_id in selected_ids) + "]"
+    selected = _format_selected_clients(selected_ids, total_users)
     learning_rate_text = (
         "" if learning_rate is None else f" | lr={learning_rate:.6g}"
     )

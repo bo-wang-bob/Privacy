@@ -59,7 +59,7 @@
 - 严格遵循“`results/` 下每个一级文件夹就是一次训练任务”。新任务目录名包含精确时间、模型、数据集、方法、seed 和目标客户端。
 - 一次任务所需文件放在同一目录内，主要包括 `run_config.yaml`、`run.log`、模型/训练指标，以及 `privacy_audit/` 下的 `summary.json`、`predictions.csv`、`signals.pt`、`candidate_selection.pt` 和 `exact_batch_candidate_selection.pt`（按实际启用项生成）。三种 CLIP 模型的统一 ProjRes 复用这些输出；只有独立 ProjRes 路径生成 `projres_strict.json`。进程内日志写入同一 `run.log`，不要重新创建独立 `projres_strict.log`。
 - `runs` 在汇总表中表示同一数据集/攻击分组包含的独立训练任务数量，不是额外的目录层级。代码仍可读取历史 `.../runs/...` 布局，但新实验不得继续生成该布局。
-- 日志必须能直接区分时间、训练任务、模型、数据集和阶段；不要重新引入只有脚本名而没有任务身份的日志命名。
+- 每个 `run.log` 开头只记录一次时间、训练任务、模型、数据集、防御、阶段和 GPU；后续子进程日志不再为每行重复这些固定字段。不要输出逐通信轮次的训练状态，只在配置的正式评估轮次和最终轮输出 `Progress`，记录轮次、loss、accuracy/MCC、学习率、参与客户端和审计累计数。不要重新引入只有脚本名而没有任务身份的日志命名。
 
 ## 分析现有结果时的注意事项
 

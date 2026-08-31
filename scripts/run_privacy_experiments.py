@@ -490,13 +490,23 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
         print(f"      command={shlex.join(task_command(task))}")
 
 
-def _scoped_line(task: ExperimentTask, line: str) -> str:
+def _timestamped_line(message: str) -> str:
     timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+    return f"{timestamp} | {message.rstrip()}\n"
+
+
+def _task_header(task: ExperimentTask) -> str:
+    """Identify one task once instead of prefixing every child log line."""
     context = (
         f"model={task.model} | dataset={task.dataset} | defense={task.defense} | "
         f"run={task.run_id} | phase=train | gpu={task.gpu}"
     )
-    return f"{timestamp} | {context} | {line.rstrip()}\n"
+    return _timestamped_line(f"TASK | {context}")
+
+
+def _forward_child_line(line: str) -> str:
+    """Preserve the child's own timestamp, level, logger, and message."""
+    return line if line.endswith("\n") else line + "\n"
 
 
 def run_task(task: ExperimentTask) -> TaskResult:
@@ -512,10 +522,13 @@ def run_task(task: ExperimentTask) -> TaskResult:
     env["FEDMIA_LAUNCHER_LOG_CAPTURE"] = "1"
     command = task_command(task)
     with (task.run_dir / "run.log").open("w", encoding="utf-8") as log:
-        header = _scoped_line(task, "COMMAND | " + shlex.join(command))
+        header = _task_header(task)
+        command_line = _timestamped_line("COMMAND | " + shlex.join(command))
         log.write(header)
+        log.write(command_line)
         with _PRINT_LOCK:
             sys.stdout.write(header)
+            sys.stdout.write(command_line)
             sys.stdout.flush()
         process = subprocess.Popen(
             command,
@@ -528,14 +541,14 @@ def run_task(task: ExperimentTask) -> TaskResult:
         )
         assert process.stdout is not None
         for raw_line in process.stdout:
-            formatted = _scoped_line(task, raw_line)
+            formatted = _forward_child_line(raw_line)
             log.write(formatted)
             log.flush()
             with _PRINT_LOCK:
                 sys.stdout.write(formatted)
                 sys.stdout.flush()
         returncode = process.wait()
-        footer = _scoped_line(task, f"EXIT | returncode={returncode}")
+        footer = _timestamped_line(f"EXIT | returncode={returncode}")
         log.write(footer)
         with _PRINT_LOCK:
             sys.stdout.write(footer)
