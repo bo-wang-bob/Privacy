@@ -109,7 +109,7 @@ models:
     config: configs/models/bert_lora.yaml
     runner: text
     datasets: *text_datasets
-    default_datasets: *text_datasets
+    default_datasets: [cola]
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
     supported_defenses: [none, iclr]

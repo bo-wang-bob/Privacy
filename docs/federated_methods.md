@@ -65,14 +65,14 @@ checkpoint 均不包含冻结的 BERT/GPT2 参数。
 
 `bert_lora` 使用相同的 30 客户端、one-batch、等权 FedSGD 协议。BERT 主干冻结，
 默认在全部 12 层自注意力的 Query 和 Value 投影中加入
-`W_eff = W_0 + (alpha/r) B A`，使用 `rank=8`、`alpha=16`、LoRA dropout `0.1`，
+`W_eff = W_0 + (alpha/r) B A`，使用 `rank=16`、`alpha=32`、LoRA dropout `0.1`，
 并同时训练任务分类头。每个客户端只在 CPU 保存自己的 LoRA 因子和分类头；执行时
 临时绑定到共享 BERT 主干。
 
 聚合与 CLIP-LoRA 一致：服务器分别线性平均每个同名 `lora_A`、`lora_B`，不会先
 合成为稠密的 `BA` 更新；分类头参数也按相同客户端权重线性聚合。FedSGD 下等价于
 分别平均各可训练张量的真实 batch-mean 梯度，再执行一次全局 SGD step。默认配置为
-`configs/models/bert_lora.yaml`，默认训练 750 轮并使用恒定学习率 `0.01`。ProjRes 观察首个 Query
+`configs/models/bert_lora.yaml`，默认数据集为 CoLA，训练 500 轮并使用恒定学习率 `0.015`。ProjRes 观察首个 Query
 投影的 `lora_A` 上传，并使用 attention mask 覆盖的有效 token 输入均值作为样本表示；
 不再使用首层注意力前、对不同文本恒定的 CLS 输入。
 
@@ -100,7 +100,7 @@ PEFT/分类头参数
 统计 AUC、TPR@10%FPR 与 TPR@1%FPR，不生成 TPR@0.1%FPR。
 
 BERT 同时启用周期性 ICLR 排名分析。服务器在 BERT Adapter 的第 50、100、…、500 轮及
-BERT-LoRA 的第 50、100、…、750 个通信轮完成聚合后，
+BERT-LoRA 的第 50、100、…、500 个通信轮完成聚合后，
 根据该轮真实客户端上传和等权聚合系数，为每个客户端精确重建其他客户端的聚合模型，
 并在该轮真实 one-batch 训练样本上计算 `L(x; theta_-k) - L(x; theta_k)`。该分析只记录
 排名与统计，不筛选样本、不改变优化步骤；逐轮结果写入 `iclr_round_metrics.csv`、

@@ -18,13 +18,14 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 | CLIP-Adapter | 图像、文本两侧瓶颈 Adapter | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.001 | 11 种攻击 |
 | CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.0002 | 11 种攻击 |
 | BERT-Base Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.005 | 11 种攻击 |
-| BERT-Base LoRA | 各层注意力 Query/Value 的 LoRA 因子和分类头 | FedSGD | 1 个 batch，batch size 16 | 750 | 0.01 | 11 种攻击 |
+| BERT-Base LoRA | 各层注意力 Query/Value 的 LoRA 因子和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.015 | 11 种攻击 |
 | GPT2-Large Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.001 | 11 种攻击 |
 
 当前正式 sweep 的共同约定：
 
 - CLIP 三种模型使用 10 个客户端、batch size 32、IID 划分和参与客户端等权 FedSGD；CLIP-MLP 与 CLIP-Adapter 使用每类 16 张训练图像，CLIP-LoRA 使用完整训练集。
 - BERT/GPT2 使用 30 个客户端、IID 划分和 one-batch 等权 FedSGD。
+- BERT-LoRA 默认只展开 CoLA；SST-5 与 IMDb 仍可通过 `--datasets` 显式选择。
 - FedSGD 客户端上传各自的可训练参数梯度；服务器先等权聚合梯度，再执行一次
   `global = base - learning_rate * mean_gradient` 并下发新的全局模型。
 - CLIP 普通任务每 5 个已完成通信轮评估一次；多轮攻击通常每 10 轮审计。

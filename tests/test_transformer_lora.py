@@ -386,8 +386,12 @@ def test_bert_lora_default_config_is_valid():
     validate_config(config)
 
     assert config["model_type"] == "bert_lora"
+    assert config["dataset_name"] == "cola"
+    assert config["num_global_iters"] == 500
     assert config["lora"]["target_modules"] == ["query", "value"]
+    assert config["lora"]["rank"] == 16
+    assert config["lora"]["alpha"] == 32.0
     assert config["lora"]["scaling"] == "rank"
-    assert config["learning_rate"] == 0.01
+    assert config["learning_rate"] == 0.015
     assert config["aggregation_weighting"] == "uniform"
     assert config["projres"]["token_reduction"] == "mean"

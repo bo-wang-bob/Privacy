@@ -86,6 +86,30 @@ def test_all_attacks_are_resolved_per_model_and_incompatible_model_is_skipped(tm
     assert any("resnet18" in message and "不支持攻击" in message for message in skipped)
 
 
+def test_bert_lora_defaults_match_the_cola_rank16_protocol(tmp_path):
+    tasks, skipped = build_tasks(
+        CATALOG,
+        _args(
+            "--models",
+            "bert_lora",
+            "--results-root",
+            str(tmp_path),
+        ),
+    )
+
+    assert skipped == []
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.dataset == "cola"
+    assert task.defense == "none"
+    assert len(task.attacks) == 11
+    assert task.config["num_global_iters"] == 500
+    assert task.config["learning_rate"] == 0.015
+    assert task.config["lora"]["rank"] == 16
+    assert task.config["lora"]["alpha"] == 32.0
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_catalog_defenses_deep_merge_to_valid_configs(tmp_path):
     cases = (
         ("resnet18", "cifar100", "record_dp", "vision"),
