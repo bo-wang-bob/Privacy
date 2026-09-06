@@ -158,7 +158,7 @@ def _defense_override(
 
 def _disable_resnet_paper_protocol(config: dict[str, Any]) -> None:
     config.setdefault("resnet18", {})["paper_protocol"] = False
-    config.setdefault("audit", {})["iclr_candidate_scoring"] = False
+    config.setdefault("audit", {})["www_candidate_scoring"] = False
 
 
 def resolve_model_config(
@@ -496,6 +496,14 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             f"partition:{partition} data:{data_view}"
         )
         defense_config = config.get("defense", {})
+        if task.defense == "www":
+            print(
+                f"      www=epsilon:{defense_config['target_epsilon']} "
+                f"clip:{defense_config['max_grad_norm']} delta:{defense_config['delta']} "
+                f"tail:{defense_config['www_tail_fraction']}*expected_batch ranking:ascending "
+                f"noise:{defense_config['noise_multiplier']} "
+                "sampling:poisson adjacency:add_remove accounting:poisson_sampled_gaussian_rdp"
+            )
         if task.defense == "cofedmid":
             print(
                 f"      cofedmid=clients:{defense_config['cofedmid_clients']} "

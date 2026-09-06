@@ -68,7 +68,7 @@ models:
     default_datasets: *clip_datasets
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
-    supported_defenses: &clip_defenses [none, iclr, cofedmid]
+    supported_defenses: &clip_defenses [none, www, cofedmid]
     default_defenses: [none]
     default_seeds: [42]
 
@@ -101,8 +101,8 @@ models:
     default_datasets: *text_datasets
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
-    supported_defenses: [none, iclr, cofedmid, record_dp, local_client_dp]
-    default_defenses: [iclr]
+    supported_defenses: [none, www, cofedmid, record_dp, local_client_dp]
+    default_defenses: [www]
     default_seeds: [42]
 
   bert_lora:
@@ -112,7 +112,7 @@ models:
     default_datasets: [cola]
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
-    supported_defenses: [none, iclr, cofedmid]
+    supported_defenses: [none, www, cofedmid]
     default_defenses: [none]
     default_seeds: [42]
 
@@ -160,26 +160,30 @@ defense_overrides:
       defense:
         name: none
 
-  iclr:
+  www:
     common:
       defense:
-        name: iclr
-        iclr_validation_top_fraction: 0.2
-    models:
-      bert_adapter:
-        defense:
-          name: iclr
-          iclr_analysis_interval: 50
-          iclr_analysis_timing: post_round
-          iclr_feature_statistics: false
-          iclr_validation_top_fraction: 0.2
-      bert_lora:
-        defense:
-          name: iclr
-          iclr_analysis_interval: 50
-          iclr_analysis_timing: post_round
-          iclr_feature_statistics: false
-          iclr_validation_top_fraction: 0.2
+        name: www
+        target_epsilon: 3.0
+        max_grad_norm: 8.0
+        delta: 1.0e-5
+        noise_multiplier: auto
+        www_tail_fraction: 0.2
+        www_beta_alpha: 1.0
+        www_beta_beta: 1.0
+        www_analysis_interval: 1
+        www_analysis_timing: pre_update
+        www_feature_statistics: false
+        www_validation_top_fraction: 0.2
+        adjacency: add_remove
+        sampling: poisson
+        accountant: rdp
+        reproducible_dp_noise: false
+        release_private_diagnostics: false
+      projres:
+        max_candidates: 0
+        min_nonmembers: 0
+        max_nonmembers: 0
 
   record_dp:
     models:
@@ -187,7 +191,7 @@ defense_overrides:
         resnet18:
           paper_protocol: false
         audit:
-          iclr_candidate_scoring: false
+          www_candidate_scoring: false
         defense:
           name: record_dp
           adjacency: add_remove

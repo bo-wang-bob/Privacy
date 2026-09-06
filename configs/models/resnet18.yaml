@@ -50,7 +50,7 @@ audit:
   attack_audit_intervals: {fedmia_loss: 10}
   fedmia_loss_aggregation: mean
   fedmia_loss_tail: upper
-  iclr_candidate_scoring: true
+  www_candidate_scoring: true
   signal_storage: compact
   training_health_check: true
   fedmia_signal_health_check: true

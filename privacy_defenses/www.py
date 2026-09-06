@@ -1,4 +1,4 @@
-"""Model reconstruction and loss-difference ranking for the ICLR defense."""
+"""Model reconstruction and loss-difference ranking for the WWW defense."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ TrainingBatch = tuple[torch.Tensor, torch.Tensor]
 
 
 @dataclass(frozen=True)
-class ICLRRanking:
+class WWWRanking:
     """Per-sample scores for one client's actual local-update batch stream."""
 
     own_losses: torch.Tensor
@@ -38,10 +38,10 @@ def encode_training_batches(
     model's frozen image-encoding path.
     """
     if not batches:
-        raise ValueError("ICLR feature statistics require at least one batch.")
+        raise ValueError("WWW feature statistics require at least one batch.")
     encoder = getattr(model, "encode_images", None)
     if not callable(encoder):
-        raise TypeError("ICLR feature statistics require model.encode_images().")
+        raise TypeError("WWW feature statistics require model.encode_images().")
 
     was_training = model.training
     feature_parts = []
@@ -52,11 +52,11 @@ def encode_training_batches(
                 features = encoder(images.to(device))
                 if not isinstance(features, torch.Tensor) or features.ndim != 2:
                     raise ValueError(
-                        "ICLR encoded features must have shape [samples, dimension]."
+                        "WWW encoded features must have shape [samples, dimension]."
                     )
                 if features.shape[0] != labels.numel():
                     raise ValueError(
-                        "ICLR encoded features must align one-to-one with labels."
+                        "WWW encoded features must align one-to-one with labels."
                     )
                 feature_parts.append(features.detach().to(device="cpu"))
     finally:
@@ -77,12 +77,12 @@ def infer_other_clients_state(
     """
     weight = float(own_weight)
     if not 0.0 < weight < 1.0:
-        raise ValueError("ICLR reconstruction requires own_weight in (0, 1).")
+        raise ValueError("WWW reconstruction requires own_weight in (0, 1).")
     if set(global_state) != set(own_state):
         missing_from_own = sorted(set(global_state) - set(own_state))
         missing_from_global = sorted(set(own_state) - set(global_state))
         raise ValueError(
-            "ICLR model states must contain identical parameter names; "
+            "WWW model states must contain identical parameter names; "
             f"missing_from_own={missing_from_own}, "
             f"missing_from_global={missing_from_global}."
         )
@@ -93,12 +93,12 @@ def infer_other_clients_state(
         own_tensor = own_state[name]
         if global_tensor.shape != own_tensor.shape:
             raise ValueError(
-                f"ICLR parameter {name!r} has incompatible shapes "
+                f"WWW parameter {name!r} has incompatible shapes "
                 f"{tuple(global_tensor.shape)} and {tuple(own_tensor.shape)}."
             )
         if not (global_tensor.is_floating_point() or global_tensor.is_complex()):
             raise TypeError(
-                f"ICLR parameter {name!r} must use a floating or complex dtype."
+                f"WWW parameter {name!r} must use a floating or complex dtype."
             )
         own_tensor = own_tensor.to(
             device=global_tensor.device,
@@ -118,8 +118,8 @@ def rank_loss_differences(
     restore_state: ModelState,
     device: torch.device,
     sample_indices: torch.Tensor | None = None,
-) -> ICLRRanking:
-    """Compute ``L(x; other) - L(x; own)`` and rank it descending.
+) -> WWWRanking:
+    """Compute ``L(x; other) - L(x; own)`` and rank it ascending.
 
     ``batches`` is the exact batch stream already chosen for the upcoming local
     update.  Positions therefore refer to the concatenation of that stream,
@@ -127,11 +127,24 @@ def rank_loss_differences(
     local epochs.
     """
     if not batches:
-        raise ValueError("ICLR ranking requires at least one training batch.")
+        raise ValueError("WWW ranking requires at least one training batch.")
 
     reference_names = set(restore_state)
     if set(own_state) != reference_names or set(other_state) != reference_names:
-        raise ValueError("ICLR own, other, and restore states must have equal keys.")
+        raise ValueError("WWW own, other, and restore states must have equal keys.")
+
+    labels = torch.cat([labels.detach().cpu().long() for _, labels in batches])
+    if sample_indices is None:
+        sample_indices = torch.arange(labels.numel(), dtype=torch.long)
+    else:
+        sample_indices = sample_indices.detach().cpu().long().flatten()
+    if sample_indices.numel() != labels.numel():
+        raise ValueError("WWW sample_indices must align one-to-one with the batch stream.")
+    if labels.numel() == 0:
+        # Poisson empty draws still execute a noise-only private optimizer step.
+        empty = torch.empty(0)
+        return WWWRanking(empty, empty.clone(), empty.clone(),
+                          torch.empty(0, dtype=torch.long), labels, sample_indices)
 
     was_training = model.training
 
@@ -141,6 +154,8 @@ def rank_loss_differences(
         losses = []
         with torch.no_grad():
             for images, labels in batches:
+                if not labels.numel():
+                    continue
                 images = images.to(device)
                 labels = labels.to(device).long()
                 losses.append(
@@ -158,17 +173,10 @@ def rank_loss_differences(
         model.train(was_training)
 
     scores = other_losses - own_losses
-    ranked_positions = torch.argsort(scores, descending=True, stable=True)
-    labels = torch.cat([labels.detach().cpu().long() for _, labels in batches])
-    if sample_indices is None:
-        sample_indices = torch.arange(labels.numel(), dtype=torch.long)
-    else:
-        sample_indices = sample_indices.detach().cpu().long().flatten()
-    if sample_indices.numel() != labels.numel():
-        raise ValueError(
-            "ICLR sample_indices must align one-to-one with the batch stream."
-        )
-    return ICLRRanking(
+    if not torch.isfinite(scores).all():
+        raise ValueError("WWW loss differences must be finite.")
+    ranked_positions = torch.argsort(scores, descending=False, stable=True)
+    return WWWRanking(
         own_losses=own_losses,
         other_losses=other_losses,
         scores=scores,

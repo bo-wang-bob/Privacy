@@ -16,6 +16,7 @@ from aggregator.aggregator_builder import build_aggregator
 from privacy_attacks.auditor import POOLED_CLIENT_ATTACKS, SUPPORTED_ATTACKS
 from privacy_defenses import FEDMIA_BASELINE_DEFENSES, SUPPORTED_DEFENSES
 from privacy_defenses.cofedmid import validate_cofedmid
+from privacy_defenses.www_dp import validate_www
 from servers.serverbase import ServerBase
 from utils.data_loader import (
     generate_dirichlet_split,
@@ -420,7 +421,7 @@ def validate_config(config: dict) -> None:
             "match_candidate_labels": False,
             "fedmia_loss_aggregation": "mean",
             "fedmia_loss_tail": "upper",
-            "iclr_candidate_scoring": True,
+            "www_candidate_scoring": True,
         }
         mismatches = {
             key: (audit.get(key), value)
@@ -563,27 +564,27 @@ def validate_config(config: dict) -> None:
             "audit.candidate_sampling=fedmia_mix requires "
             "match_candidate_labels=false to reproduce the reference protocol."
         )
-    iclr_candidate_scoring = bool(audit.get("iclr_candidate_scoring", False))
-    if iclr_candidate_scoring:
+    www_candidate_scoring = bool(audit.get("www_candidate_scoring", False))
+    if www_candidate_scoring:
         if model_type != "resnet18" or not bool(
             config.get("resnet18", {}).get("paper_protocol", False)
         ):
             raise ValueError(
-                "audit.iclr_candidate_scoring currently requires the ResNet18/"
+                "audit.www_candidate_scoring currently requires the ResNet18/"
                 "CIFAR100 FedMIA paper protocol."
             )
         if method != "fedavg":
             raise ValueError(
-                "audit.iclr_candidate_scoring requires linear FedAvg aggregation."
+                "audit.www_candidate_scoring requires linear FedAvg aggregation."
             )
         if attacks != {"fedmia_loss"} or candidate_sampling != "fedmia_mix":
             raise ValueError(
-                "audit.iclr_candidate_scoring must use the fixed fedmia_mix "
+                "audit.www_candidate_scoring must use the fixed fedmia_mix "
                 "candidate view with only fedmia_loss enabled."
             )
         if pooled_audit:
             raise ValueError(
-                "audit.iclr_candidate_scoring currently requires one target client."
+                "audit.www_candidate_scoring currently requires one target client."
             )
     if model_type == "clip_lora" and candidate_sampling == "low_fpr_full":
         raise ValueError(
@@ -847,12 +848,15 @@ def validate_config(config: dict) -> None:
         max_candidates = int(projres.get("max_candidates", 32))
         min_nonmembers = int(projres.get("min_nonmembers", 1000))
         max_nonmembers = int(projres.get("max_nonmembers", 20000))
+        poisson_projres = unified_projres and str(
+            config.get("defense", {}).get("name", "none")
+        ).lower() == "www"
         minimum_required_nonmembers = (
             int(config["batch_size"]) * int(configured_exact_batch_ratio)
             if unified_projres
             else 1000
         )
-        if (
+        if not poisson_projres and (
             max_candidates <= 0
             or min_nonmembers < minimum_required_nonmembers
         ):
@@ -867,14 +871,19 @@ def validate_config(config: dict) -> None:
                 "ProjRes max_nonmembers must be 0 or at least min_nonmembers."
             )
         if unified_projres:
+            if poisson_projres and any((max_candidates, min_nonmembers, max_nonmembers)):
+                raise ValueError(
+                    "WWW Poisson batches require dynamic unified ProjRes "
+                    "candidate bounds (all three bounds must be zero)."
+                )
             expected_nonmembers = int(config["batch_size"]) * int(
                 configured_exact_batch_ratio
             )
-            if max_candidates != int(config["batch_size"]):
+            if not poisson_projres and max_candidates != int(config["batch_size"]):
                 raise ValueError(
                     "Unified ProjRes must audit the complete real training batch."
                 )
-            if (
+            if not poisson_projres and (
                 min_nonmembers != expected_nonmembers
                 or max_nonmembers != expected_nonmembers
             ):
@@ -924,11 +933,12 @@ def validate_config(config: dict) -> None:
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
     validate_cofedmid(defense, int(config["total_users"]), int(config["sample_users"]))
+    validate_www(defense)
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
-    if iclr_candidate_scoring and defense_name != "none":
+    if www_candidate_scoring and defense_name != "none":
         raise ValueError(
-            "Candidate-level ICLR scoring is observational; use defense.name=none "
+            "Candidate-level WWW scoring is observational; use defense.name=none "
             "so the FedMIA paper training protocol is not modified."
         )
     if model_type in {
@@ -937,34 +947,34 @@ def validate_config(config: dict) -> None:
         "clip_lora",
     } and defense_name not in {
         "none",
-        "iclr",
+        "www",
         "cofedmid",
     }:
         raise ValueError(
             f"{model_type} attack experiments currently require defense.name "
-            "to be none, iclr, or cofedmid."
+            "to be none, www, or cofedmid."
         )
-    if defense_name == "iclr":
+    if defense_name == "www":
         if model_type not in {"clip_mlp", "clip_adapter", "clip_lora"}:
             raise ValueError(
-                "ICLR requires CLIP-MLP, CLIP-Adapter, or CLIP-LoRA."
+                "WWW requires CLIP-MLP, CLIP-Adapter, or CLIP-LoRA."
             )
         if method not in {"fedavg", "fedsgd"}:
-            raise ValueError("ICLR requires linear FedAvg or FedSGD aggregation.")
+            raise ValueError("WWW requires linear FedAvg or FedSGD aggregation.")
         if config["sample_users"] < 2:
-            raise ValueError("ICLR requires at least two selected clients per round.")
+            raise ValueError("WWW requires at least two selected clients per round.")
         model_config = dict(config.get(model_type, {}))
         if model_type != "clip_lora" and not bool(
             model_config.get("precompute_features", True)
         ):
             raise ValueError(
-                "ICLR currently requires precomputed CLIP features so the exact "
+                "WWW currently requires precomputed CLIP features so the exact "
                 "local-update batch stream can be ranked without retaining raw images."
             )
-        top_fraction = float(defense.get("iclr_validation_top_fraction", 0.2))
+        top_fraction = float(defense.get("www_validation_top_fraction", 0.2))
         if not 0.0 < top_fraction <= 0.5:
             raise ValueError(
-                "defense.iclr_validation_top_fraction must be in (0, 0.5]."
+                "defense.www_validation_top_fraction must be in (0, 0.5]."
             )
     if (
         defense_name in FEDMIA_BASELINE_DEFENSES
@@ -1446,7 +1456,7 @@ def default_config() -> dict:
             "max_samples_per_group": 32,
             "calibration_fraction": 0.5,
             "candidate_sampling": "legacy",
-            "iclr_candidate_scoring": False,
+            "www_candidate_scoring": False,
             "nonmember_to_member_ratio": 1.0,
             "match_candidate_labels": False,
             "low_fpr_min_nonmembers": 1000,
@@ -1536,7 +1546,7 @@ def default_config() -> dict:
             "hamp_true_probability": 0.6,
             "hamp_entropy_weight": 0.05,
             "hamp_output_temperature": 4.0,
-            "iclr_validation_top_fraction": 0.2,
+            "www_validation_top_fraction": 0.2,
         },
     }
 

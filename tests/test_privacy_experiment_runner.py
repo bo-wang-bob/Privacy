@@ -33,7 +33,7 @@ def test_matrix_bundles_attacks_and_expands_defenses_seeds_and_targets(tmp_path)
         "--attacks",
         "blackbox_loss,projres",
         "--defenses",
-        "none,iclr",
+        "none,www",
         "--seeds",
         "7,8",
         "--target-clients",
@@ -47,7 +47,7 @@ def test_matrix_bundles_attacks_and_expands_defenses_seeds_and_targets(tmp_path)
     assert skipped == []
     assert len(tasks) == 2 * 1 * 2 * 2 * 2
     assert {task.attacks for task in tasks} == {("blackbox_loss", "projres")}
-    assert {task.defense for task in tasks} == {"none", "iclr"}
+    assert {task.defense for task in tasks} == {"none", "www"}
     assert {task.config["projres"]["enabled"] for task in tasks} == {True}
     assert list(tmp_path.iterdir()) == [], "task expansion must not write results"
 
@@ -115,7 +115,7 @@ def test_catalog_defenses_deep_merge_to_valid_configs(tmp_path):
         ("resnet18", "cifar100", "record_dp", "vision"),
         ("bert_adapter", "sst5", "record_dp", "text"),
         ("bert_adapter", "sst5", "local_client_dp", "text"),
-        ("bert_lora", "cola", "iclr", "text"),
+        ("bert_lora", "cola", "www", "text"),
     )
     for model, dataset, defense, runner in cases:
         attacks = CATALOG["models"][model]["supported_attacks"]
@@ -165,7 +165,7 @@ def test_run_ids_are_first_level_task_directories(tmp_path):
             "--attacks",
             "loss_series",
             "--defenses",
-            "none,iclr",
+            "none,www",
             "--results-root",
             str(tmp_path),
         ),

@@ -33,17 +33,17 @@ ResNet18/CIFAR100 论文复现配置使用 `fedmia_loss`、`mean` 和 `upper`：
 完整 5000 个训练成员，对 1000 个独立测试样本和其余 9 个客户端各 1000 个训练
 样本组成的 10000 个目标客户端非成员。
 
-该 ResNet18 复现入口还在完全相同的固定候选和审计轮上计算逐样本 ICLR 观测分数：
+该 ResNet18 复现入口还在完全相同的固定候选和审计轮上计算逐样本 WWW 观测分数：
 
 \[
-s_{\mathrm{ICLR}}(x)=L(x;\theta_{-k})-L(x;\theta_k).
+s_{\mathrm{WWW}}(x)=L(x;\theta_{-k})-L(x;\theta_k).
 \]
 
 其中 `theta_k` 是目标客户端本轮完成一个 local epoch 后上传的模型，`theta_-k`
 通过 `theta_global = w_k theta_k + (1-w_k) theta_-k` 使用服务器实际聚合权重反解。
 评分不参与客户端训练、候选过滤或聚合，因此 `defense.name` 仍为 `none`，论文的
 FedAvg 优化过程保持不变。每轮 15000 个原始评分和按样本跨轮聚合的评分分别写入
-`iclr_candidate_round_scores.csv` 与 `iclr_candidate_scores.csv`；后者使用稳定的
+`www_candidate_round_scores.csv` 与 `www_candidate_scores.csv`；后者使用稳定的
 `sample_index` 与最终 FedMIA-Loss 分数一一连接。由于非成员同时包含独立测试样本
 和其他客户端训练样本，结果还按候选来源报告均值及其与 FedMIA-Loss 的相关性。
 
@@ -146,7 +146,7 @@ evaluation 非成员。
 
 ## 9. YOQO
 
-论文：[ICLR 2024](https://proceedings.iclr.cc/paper_files/paper/2024/hash/b3edfc1950c30c42e2ecf6637ab7fb09-Abstract-Conference.html)，[官方代码](https://github.com/WU-YU-TONG/YOQO)。
+论文：[ICLR 2024](https://proceedings.www.cc/paper_files/paper/2024/hash/b3edfc1950c30c42e2ecf6637ab7fb09-Abstract-Conference.html)，[官方代码](https://github.com/WU-YU-TONG/YOQO)。
 
 `privacy_attacks/query_attacks.py` 的 offline 适配使用非目标客户端 prompts 作为 OUT shadow models，为每个 OUT prompt 分别选择最高概率错误类，并按论文式 (5) 优化错误类交叉熵与 MSE 距离。实现采用官方代码的归一化 loss threshold 早停；由于输入是 CLIP 归一化张量，步长缩放为 `0.001`。对目标 prompt 只执行一次查询，并仅保留 argmax hard label；预测仍保持真实类别时判为更可能是成员。
 

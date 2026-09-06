@@ -13,6 +13,8 @@ tests/*
 !tests/test_privacy_experiment_runner.py
 !tests/test_gpt2_adapter_schedule.py
 !tests/test_cofedmid.py
+!tests/test_www_dp.py
+!tests/test_www_feature_statistics.py
 paper/
 
 # Local model weights and experiment artifacts

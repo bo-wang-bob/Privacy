@@ -25,6 +25,15 @@
 - 三种微调方式的服务器端聚合都使用 `aggregation_weighting: uniform`，即对本轮参与客户端上传的梯度直接等权平均，不按客户端本地样本数或实际 batch 大小加权。三者任务目录方法名均为 `fedsgd`。
 - 正常任务指标默认按 `eval_interval: 5` 在已完成的第 5、10、15、…轮评估；若总轮数不能被 5 整除，最后一轮仍会额外评估。`training_metrics.csv` 使用相同的一基轮次编号。
 
+## 当前 WWW 防御（原 ICLR）
+
+- 原观测型 `iclr` 已更名并更新为实际参与训练的 `www`；配置和新产物使用 `www_*`，历史 `results/` 与 `iclr_*` 产物不改写。
+- 支持三个 CLIP 模型及 BERT Adapter/LoRA。每个真实训练 batch 按上一轮防御后模型的 `M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 升序排序，按固定期望 batch 大小 b 预设尾部宽度 `ceil(0.2 * b)`，实际 batch 有 n 条样本时，尾部包含最后 `min(n, ceil(0.2*b))` 条；短于尾部的 batch 使用重要性函数的最右侧区间。首轮或缺少上一轮参考状态时统一裁剪并加噪。
+- 所有样本联合 L2 裁剪到默认 `defense.max_grad_norm=8`，再乘 INO-SGD 的 Beta 尾部函数积分权重；默认 Beta(1,1)。先裁剪再缩放，不能替换成直接裁剪到缩放后的阈值。
+- 默认全程预算 `defense.target_epsilon=3`、`delta=1e-5`。与普通 `record_dp` 共用 Poisson 采样，按 `add_remove`、敏感度 C 和 Poisson sampled-Gaussian RDP 校准全程噪声；梯度和加噪后除以固定期望 batch 大小。空 batch 不重抽，仍上传纯噪声并计入预算。防御每轮运行，诊断间隔不影响训练保护。
+- 默认不导出未私有化分数诊断；固定噪声或 `release_private_diagnostics=true` 将使 `formal_dp_enabled=false`。受保护发布范围为防御后的上传与模型，审计私有信号与标签属于本地研究资料。
+- WWW 下 ProjRes 按真实 Poisson batch 动态构造候选，三个候选规模参数均为 0；取消无噪声 batch 秩上限，`paper_fedsgd_exact=false`。空 batch 跳过真实 Batch 攻击并记录原因，固定候选攻击继续执行。入口与完整公式见 `docs/defenses.md`。
+
 ## 当前 CoFedMID 防御
 
 - `--defenses cofedmid` 已支持三个 CLIP 模型、BERT Adapter/LoRA 和 GPT2 Adapter。默认 `cofedmid_clients: all`，所有客户端协作，且每轮要求全员参与；显式列表可设置至少两个联盟成员。

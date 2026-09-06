@@ -34,11 +34,11 @@ from privacy_attacks.transfer import run_transfer_representation_attack
 from privacy_attacks.update_attacks import run_update_attack
 from privacy_attacks.whitebox import run_active_whitebox, run_passive_whitebox
 from privacy_defenses import attach_hamp_output_transform
-from privacy_defenses.iclr import infer_other_clients_state
-from privacy_defenses.iclr_validation import (
+from privacy_defenses.www import infer_other_clients_state
+from privacy_defenses.www_validation import (
     _pearson,
     _spearman,
-    validate_iclr_attack_relationships,
+    validate_www_attack_relationships,
 )
 from utils.data_loader import group_idx_by_class
 
@@ -316,6 +316,7 @@ class MembershipAuditor:
         )
         self.requested_audit_client_ids = list(self.audit_client_ids)
         self.skipped_audit_clients: dict[str, str] = {}
+        self.exact_batch_skipped_rounds: list[dict] = []
         self.audit_interval = int(self.config.get("audit_interval", 1))
         configured_attack_intervals = self.config.get(
             "attack_audit_intervals", {}
@@ -564,29 +565,29 @@ class MembershipAuditor:
         self.candidate_local_indices: torch.Tensor | None = None
         self.paper_balanced_candidate_indices: torch.Tensor | None = None
         self.paper_balanced_evaluation: dict | None = None
-        self.iclr_candidate_scoring = bool(
-            self.config.get("iclr_candidate_scoring", False)
+        self.www_candidate_scoring = bool(
+            self.config.get("www_candidate_scoring", False)
         )
         self.candidate_source_names: list[str] | None = None
-        if self.iclr_candidate_scoring:
+        if self.www_candidate_scoring:
             if self.federated_method != "fedavg":
                 raise ValueError(
-                    "ICLR candidate scoring requires linear FedAvg aggregation."
+                    "WWW candidate scoring requires linear FedAvg aggregation."
                 )
             if self.candidate_sampling_mode != "fedmia_mix" or set(
                 self.attacks
             ) != {"fedmia_loss"}:
                 raise ValueError(
-                    "ICLR candidate scoring requires the fixed fedmia_mix view "
+                    "WWW candidate scoring requires the fixed fedmia_mix view "
                     "with FedMIA-Loss."
                 )
             if self.pooled_client_audit:
                 raise ValueError(
-                    "ICLR candidate scoring currently supports one target client."
+                    "WWW candidate scoring currently supports one target client."
                 )
             if self.defense_name != "none":
                 raise ValueError(
-                    "ICLR candidate scoring is observational and requires "
+                    "WWW candidate scoring is observational and requires "
                     "defense.name=none."
                 )
 
@@ -2413,7 +2414,7 @@ class MembershipAuditor:
             )
             update_source = "base_minus_client_post_state"
         cofedmid = self._cofedmid_metadata()
-        parameter_perturbed = False
+        parameter_perturbed = getattr(self, "defense_name", "none") == "www"
         if cofedmid and cofedmid["upload_perturbed"]:
             # The unperturbed batch-rank bound need not hold after upload noise.
             # Reconstruct the public mask from the shared trainable parameter order.
@@ -2450,6 +2451,7 @@ class MembershipAuditor:
         )
         paper_fedsgd_exact = (
             getattr(self, "federated_method", "fedsgd") == "fedsgd"
+            and getattr(self, "defense_name", "none") != "www"
         )
         if cofedmid and (cofedmid["upload_perturbed"] or cofedmid["custom_training_loss"]):
             paper_fedsgd_exact = False
@@ -3372,7 +3374,7 @@ class MembershipAuditor:
             raise ValueError(f"No released prompt is available for client {user_id}.")
         return released
 
-    def _attach_iclr_candidate_scores(
+    def _attach_www_candidate_scores(
         self,
         observation: dict,
         *,
@@ -3384,7 +3386,7 @@ class MembershipAuditor:
         aggregation_weights: dict[int, float] | None,
         learning_rate: float | None,
     ) -> None:
-        """Attach sample-aligned observational ICLR scores to one audit round.
+        """Attach sample-aligned observational WWW scores to one audit round.
 
         For every fixed FedMIA candidate this computes
         ``L(x; theta_-k) - L(x; theta_k)``. ``theta_k`` is the target client's
@@ -3393,28 +3395,28 @@ class MembershipAuditor:
         aggregation contribution. No sample is filtered and training is not
         changed.
         """
-        if not self.iclr_candidate_scoring:
+        if not self.www_candidate_scoring:
             return
         client_ids = observation["client_ids"].tolist()
         if self.target_client_id not in client_ids:
             raise ValueError(
-                "ICLR candidate scoring requires the target client in the "
+                "WWW candidate scoring requires the target client in the "
                 "observed FedAvg round."
             )
         if "confidence" not in observation:
             raise ValueError(
-                "ICLR candidate scoring requires per-client candidate losses."
+                "WWW candidate scoring requires per-client candidate losses."
             )
         if not released_states or 0 not in released_states:
             raise ValueError(
-                "ICLR candidate scoring requires the released aggregated state."
+                "WWW candidate scoring requires the released aggregated state."
             )
         if (
             not aggregation_weights
             or self.target_client_id not in aggregation_weights
         ):
             raise ValueError(
-                "ICLR candidate scoring requires the target aggregation weight."
+                "WWW candidate scoring requires the target aggregation weight."
             )
 
         target_position = client_ids.index(self.target_client_id)
@@ -3450,11 +3452,11 @@ class MembershipAuditor:
         )
         scores = other_losses - own_losses
         if scores.numel() != self.labels.numel():
-            raise AssertionError("ICLR candidate scores lost sample alignment.")
-        observation["iclr_candidate_own_loss"] = own_losses.detach().cpu()
-        observation["iclr_candidate_other_loss"] = other_losses.detach().cpu()
-        observation["iclr_candidate_score"] = scores.detach().cpu()
-        observation["iclr_candidate_aggregation_weight"] = own_weight
+            raise AssertionError("WWW candidate scores lost sample alignment.")
+        observation["www_candidate_own_loss"] = own_losses.detach().cpu()
+        observation["www_candidate_other_loss"] = other_losses.detach().cpu()
+        observation["www_candidate_score"] = scores.detach().cpu()
+        observation["www_candidate_aggregation_weight"] = own_weight
 
     def _observe_exact_batch_round(
         self,
@@ -3479,6 +3481,18 @@ class MembershipAuditor:
                 "Exact-batch membership cannot audit a round where the target "
                 "client did not upload."
             )
+        retained_batch = self.users[target_id].last_train_batch
+        if (self.defense_name in {"www", "record_dp"}
+                and retained_batch is not None and retained_batch[1].numel() == 0):
+            # The noise-only upload is a valid accounted step, but has no true
+            # batch members on which to define these six membership attacks.
+            self.exact_batch_skipped_rounds.append({
+                "communication_round": int(round_index) + 1,
+                "client_id": int(target_id),
+                "attacks": sorted(attacks),
+                "reason": "empty_poisson_batch",
+            })
+            return None
         candidates = self._build_exact_batch_candidates(round_index)
         inputs = candidates["inputs"]
         labels = candidates["labels"]
@@ -4090,7 +4104,7 @@ class MembershipAuditor:
                 if protocol_messages is not None and user_id in protocol_messages
             }
             observation["audit_view"] = self.audit_view
-        self._attach_iclr_candidate_scores(
+        self._attach_www_candidate_scores(
             observation,
             base_state=base_state,
             updated_states=updated_states,
@@ -4929,24 +4943,24 @@ class MembershipAuditor:
         logger.info("Saved %d periodic attack metric rows to %s", len(rows), path)
         return len(rows)
 
-    def _write_iclr_candidate_artifacts(self) -> dict | None:
-        """Persist sample-aligned ICLR scores for the fixed FedMIA candidates.
+    def _write_www_candidate_artifacts(self) -> dict | None:
+        """Persist sample-aligned WWW scores for the fixed FedMIA candidates.
 
         The raw artifact keeps one score per candidate and audit round.  The
         compact artifact aggregates those scores by sample and joins the final
         FedMIA-Loss score, so downstream analysis never has to infer candidate
         alignment from row order.
         """
-        if not self.iclr_candidate_scoring:
+        if not self.www_candidate_scoring:
             return None
         observations = [
             observation
             for observation in self.observations
-            if "iclr_candidate_score" in observation
+            if "www_candidate_score" in observation
         ]
         if not observations:
             raise ValueError(
-                "ICLR candidate scoring was enabled but no scored audit round "
+                "WWW candidate scoring was enabled but no scored audit round "
                 "was collected."
             )
 
@@ -4960,19 +4974,19 @@ class MembershipAuditor:
             ]
             if any(part.numel() != candidate_count for part in parts):
                 raise ValueError(
-                    f"ICLR field {name!r} is not aligned with all candidates."
+                    f"WWW field {name!r} is not aligned with all candidates."
                 )
             return torch.stack(parts)
 
-        scores = stacked_field("iclr_candidate_score")
-        own_losses = stacked_field("iclr_candidate_own_loss")
-        other_losses = stacked_field("iclr_candidate_other_loss")
+        scores = stacked_field("www_candidate_score")
+        own_losses = stacked_field("www_candidate_own_loss")
+        other_losses = stacked_field("www_candidate_other_loss")
         weights = [
-            float(observation["iclr_candidate_aggregation_weight"])
+            float(observation["www_candidate_aggregation_weight"])
             for observation in observations
         ]
         if not torch.isfinite(scores).all():
-            raise ValueError("ICLR candidate scores contain non-finite values.")
+            raise ValueError("WWW candidate scores contain non-finite values.")
 
         membership = self.membership.detach().cpu().long().flatten()
         class_labels = self.labels.detach().cpu().long().flatten()
@@ -4980,7 +4994,7 @@ class MembershipAuditor:
         if sources is None:
             sources = ["unknown"] * candidate_count
         if len(sources) != candidate_count:
-            raise ValueError("ICLR candidate-source metadata is not sample-aligned.")
+            raise ValueError("WWW candidate-source metadata is not sample-aligned.")
 
         fedmia_result = next(
             (result for result in self.results if result.name == "fedmia_loss"),
@@ -4988,7 +5002,7 @@ class MembershipAuditor:
         )
         if fedmia_result is None:
             raise ValueError(
-                "ICLR candidate scoring requires a completed FedMIA-Loss result."
+                "WWW candidate scoring requires a completed FedMIA-Loss result."
             )
         fedmia_scores = torch.full(
             (candidate_count,), float("nan"), dtype=torch.float64
@@ -4999,11 +5013,11 @@ class MembershipAuditor:
         )
         if not torch.isfinite(fedmia_scores).all():
             raise ValueError(
-                "FedMIA-Loss did not return one finite score for every ICLR candidate."
+                "FedMIA-Loss did not return one finite score for every WWW candidate."
             )
 
         round_path = os.path.join(
-            self.results_dir, "iclr_candidate_round_scores.csv"
+            self.results_dir, "www_candidate_round_scores.csv"
         )
         with open(round_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
@@ -5016,7 +5030,7 @@ class MembershipAuditor:
                     "class_label",
                     "own_loss",
                     "other_loss",
-                    "iclr_score",
+                    "www_score",
                     "target_aggregation_weight",
                 )
             )
@@ -5051,7 +5065,7 @@ class MembershipAuditor:
         own_loss_mean = own_losses.mean(dim=0)
         other_loss_mean = other_losses.mean(dim=0)
         sample_path = os.path.join(
-            self.results_dir, "iclr_candidate_scores.csv"
+            self.results_dir, "www_candidate_scores.csv"
         )
         with open(sample_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
@@ -5062,12 +5076,12 @@ class MembershipAuditor:
                     "membership",
                     "class_label",
                     "observation_count",
-                    "iclr_score_mean",
-                    "iclr_score_std",
-                    "iclr_score_min",
-                    "iclr_score_max",
-                    "iclr_score_last",
-                    "iclr_score_last_round",
+                    "www_score_mean",
+                    "www_score_std",
+                    "www_score_min",
+                    "www_score_max",
+                    "www_score_last",
+                    "www_score_last_round",
                     "own_loss_mean",
                     "other_loss_mean",
                     "fedmia_loss_score",
@@ -5093,8 +5107,8 @@ class MembershipAuditor:
                     )
                 )
 
-        iclr_result = AttackResult(
-            name="iclr_candidate_score",
+        www_result = AttackResult(
+            name="www_candidate_score",
             scores=score_mean.to(torch.float32),
             labels=membership,
             sample_indices=torch.arange(candidate_count, dtype=torch.long),
@@ -5105,7 +5119,7 @@ class MembershipAuditor:
                 "target_client_id": int(self.target_client_id),
             },
         )
-        iclr_metrics = iclr_result.to_summary()
+        www_metrics = www_result.to_summary()
 
         def relationship(mask: torch.Tensor) -> dict:
             count = int(mask.sum())
@@ -5113,7 +5127,7 @@ class MembershipAuditor:
                 "samples": count,
                 "pearson": _pearson(score_mean[mask], fedmia_scores[mask]),
                 "spearman": _spearman(score_mean[mask], fedmia_scores[mask]),
-                "mean_iclr_score": (
+                "mean_www_score": (
                     float(score_mean[mask].mean()) if count else None
                 ),
                 "mean_fedmia_loss_score": (
@@ -5147,22 +5161,22 @@ class MembershipAuditor:
             "nonmember_count": int((membership == 0).sum()),
             "audit_rounds": rounds,
             "round_aggregation": "mean",
-            "iclr_membership_metrics": iclr_metrics,
+            "www_membership_metrics": www_metrics,
             "relationship_with_fedmia_loss": relationships,
             "artifacts": {
                 "per_round_scores": os.path.basename(round_path),
                 "per_sample_scores": os.path.basename(sample_path),
-                "relationship_summary": "iclr_candidate_relationship.json",
+                "relationship_summary": "www_candidate_relationship.json",
             },
         }
         relationship_path = os.path.join(
-            self.results_dir, "iclr_candidate_relationship.json"
+            self.results_dir, "www_candidate_relationship.json"
         )
         with open(relationship_path, "w", encoding="utf-8") as file:
             json.dump(payload, file, indent=2, allow_nan=False)
             file.write("\n")
         logger.info(
-            "Saved sample-aligned ICLR scores for %d candidates across %d rounds",
+            "Saved sample-aligned WWW scores for %d candidates across %d rounds",
             candidate_count,
             len(rounds),
         )
@@ -5211,6 +5225,10 @@ class MembershipAuditor:
             )
         for attack in self.attacks:
             try:
+                if (attack in self.exact_batch_membership_attacks
+                        and not self._observations_for_attack(attack)
+                        and any(attack in row["attacks"] for row in self.exact_batch_skipped_rounds)):
+                    continue
                 if self.device.type == "cuda":
                     torch.cuda.empty_cache()
                 result = self._run(attack, final_model, final_state)
@@ -5295,18 +5313,18 @@ class MembershipAuditor:
                 summary["paper_balanced_evaluation"] = paper_balanced
             summaries.append(summary)
         periodic_metric_rows = self._write_periodic_attack_metrics()
-        iclr_candidate_summary = None
-        if self.iclr_candidate_scoring:
+        www_candidate_summary = None
+        if self.www_candidate_scoring:
             try:
-                iclr_candidate_summary = self._write_iclr_candidate_artifacts()
+                www_candidate_summary = self._write_www_candidate_artifacts()
             except Exception as error:
-                logger.exception("ICLR candidate scoring finalization failed")
-                self.errors["iclr_candidate_scoring"] = (
+                logger.exception("WWW candidate scoring finalization failed")
+                self.errors["www_candidate_scoring"] = (
                     f"{type(error).__name__}: {error}"
                 )
-                iclr_candidate_summary = {
+                www_candidate_summary = {
                     "status": "error",
-                    "error": self.errors["iclr_candidate_scoring"],
+                    "error": self.errors["www_candidate_scoring"],
                 }
         signal_health_enabled = bool(
             self.config.get("fedmia_signal_health_check", False)
@@ -5364,10 +5382,10 @@ class MembershipAuditor:
                 if key != "candidate_indices"
             }
         )
-        iclr_validation = None
-        if self.defense_name == "iclr":
+        www_validation = None
+        if self.defense_name == "www" and self.defense_config.get("release_private_diagnostics", False):
             try:
-                validation = validate_iclr_attack_relationships(
+                validation = validate_www_attack_relationships(
                     results=[
                         result
                         for result in self.results
@@ -5382,23 +5400,23 @@ class MembershipAuditor:
                     output_dir=self.results_dir,
                     top_fraction=float(
                         self.defense_config.get(
-                            "iclr_validation_top_fraction", 0.2
+                            "www_validation_top_fraction", 0.2
                         )
                     ),
                 )
-                iclr_validation = {
+                www_validation = {
                     key: value
                     for key, value in validation.items()
                     if key != "relationships"
                 }
             except Exception as error:
-                logger.exception("ICLR specificity validation failed")
-                self.errors["iclr_validation"] = (
+                logger.exception("WWW specificity validation failed")
+                self.errors["www_validation"] = (
                     f"{type(error).__name__}: {error}"
                 )
-                iclr_validation = {
+                www_validation = {
                     "status": "error",
-                    "error": self.errors["iclr_validation"],
+                    "error": self.errors["www_validation"],
                 }
         with open(
             os.path.join(self.results_dir, "summary.json"), "w", encoding="utf-8"
@@ -5414,6 +5432,7 @@ class MembershipAuditor:
                         else "single_client"
                     ),
                     "defense": self.defense_name,
+                    "exact_batch_skipped_rounds": self.exact_batch_skipped_rounds,
                     "cofedmid": self._cofedmid_metadata(),
                     "defense_validation_split_sha256": getattr(self.users[0], "defense_validation_split_sha256", None),
                     "federated_method": self.federated_method,
@@ -5604,8 +5623,8 @@ class MembershipAuditor:
                         "per_client": self.candidate_sampling_by_client,
                     },
                     "audit_health": audit_health,
-                    "iclr_candidate_scoring": iclr_candidate_summary,
-                    "iclr_validation": iclr_validation,
+                    "www_candidate_scoring": www_candidate_summary,
+                    "www_validation": www_validation,
                     "record_dp_verification": (
                         None
                         if record_dp_accounting is None

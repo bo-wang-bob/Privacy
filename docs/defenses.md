@@ -16,7 +16,7 @@
 | `sampling` | FedMIA Data Sampling 基线 | 每个本地 batch 无放回抽取固定比例样本参与训练 |
 | `data_aug` | FedMIA Data Aug 基线 | 对已经预处理的 CLIP 张量做翻转、平移和颜色扰动 |
 | `data_aug_sampling` | FedMIA Data Aug + Sampling 基线 | 在同一本地训练分支中先抽样再增强 |
-| `iclr` | ICLR（暂定名，第一阶段） | 从上一轮全局模型、客户端本地上传和真实聚合权重反演其他客户端聚合模型，并按逐样本损失差降序排名 |
+| `www` | WWW（原 ICLR） | Poisson 样本采样、损失差升序及固定尾部积分权重、逐样本裁剪、add/remove 采样 RDP 核算 |
 
 历史通用防御主要针对“冻结 CLIP、只训练共享 CoOp prompt”的场景适配；正式模型的可用范围以 `configs/experiment_catalog.yaml` 为准。CoFedMID 已单独适配当前六个 PEFT 模型的 one-batch FedSGD。SOFT 原论文处理文本，因此本仓库使用保持图像语义的视觉混淆；HAMP 原论文测试阶段使用随机低置信度分数重排，本仓库使用可微温度映射。
 
@@ -24,52 +24,86 @@
 
 参数放在 YAML 的 `defense:` 节点中；命令行 `--defense` 只覆盖方法名。
 
-### ICLR（第一阶段）
+### WWW
 
-当前实现使用服务器实际记录的线性聚合权重。客户端对象自然保留上一轮本地模型；下一轮用新全局模型覆盖它之前，客户端即时读取该模型并计算：
+原 ICLR 已统一更名为 WWW：配置、代码和新产物使用 `www` / `www_*`，旧名称不再作为防御入口。历史 `results/` 及其中的 `iclr_*` 文件不改写；历史观测型 ICLR 不能当作 WWW 的防御结果。
 
-```text
-theta_-k^t = (theta_global^(t+1) - w_k^t * theta_k^t) / (1 - w_k^t)
-```
+WWW 支持 CLIP-MLP、CLIP-Adapter、CLIP-LoRA、BERT Adapter 和 BERT-LoRA，要求线性 FedSGD/FedAvg 且每轮至少两个客户端。统一入口保留各模型既有的 IID、few-shot、学习率、轮数及 one-batch 等权 FedSGD；batch 大小作为 Poisson 采样的期望值。默认每一轮执行防御，与攻击审计和任务评估频次无关。
 
-客户端下一次参与训练时，对该次本地更新实际消费的 batch 流计算：
+**样本排序与尾部。** 在当前全局参数覆盖客户端状态前，用上一轮防御后的上传与实际聚合权重重建参考模型：
 
 ```text
-s_i = L(x_i; theta_-k^t) - L(x_i; theta_k^t)
+theta_-k = (theta_global - w_k * theta_k) / (1 - w_k)
+M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)
 ```
 
-两套参考参数只在当前客户端打分期间临时存在，打分完成后立即释放，不在聚合后为每个客户端保存完整模型副本。`iclr_ranked_positions` 是上述 batch 流拼接后的降序位置，而不是原始数据集的永久索引；`iclr_ranked_scores` 和 `iclr_ranked_labels` 分别保存对应的有序分数与标签。首轮没有历史模型对，因此不打分。若采用部分客户端参与，只有连续两轮均被选中的客户端能够执行这种精确反演。现阶段只生成排名并保存在客户端运行态，同时将汇总统计写入 `defense_summary.json`；不会根据排名筛样本、改变损失或改变原有训练顺序。该实现支持预计算特征的 CLIP-MLP/CLIP-Adapter，也支持直接编码原始图像的 CLIP-LoRA，并要求每轮至少聚合两个客户端。LoRA 使用一个全局共享的冻结 CLIP 主干，但每个客户端模型独立持有自己的 `lora_A/lora_B`；下一轮 ICLR 在全局参数覆盖之前直接读取该客户端模型中的上次上传状态。这些因子不会形成服务器端客户端状态映射，也不会写入结果目录。
+与普通 `record_dp` 共用 Poisson 采样器：每条本地记录独立以固定概率 `q=b/N` 进入当前 batch，其中 `b=min(configured_batch_size,N)` 在训练前确定。每步重新抽取，实际样本数 `n` 可以小于或大于 `b`，也可以为 0；空抽样不会重抽，仍执行一次纯噪声更新并计入预算。样本本地索引随 batch 保留，以便真实 Batch 攻击精确配对。
 
-BERT Adapter 使用 `iclr_analysis_timing: post_round`：在每个配置的分析轮完成聚合后，
-由真实 one-batch 上传梯度构造对应客户端 step state，再与其他客户端梯度形成的聚合
-step state 比较。
-默认 `iclr_analysis_interval: 50`，因此 500 轮任务分析第 50、100、…、500 轮，并将
-逐客户端统计写入 `iclr_round_metrics.csv`，逐样本分数写入 `iclr_round_samples.csv`，
-轮次索引写入 `iclr_series.json`。这个后聚合模式不需要 CLIP 辅助特征统计，
-所以 BERT 配置使用 `iclr_feature_statistics: false`。CLIP 原有的下一轮打分协议不变。
-BERT 的同轮 ProjRes 结果会额外保存成员的 `batch_position` 和 `local_sample_index`，并与
-ICLR 记录做四键严格连接。`privacy_audit/iclr_projres_samples.csv` 保存逐样本配对；
-`iclr_projres_relationship.csv/json` 保存 Pearson/Spearman、类别控制 Spearman、ICLR
-高低分组的 ProjRes 分数，以及双方 Top-K 的重合率和富集倍数。ProjRes 命中率不再复用
-固定残差阈值预测，而是以同轮共享的 160 个非成员连续分数分别在 10% 和 1% FPR 下复算，
-并报告 ICLR 高低分组的命中率差与比值；不再统计 0.1% FPR。
+对真实 batch 按 `M_i` 稳定升序排序。尾部宽度在每个客户端训练前固定为 `m=ceil(0.2*b)` 个长度为 C 的区间，实际落入尾部的样本数为 `min(n,m)`，仍是损失差最大的样本。同分保持原顺序。这里 20% 以**固定期望 batch 大小**计算，不能每次按随机的 `n` 重算尾部宽度，否则不能直接沿用论文的 C 增删敏感度界。比如期望 batch=16 时尾部宽度固定为 4；实际抽到 20 条时仍取最后 4 条，抽到 2 条时使用完整尾部最后两个区间。
 
-为了验证该分数能否衡量样本特异性，ICLR 会为训练 batch 携带相对于客户端训练集的稳定本地索引，并在训练期间为每个样本累计 `mean`、`last`、`max`、标准差和观测次数。审计完成后，这些索引会与 `low_fpr_full` 候选池中的成员索引严格连接，并针对每种攻击分别计算：
+首轮没有历史参考模型，统一以 C 裁剪并加噪；部分参与时，缺少紧邻上一轮上传的客户端也使用这一回退规则。
 
-- Pearson 和 Spearman 相关性；
-- 类别内秩中心化 Spearman 及逐类别宏平均 Spearman，用于控制类别分布泄漏；
-- ICLR 最高/最低分位组的平均攻击分数差；
-- ICLR Top-K 与攻击 Top-K 的重合率和相对随机期望的富集倍数；
-- 在 `FPR=0.1/0.01/0.001` 下，全部成员、ICLR 高分组和低分组被攻击命中的比例及其差值。
+**INO-SGD 自适应裁剪。** 使用 [Tian 等，INO-SGD](https://arxiv.org/abs/2605.07930) 的 Algorithm 1、Definition 3.2 和 Appendix C.2.3。WWW 将论文默认的 loss 降序替换为上述 `M_i` 升序；其它排序的适用性见 Appendix C.2.2。设所有样本初始阈值为 `C`，累计阈值 `c_j=jC`，固定尾部长度 `gamma=ceil(0.2b)C`，其中 b 是期望 batch 大小，n 是实际抽样大小。尾部重要性函数为翻转的 Beta CDF：
 
-`defense.iclr_validation_top_fraction` 控制高分组和低分组比例，默认 `0.2`。验证只比较能够严格对齐且至少获得一次 ICLR 观测的成员样本；它衡量的是 ICLR 分数与“成员样本被攻击识别的难易程度”之间的关联，不能单独证明因果关系或防御有效性。`candidate_sampling: low_fpr_full` 和 `balanced_global_holdout` 都会保存目标客户端成员的稳定本地索引，可用于该验证；缺少本地索引的采样方式会在验证 JSON 中标记为不可用。
+```text
+f_tail(u) = I_(1-u/gamma)(alpha, beta)
+f_B(c) = 1                           if c <= nC - gamma
+         f_tail(c - (nC - gamma))    otherwise
+rho_j = integral[f_B(c), c_(j-1), c_j] / C
+g_bar_i = g_i / max(1, ||g_i||_2 / C)
+g_private = (sum_i rho_i * g_bar_i + Normal(0, sigma_sum^2 I)) / b
+```
 
-验证产物位于任务的 `privacy_audit/`：
+梯度范数联合覆盖所有可训练参数，冻结主干不参与。采用“先裁剪到 C，再乘 rho”的论文算法，故 `rho_i*C` 是最终贡献范数上界；并非直接把原始梯度裁剪到 `rho_i*C`，两者对小梯度的处理不同。默认 `alpha=beta=1`，尾部函数为线性下降。当实际 batch 小于尾部宽度时，依照 Appendix C.2.3 使用尾部函数最右侧的区间。比如 `b=10` 且实际 batch 至少含两条样本时，最后两个样本的权重为 `0.75、0.25`，其余为 `1`；`C=8` 时相应上界为 `6、2`。
 
-- `iclr_attack_samples.csv`：攻击、候选索引、客户端本地索引、类别、攻击分数及 ICLR 聚合分数；
-- `iclr_attack_relationship.csv`：每个攻击、客户端和 ICLR 聚合方式的关联指标；
-- `iclr_attack_relationship.json`：方法定义、覆盖范围和完整指标；
-- `summary.json` 中的 `iclr_validation`：状态、覆盖规模和产物入口。
+**全程隐私预算。** 默认 `defense.target_epsilon=3` 为整个训练任务预算，`max_grad_norm=8` 为基准阈值，`delta=1e-5`。WWW 与普通 `record_dp` 使用相同的 `add_remove` 邻接、客户端采样率、计划更新步数、Poisson sampled-Gaussian RDP 校准函数和固定期望 batch 归一化：
+
+```text
+Delta_sum = C
+sigma_sum = noise_multiplier * C
+RDP_i(a,T_i) = T_i * poisson_sampled_gaussian_rdp(noise_multiplier, q_i, a)
+epsilon_i = min_a [RDP_i(a,T_i) + log(1/delta)/(a-1)]
+epsilon_run = max_i epsilon_i
+```
+
+固定长度、右对齐的 INO 尾部使增加或删除一条样本引起的总变化（包括其他样本权重变化）被 C 控制。采样率、期望 batch 大小和尾部宽度是训练前固定的公开机制参数；邻接比较中不随记录的增删重新校准这些参数。不同客户端数据互不相交，各客户端跨步顺序组合，整体取最大值。FedAvg 还计入每轮全部计划 Poisson 更新，空 batch 也计步。
+
+自动噪声校准覆盖完整计划。相同 epsilon、delta、C、客户端规模、期望 batch 和轮数下，WWW 与普通 `record_dp` 的噪声尺度一致。默认各任务独立使用系统随机种子，采样分布相同但实际抽样名单不保证相同；仅封闭调试时可共同设置 `defense.reproducible_noise=true`，此时采样及噪声种子规则也一致，并标记 `formal_dp_enabled=false`。
+
+超过校准步数会在更新前报错；手动指定不足以满足预算的噪声会被拒绝。当前不支持隔离式主动客户端探测及含 BatchNorm 运行统计的模型。早期 WWW 的打乱采样、replace_one 与无放大核算属于旧协议，已有结果不改写，不能直接混入当前实验。
+
+常用参数集中在 `configs/experiment_catalog.yaml`：
+
+| 配置键（`defense.` 下） | 默认值 | 用途 |
+|---|---:|---|
+| `target_epsilon` | `3.0` | 全程隐私预算 |
+| `max_grad_norm` | `8.0` | 初始联合 L2 裁剪阈值 |
+| `delta` | `1e-5` | DP 的 delta |
+| `noise_multiplier` | `auto` | 相对于 `C` 的噪声倍数 |
+| `www_tail_fraction` | `0.2` | 固定期望 batch 的尾部宽度比例，向上取整 |
+| `www_beta_alpha`, `www_beta_beta` | `1.0`, `1.0` | 尾部函数形状 |
+| `reproducible_dp_noise` | `false` | 仅调试时固定噪声种子 |
+| `release_private_diagnostics` | `false` | 是否导出未私有化的分数诊断 |
+
+```bash
+python scripts/run_privacy_experiments.py --models clip_mlp --defenses www
+python scripts/run_privacy_experiments.py --models bert_lora --defenses www \
+  --set defense.target_epsilon=5 --set defense.max_grad_norm=4
+```
+
+以 BERT-Adapter/CoLA 比较 WWW 与普通样本级 DP，统一全程预算 8 和裁剪阈值 8：
+
+```bash
+python scripts/run_privacy_experiments.py --models bert_adapter --datasets cola \
+  --defenses www,record_dp --attacks all \
+  --set defense.target_epsilon=8 --set defense.max_grad_norm=8
+```
+
+**输出与审计。** `defense_summary.json` 保存算法、目标/实际 epsilon、delta、噪声尺度和每客户端采样率、期望 batch 大小、固定尾部宽度和计划/实际步数。随机噪声默认使用不写入配置的系统随机种子。形式化保证的范围是防御后上传与模型；审计成员标签、私有信号、原始训练数据和可选诊断均为本地研究资料，不属于受保护发布内容。打开固定噪声或未私有化诊断时，汇总会明确设置 `formal_dp_enabled=false`。
+
+`www_ranked_positions`、`www_tail_mask`、`www_importance_weights`、`www_effective_clip_norms` 及本地索引只保留在客户端运行态。默认不导出损失差/特征统计；可用 `release_private_diagnostics=true` 开启原有攻击相关性验证。额外设置 `www_analysis_timing=post_round` 与 `www_analysis_interval=50` 可保留周期后聚合诊断及 WWW-ProjRes 配对 CSV；这些选项仅影响诊断，不会降低防御频次或改变用于训练的上一轮参考模型。
+
+ProjRes 成员仍是当轮真实 Poisson batch，非成员仍为严格标签匹配的 10 倍候选。WWW 的 `projres.max_candidates/min_nonmembers/max_nonmembers` 均为 0，表示按实际 batch 动态构造完整候选；不把大于期望大小的抽样截断。空 batch 没有真实成员，六种真实 Batch 攻击会跳过该轮并在 `privacy_audit/summary.json` 的 `exact_batch_skipped_rounds` 中记录 `empty_poisson_batch`；固定候选攻击继续执行。由于每个上传参数坐标都加了噪声，WWW 下取消无噪声 batch 秩上限，并记录 `paper_fedsgd_exact=false`、`attacked_parameter_perturbed=true`；这不意味着使用了非真实 batch 候选。真实数据上的防御效果仍需通过实验衡量。
 
 ### FedMIA 比较基线
 

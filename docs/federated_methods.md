@@ -99,25 +99,22 @@ PEFT/分类头参数
 16 成员/160 非成员，只
 统计 AUC、TPR@10%FPR 与 TPR@1%FPR，不生成 TPR@0.1%FPR。
 
-BERT 同时启用周期性 ICLR 排名分析。服务器在 BERT Adapter 的第 50、100、…、500 轮及
-BERT-LoRA 的第 50、100、…、500 个通信轮完成聚合后，
-根据该轮真实客户端上传和等权聚合系数，为每个客户端精确重建其他客户端的聚合模型，
-并在该轮真实 one-batch 训练样本上计算 `L(x; theta_-k) - L(x; theta_k)`。该分析只记录
-排名与统计，不筛选样本、不改变优化步骤；逐轮结果写入 `iclr_round_metrics.csv`、
-`iclr_round_samples.csv` 和 `iclr_series.json`，最终
-与具有稳定本地索引的固定攻击成员候选对齐。六种真实 Batch 攻击另存逐轮成员本地索引，
-不会错误套用固定候选池的位置。GPT2-Large 当前保持 `defense.name: none`。
-由于 ICLR 和 ProjRes 使用同轮同客户端的真实 FedSGD batch，两者还会按通信轮、客户端、
-batch 位置和本地样本索引进行严格逐样本连接，并报告分数相关性与 Top-K 富集倍数。
-ProjRes 命中率使用同轮共享的 160 个非成员连续分数分别在 10% 和 1% FPR 下复算，再比较高低
-ICLR 组；ProjRes 采用 ranking-only 协议，不再产生固定残差阈值预测。
+BERT Adapter 的统一入口默认启用 WWW 差分隐私防御，BERT-LoRA 可通过
+`--defenses www` 显式启用。每个真实 batch 按上一轮防御模型间的逐样本损失差升序排序，
+使用与普通样本级 DP 相同的 Poisson 抽样，以期望 batch 的 20% 固定尾部宽度，
+执行 INO-SGD 积分权重缩放、联合逐样本裁剪和高斯加噪。邻接关系为 add_remove，
+使用采样 RDP 核算并除以固定期望 batch 大小；空抽样仍上传纯噪声并计步。
+默认全程 epsilon=3、初始裁剪阈值 C=8、delta=1e-5；防御每轮执行，任务评估和攻击频次不变。
+首轮或缺少上一轮客户端参考状态时仍以统一阈值裁剪并加噪。算法与预算核算详见
+[WWW 文档](defenses.md#www)。GPT2-Large 当前保持 `defense.name: none`。
 
 严格 ProjRes 每 50 个已完成通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
 down-projection 权重更新构造子空间，并在同一全局模型下提取进入该层的样本级隐藏
 表示。BERT Adapter、BERT-LoRA 与 GPT2-Large 的成员和非成员直接复用共享真实 Batch 候选视图，即当轮
 `N` 个成员及按标签匹配的 `10N` 个从未训练 evaluation 样本；完整 Batch 时为
 16/160。结果与其他攻击统一写入审计器输出，`projres.max_candidates: 16` 不会截断
-实际上传 Batch；完整 16 条 Batch 的结果元数据会将 `paper_fedsgd_exact` 记为 `true`。
+实际上传 Batch。无噪声且满足原论文梯度条件时 `paper_fedsgd_exact=true`；WWW 上传加噪，
+该字段为 `false`，同时取消无噪声 batch 秩上限，成员身份仍由真实 batch 确定。
 
 ## 攻击可见性
 

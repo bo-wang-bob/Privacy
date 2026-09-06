@@ -7,14 +7,14 @@ from privacy_defenses.controller import (
     attach_hamp_output_transform,
     attach_output_temperature_transform,
 )
-from privacy_defenses.iclr import (
-    ICLRRanking,
+from privacy_defenses.www import (
+    WWWRanking,
     encode_training_batches,
     infer_other_clients_state,
     rank_loss_differences,
 )
-from privacy_defenses.iclr_validation import (
-    validate_iclr_attack_relationships,
+from privacy_defenses.www_validation import (
+    validate_www_attack_relationships,
 )
 
 __all__ = [
@@ -23,9 +23,9 @@ __all__ = [
     "DefenseController",
     "attach_hamp_output_transform",
     "attach_output_temperature_transform",
-    "ICLRRanking",
+    "WWWRanking",
     "encode_training_batches",
     "infer_other_clients_state",
     "rank_loss_differences",
-    "validate_iclr_attack_relationships",
+    "validate_www_attack_relationships",
 ]

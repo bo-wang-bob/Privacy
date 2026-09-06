@@ -1,4 +1,4 @@
-"""Sample-aligned validation of ICLR specificity scores against MIA scores."""
+"""Sample-aligned validation of WWW specificity scores against MIA scores."""
 
 from __future__ import annotations
 
@@ -114,24 +114,24 @@ def _safe_mean(values: torch.Tensor) -> float | None:
 
 
 def _user_score_statistics(user) -> dict[str, torch.Tensor] | None:
-    count = getattr(user, "iclr_score_count", None)
+    count = getattr(user, "www_score_count", None)
     if count is None:
         return None
     count = count.detach().cpu().long()
     covered = count > 0
     denominator = count.clamp_min(1).to(torch.float64)
-    total = user.iclr_score_sum.detach().cpu().to(torch.float64)
-    total_sq = user.iclr_score_sum_sq.detach().cpu().to(torch.float64)
+    total = user.www_score_sum.detach().cpu().to(torch.float64)
+    total_sq = user.www_score_sum_sq.detach().cpu().to(torch.float64)
     mean = total / denominator
     variance = (total_sq / denominator - mean.square()).clamp_min(0.0)
     outputs = {
         "count": count,
         "mean": mean,
         "std": variance.sqrt(),
-        "min": user.iclr_score_min.detach().cpu().to(torch.float64).clone(),
-        "max": user.iclr_score_max.detach().cpu().to(torch.float64).clone(),
-        "last": user.iclr_score_last.detach().cpu().to(torch.float64).clone(),
-        "last_round": user.iclr_score_last_round.detach().cpu().long().clone(),
+        "min": user.www_score_min.detach().cpu().to(torch.float64).clone(),
+        "max": user.www_score_max.detach().cpu().to(torch.float64).clone(),
+        "last": user.www_score_last.detach().cpu().to(torch.float64).clone(),
+        "last_round": user.www_score_last_round.detach().cpu().long().clone(),
     }
     for key in ("mean", "std", "min", "max", "last"):
         outputs[key][~covered] = float("nan")
@@ -142,7 +142,7 @@ def _relationship_metrics(
     attack: str,
     client_id: int,
     aggregation: str,
-    iclr_scores: torch.Tensor,
+    www_scores: torch.Tensor,
     attack_scores: torch.Tensor,
     class_labels: torch.Tensor,
     observation_counts: torch.Tensor,
@@ -150,36 +150,36 @@ def _relationship_metrics(
     attack_member_count: int,
     top_fraction: float,
 ) -> dict:
-    top, bottom, top_count = _top_bottom_masks(iclr_scores, top_fraction)
+    top, bottom, top_count = _top_bottom_masks(www_scores, top_fraction)
     attack_top = torch.zeros(attack_scores.numel(), dtype=torch.bool)
     attack_order = torch.argsort(attack_scores, descending=True, stable=True)
     attack_top[attack_order[:top_count]] = True
     overlap = int((top & attack_top).sum())
     expected_overlap = top_count * top_count / max(attack_scores.numel(), 1)
     adjusted, macro, adjusted_classes = _class_adjusted_spearman(
-        iclr_scores, attack_scores, class_labels
+        www_scores, attack_scores, class_labels
     )
     row = {
         "scope": "client",
         "attack": attack,
         "audit_client_id": int(client_id),
-        "iclr_aggregation": aggregation,
+        "www_aggregation": aggregation,
         "attack_member_samples": int(attack_member_count),
-        "aligned_member_samples": int(iclr_scores.numel()),
+        "aligned_member_samples": int(www_scores.numel()),
         "alignment_coverage": (
-            iclr_scores.numel() / attack_member_count if attack_member_count else None
+            www_scores.numel() / attack_member_count if attack_member_count else None
         ),
         "attack_nonmember_samples": int(nonmember_scores.numel()),
-        "mean_iclr_observations": _safe_mean(observation_counts),
-        "pearson": _pearson(iclr_scores, attack_scores),
-        "spearman": _spearman(iclr_scores, attack_scores),
+        "mean_www_observations": _safe_mean(observation_counts),
+        "pearson": _pearson(www_scores, attack_scores),
+        "spearman": _spearman(www_scores, attack_scores),
         "class_adjusted_spearman": adjusted,
         "class_macro_spearman": macro,
         "class_adjusted_classes": adjusted_classes,
         "top_fraction": float(top_fraction),
         "top_count": top_count,
-        "attack_score_mean_iclr_top": _safe_mean(attack_scores[top]),
-        "attack_score_mean_iclr_bottom": _safe_mean(attack_scores[bottom]),
+        "attack_score_mean_www_top": _safe_mean(attack_scores[top]),
+        "attack_score_mean_www_bottom": _safe_mean(attack_scores[bottom]),
         "attack_score_top_minus_bottom": (
             _safe_mean(attack_scores[top]) - _safe_mean(attack_scores[bottom])
         ),
@@ -193,8 +193,8 @@ def _relationship_metrics(
         hits = _low_fpr_hits(attack_scores, nonmember_scores, target)
         if hits is None:
             row[f"attack_hit_rate_fpr_{suffix}"] = None
-            row[f"attack_hit_rate_iclr_top_fpr_{suffix}"] = None
-            row[f"attack_hit_rate_iclr_bottom_fpr_{suffix}"] = None
+            row[f"attack_hit_rate_www_top_fpr_{suffix}"] = None
+            row[f"attack_hit_rate_www_bottom_fpr_{suffix}"] = None
             row[f"attack_hit_top_minus_bottom_fpr_{suffix}"] = None
             row[f"attack_hit_top_over_bottom_fpr_{suffix}"] = None
             continue
@@ -202,8 +202,8 @@ def _relationship_metrics(
         top_rate = _safe_mean(hits[top])
         bottom_rate = _safe_mean(hits[bottom])
         row[f"attack_hit_rate_fpr_{suffix}"] = overall
-        row[f"attack_hit_rate_iclr_top_fpr_{suffix}"] = top_rate
-        row[f"attack_hit_rate_iclr_bottom_fpr_{suffix}"] = bottom_rate
+        row[f"attack_hit_rate_www_top_fpr_{suffix}"] = top_rate
+        row[f"attack_hit_rate_www_bottom_fpr_{suffix}"] = bottom_rate
         row[f"attack_hit_top_minus_bottom_fpr_{suffix}"] = top_rate - bottom_rate
         row[f"attack_hit_top_over_bottom_fpr_{suffix}"] = (
             top_rate / bottom_rate if bottom_rate > 0 else None
@@ -211,7 +211,7 @@ def _relationship_metrics(
     return row
 
 
-def validate_iclr_attack_relationships(
+def validate_www_attack_relationships(
     results: list[AttackResult],
     users: list,
     candidate_labels: torch.Tensor,
@@ -221,11 +221,11 @@ def validate_iclr_attack_relationships(
     output_dir: str,
     top_fraction: float = 0.2,
 ) -> dict:
-    """Join ICLR scores to attack outputs and write reproducible diagnostics."""
+    """Join WWW scores to attack outputs and write reproducible diagnostics."""
     if not 0.0 < top_fraction <= 0.5:
-        raise ValueError("ICLR validation top_fraction must be in (0, 0.5].")
+        raise ValueError("WWW validation top_fraction must be in (0, 0.5].")
     os.makedirs(output_dir, exist_ok=True)
-    summary_path = os.path.join(output_dir, "iclr_attack_relationship.json")
+    summary_path = os.path.join(output_dir, "www_attack_relationship.json")
     if candidate_local_indices is None:
         summary = {
             "status": "unavailable",
@@ -250,7 +250,7 @@ def validate_iclr_attack_relationships(
         == local_indices.numel()
         == expected
     ):
-        raise ValueError("ICLR validation candidate tensors are not aligned.")
+        raise ValueError("WWW validation candidate tensors are not aligned.")
 
     user_statistics = {
         int(user.id): _user_score_statistics(user) for user in users
@@ -318,21 +318,21 @@ def validate_iclr_attack_relationships(
                         "class_label": int(aligned_class_labels[position]),
                         "membership": 1,
                         "attack_score": float(aligned_attack_scores[position]),
-                        "iclr_observations": int(statistics["count"][local_index]),
-                        "iclr_mean": float(statistics["mean"][local_index]),
-                        "iclr_std": float(statistics["std"][local_index]),
-                        "iclr_min": float(statistics["min"][local_index]),
-                        "iclr_max": float(statistics["max"][local_index]),
-                        "iclr_last": float(statistics["last"][local_index]),
-                        "iclr_last_round": int(
+                        "www_observations": int(statistics["count"][local_index]),
+                        "www_mean": float(statistics["mean"][local_index]),
+                        "www_std": float(statistics["std"][local_index]),
+                        "www_min": float(statistics["min"][local_index]),
+                        "www_max": float(statistics["max"][local_index]),
+                        "www_last": float(statistics["last"][local_index]),
+                        "www_last_round": int(
                             statistics["last_round"][local_index]
                         ),
                     }
                 )
 
             for aggregation in ("mean", "last", "max"):
-                iclr_scores = statistics[aggregation][aligned_local_indices]
-                finite = torch.isfinite(iclr_scores) & torch.isfinite(
+                www_scores = statistics[aggregation][aligned_local_indices]
+                finite = torch.isfinite(www_scores) & torch.isfinite(
                     aligned_attack_scores
                 )
                 if int(finite.sum()) < 2:
@@ -342,7 +342,7 @@ def validate_iclr_attack_relationships(
                         attack=result.name,
                         client_id=int(client_id),
                         aggregation=aggregation,
-                        iclr_scores=iclr_scores[finite],
+                        www_scores=www_scores[finite],
                         attack_scores=aligned_attack_scores[finite],
                         class_labels=aligned_class_labels[finite],
                         observation_counts=observation_counts[finite],
@@ -354,7 +354,7 @@ def validate_iclr_attack_relationships(
                     )
                 )
 
-    sample_path = os.path.join(output_dir, "iclr_attack_samples.csv")
+    sample_path = os.path.join(output_dir, "www_attack_samples.csv")
     sample_fields = (
         list(sample_rows[0])
         if sample_rows
@@ -366,13 +366,13 @@ def validate_iclr_attack_relationships(
             "class_label",
             "membership",
             "attack_score",
-            "iclr_observations",
-            "iclr_mean",
-            "iclr_std",
-            "iclr_min",
-            "iclr_max",
-            "iclr_last",
-            "iclr_last_round",
+            "www_observations",
+            "www_mean",
+            "www_std",
+            "www_min",
+            "www_max",
+            "www_last",
+            "www_last_round",
         ]
     )
     with open(sample_path, "w", newline="", encoding="utf-8") as file:
@@ -380,12 +380,12 @@ def validate_iclr_attack_relationships(
         writer.writeheader()
         writer.writerows(sample_rows)
 
-    metric_path = os.path.join(output_dir, "iclr_attack_relationship.csv")
+    metric_path = os.path.join(output_dir, "www_attack_relationship.csv")
     leading_fields = [
         "scope",
         "attack",
         "audit_client_id",
-        "iclr_aggregation",
+        "www_aggregation",
     ]
     extra_fields = sorted(
         {key for row in metric_rows for key in row} - set(leading_fields)
@@ -404,8 +404,8 @@ def validate_iclr_attack_relationships(
         "methodology": {
             "population": "strictly aligned audited member samples",
             "attack_score_direction": "higher means more member-like",
-            "iclr_score": "L(x; theta_-k) - L(x; theta_k)",
-            "iclr_aggregations": ["mean", "last", "max"],
+            "www_score": "L(x; theta_-k) - L(x; theta_k)",
+            "www_aggregations": ["mean", "last", "max"],
             "top_fraction": top_fraction,
             "class_control": (
                 "within-class rank centering plus macro per-class Spearman"

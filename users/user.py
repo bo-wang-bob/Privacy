@@ -68,9 +68,9 @@ class UserBase:
             train_generator = torch.Generator().manual_seed(
                 int(self.method_config.get("seed", 42)) + 1000003 * int(self.id)
             )
-        self._iclr_enabled = (
+        self._www_enabled = (
             str(getattr(self.defense_controller, "name", "none")).lower()
-            == "iclr"
+            == "www"
         )
         self._record_dp_enabled = (
             str(getattr(self.defense_controller, "name", "none")).lower()
@@ -100,21 +100,9 @@ class UserBase:
             shuffle=True,
             collate_fn=collate_fn,
             drop_last=False,
-            generator=None if self._iclr_enabled else train_generator,
+            generator=train_generator,
         )
-        self.iclr_trainloader = (
-            DataLoader(
-                _IndexedDataset(train_data),
-                batch_size=batch_size,
-                shuffle=True,
-                collate_fn=self._collate_indexed_batch,
-                drop_last=False,
-                generator=train_generator,
-            )
-            if self._iclr_enabled
-            else None
-        )
-        self.iclr_statistics_loader = (
+        self.www_statistics_loader = (
             DataLoader(
                 _IndexedDataset(train_data),
                 batch_size=eval_batch_size,
@@ -122,7 +110,7 @@ class UserBase:
                 collate_fn=self._collate_indexed_batch,
                 drop_last=False,
             )
-            if self._iclr_enabled
+            if self._www_enabled
             else None
         )
         self.testloader = DataLoader(
@@ -137,37 +125,40 @@ class UserBase:
         else:
             self.model = copy.deepcopy(model)
         self._train_iterator = None
-        self._iclr_train_iterator = None
         self.last_update_sample_count = 0
         self.last_train_batch: tuple[torch.Tensor, torch.Tensor] | None = None
         self.last_train_indices: torch.Tensor | None = None
         self.last_train_recycled: torch.Tensor | None = None
         self.last_update_gradients: dict[str, torch.Tensor] | None = None
         self.last_gradient_capture_count = 0
-        self.iclr_source_round: int | None = None
-        self.iclr_aggregation_weight: float | None = None
-        self.iclr_ranking_round: int | None = None
-        self.iclr_own_losses: torch.Tensor | None = None
-        self.iclr_other_losses: torch.Tensor | None = None
-        self.iclr_scores: torch.Tensor | None = None
-        self.iclr_ranked_positions: torch.Tensor | None = None
-        self.iclr_ranked_scores: torch.Tensor | None = None
-        self.iclr_ranked_labels: torch.Tensor | None = None
-        self.iclr_local_indices: torch.Tensor | None = None
-        self.iclr_ranked_local_indices: torch.Tensor | None = None
-        self.iclr_score_count: torch.Tensor | None = None
-        self.iclr_score_sum: torch.Tensor | None = None
-        self.iclr_score_sum_sq: torch.Tensor | None = None
-        self.iclr_score_min: torch.Tensor | None = None
-        self.iclr_score_max: torch.Tensor | None = None
-        self.iclr_score_last: torch.Tensor | None = None
-        self.iclr_score_last_round: torch.Tensor | None = None
-        self.iclr_feature_seen: torch.Tensor | None = None
-        self.iclr_class_feature_counts: torch.Tensor | None = None
-        self.iclr_class_feature_means: torch.Tensor | None = None
-        self.iclr_within_class_scatter: torch.Tensor | None = None
-        self.iclr_within_class_covariance: torch.Tensor | None = None
-        self.iclr_within_class_covariance_dof: int = 0
+        self.www_source_round: int | None = None
+        self.www_aggregation_weight: float | None = None
+        self.www_ranking_round: int | None = None
+        self.www_own_losses: torch.Tensor | None = None
+        self.www_other_losses: torch.Tensor | None = None
+        self.www_scores: torch.Tensor | None = None
+        self.www_ranked_positions: torch.Tensor | None = None
+        self.www_ranked_scores: torch.Tensor | None = None
+        self.www_ranked_labels: torch.Tensor | None = None
+        self.www_local_indices: torch.Tensor | None = None
+        self.www_ranked_local_indices: torch.Tensor | None = None
+        self.www_importance_weights: torch.Tensor | None = None
+        self.www_tail_mask: torch.Tensor | None = None
+        self.www_effective_clip_norms: torch.Tensor | None = None
+        self.www_tail_local_indices: torch.Tensor | None = None
+        self.www_score_count: torch.Tensor | None = None
+        self.www_score_sum: torch.Tensor | None = None
+        self.www_score_sum_sq: torch.Tensor | None = None
+        self.www_score_min: torch.Tensor | None = None
+        self.www_score_max: torch.Tensor | None = None
+        self.www_score_last: torch.Tensor | None = None
+        self.www_score_last_round: torch.Tensor | None = None
+        self.www_feature_seen: torch.Tensor | None = None
+        self.www_class_feature_counts: torch.Tensor | None = None
+        self.www_class_feature_means: torch.Tensor | None = None
+        self.www_within_class_scatter: torch.Tensor | None = None
+        self.www_within_class_covariance: torch.Tensor | None = None
+        self.www_within_class_covariance_dof: int = 0
 
     def _collate_indexed_batch(self, batch):
         samples, indices = zip(*batch)
@@ -231,47 +222,17 @@ class UserBase:
         self._record_train_batch(images, labels)
         return images, labels
 
-    def next_iclr_train_batch(
-        self,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the next indexed FedSGD batch, cycling across rounds."""
-        if self.iclr_trainloader is None:
-            raise RuntimeError("Indexed ICLR training is not enabled for this client.")
-        if self._iclr_train_iterator is None:
-            self._iclr_train_iterator = iter(self.iclr_trainloader)
-        try:
-            batch = next(self._iclr_train_iterator)
-        except StopIteration:
-            self._iclr_train_iterator = iter(self.iclr_trainloader)
-            try:
-                batch = next(self._iclr_train_iterator)
-            except StopIteration as error:
-                raise ValueError(
-                    f"Client {self.id} has no indexed local training batch."
-                ) from error
-        images, labels, indices = batch
-        self._record_train_batch(images, labels)
-        self.last_train_indices = indices.detach().cpu().long().clone()
-        return images, labels, indices
+    def iter_www_local_batches(self, generator: torch.Generator):
+        """Yield the same Poisson draws as Record-DP with stable local indices."""
+        if not self._www_enabled:
+            raise RuntimeError("Indexed WWW training is not enabled for this client.")
+        yield from self.iter_poisson_batches(generator)
 
-    def iter_iclr_local_batches(self):
-        """Yield exact local-update batches together with stable local indices."""
-        if self.iclr_trainloader is None:
-            raise RuntimeError("Indexed ICLR training is not enabled for this client.")
-        if self.federated_method == "fedsgd":
-            yield self.next_iclr_train_batch()
-            return
-        for _ in range(self.local_epochs):
-            for images, labels, indices in self.iclr_trainloader:
-                self._record_train_batch(images, labels)
-                self.last_train_indices = indices.detach().cpu().long().clone()
-                yield images, labels, indices
-
-    def iter_iclr_statistics_batches(self):
+    def iter_www_statistics_batches(self):
         """Yield the complete local training set once in stable index order."""
-        if self.iclr_statistics_loader is None:
-            raise RuntimeError("ICLR statistics are not enabled for this client.")
-        yield from self.iclr_statistics_loader
+        if self.www_statistics_loader is None:
+            raise RuntimeError("WWW statistics are not enabled for this client.")
+        yield from self.www_statistics_loader
 
     def iter_local_batches(self):
         """Yield the batches used by one local update under the active protocol."""
@@ -321,14 +282,21 @@ class UserBase:
         return tuple(tensor.clone() for tensor in self._record_dp_empty_batch)
 
     def iter_record_dp_batches(self, generator: torch.Generator):
-        """Yield fixed-count Poisson batches for one private local update.
+        """Yield Record-DP batches through the common indexed Poisson sampler."""
+        if not self._record_dp_enabled:
+            raise RuntimeError("Record-DP batches require defense.name=record_dp.")
+        for images, labels, _ in self.iter_poisson_batches(generator):
+            yield images, labels
+
+    def iter_poisson_batches(self, generator: torch.Generator):
+        """Yield fixed-count indexed Poisson draws for one private local update.
 
         Every local record is sampled independently with probability ``q``.
         Empty draws are retained because conditioning on a non-empty draw would
         not match the sampled-Gaussian privacy accountant.
         """
-        if not self._record_dp_enabled:
-            raise RuntimeError("Record-DP batches require defense.name=record_dp.")
+        if not (self._record_dp_enabled or self._www_enabled):
+            raise RuntimeError("Poisson batches require defense.name=record_dp or www.")
         if self.train_samples <= 0 or self.record_dp_sample_rate <= 0:
             raise ValueError(f"Client {self.id} has no local training records.")
         for _ in range(self.record_dp_steps_per_update):
@@ -345,7 +313,8 @@ class UserBase:
             else:
                 images, labels = self._empty_record_dp_batch_tensors()
             self._record_train_batch(images, labels)
-            yield images, labels
+            self.last_train_indices = torch.tensor(indices, dtype=torch.long)
+            yield images, labels, self.last_train_indices.clone()
 
     def set_parameters(self, state: dict[str, torch.Tensor]) -> None:
         loader = getattr(self.model, "load_trainable_state", None)

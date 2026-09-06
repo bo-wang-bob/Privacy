@@ -24,6 +24,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from aggregator.aggregator_builder import build_aggregator
 from privacy_defenses.cofedmid import validate_cofedmid
+from privacy_defenses.www_dp import validate_www
 from servers.serverbase import ServerBase
 from trainmodel.transformer_adapter import TransformerAdapterClassifier
 from trainmodel.transformer_lora import TransformerLoRAClassifier
@@ -51,7 +52,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir")
     parser.add_argument(
         "--defense",
-        choices=("none", "iclr", "record_dp", "local_client_dp"),
+        choices=("none", "www", "record_dp", "local_client_dp"),
         help="Override defense.name from the YAML configuration.",
     )
     parser.add_argument(
@@ -65,7 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-grad-norm",
         type=float,
-        help="Override the Record-DP per-sequence clipping threshold C.",
+        help="Override the Record-DP or WWW per-sequence clipping threshold C.",
     )
     parser.add_argument(
         "--max-client-update-norm",
@@ -130,6 +131,7 @@ def load_config(args: argparse.Namespace) -> dict:
     if args.target_epsilon is not None:
         defense = config.setdefault("defense", {})
         if str(defense.get("name", "none")).lower() not in {
+            "www",
             "record_dp",
             "local_client_dp",
         }:
@@ -141,9 +143,9 @@ def load_config(args: argparse.Namespace) -> dict:
     max_grad_norm = getattr(args, "max_grad_norm", None)
     if max_grad_norm is not None:
         defense = config.setdefault("defense", {})
-        if str(defense.get("name", "none")).lower() != "record_dp":
+        if str(defense.get("name", "none")).lower() not in {"record_dp", "www"}:
             raise ValueError(
-                "--max-grad-norm requires defense.name=record_dp."
+                "--max-grad-norm requires defense.name=record_dp or www."
             )
         defense["max_grad_norm"] = float(max_grad_norm)
     max_client_update_norm = getattr(args, "max_client_update_norm", None)
@@ -412,34 +414,33 @@ def validate_config(config: dict) -> None:
     defense = dict(config.get("defense", {"name": "none"}))
     defense_name = str(defense.get("name", "none")).lower()
     validate_cofedmid(defense, int(config["total_users"]), int(config["sample_users"]))
+    validate_www(defense)
     config["defense"] = defense
-    if defense_name not in {"none", "iclr", "cofedmid", "record_dp", "local_client_dp"}:
+    if defense_name not in {"none", "www", "cofedmid", "record_dp", "local_client_dp"}:
         raise ValueError(
-            "Text PEFT experiments support defense=none, iclr, cofedmid, record_dp, "
+            "Text PEFT experiments support defense=none, www, cofedmid, record_dp, "
             "or local_client_dp."
         )
-    if defense_name == "iclr":
+    if defense_name == "www":
         if architecture != "bert":
-            raise ValueError("Text PEFT ICLR currently supports BERT only.")
-        interval = int(defense.get("iclr_analysis_interval", 50))
+            raise ValueError("Text PEFT WWW currently supports BERT only.")
+        if int(config["sample_users"]) < 2:
+            raise ValueError("WWW requires at least two selected clients per round.")
+        interval = int(defense.get("www_analysis_interval", 1))
         if interval <= 0:
-            raise ValueError("defense.iclr_analysis_interval must be positive.")
+            raise ValueError("defense.www_analysis_interval must be positive.")
         if interval > int(config["num_global_iters"]):
             raise ValueError(
-                "defense.iclr_analysis_interval cannot exceed num_global_iters."
+                "defense.www_analysis_interval cannot exceed num_global_iters."
             )
-        if str(
-            defense.get("iclr_analysis_timing", "post_round")
-        ).lower() != "post_round":
-            raise ValueError(
-                "BERT ICLR requires iclr_analysis_timing=post_round."
-            )
+        if str(defense.get("www_analysis_timing", "pre_update")) not in {"pre_update", "post_round"}:
+            raise ValueError("WWW analysis timing must be pre_update or post_round.")
         top_fraction = float(
-            defense.get("iclr_validation_top_fraction", 0.2)
+            defense.get("www_validation_top_fraction", 0.2)
         )
         if not 0.0 < top_fraction <= 0.5:
             raise ValueError(
-                "defense.iclr_validation_top_fraction must be in (0, 0.5]."
+                "defense.www_validation_top_fraction must be in (0, 0.5]."
             )
     if defense_name == "record_dp":
         max_norm = float(
@@ -535,7 +536,7 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "audit exact-batch ProjRes requires projres.enabled=true."
             )
-        if defense_name == "record_dp":
+        if defense_name in {"record_dp", "www"}:
             if any(
                 int(projres.get(key, 0)) != 0
                 for key in (
@@ -545,7 +546,7 @@ def validate_config(config: dict) -> None:
                 )
             ):
                 raise ValueError(
-                    "Record-DP Poisson batches require dynamic unified ProjRes "
+                    "Poisson DP batches require dynamic unified ProjRes "
                     "candidate bounds (all three bounds must be zero)."
                 )
         else:
@@ -631,12 +632,12 @@ def make_result_dir(config: dict) -> Path:
     target_client = int(config.get("audit", {}).get("target_client_id", 0))
     epsilon_suffix = ""
     clipping_suffix = ""
-    if defense in {"record_dp", "local_client_dp"}:
+    if defense in {"record_dp", "local_client_dp", "www"}:
         defense_config = config.get("defense", {})
         target_epsilon = defense_config.get("target_epsilon")
         if target_epsilon is not None:
             epsilon_suffix = f"_eps{float(target_epsilon):g}"
-        if defense == "record_dp":
+        if defense in {"record_dp", "www"}:
             max_grad_norm = defense_config.get(
                 "max_grad_norm", defense_config.get("dp_max_grad_norm")
             )
@@ -737,12 +738,15 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
         ),
         ("privacy_audit.target_client_id", audit.get("target_client_id", 0)),
         ("privacy_audit.candidate_sampling", audit.get("candidate_sampling")),
-        ("iclr.enabled", defense.get("name", "none") == "iclr"),
+        ("www.enabled", defense.get("name", "none") == "www"),
         (
-            "iclr.analysis_interval",
-            defense.get("iclr_analysis_interval"),
+            "www.analysis_interval",
+            defense.get("www_analysis_interval"),
         ),
-        ("iclr.analysis_timing", defense.get("iclr_analysis_timing")),
+        ("www.analysis_timing", defense.get("www_analysis_timing")),
+        ("www.target_epsilon", defense.get("target_epsilon") if defense.get("name") == "www" else None),
+        ("www.max_grad_norm", defense.get("max_grad_norm") if defense.get("name") == "www" else None),
+        ("www.tail_fraction", defense.get("www_tail_fraction")),
         ("record_dp.enabled", defense.get("name", "none") == "record_dp"),
         ("record_dp.target_epsilon", defense.get("target_epsilon")),
         (

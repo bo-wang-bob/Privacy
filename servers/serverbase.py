@@ -429,7 +429,7 @@ class ServerBase:
             for user in self.ctx.users:
                 user.set_parameters(state)
 
-        self.defense.initialize_iclr_feature_statistics(self.ctx.users)
+        self.defense.initialize_www_feature_statistics(self.ctx.users)
 
         self.auditor = MembershipAuditor(
             model=model,
@@ -466,6 +466,12 @@ class ServerBase:
         )
         self.defense.configure_record_dp(self.ctx.users)
         self.defense.configure_local_client_dp(self.ctx.users)
+        if self.defense.www_privacy is not None:
+            if user_per_round < 2:
+                raise ValueError("WWW requires at least two selected clients per round.")
+            self.defense.www_privacy.configure(
+                self.ctx.users, self.defense.additional_private_steps,
+            )
         if self.defense.name == "local_client_dp":
             logger.info(
                 "Local client-DP calibrated | epsilon=%s | delta=%g | "
@@ -520,7 +526,7 @@ class ServerBase:
         for user in self.ctx.users:
             local_state = (
                 self._clone_state(user.get_parameters())
-                if self.defense.name == "iclr"
+                if self.defense.name == "www"
                 or bool(getattr(user.model, "client_scoped_lora", False))
                 or bool(
                     getattr(user.model, "client_scoped_parameters", False)
@@ -781,14 +787,14 @@ class ServerBase:
                 if self.federated_method == "fedsgd":
                     if (
                         user.last_update_sample_count <= 0
-                        and self.defense.name != "record_dp"
+                        and self.defense.name not in {"record_dp", "www"}
                     ):
                         raise RuntimeError(
                             f"FedSGD client {user_id} did not consume a mini-batch."
                         )
                     self.ctx.update_sample_counts[user_id] = (
                         user.record_dp_expected_batch_size
-                        if self.defense.name == "record_dp"
+                        if self.defense.name in {"record_dp", "www"}
                         else user.last_update_sample_count
                     )
                     if (
@@ -973,7 +979,7 @@ class ServerBase:
                     }
                     for user_id in selected_ids
                 }
-            iclr_analyzed = self.defense.analyze_iclr_completed_round(
+            www_analyzed = self.defense.analyze_www_completed_round(
                 users=self.ctx.users,
                 global_state=self.ctx.new_model_state[0],
                 updated_states=protocol_client_states,
@@ -981,8 +987,8 @@ class ServerBase:
                 selected_ids=selected_ids,
                 round_index=round_index,
             )
-            if iclr_analyzed:
-                self.defense.save_iclr_round_metrics(self.results_dir)
+            if www_analyzed:
+                self.defense.save_www_round_metrics(self.results_dir)
             previous_selected_ids = set(selected_ids)
             previous_aggregation_weights = dict(self.ctx.aggregation_weights)
             unified_projres_payload = self.auditor.observe_round(
@@ -998,8 +1004,8 @@ class ServerBase:
             )
             if unified_projres_payload is not None:
                 projres_payload = unified_projres_payload
-            if iclr_analyzed and projres_payload is not None:
-                self.defense.record_iclr_projres_relationship(
+            if www_analyzed and projres_payload is not None:
+                self.defense.record_www_projres_relationship(
                     projres_payload=projres_payload,
                     output_dir=os.path.join(
                         self.results_dir, "privacy_audit"

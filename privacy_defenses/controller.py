@@ -31,12 +31,13 @@ from privacy_attacks.code_poison import (
     generate_membership_encoding_samples,
 )
 from privacy_defenses.cofedmid import CoFedMID
-from privacy_defenses.iclr import (
+from privacy_defenses.www_dp import WWWPrivacy, ino_weights
+from privacy_defenses.www import (
     encode_training_batches,
     infer_other_clients_state,
     rank_loss_differences,
 )
-from privacy_defenses.iclr_validation import (
+from privacy_defenses.www_validation import (
     _class_adjusted_spearman,
     _low_fpr_hits,
     _pearson,
@@ -61,7 +62,7 @@ SUPPORTED_DEFENSES = {
     "mist",
     "soft",
     "hamp",
-    "iclr",
+    "www",
 }
 
 FEDMIA_BASELINE_DEFENSES = {
@@ -342,6 +343,10 @@ class DefenseController:
         self.total_rounds = int(total_rounds)
         self.samples_num = list(samples_num or [])
         self.seed = int(self.config.get("seed", 42))
+        self.www_privacy = (
+            WWWPrivacy(self.config, self.total_rounds, self.device, self.seed)
+            if self.name == "www" else None
+        )
         self.cofedmid = (
             CoFedMID(
                 self.config, self.total_users, self.num_classes,
@@ -354,32 +359,32 @@ class DefenseController:
         self.batch_counts = defaultdict(int)
         self._generator_calls = defaultdict(int)
         self._selected_by_round: dict[int, list[int]] = {}
-        self._iclr_client_stats: dict[int, dict[str, int | float]] = {}
-        self._iclr_pending_states: dict[
+        self._www_client_stats: dict[int, dict[str, int | float]] = {}
+        self._www_pending_states: dict[
             int,
             tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]],
         ] = {}
-        self.iclr_analysis_interval = int(
-            self.config.get("iclr_analysis_interval", 1)
+        self.www_analysis_interval = int(
+            self.config.get("www_analysis_interval", 1)
         )
-        self.iclr_analysis_timing = str(
-            self.config.get("iclr_analysis_timing", "pre_update")
+        self.www_analysis_timing = str(
+            self.config.get("www_analysis_timing", "pre_update")
         ).lower()
-        self.iclr_feature_statistics_enabled = bool(
-            self.config.get("iclr_feature_statistics", True)
+        self.www_feature_statistics_enabled = bool(
+            self.config.get("www_feature_statistics", False)
         )
-        self._iclr_round_metrics: list[dict[str, int | float]] = []
-        self._iclr_round_samples: list[dict[str, int | float]] = []
-        self._iclr_projres_samples: list[dict[str, int | float]] = []
-        self._iclr_projres_metrics: list[
+        self._www_round_metrics: list[dict[str, int | float]] = []
+        self._www_round_samples: list[dict[str, int | float]] = []
+        self._www_projres_samples: list[dict[str, int | float]] = []
+        self._www_projres_metrics: list[
             dict[str, int | float | None]
         ] = []
-        if self.name == "iclr":
-            if self.iclr_analysis_interval <= 0:
-                raise ValueError("iclr_analysis_interval must be positive.")
-            if self.iclr_analysis_timing not in {"pre_update", "post_round"}:
+        if self.name == "www":
+            if self.www_analysis_interval <= 0:
+                raise ValueError("www_analysis_interval must be positive.")
+            if self.www_analysis_timing not in {"pre_update", "post_round"}:
                 raise ValueError(
-                    "iclr_analysis_timing must be pre_update or post_round."
+                    "www_analysis_timing must be pre_update or post_round."
                 )
         if self.name == "record_dp":
             adjacency = str(self.config.get("adjacency", "add_remove")).lower()
@@ -595,12 +600,12 @@ class DefenseController:
         code_poison: bool = False,
         privacy_probe: bool = False,
     ) -> None:
-        if privacy_probe and self.name == "cofedmid":
-            raise ValueError("CoFedMID does not support isolated active client probes.")
+        if privacy_probe and self.name in {"cofedmid", "www"}:
+            raise ValueError(f"{self.name} does not support isolated active client probes.")
         model.to(self.device)
         model.train()
         parameters = _trainable_parameters(model)
-        if self.name in {"record_dp", "local_client_dp"}:
+        if self.name in {"record_dp", "local_client_dp", "www"}:
             optimizer_name = str(
                 self.method_config.get("client_optimizer", "sgd")
             ).lower()
@@ -631,8 +636,8 @@ class DefenseController:
                     user.capture_protocol_gradients(model)
                 )
             )
-        if self.name == "iclr" and not privacy_probe:
-            self._iclr_training(
+        if self.name == "www" and not privacy_probe:
+            self._www_training(
                 user, model, optimizer, round_index, code_poison
             )
         elif self.name == "prompt_dp":
@@ -662,7 +667,7 @@ class DefenseController:
                 user, model, optimizer, round_index, code_poison=code_poison
             )
 
-    def _iclr_training(
+    def _www_training(
         self,
         user,
         model: torch.nn.Module,
@@ -670,57 +675,63 @@ class DefenseController:
         round_index: int,
         code_poison: bool,
     ) -> None:
-        """Rank the exact upcoming sample stream, then train without filtering it."""
-        indexed_batches = list(user.iter_iclr_local_batches())
-        batches = [(images, labels) for images, labels, _ in indexed_batches]
-        local_indices = torch.cat(
-            [indices.detach().cpu().long() for _, _, indices in indexed_batches]
-        )
-        reference_states = self._iclr_pending_states.pop(user.id, None)
-        should_rank = (
-            self.iclr_analysis_timing == "pre_update"
-            and (round_index + 1) % self.iclr_analysis_interval == 0
-        )
-        if reference_states is not None and should_rank:
-            own_state, other_state = reference_states
+        """Rank every real batch, apply INO clipping, then privatize the upload."""
+        reference_states = self._www_pending_states.pop(user.id, None)
+        generator = self.www_privacy.generator(user.id, round_index)
+        sampling_generator = self.www_privacy.sampling_generator(user.id, round_index)
+        for images, labels, local_indices in user.iter_www_local_batches(sampling_generator):
             restore_state = user.get_parameters()
+            own_state, other_state = (
+                reference_states if reference_states is not None
+                else (restore_state, restore_state)
+            )
             ranking = rank_loss_differences(
                 model=model,
-                batches=batches,
+                batches=[(images, labels)],
                 own_state=own_state,
                 other_state=other_state,
                 restore_state=restore_state,
                 device=self.device,
                 sample_indices=local_indices,
             )
-            self._record_iclr_ranking(
+            self._record_www_ranking(
                 user=user,
                 ranking=ranking,
                 ranking_round=round_index,
-                source_round=int(user.iclr_source_round),
-                aggregation_weight=float(user.iclr_aggregation_weight),
+                source_round=(
+                    int(user.www_source_round) if reference_states is not None else -1
+                ),
+                aggregation_weight=(
+                    float(user.www_aggregation_weight)
+                    if reference_states is not None else 0.0
+                ),
             )
-
-        for images, labels in batches:
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            optimizer.zero_grad(set_to_none=True)
-            if code_poison:
-                loss = compromised_prompt_loss(
-                    model,
-                    images,
-                    labels,
-                    weight=float(user.code_poison_config.get("weight", 1.0)),
-                    mean=float(user.code_poison_config.get("synthetic_mean", 0.0)),
-                    std=float(user.code_poison_config.get("synthetic_std", 0.1)),
-                )
+            if reference_states is None:
+                weights = torch.ones(labels.numel(), dtype=torch.float64)
+                tail = torch.zeros(labels.numel(), dtype=torch.bool)
             else:
-                loss = F.cross_entropy(model(images), labels)
-            loss.backward()
-            optimizer.step()
+                weights, _, tail = ino_weights(
+                    ranking.scores, float(self.config["www_tail_fraction"]),
+                    float(self.config["www_beta_alpha"]),
+                    float(self.config["www_beta_beta"]),
+                    expected_batch_size=user.record_dp_expected_batch_size,
+                )
+            user.www_importance_weights = weights
+            user.www_tail_mask = tail
+            user.www_effective_clip_norms = weights * float(
+                self.config["max_grad_norm"]
+            )
+            user.www_tail_local_indices = local_indices[tail].clone()
+            extra_loss = (
+                lambda inputs, targets: self._secret_losses(user, model, inputs, targets)
+            ) if code_poison else None
+            self.www_privacy.step(
+                user, model, optimizer, images.to(self.device), labels.to(self.device),
+                weights, self.steps[user.id], generator, extra_loss,
+            )
             self.steps[user.id] += 1
 
-    def _record_iclr_ranking(
+    def _record_www_ranking(
         self,
         user,
         ranking,
@@ -728,22 +739,22 @@ class DefenseController:
         source_round: int,
         aggregation_weight: float,
     ) -> None:
-        """Store one sample-aligned ICLR ranking and its compact statistics."""
-        user.iclr_ranking_round = int(ranking_round)
-        user.iclr_source_round = int(source_round)
-        user.iclr_aggregation_weight = float(aggregation_weight)
-        user.iclr_own_losses = ranking.own_losses
-        user.iclr_other_losses = ranking.other_losses
-        user.iclr_scores = ranking.scores
-        user.iclr_ranked_positions = ranking.ranked_positions
-        user.iclr_ranked_scores = ranking.scores[ranking.ranked_positions]
-        user.iclr_ranked_labels = ranking.labels[ranking.ranked_positions]
-        user.iclr_local_indices = ranking.sample_indices
-        user.iclr_ranked_local_indices = ranking.sample_indices[
+        """Store one sample-aligned WWW ranking and its compact statistics."""
+        user.www_ranking_round = int(ranking_round)
+        user.www_source_round = int(source_round)
+        user.www_aggregation_weight = float(aggregation_weight)
+        user.www_own_losses = ranking.own_losses
+        user.www_other_losses = ranking.other_losses
+        user.www_scores = ranking.scores
+        user.www_ranked_positions = ranking.ranked_positions
+        user.www_ranked_scores = ranking.scores[ranking.ranked_positions]
+        user.www_ranked_labels = ranking.labels[ranking.ranked_positions]
+        user.www_local_indices = ranking.sample_indices
+        user.www_ranked_local_indices = ranking.sample_indices[
             ranking.ranked_positions
         ]
-        self._update_iclr_score_statistics(user, ranking, ranking_round)
-        self._iclr_client_stats.setdefault(user.id, {}).update(
+        self._update_www_score_statistics(user, ranking, ranking_round)
+        self._www_client_stats.setdefault(user.id, {}).update(
             {
                 "latest_ranking_round": int(ranking_round),
                 "latest_ranking_source_round": int(source_round),
@@ -751,15 +762,17 @@ class DefenseController:
                 "latest_ranking_weight": float(aggregation_weight),
             }
         )
-        self._record("iclr_score_mean", float(ranking.scores.mean()))
-        self._record("iclr_score_min", float(ranking.scores.min()))
-        self._record("iclr_score_max", float(ranking.scores.max()))
+        if not bool(self.config.get("release_private_diagnostics", False)) or not ranking.scores.numel():
+            return
+        self._record("www_score_mean", float(ranking.scores.mean()))
+        self._record("www_score_min", float(ranking.scores.min()))
+        self._record("www_score_max", float(ranking.scores.max()))
         self._record(
-            "iclr_positive_score_fraction",
+            "www_positive_score_fraction",
             float((ranking.scores > 0).float().mean()),
         )
 
-    def analyze_iclr_completed_round(
+    def analyze_www_completed_round(
         self,
         users,
         global_state: dict[str, torch.Tensor],
@@ -771,22 +784,25 @@ class DefenseController:
         """Analyze the exact FedSGD batches uploaded at a scheduled round."""
         completed_round = int(round_index) + 1
         if (
-            self.name != "iclr"
-            or self.iclr_analysis_timing != "post_round"
-            or completed_round % self.iclr_analysis_interval != 0
+            self.name != "www"
+            or not bool(self.config.get("release_private_diagnostics", False))
+            or self.www_analysis_timing != "post_round"
+            or completed_round % self.www_analysis_interval != 0
         ):
             return False
         if self.federated_method != "fedsgd":
             raise ValueError(
-                "Post-round ICLR analysis currently requires one-batch FedSGD."
+                "Post-round WWW analysis currently requires one-batch FedSGD."
             )
 
         for client_id in selected_ids:
             user = users[client_id]
             if user.last_train_batch is None or user.last_train_indices is None:
                 raise RuntimeError(
-                    f"Client {client_id} has no indexed FedSGD batch for ICLR."
+                    f"Client {client_id} has no indexed FedSGD batch for WWW."
                 )
+            if not user.last_train_batch[1].numel():
+                continue
             own_state = updated_states[client_id]
             weight = float(aggregation_weights[client_id])
             other_state = infer_other_clients_state(
@@ -807,14 +823,14 @@ class DefenseController:
                     device=self.device,
                     sample_indices=user.last_train_indices,
                 )
-            self._record_iclr_ranking(
+            self._record_www_ranking(
                 user=user,
                 ranking=ranking,
                 ranking_round=round_index,
                 source_round=round_index,
                 aggregation_weight=weight,
             )
-            self._iclr_round_metrics.append(
+            self._www_round_metrics.append(
                 {
                     "communication_round": completed_round,
                     "client_id": int(client_id),
@@ -828,7 +844,7 @@ class DefenseController:
                 }
             )
             for position in range(ranking.scores.numel()):
-                self._iclr_round_samples.append(
+                self._www_round_samples.append(
                     {
                         "communication_round": completed_round,
                         "client_id": int(client_id),
@@ -839,80 +855,80 @@ class DefenseController:
                         "class_label": int(ranking.labels[position]),
                         "own_loss": float(ranking.own_losses[position]),
                         "other_loss": float(ranking.other_losses[position]),
-                        "iclr_score": float(ranking.scores[position]),
+                        "www_score": float(ranking.scores[position]),
                     }
                 )
-        return True
+        return any(row["communication_round"] == completed_round for row in self._www_round_metrics)
 
-    def initialize_iclr_feature_statistics(self, users) -> None:
+    def initialize_www_feature_statistics(self, users) -> None:
         """Compute fixed feature statistics from every complete local dataset."""
-        if self.name != "iclr" or not self.iclr_feature_statistics_enabled:
+        if self.name != "www" or not self.www_feature_statistics_enabled:
             return
         for user in users:
-            user.iclr_feature_seen = None
-            user.iclr_class_feature_counts = None
-            user.iclr_class_feature_means = None
-            user.iclr_within_class_scatter = None
-            user.iclr_within_class_covariance = None
-            user.iclr_within_class_covariance_dof = 0
+            user.www_feature_seen = None
+            user.www_class_feature_counts = None
+            user.www_class_feature_means = None
+            user.www_within_class_scatter = None
+            user.www_within_class_covariance = None
+            user.www_within_class_covariance_dof = 0
             for images, labels, local_indices in (
-                user.iter_iclr_statistics_batches()
+                user.iter_www_statistics_batches()
             ):
                 encoded_features = encode_training_batches(
                     model=user.model,
                     batches=[(images, labels)],
                     device=self.device,
                 )
-                self._update_iclr_feature_statistics(
+                self._update_www_feature_statistics(
                     user=user,
                     encoded_features=encoded_features,
                     labels=labels,
                     sample_indices=local_indices,
                     num_classes=self.num_classes,
                 )
-            if user.iclr_class_feature_counts is None:
+            if user.www_class_feature_counts is None:
                 raise ValueError(
-                    f"Client {user.id} has no samples for ICLR feature statistics."
+                    f"Client {user.id} has no samples for WWW feature statistics."
                 )
-            encoded_samples = int(user.iclr_class_feature_counts.sum())
+            encoded_samples = int(user.www_class_feature_counts.sum())
             if encoded_samples != int(user.train_samples):
                 raise RuntimeError(
-                    f"Client {user.id} ICLR feature statistics cover "
+                    f"Client {user.id} WWW feature statistics cover "
                     f"{encoded_samples}/{user.train_samples} local samples."
                 )
-            self._iclr_client_stats.setdefault(user.id, {}).update(
+            self._www_client_stats.setdefault(user.id, {}).update(
                 {
                     "encoded_feature_samples": encoded_samples,
                     "encoded_feature_classes": int(
-                        (user.iclr_class_feature_counts > 0).sum()
+                        (user.www_class_feature_counts > 0).sum()
                     ),
                     "encoded_feature_dimension": int(
-                        user.iclr_class_feature_means.shape[1]
+                        user.www_class_feature_means.shape[1]
                     ),
                     "within_class_covariance_dof": int(
-                        user.iclr_within_class_covariance_dof
+                        user.www_within_class_covariance_dof
                     ),
                 }
             )
 
     @staticmethod
-    def _update_iclr_score_statistics(user, ranking, round_index: int) -> None:
+    def _update_www_score_statistics(user, ranking, round_index: int) -> None:
         """Maintain compact per-local-sample statistics across communication rounds."""
         sample_count = int(user.train_samples)
-        if user.iclr_score_count is None:
-            user.iclr_score_count = torch.zeros(sample_count, dtype=torch.long)
-            user.iclr_score_sum = torch.zeros(sample_count, dtype=torch.float64)
-            user.iclr_score_sum_sq = torch.zeros(sample_count, dtype=torch.float64)
-            user.iclr_score_min = torch.full(
+        if user.www_score_count is None:
+            user.www_score_count = torch.zeros(sample_count, dtype=torch.long)
+            user.www_score_sum = torch.zeros(sample_count, dtype=torch.float64)
+            user.www_score_sum_sq = torch.zeros(sample_count, dtype=torch.float64)
+            user.www_score_min = torch.full(
                 (sample_count,), float("inf"), dtype=torch.float64
             )
-            user.iclr_score_max = torch.full(
+            user.www_score_max = torch.full(
                 (sample_count,), float("-inf"), dtype=torch.float64
             )
-            user.iclr_score_last = torch.full(
+            user.www_score_last = torch.full(
                 (sample_count,), float("nan"), dtype=torch.float64
             )
-            user.iclr_score_last_round = torch.full(
+            user.www_score_last_round = torch.full(
                 (sample_count,), -1, dtype=torch.long
             )
 
@@ -921,27 +937,27 @@ class DefenseController:
         if indices.numel() == 0:
             return
         if int(indices.min()) < 0 or int(indices.max()) >= sample_count:
-            raise IndexError("ICLR local sample index is outside the client dataset.")
+            raise IndexError("WWW local sample index is outside the client dataset.")
         ones = torch.ones(indices.numel(), dtype=torch.long)
-        user.iclr_score_count.index_add_(0, indices, ones)
-        user.iclr_score_sum.index_add_(0, indices, scores)
-        user.iclr_score_sum_sq.index_add_(0, indices, scores.square())
-        user.iclr_score_min.scatter_reduce_(
+        user.www_score_count.index_add_(0, indices, ones)
+        user.www_score_sum.index_add_(0, indices, scores)
+        user.www_score_sum_sq.index_add_(0, indices, scores.square())
+        user.www_score_min.scatter_reduce_(
             0, indices, scores, reduce="amin", include_self=True
         )
-        user.iclr_score_max.scatter_reduce_(
+        user.www_score_max.scatter_reduce_(
             0, indices, scores, reduce="amax", include_self=True
         )
         if torch.unique(indices).numel() == indices.numel():
-            user.iclr_score_last[indices] = scores
-            user.iclr_score_last_round[indices] = int(round_index)
+            user.www_score_last[indices] = scores
+            user.www_score_last_round[indices] = int(round_index)
         else:
             for index, score in zip(indices.tolist(), scores.tolist()):
-                user.iclr_score_last[index] = score
-                user.iclr_score_last_round[index] = int(round_index)
+                user.www_score_last[index] = score
+                user.www_score_last_round[index] = int(round_index)
 
     @staticmethod
-    def _update_iclr_feature_statistics(
+    def _update_www_feature_statistics(
         user,
         encoded_features: torch.Tensor,
         labels: torch.Tensor,
@@ -953,43 +969,43 @@ class DefenseController:
         labels = labels.detach().cpu().long().flatten()
         indices = sample_indices.detach().cpu().long().flatten()
         if features.ndim != 2:
-            raise ValueError("ICLR encoded features must be a matrix.")
+            raise ValueError("WWW encoded features must be a matrix.")
         if features.shape[0] != labels.numel() or labels.numel() != indices.numel():
             raise ValueError(
-                "ICLR features, labels, and local indices must be sample-aligned."
+                "WWW features, labels, and local indices must be sample-aligned."
             )
         if indices.numel() == 0:
             return
         sample_count = int(user.train_samples)
         if int(indices.min()) < 0 or int(indices.max()) >= sample_count:
-            raise IndexError("ICLR feature local index is outside the client dataset.")
+            raise IndexError("WWW feature local index is outside the client dataset.")
         if int(labels.min()) < 0 or int(labels.max()) >= int(num_classes):
-            raise ValueError("ICLR feature label is outside the configured classes.")
+            raise ValueError("WWW feature label is outside the configured classes.")
 
         dimension = int(features.shape[1])
-        if user.iclr_feature_seen is None:
-            user.iclr_feature_seen = torch.zeros(sample_count, dtype=torch.bool)
-            user.iclr_class_feature_counts = torch.zeros(
+        if user.www_feature_seen is None:
+            user.www_feature_seen = torch.zeros(sample_count, dtype=torch.bool)
+            user.www_class_feature_counts = torch.zeros(
                 num_classes, dtype=torch.long
             )
-            user.iclr_class_feature_means = torch.zeros(
+            user.www_class_feature_means = torch.zeros(
                 (num_classes, dimension), dtype=torch.float64
             )
-            user.iclr_within_class_scatter = torch.zeros(
+            user.www_within_class_scatter = torch.zeros(
                 (dimension, dimension), dtype=torch.float64
             )
-            user.iclr_within_class_covariance = torch.zeros(
+            user.www_within_class_covariance = torch.zeros(
                 (dimension, dimension), dtype=torch.float64
             )
-        elif user.iclr_class_feature_means.shape != (num_classes, dimension):
+        elif user.www_class_feature_means.shape != (num_classes, dimension):
             raise ValueError(
-                "ICLR encoded feature dimension or class count changed during training."
+                "WWW encoded feature dimension or class count changed during training."
             )
 
         new_positions = []
         batch_indices = set()
         for position, local_index in enumerate(indices.tolist()):
-            if user.iclr_feature_seen[local_index] or local_index in batch_indices:
+            if user.www_feature_seen[local_index] or local_index in batch_indices:
                 continue
             batch_indices.add(local_index)
             new_positions.append(position)
@@ -1008,8 +1024,8 @@ class DefenseController:
             centered = class_features - batch_mean
             batch_scatter = centered.t().matmul(centered)
 
-            previous_count = int(user.iclr_class_feature_counts[class_id])
-            previous_mean = user.iclr_class_feature_means[class_id]
+            previous_count = int(user.www_class_feature_counts[class_id])
+            previous_mean = user.www_class_feature_means[class_id]
             combined_count = previous_count + batch_count
             if previous_count == 0:
                 combined_mean = batch_mean
@@ -1023,22 +1039,22 @@ class DefenseController:
                     previous_count * batch_count / combined_count
                 )
                 merge_scatter = batch_scatter + correction
-            user.iclr_class_feature_counts[class_id] = combined_count
-            user.iclr_class_feature_means[class_id] = combined_mean
-            user.iclr_within_class_scatter.add_(merge_scatter)
+            user.www_class_feature_counts[class_id] = combined_count
+            user.www_class_feature_means[class_id] = combined_mean
+            user.www_within_class_scatter.add_(merge_scatter)
 
-        user.iclr_feature_seen[new_indices] = True
-        populated_classes = int((user.iclr_class_feature_counts > 0).sum())
-        total_samples = int(user.iclr_class_feature_counts.sum())
+        user.www_feature_seen[new_indices] = True
+        populated_classes = int((user.www_class_feature_counts > 0).sum())
+        total_samples = int(user.www_class_feature_counts.sum())
         degrees_of_freedom = total_samples - populated_classes
-        user.iclr_within_class_covariance_dof = degrees_of_freedom
+        user.www_within_class_covariance_dof = degrees_of_freedom
         if degrees_of_freedom > 0:
-            covariance = user.iclr_within_class_scatter / degrees_of_freedom
-            user.iclr_within_class_covariance.copy_(
+            covariance = user.www_within_class_scatter / degrees_of_freedom
+            user.www_within_class_covariance.copy_(
                 (covariance + covariance.t()) * 0.5
             )
         else:
-            user.iclr_within_class_covariance.zero_()
+            user.www_within_class_covariance.zero_()
 
     def prepare_client_training(
         self,
@@ -1048,18 +1064,15 @@ class DefenseController:
         source_round: int,
         own_state: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        """Build the two ICLR references immediately before global overwrite."""
-        if self.name != "iclr" or self.iclr_analysis_timing == "post_round":
-            return
-        upcoming_completed_round = int(source_round) + 2
-        if upcoming_completed_round % self.iclr_analysis_interval != 0:
+        """Build the two WWW references immediately before global overwrite."""
+        if self.name != "www":
             return
         own_state = user.get_parameters() if own_state is None else own_state
         weight = float(own_weight)
         other_state = infer_other_clients_state(global_state, own_state, weight)
-        self._iclr_pending_states[user.id] = (own_state, other_state)
-        user.iclr_source_round = int(source_round)
-        user.iclr_aggregation_weight = weight
+        self._www_pending_states[user.id] = (own_state, other_state)
+        user.www_source_round = int(source_round)
+        user.www_aggregation_weight = weight
 
     @staticmethod
     def _secret_losses(user, model, images, labels) -> torch.Tensor:
@@ -1772,6 +1785,8 @@ class DefenseController:
         self.cofedmid.perturb(updated_states, aggregation_weights, round_index)
 
     def conservative_dp_epsilon(self) -> float | None:
+        if self.www_privacy is not None:
+            return self.www_privacy.summary(self.steps)["epsilon_upper_bound"]
         if self.name == "record_dp":
             epsilons = self.record_dp_epsilons()
             return max(epsilons.values()) if epsilons else None
@@ -1840,49 +1855,60 @@ class DefenseController:
         }
         if self.cofedmid is not None:
             summary["cofedmid"] = self.cofedmid.summary()
-        if self.name == "iclr":
-            periodic_post_round = self.iclr_analysis_timing == "post_round"
+        if self.name == "www":
+            periodic_post_round = self.www_analysis_timing == "post_round"
             completed_rounds = (
                 sorted(
                     {
                         int(row["communication_round"])
-                        for row in self._iclr_round_metrics
+                        for row in self._www_round_metrics
                     }
                 )
                 if periodic_post_round
                 else None
             )
-            summary["iclr"] = {
+            summary["www"] = {
                 "score": "L(x; theta_-k) - L(x; theta_k)",
-                "ranking": "descending",
-                "training_action": "rank_only",
-                "analysis_timing": self.iclr_analysis_timing,
-                "analysis_interval": self.iclr_analysis_interval,
+                "ranking": "ascending",
+                "training_action": "ino_weighted_per_sample_clipping_and_gaussian_noise",
+                "tail_fraction": self.config["www_tail_fraction"],
+                "tail_count": "min(actual_batch_size, ceil(expected_batch_size * tail_fraction))",
+                "tail_length": "fixed_per_client_expected_batch_size",
+                "tail_selection": "largest_loss_differences",
+                "initial_clip_norm": self.config["max_grad_norm"],
+                "importance_function": "flipped_beta_cdf_interval_average",
+                "beta_alpha": self.config["www_beta_alpha"],
+                "beta_beta": self.config["www_beta_beta"],
+                "defense_interval": 1,
+                "reference": "previous_round_defended_local_and_other_client_models",
+                "missing_reference": "uniform_clipping_and_noise",
+                "analysis_timing": self.www_analysis_timing,
+                "analysis_interval": self.www_analysis_interval,
                 "scheduled_rounds": (
                     list(
                         range(
-                            self.iclr_analysis_interval,
+                            self.www_analysis_interval,
                             self.total_rounds + 1,
-                            self.iclr_analysis_interval,
+                            self.www_analysis_interval,
                         )
                     )
                     if periodic_post_round
                     else None
                 ),
                 "completed_rounds": completed_rounds,
-                "round_metric_rows": len(self._iclr_round_metrics),
-                "round_sample_rows": len(self._iclr_round_samples),
+                "round_metric_rows": len(self._www_round_metrics),
+                "round_sample_rows": len(self._www_round_samples),
                 "projres_alignment_sample_rows": len(
-                    self._iclr_projres_samples
+                    self._www_projres_samples
                 ),
                 "projres_alignment_relationship_rows": len(
-                    self._iclr_projres_metrics
+                    self._www_projres_metrics
                 ),
                 "feature_statistics": {
-                    "enabled": self.iclr_feature_statistics_enabled,
+                    "enabled": self.www_feature_statistics_enabled,
                     "feature_space": (
                         "frozen_clip_image_encoder_output"
-                        if self.iclr_feature_statistics_enabled
+                        if self.www_feature_statistics_enabled
                         else None
                     ),
                     "sample_weighting": "full_local_training_set_once",
@@ -1893,13 +1919,15 @@ class DefenseController:
                 "client_state": {
                     str(client_id): values
                     for client_id, values in sorted(
-                        self._iclr_client_stats.items()
+                        self._www_client_stats.items()
                     )
                 },
             }
         epsilon = self.conservative_dp_epsilon()
         if epsilon is not None:
-            if self.name == "record_dp":
+            if self.www_privacy is not None:
+                summary["privacy_accounting"] = self.www_privacy.summary(self.steps)
+            elif self.name == "record_dp":
                 epsilons = self.record_dp_epsilons()
                 summary["privacy_accounting"] = {
                     "privacy_unit": "record",
@@ -2013,24 +2041,24 @@ class DefenseController:
         summary = self.summary()
         if self.cofedmid is not None:
             self.cofedmid.save(results_dir)
-        if self.name == "iclr" and self._iclr_round_metrics:
-            self.save_iclr_round_metrics(results_dir)
-            summary["iclr"]["round_metrics_artifact"] = (
-                "iclr_round_metrics.csv"
+        if self.name == "www" and self._www_round_metrics:
+            self.save_www_round_metrics(results_dir)
+            summary["www"]["round_metrics_artifact"] = (
+                "www_round_metrics.csv"
             )
-            summary["iclr"]["round_samples_artifact"] = (
-                "iclr_round_samples.csv"
+            summary["www"]["round_samples_artifact"] = (
+                "www_round_samples.csv"
             )
-            summary["iclr"]["round_series_artifact"] = "iclr_series.json"
-        if self.name == "iclr" and self._iclr_projres_samples:
+            summary["www"]["round_series_artifact"] = "www_series.json"
+        if self.name == "www" and self._www_projres_samples:
             relationship_dir = os.path.join(results_dir, "privacy_audit")
-            self._save_iclr_projres_relationship(relationship_dir)
-            summary["iclr"]["projres_alignment_artifacts"] = {
-                "samples": "privacy_audit/iclr_projres_samples.csv",
+            self._save_www_projres_relationship(relationship_dir)
+            summary["www"]["projres_alignment_artifacts"] = {
+                "samples": "privacy_audit/www_projres_samples.csv",
                 "relationships": (
-                    "privacy_audit/iclr_projres_relationship.csv"
+                    "privacy_audit/www_projres_relationship.csv"
                 ),
-                "summary": "privacy_audit/iclr_projres_relationship.json",
+                "summary": "privacy_audit/www_projres_relationship.json",
             }
         with open(
             os.path.join(results_dir, "defense_summary.json"),
@@ -2040,52 +2068,52 @@ class DefenseController:
             json.dump(summary, file, indent=2, allow_nan=False)
         return summary
 
-    def save_iclr_round_metrics(self, results_dir: str) -> None:
-        """Persist completed periodic ICLR rows so long runs are resumable."""
-        if self.name != "iclr" or not self._iclr_round_metrics:
+    def save_www_round_metrics(self, results_dir: str) -> None:
+        """Persist completed periodic WWW rows so long runs are resumable."""
+        if self.name != "www" or not self._www_round_metrics:
             return
         os.makedirs(results_dir, exist_ok=True)
-        metric_path = os.path.join(results_dir, "iclr_round_metrics.csv")
+        metric_path = os.path.join(results_dir, "www_round_metrics.csv")
         with open(metric_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
                 file,
-                fieldnames=list(self._iclr_round_metrics[0]),
+                fieldnames=list(self._www_round_metrics[0]),
             )
             writer.writeheader()
-            writer.writerows(self._iclr_round_metrics)
-        sample_path = os.path.join(results_dir, "iclr_round_samples.csv")
+            writer.writerows(self._www_round_metrics)
+        sample_path = os.path.join(results_dir, "www_round_samples.csv")
         with open(sample_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
                 file,
-                fieldnames=list(self._iclr_round_samples[0]),
+                fieldnames=list(self._www_round_samples[0]),
             )
             writer.writeheader()
-            writer.writerows(self._iclr_round_samples)
+            writer.writerows(self._www_round_samples)
         completed_rounds = sorted(
             {
                 int(row["communication_round"])
-                for row in self._iclr_round_metrics
+                for row in self._www_round_metrics
             }
         )
         with open(
-            os.path.join(results_dir, "iclr_series.json"),
+            os.path.join(results_dir, "www_series.json"),
             "w",
             encoding="utf-8",
         ) as file:
             json.dump(
                 {
-                    "experiment": "periodic_post_round_iclr",
-                    "analysis_interval": self.iclr_analysis_interval,
+                    "experiment": "periodic_post_round_www",
+                    "analysis_interval": self.www_analysis_interval,
                     "scheduled_rounds": list(
                         range(
-                            self.iclr_analysis_interval,
+                            self.www_analysis_interval,
                             self.total_rounds + 1,
-                            self.iclr_analysis_interval,
+                            self.www_analysis_interval,
                         )
                     ),
                     "completed_rounds": completed_rounds,
-                    "metric_rows": len(self._iclr_round_metrics),
-                    "sample_rows": len(self._iclr_round_samples),
+                    "metric_rows": len(self._www_round_metrics),
+                    "sample_rows": len(self._www_round_samples),
                     "round_metrics": os.path.basename(metric_path),
                     "round_samples": os.path.basename(sample_path),
                 },
@@ -2094,20 +2122,20 @@ class DefenseController:
                 allow_nan=False,
             )
 
-    def record_iclr_projres_relationship(
+    def record_www_projres_relationship(
         self,
         projres_payload: dict,
         output_dir: str,
         round_index: int,
     ) -> bool:
-        """Strictly join one periodic ProjRes result to its ICLR batch rows."""
-        if self.name != "iclr" or self.iclr_analysis_timing != "post_round":
+        """Strictly join one periodic ProjRes result to its WWW batch rows."""
+        if self.name != "www" or self.www_analysis_timing != "post_round":
             return False
         completed_round = int(round_index) + 1
         payload_round = int(projres_payload.get("communication_round", -1))
         if payload_round != completed_round:
             raise ValueError(
-                "ICLR and ProjRes communication rounds do not match: "
+                "WWW and ProjRes communication rounds do not match: "
                 f"{completed_round} != {payload_round}."
             )
         if "result" in projres_payload:
@@ -2117,23 +2145,23 @@ class DefenseController:
         if not client_results:
             raise ValueError("ProjRes payload contains no client results.")
 
-        current_iclr = {
+        current_www = {
             (
                 int(row["client_id"]),
                 int(row["batch_position"]),
             ): row
-            for row in self._iclr_round_samples
+            for row in self._www_round_samples
             if int(row["communication_round"]) == completed_round
         }
-        if not current_iclr:
+        if not current_www:
             raise ValueError(
-                f"No ICLR sample rows exist for communication round {completed_round}."
+                f"No WWW sample rows exist for communication round {completed_round}."
             )
 
         new_rows = []
         new_metrics = []
         top_fraction = float(
-            self.config.get("iclr_validation_top_fraction", 0.2)
+            self.config.get("www_validation_top_fraction", 0.2)
         )
         for result in client_results:
             client_id = int(result["client_id"])
@@ -2172,7 +2200,7 @@ class DefenseController:
             nonmember_scores = all_projres_scores[raw_labels == 0]
             if nonmember_scores.numel() == 0:
                 raise ValueError(
-                    "ICLR-ProjRes low-FPR analysis requires nonmember scores."
+                    "WWW-ProjRes low-FPR analysis requires nonmember scores."
                 )
             if int((raw_labels == 1).sum()) != member_count:
                 raise ValueError(
@@ -2183,20 +2211,20 @@ class DefenseController:
             for offset in range(member_count):
                 batch_position = int(batch_positions[offset])
                 local_sample_index = int(local_indices[offset])
-                iclr = current_iclr.get((client_id, batch_position))
-                if iclr is None:
+                www = current_www.get((client_id, batch_position))
+                if www is None:
                     raise ValueError(
-                        "Missing ICLR row for ProjRes member "
+                        "Missing WWW row for ProjRes member "
                         f"round={completed_round}, client={client_id}, "
                         f"batch_position={batch_position}."
                     )
-                if int(iclr["local_sample_index"]) != local_sample_index:
+                if int(www["local_sample_index"]) != local_sample_index:
                     raise ValueError(
-                        "ICLR and ProjRes local sample indices do not match."
+                        "WWW and ProjRes local sample indices do not match."
                     )
                 class_label = int(member_labels[offset])
-                if int(iclr["class_label"]) != class_label:
-                    raise ValueError("ICLR and ProjRes class labels do not match.")
+                if int(www["class_label"]) != class_label:
+                    raise ValueError("WWW and ProjRes class labels do not match.")
                 if int(raw["labels"][offset]) != 1:
                     raise ValueError("ProjRes aligned batch entry is not a member.")
                 row = {
@@ -2205,9 +2233,9 @@ class DefenseController:
                     "batch_position": batch_position,
                     "local_sample_index": local_sample_index,
                     "class_label": class_label,
-                    "iclr_score": float(iclr["iclr_score"]),
-                    "iclr_own_loss": float(iclr["own_loss"]),
-                    "iclr_other_loss": float(iclr["other_loss"]),
+                    "www_score": float(www["www_score"]),
+                    "www_own_loss": float(www["own_loss"]),
+                    "www_other_loss": float(www["other_loss"]),
                     "projres_score": float(raw["scores"][offset]),
                     "projres_l1_residual": float(
                         raw["l1_residuals"][offset]
@@ -2216,8 +2244,8 @@ class DefenseController:
                 client_rows.append(row)
                 new_rows.append(row)
 
-            iclr_scores = torch.tensor(
-                [row["iclr_score"] for row in client_rows],
+            www_scores = torch.tensor(
+                [row["www_score"] for row in client_rows],
                 dtype=torch.float64,
             )
             projres_scores = torch.tensor(
@@ -2233,7 +2261,7 @@ class DefenseController:
                 dtype=torch.long,
             )
             top, bottom, top_count = _top_bottom_masks(
-                iclr_scores, top_fraction
+                www_scores, top_fraction
             )
             projres_top = torch.zeros(member_count, dtype=torch.bool)
             projres_order = torch.argsort(
@@ -2243,7 +2271,7 @@ class DefenseController:
             overlap_count = int((top & projres_top).sum())
             expected_overlap = top_count * top_count / max(member_count, 1)
             adjusted, macro, adjusted_classes = _class_adjusted_spearman(
-                iclr_scores,
+                www_scores,
                 projres_scores,
                 class_labels,
             )
@@ -2256,23 +2284,23 @@ class DefenseController:
                 "projres_nonmember_samples": int(nonmember_scores.numel()),
                 "top_fraction": top_fraction,
                 "top_count": top_count,
-                "pearson_iclr_projres_score": _pearson(
-                    iclr_scores, projres_scores
+                "pearson_www_projres_score": _pearson(
+                    www_scores, projres_scores
                 ),
-                "spearman_iclr_projres_score": _spearman(
-                    iclr_scores, projres_scores
+                "spearman_www_projres_score": _spearman(
+                    www_scores, projres_scores
                 ),
                 "class_adjusted_spearman": adjusted,
                 "class_macro_spearman": macro,
                 "class_adjusted_classes": adjusted_classes,
-                "pearson_iclr_negative_l1_residual": _pearson(
-                    iclr_scores, negative_residuals
+                "pearson_www_negative_l1_residual": _pearson(
+                    www_scores, negative_residuals
                 ),
-                "spearman_iclr_negative_l1_residual": _spearman(
-                    iclr_scores, negative_residuals
+                "spearman_www_negative_l1_residual": _spearman(
+                    www_scores, negative_residuals
                 ),
-                "projres_score_mean_iclr_top": top_score,
-                "projres_score_mean_iclr_bottom": bottom_score,
+                "projres_score_mean_www_top": top_score,
+                "projres_score_mean_www_bottom": bottom_score,
                 "projres_score_top_minus_bottom": (
                     top_score - bottom_score
                     if top_score is not None and bottom_score is not None
@@ -2305,10 +2333,10 @@ class DefenseController:
                     bottom_hit = _safe_mean(hits[bottom])
                 metric_row[f"projres_hit_rate_fpr_{suffix}"] = overall_hit
                 metric_row[
-                    f"projres_hit_rate_iclr_top_fpr_{suffix}"
+                    f"projres_hit_rate_www_top_fpr_{suffix}"
                 ] = top_hit
                 metric_row[
-                    f"projres_hit_rate_iclr_bottom_fpr_{suffix}"
+                    f"projres_hit_rate_www_bottom_fpr_{suffix}"
                 ] = bottom_hit
                 metric_row[
                     f"projres_hit_top_minus_bottom_fpr_{suffix}"
@@ -2334,7 +2362,7 @@ class DefenseController:
                 int(row["client_id"]),
                 int(row["batch_position"]),
             )
-            for row in self._iclr_projres_samples
+            for row in self._www_projres_samples
         }
         duplicate_keys = {
             (
@@ -2346,44 +2374,44 @@ class DefenseController:
         } & existing_keys
         if duplicate_keys:
             raise ValueError(
-                f"Duplicate ICLR-ProjRes alignment rows: {sorted(duplicate_keys)}"
+                f"Duplicate WWW-ProjRes alignment rows: {sorted(duplicate_keys)}"
             )
-        self._iclr_projres_samples.extend(new_rows)
-        self._iclr_projres_metrics.extend(new_metrics)
-        self._save_iclr_projres_relationship(output_dir)
+        self._www_projres_samples.extend(new_rows)
+        self._www_projres_metrics.extend(new_metrics)
+        self._save_www_projres_relationship(output_dir)
         return True
 
-    def _save_iclr_projres_relationship(self, output_dir: str) -> None:
-        """Persist all completed exact ICLR-ProjRes joins."""
-        if not self._iclr_projres_samples:
+    def _save_www_projres_relationship(self, output_dir: str) -> None:
+        """Persist all completed exact WWW-ProjRes joins."""
+        if not self._www_projres_samples:
             return
         os.makedirs(output_dir, exist_ok=True)
-        sample_path = os.path.join(output_dir, "iclr_projres_samples.csv")
+        sample_path = os.path.join(output_dir, "www_projres_samples.csv")
         with open(sample_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
                 file,
-                fieldnames=list(self._iclr_projres_samples[0]),
+                fieldnames=list(self._www_projres_samples[0]),
             )
             writer.writeheader()
-            writer.writerows(self._iclr_projres_samples)
+            writer.writerows(self._www_projres_samples)
         metric_path = os.path.join(
-            output_dir, "iclr_projres_relationship.csv"
+            output_dir, "www_projres_relationship.csv"
         )
         with open(metric_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
                 file,
-                fieldnames=list(self._iclr_projres_metrics[0]),
+                fieldnames=list(self._www_projres_metrics[0]),
             )
             writer.writeheader()
-            writer.writerows(self._iclr_projres_metrics)
+            writer.writerows(self._www_projres_metrics)
         completed_rounds = sorted(
             {
                 int(row["communication_round"])
-                for row in self._iclr_projres_metrics
+                for row in self._www_projres_metrics
             }
         )
         with open(
-            os.path.join(output_dir, "iclr_projres_relationship.json"),
+            os.path.join(output_dir, "www_projres_relationship.json"),
             "w",
             encoding="utf-8",
         ) as file:
@@ -2400,7 +2428,7 @@ class DefenseController:
                         "population": (
                             "exact members in the observed one-batch FedSGD upload"
                         ),
-                        "iclr_score": "L(x; theta_-k) - L(x; theta_k)",
+                        "www_score": "L(x; theta_-k) - L(x; theta_k)",
                         "projres_score_direction": "higher_is_more_member_like",
                         "projres_residual_direction": "lower_is_more_member_like",
                         "low_fpr_hit_rule": (
@@ -2415,13 +2443,13 @@ class DefenseController:
                         ),
                     },
                     "completed_rounds": completed_rounds,
-                    "sample_rows": len(self._iclr_projres_samples),
-                    "relationship_rows": len(self._iclr_projres_metrics),
+                    "sample_rows": len(self._www_projres_samples),
+                    "relationship_rows": len(self._www_projres_metrics),
                     "artifacts": {
                         "samples": os.path.basename(sample_path),
                         "relationships": os.path.basename(metric_path),
                     },
-                    "relationships": self._iclr_projres_metrics,
+                    "relationships": self._www_projres_metrics,
                 },
                 file,
                 indent=2,

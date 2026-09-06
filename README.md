@@ -29,7 +29,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 - FedSGD 客户端上传各自的可训练参数梯度；服务器先等权聚合梯度，再执行一次
   `global = base - learning_rate * mean_gradient` 并下发新的全局模型。
 - CLIP 普通任务每 5 个已完成通信轮评估一次；多轮攻击通常每 10 轮审计。
-- BERT 普通任务、六种真实 Batch 攻击与 ICLR 每 50 轮评估，五种固定候选攻击每
+- BERT 普通任务与六种真实 Batch 攻击每 50 轮评估，五种固定候选攻击每
   10 轮评估；GPT2 普通任务与全部攻击每 50 轮评估。调度始终包含最后一轮。
 - 所有聚合和保存操作只处理 `requires_grad=True` 的参数，冻结主干不上传。
 
@@ -62,7 +62,7 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 
 | 模型 | 默认通用攻击 | ProjRes | 说明 |
 | --- | --- | --- | --- |
-| ResNet18 / CIFAR100 | `fedmia_loss` | 不支持 | 论文复现入口；同时输出同一固定候选的逐样本 ICLR 评分 |
+| ResNet18 / CIFAR100 | `fedmia_loss` | 不支持 | 论文复现入口；同时输出同一固定候选的逐样本 WWW 评分 |
 | CLIP-MLP | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种；ProjRes 攻击 `classifier.0.weight` |
 | CLIP-Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
 | CLIP-LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
@@ -135,7 +135,7 @@ CLIP-MLP、CLIP-Adapter、CLIP-LoRA、BERT 和 GPT2 固定候选攻击的经验 
 ├── users/                  # 客户端本地训练与协议消息
 ├── servers/                # 联邦训练循环
 ├── privacy_attacks/        # 统一审计器、攻击与 ProjRes
-├── privacy_defenses/       # 隐私防御和 ICLR 分析
+├── privacy_defenses/       # 隐私防御和 WWW 分析
 ├── configs/                # 统一能力目录与 7 份模型基线
 ├── scripts/                # 唯一批量入口及专项校准/诊断工具
 ├── analysis_scripts/       # CSV/Markdown/PNG 等结果分析工具
@@ -214,7 +214,7 @@ python scripts/run_privacy_experiments.py \
 # 多模型、多数据集、多防御；每种防御生成独立训练任务
 python scripts/run_privacy_experiments.py \
   --models bert_adapter,bert_lora --datasets sst5,cola \
-  --attacks all --defenses none,iclr
+  --attacks all --defenses none,www
 
 # 运行仓库全部模型以及每个模型正式支持的全部攻击/防御
 python scripts/run_privacy_experiments.py \
@@ -284,11 +284,11 @@ python scripts/validate_projres_mlp_real.py \
 当前统一 CLIP-MLP、CLIP-Adapter、CLIP-LoRA、BERT 和 GPT2 sweep 均使用
 `balanced_global_holdout`。
 
-## 隐私防御与 ICLR 分析
+## 隐私防御与 WWW 分析
 
 仓库保留更新扰动、稀疏化、Mixup、采样、数据增强、CoFedMID、Prompt-DP、
-MIST、SOFT、HAMP 和 ICLR 等实现。当前 CLIP 三模型正式支持 `none`、观测型
-`iclr` 与 `cofedmid`；BERT Adapter/LoRA 和 GPT2 Adapter 也支持 CoFedMID。
+MIST、SOFT、HAMP 和 WWW 等实现。当前 CLIP 三模型正式支持 `none`、差分隐私防御
+`www` 与 `cofedmid`；BERT Adapter/LoRA 和 GPT2 Adapter 也支持 CoFedMID。
 具体兼容性由 `configs/experiment_catalog.yaml` 维护。
 
 CoFedMID 默认**所有客户端协作防御**，开启动态类别分配、EXP3 样本回收与正则、
@@ -305,8 +305,24 @@ python scripts/run_privacy_experiments.py --models clip_mlp --defenses none,cofe
 六个模型已通过无下载小模型端到端测试；真实数据集上的隐私与效用效果仍需实验测量。
 详细参数和论文适配边界见 [CoFedMID 文档](docs/defenses.md#cofedmid)。
 
-BERT 配置默认执行不修改训练的 ICLR 排名分析；GPT2 默认不执行。ICLR 输出写入
-同一任务目录的 `defense_summary.json` 及对应逐轮 CSV，不会额外创建训练任务。
+原 ICLR 方法已更名为 WWW，并改为实际参与训练的差分隐私防御。每个客户端每轮按
+`M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 升序排列真实 Poisson batch，
+以期望 batch 大小的 20%（向上取整）固定尾部宽度，选取最高分样本，
+按 INO-SGD 的重要性函数积分缩放逐样本裁剪梯度后加高斯噪声。
+采样、`add_remove` 邻接、Poisson RDP 核算和固定期望 batch 归一化均与普通样本级 DP 一致。
+默认全程隐私预算 `epsilon=3`、初始裁剪阈值 `C=8`、`delta=1e-5`；
+支持三个 CLIP 模型及 BERT Adapter/LoRA。统一入口的 BERT Adapter 默认启用 WWW，
+其余模型默认防御不变。首轮先执行统一裁剪及加噪。
+
+```bash
+python scripts/run_privacy_experiments.py --models clip_mlp --defenses www
+# 覆盖全程预算和初始裁剪阈值
+python scripts/run_privacy_experiments.py --models clip_mlp --defenses www \
+  --set defense.target_epsilon=5 --set defense.max_grad_norm=4
+```
+
+`defense_summary.json` 记录实际预算、噪声尺度和裁剪协议。WWW 默认关闭非隐私逐样本
+诊断文件；历史结果及其 `iclr_*` 文件保持原样。
 防御与威胁模型说明见 [`docs/defenses.md`](docs/defenses.md)。
 
 ### 记录级 DP-SGD
@@ -433,9 +449,9 @@ results/
         ├── candidate_selection.pt
         ├── exact_batch_candidate_selection.pt
         ├── attack_round_metrics.csv
-        ├── iclr_candidate_round_scores.csv
-        ├── iclr_candidate_scores.csv
-        ├── iclr_candidate_relationship.json
+        ├── www_candidate_round_scores.csv
+        ├── www_candidate_scores.csv
+        ├── www_candidate_relationship.json
         └── projres_strict.json       # 仅独立 ProjRes 路径
 ```
 
@@ -452,10 +468,10 @@ results/
 - `candidate_selection.pt` 固定历史候选池；`exact_batch_candidate_selection.pt`
   保存每个真实 batch 审计轮的成员/非成员索引。
 - `attack_round_metrics.csv` 保存周期攻击结果。
-- ResNet18/CIFAR100 FedMIA 任务的 `iclr_candidate_round_scores.csv` 保存每个审计轮、
-  每个候选的目标/其余客户端损失及 ICLR 分数；`iclr_candidate_scores.csv` 保存
+- ResNet18/CIFAR100 FedMIA 任务的 `www_candidate_round_scores.csv` 保存每个审计轮、
+  每个候选的目标/其余客户端损失及 WWW 分数；`www_candidate_scores.csv` 保存
   跨轮均值、方差、末轮分数并按 `sample_index` 连接最终 FedMIA-Loss 分数；关系
-  与成员推理指标汇总在 `iclr_candidate_relationship.json`。
+  与成员推理指标汇总在 `www_candidate_relationship.json`。
 - CLIP-MLP、CLIP-Adapter、CLIP-LoRA、BERT 和 GPT2 的统一 ProjRes 与其他攻击共享上述
   输出，不生成独立 ProjRes 目录。
 
@@ -508,4 +524,4 @@ git diff --check
 - [`docs/attack_mapping.md`](docs/attack_mapping.md)：论文、公式与运行名映射
 - [`docs/federated_methods.md`](docs/federated_methods.md)：FedAvg/FedSGD、聚合和协议消息
 - [`docs/projres_mlp_strict.md`](docs/projres_mlp_strict.md)：统一与独立 CLIP ProjRes
-- [`docs/defenses.md`](docs/defenses.md)：防御与 ICLR 分析
+- [`docs/defenses.md`](docs/defenses.md)：防御与 WWW 分析
