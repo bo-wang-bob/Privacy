@@ -9,8 +9,10 @@ import math
 import statistics
 
 import torch
+from torch.utils.data import DataLoader
 
 from aggregator.base_aggregator import BaseAggregator
+from aggregator.fedavg_aggregator import normalize_client_weights
 from context.context import Context
 from privacy_attacks.auditor import MembershipAuditor
 from privacy_attacks.projres_integrated import run_integrated_projres
@@ -19,8 +21,9 @@ from privacy_defenses import (
     DefenseController,
     attach_hamp_output_transform,
 )
-from utils.privacy_accounting import planned_private_probe_steps
+from privacy_defenses.cofedmid import reserve_validation, validate_cofedmid
 from users.user import UserBase
+from utils.privacy_accounting import planned_private_probe_steps
 
 logger = logging.getLogger(__name__)
 
@@ -296,11 +299,11 @@ class ServerBase:
         self.projres_evaluation_round = self.projres_evaluation_rounds[-1]
         self._projres_series_entries: list[dict] = []
         self.defense_config = defense_config or {"name": "none"}
+        validate_cofedmid(self.defense_config, total_users, user_per_round)
         if self.federated_method == "fedsgd" and str(
             self.defense_config.get("name", "none")
         ).lower() in {
             "mist",
-            "cofedmid",
             "perturb",
             "sparse",
         }:
@@ -351,6 +354,24 @@ class ServerBase:
         )
         self.defense.federated_method = self.federated_method
         self.defense.method_config = self.method_config
+        validation_fraction = float(
+            self.defense_config.get("cofedmid_validation_fraction", 0)
+        )
+        test_sets, defense_validation, validation_manifest = reserve_validation(
+            test_sets, validation_fraction, self.defense.seed
+        )
+        self.defense_validation_manifest = validation_manifest
+        if validation_manifest is not None:
+            manifest_path = os.path.join(results_dir, "defense_validation_split.json")
+            with open(manifest_path, "w", encoding="utf-8") as handle:
+                json.dump(validation_manifest, handle, indent=2)
+        if self.defense.cofedmid is not None:
+            self.defense.cofedmid.validation_manifest = validation_manifest
+            if defense_validation is not None:
+                self.defense.cofedmid.validation_loader = DataLoader(
+                    defense_validation, batch_size=eval_batch_size,
+                    shuffle=False, collate_fn=collate_fn,
+                )
         if self.defense.name == "local_client_dp" and (
             self.federated_method != "fedsgd"
             or self.user_per_round != self.total_users_num
@@ -391,6 +412,9 @@ class ServerBase:
                 method_config=self.method_config,
             )
             self.ctx.users.append(user)
+            user.defense_validation_split_sha256 = (
+                None if validation_manifest is None else validation_manifest["split_sha256"]
+            )
             if self.defense.name == "hamp":
                 attach_hamp_output_transform(
                     user.model,
@@ -779,7 +803,10 @@ class ServerBase:
                     self.ctx.client_gradients[user_id] = self._clone_state(
                         user.last_update_gradients
                     )
-                    if self.client_gradient_observer is not None:
+                    if (
+                        self.client_gradient_observer is not None
+                        and self.defense.name != "cofedmid"
+                    ):
                         self.client_gradient_observer(
                             round_index=round_index,
                             client_id=user_id,
@@ -791,13 +818,39 @@ class ServerBase:
                     user_id, self._clone_state(user.get_parameters())
                 )
 
+            upload_weights = None
+            if self.defense.name == "cofedmid":
+                counts = (
+                    {i: 1 for i in selected_ids}
+                    if self.aggregator.aggregation_weighting == "uniform"
+                    else (
+                        self.ctx.update_sample_counts if self.federated_method == "fedsgd"
+                        else {i: self.ctx.samples_num[i] for i in selected_ids}
+                    )
+                )
+                upload_weights = normalize_client_weights(selected_ids, counts)
             self.defense.after_local_training(
                 users=self.ctx.users,
                 base_state=base_state,
                 updated_states=self.ctx.updated_model_state,
                 selected_ids=selected_ids,
                 round_index=round_index,
+                client_gradients=self.ctx.client_gradients,
+                aggregation_weights=upload_weights,
+                learning_rate=self.current_learning_rate,
             )
+            if (
+                self.defense.name == "cofedmid"
+                and self.federated_method == "fedsgd"
+                and self.client_gradient_observer is not None
+            ):
+                for user_id in selected_ids:
+                    self.client_gradient_observer(
+                        round_index=round_index, client_id=user_id,
+                        gradients=self.ctx.client_gradients[user_id],
+                        sample_count=self.ctx.users[user_id].last_update_sample_count,
+                        learning_rate=self.current_learning_rate,
+                    )
 
             if str(getattr(self.model, "model_type", "")).lower() in {
                 "clip_lora",

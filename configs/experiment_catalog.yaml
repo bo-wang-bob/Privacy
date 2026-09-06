@@ -68,7 +68,7 @@ models:
     default_datasets: *clip_datasets
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
-    supported_defenses: &clip_defenses [none, iclr]
+    supported_defenses: &clip_defenses [none, iclr, cofedmid]
     default_defenses: [none]
     default_seeds: [42]
 
@@ -101,7 +101,7 @@ models:
     default_datasets: *text_datasets
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
-    supported_defenses: [none, iclr, record_dp, local_client_dp]
+    supported_defenses: [none, iclr, cofedmid, record_dp, local_client_dp]
     default_defenses: [iclr]
     default_seeds: [42]
 
@@ -112,7 +112,7 @@ models:
     default_datasets: [cola]
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
-    supported_defenses: [none, iclr]
+    supported_defenses: [none, iclr, cofedmid]
     default_defenses: [none]
     default_seeds: [42]
 
@@ -123,7 +123,7 @@ models:
     default_datasets: *text_datasets
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
-    supported_defenses: [none]
+    supported_defenses: [none, cofedmid]
     default_defenses: [none]
     default_seeds: [42]
 
@@ -131,6 +131,30 @@ models:
 # precedence over the common branch. Only combinations listed under each
 # model's supported_defenses are expanded by the ultimate runner.
 defense_overrides:
+  cofedmid:
+    common:
+      defense:
+        name: cofedmid
+        cofedmid_clients: all
+        cofedmid_partition: true
+        cofedmid_compensation: true
+        cofedmid_perturbation: true
+        cofedmid_max_class_ratio: 0.5
+        cofedmid_min_class_ratio: 0.2
+        cofedmid_coverage: strict
+        cofedmid_init_round: 10
+        cofedmid_intervals: 10
+        cofedmid_recycle_ratio: 0.05
+        cofedmid_entropy_weight: 0.005
+        cofedmid_exp3_gamma: 0.2
+        cofedmid_exp3_learning_rate: 0.3
+        cofedmid_reward_history: 20
+        cofedmid_noise_std: 0.01
+        cofedmid_noise_space: parameter
+        cofedmid_perturb_ratio: 0.2
+        cofedmid_reproducible_noise: false
+        cofedmid_validation_fraction: 0.1
+
   none:
     common:
       defense:

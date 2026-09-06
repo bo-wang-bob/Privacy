@@ -6,6 +6,16 @@ from aggregator.base_aggregator import BaseAggregator
 from context.context import Context
 
 
+def normalize_client_weights(aggregation_ids: list[int], counts: dict) -> dict[int, float]:
+    """Resolve the exact linear weights shared by upload defenses and aggregation."""
+    if not aggregation_ids:
+        raise ValueError("Aggregation requires at least one client.")
+    total = sum(counts[i] for i in aggregation_ids)
+    if total <= 0 or any(counts[i] < 0 for i in aggregation_ids):
+        raise ValueError("Aggregation counts must be non-negative with positive total.")
+    return {i: counts[i] / total for i in aggregation_ids}
+
+
 def aggregate_fedavg_model_states(
     ctx: Context,
     aggregation_ids: list[int],
@@ -26,9 +36,7 @@ def aggregate_fedavg_model_states(
     if any(count < 0 for count in counts.values()):
         raise ValueError("FedAvg client sample counts must be non-negative.")
 
-    ctx.aggregation_weights = {
-        user_id: counts[user_id] / total_samples for user_id in aggregation_ids
-    }
+    ctx.aggregation_weights = normalize_client_weights(aggregation_ids, counts)
 
     first_state = ctx.updated_model_state[aggregation_ids[0]]
     aggregated = {
@@ -141,9 +149,7 @@ class FedSGDAggregator(FedAvgAggregator):
         total = sum(counts.values())
         if total <= 0:
             raise ValueError("FedSGD cannot aggregate zero gradient samples.")
-        ctx.aggregation_weights = {
-            user_id: counts[user_id] / total for user_id in selected_ids
-        }
+        ctx.aggregation_weights = normalize_client_weights(selected_ids, counts)
         aggregate_gradient = {
             name: torch.zeros_like(base_state[name])
             for name in ctx.trainable_param_names

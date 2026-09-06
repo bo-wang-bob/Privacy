@@ -376,6 +376,15 @@ def build_tasks(
             skipped.append(f"{model}: 没有兼容的防御，未生成任务")
             continue
 
+        # A sweep containing CoFedMID must use the same holdout reservation
+        # for its controls. Explicit --set applies to every defense as usual.
+        study_overrides = list(dotted_overrides)
+        split_path = "defense.cofedmid_validation_fraction"
+        if "cofedmid" in defenses and not any(path == split_path for path, _ in study_overrides):
+            cofedmid_config = _defense_override(catalog, model, "cofedmid")
+            fraction = cofedmid_config.get("defense", {}).get("cofedmid_validation_fraction", 0.1)
+            study_overrides.append((split_path, fraction))
+
         for dataset, defense, seed, target in itertools.product(
             datasets, defenses, seeds, targets
         ):
@@ -394,7 +403,7 @@ def build_tasks(
                 partition_mode=args.partition_mode,
                 dirichlet_alpha=args.dirichlet_alpha,
                 require_cuda=args.require_cuda,
-                dotted_overrides=dotted_overrides,
+                dotted_overrides=study_overrides,
             )
             run_id = _task_id(config, model, dataset, defense, started)
             run_dir = results_root / run_id
@@ -486,6 +495,23 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             f"batch:{config.get('batch_size')} lr:{config.get('learning_rate')} "
             f"partition:{partition} data:{data_view}"
         )
+        defense_config = config.get("defense", {})
+        if task.defense == "cofedmid":
+            print(
+                f"      cofedmid=clients:{defense_config['cofedmid_clients']} "
+                f"coverage:{defense_config['cofedmid_coverage']} "
+                f"modules:{defense_config['cofedmid_partition']}/"
+                f"{defense_config['cofedmid_compensation']}/"
+                f"{defense_config['cofedmid_perturbation']} "
+                f"first_recycling_round:{defense_config['cofedmid_init_round'] + 1} "
+                f"recycle_ratio:{defense_config['cofedmid_recycle_ratio']} "
+                f"noise_std:{defense_config['cofedmid_noise_std']} "
+                f"noise_space:{defense_config['cofedmid_noise_space']} "
+                f"parameter_tail:{defense_config['cofedmid_perturb_ratio']}"
+            )
+        validation_fraction = defense_config.get("cofedmid_validation_fraction", 0)
+        if validation_fraction:
+            print(f"      defense_validation_fraction={validation_fraction}")
         print(f"      run_dir={task.run_dir}")
         print(f"      command={shlex.join(task_command(task))}")
 

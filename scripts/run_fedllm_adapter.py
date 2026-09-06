@@ -23,6 +23,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from aggregator.aggregator_builder import build_aggregator
+from privacy_defenses.cofedmid import validate_cofedmid
 from servers.serverbase import ServerBase
 from trainmodel.transformer_adapter import TransformerAdapterClassifier
 from trainmodel.transformer_lora import TransformerLoRAClassifier
@@ -410,9 +411,11 @@ def validate_config(config: dict) -> None:
             )
     defense = dict(config.get("defense", {"name": "none"}))
     defense_name = str(defense.get("name", "none")).lower()
-    if defense_name not in {"none", "iclr", "record_dp", "local_client_dp"}:
+    validate_cofedmid(defense, int(config["total_users"]), int(config["sample_users"]))
+    config["defense"] = defense
+    if defense_name not in {"none", "iclr", "cofedmid", "record_dp", "local_client_dp"}:
         raise ValueError(
-            "Text PEFT experiments support defense=none, iclr, record_dp, "
+            "Text PEFT experiments support defense=none, iclr, cofedmid, record_dp, "
             "or local_client_dp."
         )
     if defense_name == "iclr":

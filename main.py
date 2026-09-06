@@ -15,6 +15,7 @@ import yaml
 from aggregator.aggregator_builder import build_aggregator
 from privacy_attacks.auditor import POOLED_CLIENT_ATTACKS, SUPPORTED_ATTACKS
 from privacy_defenses import FEDMIA_BASELINE_DEFENSES, SUPPORTED_DEFENSES
+from privacy_defenses.cofedmid import validate_cofedmid
 from servers.serverbase import ServerBase
 from utils.data_loader import (
     generate_dirichlet_split,
@@ -922,6 +923,7 @@ def validate_config(config: dict) -> None:
                 )
     defense = config.get("defense", {})
     defense_name = str(defense.get("name", "none")).lower()
+    validate_cofedmid(defense, int(config["total_users"]), int(config["sample_users"]))
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
     if iclr_candidate_scoring and defense_name != "none":
@@ -936,10 +938,11 @@ def validate_config(config: dict) -> None:
     } and defense_name not in {
         "none",
         "iclr",
+        "cofedmid",
     }:
         raise ValueError(
             f"{model_type} attack experiments currently require defense.name "
-            "to be none or iclr."
+            "to be none, iclr, or cofedmid."
         )
     if defense_name == "iclr":
         if model_type not in {"clip_mlp", "clip_adapter", "clip_lora"}:
@@ -1526,12 +1529,6 @@ def default_config() -> dict:
             "dp_noise_multiplier": 1.0,
             "dp_delta": 1e-5,
             "reproducible_dp_noise": False,
-            "cofedmid_intervals": 4,
-            "cofedmid_recycle_ratio": 0.1,
-            "cofedmid_entropy_weight": 0.05,
-            "cofedmid_exp3_gamma": 0.2,
-            "cofedmid_noise_std": 0.05,
-            "cofedmid_perturb_ratio": 0.1,
             "mist_cross_steps": 1,
             "mist_cross_weight": 1.0,
             "soft_obfuscation_strength": 0.5,

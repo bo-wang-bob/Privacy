@@ -25,6 +25,15 @@
 - 三种微调方式的服务器端聚合都使用 `aggregation_weighting: uniform`，即对本轮参与客户端上传的梯度直接等权平均，不按客户端本地样本数或实际 batch 大小加权。三者任务目录方法名均为 `fedsgd`。
 - 正常任务指标默认按 `eval_interval: 5` 在已完成的第 5、10、15、…轮评估；若总轮数不能被 5 整除，最后一轮仍会额外评估。`training_metrics.csv` 使用相同的一基轮次编号。
 
+## 当前 CoFedMID 防御
+
+- `--defenses cofedmid` 已支持三个 CLIP 模型、BERT Adapter/LoRA 和 GPT2 Adapter。默认 `cofedmid_clients: all`，所有客户端协作，且每轮要求全员参与；显式列表可设置至少两个联盟成员。
+- 默认三个模块全部开启：动态类别分配、EXP3 回收与软目标正则、聚合中性上传扰动。保留模型基线的 IID/few-shot、学习率、轮数和 one-batch 等权 FedSGD。第 11 轮首次回收，回收池上限为完整本地训练集的 5%。
+- 默认从独立 evaluation 分区按类预留约 10% 作为防御验证集，剩余部分用于任务评估和审计非成员；训练集保持不变。统一入口 `--defenses none,cofedmid` 会让两组共享预留规则。独立 `none` 对照须显式设置 `--set defense.cofedmid_validation_fraction=0.1`；以 `defense_validation_split.json` 的 hash 核对实际划分。
+- 默认噪声标准差 `0.01` 使用参数空间单位，FedSGD 上传梯度按 `-δ/lr` 转换，作用于统一可训练参数向量尾部 20%；按真实聚合权重抵消。攻击只读取防御后的上传。原训练成员身份不变，实际训练/回收/评分暴露另存 `cofedmid_sample_exposure.pt`。
+- CoFedMID 下 ProjRes 仍审计真实 batch；若攻击层被噪声覆盖则取消无噪声 batch 秩上限。不要把 `paper_fedsgd_exact: false` 误解为候选不是实际 batch。
+- 这属于六个 PEFT 模型的适配，已验证小模型端到端执行；真实数据上的防御效果、ResNet18/FedAvg 原论文复现、IFL/SeqMIA 和全局模型威胁视图尚未验证。参数和差异说明见 `docs/defenses.md`、`docs/cofedmid_implementation_plan.md`。
+
 ## 当前成员推理审计协议
 
 - 注册攻击共 11 种：`blackbox_loss`、`loss_series`、`grad_cosine`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine`、`gradient_diff`、`score_diff`、`score_ratio`、`fta` 和 `projres`。

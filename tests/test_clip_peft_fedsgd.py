@@ -131,6 +131,8 @@ def _audit_config() -> dict:
 def test_clip_peft_runs_all_attacks_with_exact_batch_fedsgd(
     model_type, tmp_path
 ):
+    # Unseeded tiny ReLU adapters can produce an entirely zero first upload.
+    torch.manual_seed(42)
     train_sets = [_dataset(4, index * 0.02) for index in range(2)]
     test_sets = [_dataset(24, 0.4 + index * 0.02) for index in range(2)]
     server = ServerBase(

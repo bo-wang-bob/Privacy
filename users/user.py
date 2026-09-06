@@ -141,6 +141,7 @@ class UserBase:
         self.last_update_sample_count = 0
         self.last_train_batch: tuple[torch.Tensor, torch.Tensor] | None = None
         self.last_train_indices: torch.Tensor | None = None
+        self.last_train_recycled: torch.Tensor | None = None
         self.last_update_gradients: dict[str, torch.Tensor] | None = None
         self.last_gradient_capture_count = 0
         self.iclr_source_round: int | None = None
@@ -180,6 +181,7 @@ class UserBase:
         self.last_update_sample_count = 0
         self.last_train_batch = None
         self.last_train_indices = None
+        self.last_train_recycled = None
         self.last_update_gradients = None
         self.last_gradient_capture_count = 0
 
@@ -280,6 +282,21 @@ class UserBase:
             for images, labels in self.trainloader:
                 self._record_train_batch(images, labels)
                 yield images, labels
+
+    def iter_selected_batches(self, indices: torch.Tensor, generator):
+        """Train on an indexed defense-selected pool under the active protocol."""
+        for _ in range(1 if self.federated_method == "fedsgd" else self.local_epochs):
+            shuffled = indices[torch.randperm(indices.numel(), generator=generator)]
+            if self.federated_method == "fedsgd":
+                shuffled = shuffled[: self.batch_size]
+            for start in range(0, shuffled.numel(), self.batch_size):
+                batch_indices = shuffled[start : start + self.batch_size]
+                inputs, labels = self._collate_train_samples(
+                    [self.train_data[index] for index in batch_indices.tolist()]
+                )
+                self._record_train_batch(inputs, labels)
+                self.last_train_indices = batch_indices.clone()
+                yield inputs, labels, batch_indices
 
     def _collate_train_samples(
         self, samples: list

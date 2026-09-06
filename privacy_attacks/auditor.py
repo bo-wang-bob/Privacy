@@ -184,6 +184,11 @@ class MembershipAuditor:
         ).lower()
         if self.audit_view == "protocol_plus_queries":
             self.audit_view = "protocol_plus_released_prompts"
+        if self.defense_name == "cofedmid" and self.audit_view == "full_whitebox":
+            raise ValueError(
+                "CoFedMID auditing must observe defended protocol uploads, "
+                "not private pre-noise client states."
+            )
         if self.audit_view not in {
             "protocol_plus_released_prompts",
             "full_whitebox",
@@ -2171,6 +2176,26 @@ class MembershipAuditor:
             return "current_round_exact_upload_batch"
         return "current_round_last_local_training_batch"
 
+    def _cofedmid_metadata(self) -> dict | None:
+        if getattr(self, "defense_name", "none") != "cofedmid":
+            return None
+        from privacy_defenses.cofedmid import DEFAULTS, coalition_ids
+        cfg = {**DEFAULTS, **self.defense_config}
+        clients = coalition_ids(cfg, len(self.users))
+        protected = self.target_client_id in clients
+        return {
+            "coalition_clients": clients,
+            "target_defended": protected,
+            "exact_batch": self.federated_method == "fedsgd",
+            "upload_perturbed": (
+                protected and cfg["cofedmid_perturbation"]
+                and cfg["cofedmid_noise_std"] > 0 and cfg["cofedmid_perturb_ratio"] > 0
+            ),
+            "custom_training_loss": protected and cfg["cofedmid_compensation"],
+            "candidate_gradient_loss": "original_attack_objective_without_recycled_regularizer",
+            "training_exposure_file": "../cofedmid_sample_exposure.pt",
+        }
+
     def _build_exact_batch_candidates(self, round_index: int) -> dict:
         """Pair the target client's real upload batch with matched holdouts."""
         target = self.users[self.target_client_id]
@@ -2190,9 +2215,9 @@ class MembershipAuditor:
         member_inputs, member_labels = target.last_train_batch
         member_inputs = member_inputs.detach().cpu()
         member_labels = member_labels.detach().cpu().long().reshape(-1)
-        if member_labels.numel() < 2:
+        if member_labels.numel() < 1:
             raise ValueError(
-                "Exact-batch membership needs at least two batch members."
+                "Exact-batch membership needs a non-empty training batch."
             )
         member_histogram = torch.bincount(
             member_labels, minlength=self.num_classes
@@ -2266,6 +2291,9 @@ class MembershipAuditor:
             raise ValueError(
                 "Retained target-client batch indices do not match the batch size."
             )
+        recycled = getattr(target, "last_train_recycled", None)
+        if recycled is None:
+            recycled = torch.zeros(member_labels.numel(), dtype=torch.bool)
         return {
             "inputs": inputs,
             "member_inputs": member_inputs,
@@ -2273,6 +2301,7 @@ class MembershipAuditor:
             "labels": labels,
             "membership": membership,
             "member_local_indices": local_indices,
+            "member_recycled": recycled,
             "nonmember_pool_indices": nonmember_indices,
             "selection": {
                 "communication_round": int(round_index) + 1,
@@ -2289,6 +2318,7 @@ class MembershipAuditor:
                 "member_label_histogram": member_histogram.tolist(),
                 "nonmember_label_histogram": nonmember_histogram.tolist(),
                 "member_local_indices": local_indices,
+                "member_recycled": recycled,
                 "nonmember_pool_indices": nonmember_indices,
                 "nonmember_index_convention": (
                     "zero-based positions in the client-id ordered "
@@ -2382,11 +2412,32 @@ class MembershipAuditor:
                 - updated_state[parameter_name].detach().cpu().float()
             )
             update_source = "base_minus_client_post_state"
+        cofedmid = self._cofedmid_metadata()
+        parameter_perturbed = False
+        if cofedmid and cofedmid["upload_perturbed"]:
+            # The unperturbed batch-rank bound need not hold after upload noise.
+            # Reconstruct the public mask from the shared trainable parameter order.
+            widths = [
+                (name, parameter.numel())
+                for name, parameter in self.model.named_parameters()
+                if parameter.requires_grad
+            ]
+            total_width = sum(width for _, width in widths)
+            tail_start = total_width - math.floor(
+                total_width * self.defense_config.get("cofedmid_perturb_ratio", 0.2)
+            )
+            offset = 0
+            for name, width in widths:
+                if name == parameter_name:
+                    parameter_perturbed = offset + width > tail_start
+                    break
+                offset += width
+        rank_bound = None if parameter_perturbed else int(hidden_vector_count)
         attack = strict_mlp_projres(
             observed_update,
             candidate_representations,
             threshold=None,
-            max_rank=int(hidden_vector_count),
+            max_rank=rank_bound,
         )
         attack_result = AttackResult(
             name="projres",
@@ -2400,6 +2451,8 @@ class MembershipAuditor:
         paper_fedsgd_exact = (
             getattr(self, "federated_method", "fedsgd") == "fedsgd"
         )
+        if cofedmid and (cofedmid["upload_perturbed"] or cofedmid["custom_training_loss"]):
+            paper_fedsgd_exact = False
         if self.model_type == "clip_mlp":
             sample_representation = "clip_image_feature_input_to_first_mlp_projection"
         elif self.model_type in {"clip_adapter", "visual_adapter"}:
@@ -2431,6 +2484,9 @@ class MembershipAuditor:
                 None if learning_rate is None else float(learning_rate)
             ),
             "paper_fedsgd_exact": paper_fedsgd_exact,
+            "cofedmid": cofedmid,
+            "attacked_parameter_perturbed": parameter_perturbed,
+            "batch_rank_bound": rank_bound,
             "reported_fpr_targets": list(
                 _EXACT_BATCH_REPORTED_FPR_TARGETS
             ),
@@ -3446,6 +3502,7 @@ class MembershipAuditor:
             "membership": candidates["membership"],
             "candidate_labels": labels,
             "member_local_indices": candidates["member_local_indices"],
+            "member_recycled": candidates["member_recycled"],
             "nonmember_pool_indices": candidates["nonmember_pool_indices"],
             "attacks": sorted(attacks),
         }
@@ -4410,6 +4467,7 @@ class MembershipAuditor:
                     self.exact_batch_nonmember_ratio
                 ),
                 "communication_round": int(observation["round"]) + 1,
+                "cofedmid": self._cofedmid_metadata(),
                 "temporal_information": "single_round",
                 "round_reduction": "none",
                 "member_local_indices": observation[
@@ -5356,6 +5414,8 @@ class MembershipAuditor:
                         else "single_client"
                     ),
                     "defense": self.defense_name,
+                    "cofedmid": self._cofedmid_metadata(),
+                    "defense_validation_split_sha256": getattr(self.users[0], "defense_validation_split_sha256", None),
                     "federated_method": self.federated_method,
                     "model_type": self.model_type,
                     "audit_view": self.audit_view,

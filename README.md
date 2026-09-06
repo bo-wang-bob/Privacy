@@ -287,9 +287,23 @@ python scripts/validate_projres_mlp_real.py \
 ## 隐私防御与 ICLR 分析
 
 仓库保留更新扰动、稀疏化、Mixup、采样、数据增强、CoFedMID、Prompt-DP、
-MIST、SOFT、HAMP 和 ICLR 等实现。当前 CLIP 三模型
-sweep 只把 `none` 与观测型 `iclr` 作为正式可选项；不要把通用 prompt 防御配置
-直接套到 MLP、Adapter 或 LoRA。
+MIST、SOFT、HAMP 和 ICLR 等实现。当前 CLIP 三模型正式支持 `none`、观测型
+`iclr` 与 `cofedmid`；BERT Adapter/LoRA 和 GPT2 Adapter 也支持 CoFedMID。
+具体兼容性由 `configs/experiment_catalog.yaml` 维护。
+
+CoFedMID 默认**所有客户端协作防御**，开启动态类别分配、EXP3 样本回收与正则、
+聚合中性上传扰动。模型原有的 one-batch 等权 FedSGD、学习率及轮数保留。
+默认第 11 轮开始回收，参数空间噪声标准差为 0.01，扰动可训练参数向量尾部 20%。
+
+```bash
+python scripts/run_privacy_experiments.py --models clip_mlp --defenses cofedmid
+python scripts/run_privacy_experiments.py --models clip_mlp --defenses none,cofedmid
+```
+
+对照命令会为两组共同预留独立防御验证集：从原 evaluation 分区分层预留约 10%，
+其余用于任务评估和审计非成员。预留清单、逐轮统计及样本暴露次数保存在各任务目录。
+六个模型已通过无下载小模型端到端测试；真实数据集上的隐私与效用效果仍需实验测量。
+详细参数和论文适配边界见 [CoFedMID 文档](docs/defenses.md#cofedmid)。
 
 BERT 配置默认执行不修改训练的 ICLR 排名分析；GPT2 默认不执行。ICLR 输出写入
 同一任务目录的 `defense_summary.json` 及对应逐轮 CSV，不会额外创建训练任务。

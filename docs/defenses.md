@@ -2,9 +2,9 @@
 
 仓库支持多种彼此独立的防御。一次实验只能选择一个 `defense.name`，不会在后台组合其他防御。
 
-| 运行名 | 方法 | 当前联邦 prompt 适配 |
+| 运行名 | 方法 | 当前适配 |
 |---|---|---|
-| `cofedmid` | [CoFedMID](https://www.usenix.org/conference/usenixsecurity26/presentation/bai)，USENIX Security 2026 | 覆盖全类别且平衡两两重叠的动态类别子集、EXP3 样本回收、回收样本置信度正则、加权聚合中性 prompt 噪声 |
+| `cofedmid` | [CoFedMID](https://www.usenix.org/conference/usenixsecurity26/presentation/bai)，USENIX Security 2026 | 六个 PEFT 模型的动态类别分配、EXP3 回收、软目标正则、聚合中性上传扰动；默认全客户端联盟 |
 | `prompt_dp` | [Differentially Private Prompt Learning](https://proceedings.neurips.cc/paper_files/paper/2023/hash/f26119b4ffe38c24d97e4c49d334b99e-Abstract-Conference.html)，NeurIPS 2023 | 逐样本 prompt 梯度裁剪和高斯噪声，冻结 CLIP 参数不参与隐私优化 |
 | `record_dp` | 客户端侧记录级 DP-SGD | Poisson 记录采样、完整可训练参数联合梯度裁剪、sampled-Gaussian RDP 会计；支持 ResNet18 FedAvg 与 BERT Adapter one-batch FedSGD |
 | `mist` | [MIST](https://www.usenix.org/conference/usenixsecurity24/presentation/li-jiacheng)，USENIX Security 2024 | 将客户端数据分区视为 MIST 子空间，先本地训练，再以其他客户端预测作为反事实目标做 cross-difference 更新 |
@@ -18,7 +18,7 @@
 | `data_aug_sampling` | FedMIA Data Aug + Sampling 基线 | 在同一本地训练分支中先抽样再增强 |
 | `iclr` | ICLR（暂定名，第一阶段） | 从上一轮全局模型、客户端本地上传和真实聚合权重反演其他客户端聚合模型，并按逐样本损失差降序排名 |
 
-这些实现是针对“冻结 CLIP、只训练共享 CoOp prompt”的场景适配。SOFT 原论文处理文本，因此本仓库使用保持图像语义的视觉混淆；HAMP 原论文测试阶段使用随机低置信度分数重排，本仓库使用可微温度映射，使主动梯度攻击仍能正常运行并得到分数，而不是因输出不可导而失败。
+历史通用防御主要针对“冻结 CLIP、只训练共享 CoOp prompt”的场景适配；正式模型的可用范围以 `configs/experiment_catalog.yaml` 为准。CoFedMID 已单独适配当前六个 PEFT 模型的 one-batch FedSGD。SOFT 原论文处理文本，因此本仓库使用保持图像语义的视觉混淆；HAMP 原论文测试阶段使用随机低置信度分数重排，本仓库使用可微温度映射。
 
 ## 常用防御参数
 
@@ -85,15 +85,44 @@ ICLR 记录做四键严格连接。`privacy_audit/iclr_projres_samples.csv` 保�
 
 ### CoFedMID
 
-- `cofedmid_max_classes`、`cofedmid_min_classes`：每个客户端从前期到后期分配的类别数。省略时按照类别数与客户端数自动计算。
-- `cofedmid_intervals`：EXP3 难度区间数。
-- `cofedmid_recycle_ratio`：每批最多回收的排除样本比例。
-- `cofedmid_entropy_weight`：回收样本置信度正则强度。
-- `cofedmid_exp3_gamma`：EXP3 探索强度。
-- `cofedmid_noise_std`：上传 prompt 的高斯扰动标准差。
-- `cofedmid_perturb_ratio`：从 prompt 尾部开始扰动的参数比例。FedAvg 下扰动按样本权重严格抵消。
+统一入口支持 CLIP-MLP、CLIP-Adapter、CLIP-LoRA、BERT Adapter、BERT LoRA 和 GPT2 Adapter。选择 `cofedmid` 时，默认所有客户端组成防御联盟，三个模块全部开启；要求每轮全员参与。保留各模型的 IID/few-shot、学习率、轮数、batch size 上限、一次 SGD step 和等权聚合。
 
-类别分配遵循论文 class-guided partition 的两个约束：防御联盟联合覆盖完整类别空间，且客户端子集之间的两两重叠尽量平衡。默认 CIFAR100、4 客户端、首轮 50 类/客户端时，最大两两重叠为 17 类；这避免了连续切片导致两个客户端类别子集完全相同。
+```bash
+python scripts/run_privacy_experiments.py --models clip_mlp --defenses cofedmid
+python scripts/run_privacy_experiments.py --models clip_mlp --defenses none,cofedmid
+```
+
+第二条命令让基线与防御共同预留独立验证集。可用 `--dry-run --max-runs 1` 检查最终参数。完整默认值集中在 catalog 的 `defense_overrides.cofedmid.common`，无需复制模型 YAML。
+
+| 参数 | 默认值与含义 |
+|---|---|
+| `cofedmid_clients` | `all`；也支持至少两个不重复的客户端编号列表，例如 `[0, 1]` |
+| `cofedmid_partition` / `cofedmid_compensation` / `cofedmid_perturbation` | 均为 `true`；分别控制类别分配、回收正则和上传噪声 |
+| `cofedmid_max_class_ratio` / `cofedmid_min_class_ratio` | `0.5` / `0.2`；类别数先向上取整，再随通信轮数线性衰减并四舍五入 |
+| `cofedmid_coverage` | `strict`；最低类别数至少为 `ceil(总类别数/联盟人数)`，保证联合覆盖；`maximize` 允许并记录覆盖不足 |
+| `cofedmid_max_classes` / `cofedmid_min_classes` | 可显式指定类别数，优先于比例；仍受严格覆盖下限约束 |
+| `cofedmid_init_round` / `cofedmid_intervals` | `10` / `10`；首次回收发生在第 11 轮，用已完成第 10 轮的全局模型初始化固定难度区间 |
+| `cofedmid_recycle_ratio` | `0.05`；每轮回收池最多为**完整本地训练集**的 5%，向下取整 |
+| `cofedmid_exp3_gamma` / `cofedmid_exp3_learning_rate` / `cofedmid_reward_history` | `0.2` / `0.3` / `20`；探索、对数权重更新步长与历史奖励窗口 |
+| `cofedmid_entropy_weight` | `0.005`；全部实际 batch 样本使用 CE，回收样本额外使用 `KL(q||p) - μH(p)`，按整个 batch 求均值 |
+| `cofedmid_noise_std` / `cofedmid_noise_space` | `0.01` / `parameter`；FedSGD 中按 `-δ/lr` 转成上传梯度扰动；也支持显式 `gradient` 单位 |
+| `cofedmid_perturb_ratio` | `0.2`；按模型可训练参数顺序拼接后，扰动统一向量的末尾 20% |
+| `cofedmid_reproducible_noise` | `false`；默认用未记录的私有随机状态生成上传噪声；`true` 仅供可复现机制检查 |
+| `cofedmid_validation_fraction` | `0.1`；从原独立 evaluation 分区按类预留约 10%，其余用于任务评估及审计非成员 |
+
+类别分配使用多项式规模的平衡贪心，尽量降低两两重叠，支持 30 客户端。每轮从分配类别样本与回收样本的并集中，无放回抽取至多一个 batch。池不足时采用实际较小的 N；空池明确报错。评分采用 `eval/no_grad`，不算训练暴露。由于 one-batch 始终只执行一步，必须通过暴露统计实测保护效果，不能直接套用原论文完整 local epoch 的效用和攻击结果。
+
+EXP3 每轮重新计算全本地样本损失，用 min-max 归一化后映射到固定边界；根据独立验证集上全局训练前模型与本地训练后模型的损失差更新。软目标真实类概率为停止梯度的当前预测，其余类均分剩余概率。二分类时该 KL 项梯度为零，熵正则仍有效。
+
+上传扰动为每联盟成员一个高斯标量，经真实聚合权重投影后，在同一尾部掩码上满足 `sum(w_k * δ_k) = 0`。只修改可训练参数的上传；LoRA A/B 分别处理，冻结主干不参与。聚合与所有攻击读取同一份防御后消息。浮点抵消残差写入指标。`0.01` 是工程起点，尚未通过真实任务调参；CoFedMID 不提供形式 DP 保证。
+
+候选协议保持五种固定攻击的完整原训练集 M/M，以及六种真实 Batch 攻击的 N/10N 标签匹配。验证集不会进入任一非成员池。未被训练选中过的原训练成员仍是固定候选成员；实际训练/回收/评分次数单独保存。ProjRes 继续观察真实上传；若其攻击层被扰动，则取消无噪声 batch 梯度的秩上限，并通过 `paper_fedsgd_exact`、`attacked_parameter_perturbed` 和 `batch_rank_bound` 标明条件。
+
+同一 sweep 包含 CoFedMID 时，所有对照自动采用相同的验证集预留比例和种子；清单 hash 可核对实际划分。独立运行 `none` 时若要与 CoFedMID 对照，需显式设置 `--set defense.cofedmid_validation_fraction=0.1`。历史未预留结果不能直接作为此协议下的基线。
+
+新增产物位于同一训练任务目录：`defense_validation_split.json`、`cofedmid_round_metrics.csv`、`cofedmid_noise_metrics.csv` 和 `cofedmid_sample_exposure.pt`。这些含本地选择/奖励的文件是离线实验诊断，攻击信号不读取它们；公开上传消息也不包含 EXP3 状态或噪声随机种子。
+
+这是六个 PEFT 模型的适配实现；ResNet18/FedAvg 的原论文复现、IFL 非成员、SeqMIA 和全局模型攻击评估尚未接入。论文、作者代码差异与设计依据见 [实现计划](cofedmid_implementation_plan.md)。
 
 ### Prompt-DP
 
@@ -151,10 +180,10 @@ MIST 至少需要每轮选择两个客户端。
 
 ## 输出
 
-结果目录名包含攻击和防御，例如：
+一次训练任务占用一个一级结果目录，多攻击共享训练，例如：
 
 ```text
-results/cifar100_fedmia_loss_cofedmid_YYYYMMDD_HHMMSS/
+results/YYYY-MM-DD_HH-MM-SS-ffffff_clip_mlp_caltech101_fedsgd_cofedmid_seed42_target0_RUNID/
 ```
 
 主要文件：
@@ -165,4 +194,4 @@ results/cifar100_fedmia_loss_cofedmid_YYYYMMDD_HHMMSS/
 - `privacy_audit/predictions.csv`：逐候选成员分数；
 - `final_prompt.pt`：最终可训练 prompt 参数。
 
-比较防御前后效果时，应固定数据划分、随机种子、目标客户端和攻击参数，分别运行 `--defense none` 与目标防御，并同时报告攻击指标和 `training_metrics.csv` 中的任务效用。
+比较防御前后效果时，应固定数据划分、随机种子、目标客户端和攻击参数；CoFedMID 使用统一入口 `--defenses none,cofedmid`，并同时报告攻击指标和 `training_metrics.csv` 中的任务效用。

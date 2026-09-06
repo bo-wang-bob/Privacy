@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import copy
 import csv
-import itertools
 import json
 import math
 import os
@@ -31,6 +30,7 @@ from privacy_attacks.code_poison import (
     compromised_prompt_loss,
     generate_membership_encoding_samples,
 )
+from privacy_defenses.cofedmid import CoFedMID
 from privacy_defenses.iclr import (
     encode_training_batches,
     infer_other_clients_state,
@@ -342,13 +342,16 @@ class DefenseController:
         self.total_rounds = int(total_rounds)
         self.samples_num = list(samples_num or [])
         self.seed = int(self.config.get("seed", 42))
+        self.cofedmid = (
+            CoFedMID(
+                self.config, self.total_users, self.num_classes,
+                self.total_rounds, self.seed,
+            )
+            if self.name == "cofedmid" else None
+        )
         self.steps = defaultdict(int)
         self.batch_metrics = defaultdict(float)
         self.batch_counts = defaultdict(int)
-        self.cofedmid_interval_weights: dict[int, torch.Tensor] = {}
-        self.cofedmid_selected_arm: dict[int, tuple[int, float, float]] = {}
-        self._private_cofedmid_choices: dict[int, tuple[int, float, int]] = {}
-        self._class_assignments: dict[tuple[int, int], set[int]] = {}
         self._generator_calls = defaultdict(int)
         self._selected_by_round: dict[int, list[int]] = {}
         self._iclr_client_stats: dict[int, dict[str, int | float]] = {}
@@ -579,66 +582,10 @@ class DefenseController:
     def validation_loss(self, model: torch.nn.Module, loader) -> float:
         return _mean_loader_loss(model, loader, self.device)
 
-    def begin_private_cofedmid(self, user, model, round_index: int) -> float | None:
-        """Choose the EXP3 difficulty arm before a private-method client update."""
-        if self.name != "cofedmid":
-            return None
-        intervals = int(self.config.get("cofedmid_intervals", 4))
-        if intervals <= 0:
-            raise ValueError("cofedmid_intervals must be positive.")
-        gamma = float(self.config.get("cofedmid_exp3_gamma", 0.2))
-        if not 0.0 <= gamma <= 1.0:
-            raise ValueError("cofedmid_exp3_gamma must be in [0, 1].")
-        weights = self.cofedmid_interval_weights.get(user.id)
-        if weights is None or weights.numel() != intervals:
-            weights = torch.ones(intervals, dtype=torch.float64)
-            self.cofedmid_interval_weights[user.id] = weights
-        probabilities = (1.0 - gamma) * weights / weights.sum()
-        probabilities += gamma / intervals
-        generator = torch.Generator().manual_seed(
-            self.seed + 1000003 * int(user.id) + 1009 * int(round_index) + 307
-        )
-        arm = int(torch.multinomial(probabilities.float(), 1, generator=generator))
-        self._private_cofedmid_choices[user.id] = (
-            arm,
-            float(probabilities[arm]),
-            int(round_index),
-        )
-        return self.validation_loss(model, user.testloader)
-
-    def private_cofedmid_arm(self, client_id: int, round_index: int) -> int:
-        choice = self._private_cofedmid_choices.get(client_id)
-        if choice is None or choice[2] != int(round_index):
-            raise RuntimeError("CoFedMID EXP3 arm was not initialized for this update.")
-        return choice[0]
-
-    def finish_private_cofedmid(
-        self,
-        user,
-        model,
-        round_index: int,
-        before_validation: float | None,
-    ) -> None:
-        if self.name != "cofedmid" or before_validation is None:
-            return
-        arm, probability, choice_round = self._private_cofedmid_choices.pop(user.id)
-        if choice_round != int(round_index):
-            raise RuntimeError("CoFedMID EXP3 state belongs to a different round.")
-        reward = max(
-            -1.0,
-            min(
-                1.0,
-                before_validation - self.validation_loss(model, user.testloader),
-            ),
-        )
-        intervals = int(self.config.get("cofedmid_intervals", 4))
-        gamma = float(self.config.get("cofedmid_exp3_gamma", 0.2))
-        weights = self.cofedmid_interval_weights[user.id]
-        weights[arm] *= math.exp(gamma * reward / max(intervals * probability, 1e-12))
-        self.cofedmid_selected_arm[user.id] = (arm, probability, reward)
-
     def prepare_round(self, selected_ids: list[int], round_index: int) -> None:
         self._selected_by_round[int(round_index)] = list(selected_ids)
+        if self.cofedmid is not None:
+            self.cofedmid.prepare(selected_ids, round_index)
 
     def train_client(
         self,
@@ -648,6 +595,8 @@ class DefenseController:
         code_poison: bool = False,
         privacy_probe: bool = False,
     ) -> None:
+        if privacy_probe and self.name == "cofedmid":
+            raise ValueError("CoFedMID does not support isolated active client probes.")
         model.to(self.device)
         model.train()
         parameters = _trainable_parameters(model)
@@ -1600,188 +1549,26 @@ class DefenseController:
 
 
     def _cofedmid_classes(self, client_id: int, round_index: int) -> set[int]:
-        key = (client_id, round_index)
-        if key in self._class_assignments:
-            return self._class_assignments[key]
-        participants = self._selected_by_round.get(
-            round_index, list(range(self.total_users))
-        )
-        if client_id not in participants:
-            participants = [client_id, *participants]
-        coalition_size = max(1, len(participants))
-        coverage_floor = max(1, math.ceil(self.num_classes / coalition_size))
-        maximum = int(
-            self.config.get(
-                "cofedmid_max_classes",
-                coverage_floor * 2,
+        if self.cofedmid.round_index != round_index:
+            self.cofedmid.prepare(
+                self._selected_by_round.get(round_index, list(range(self.total_users))),
+                round_index,
             )
-        )
-        minimum = int(
-            self.config.get(
-                "cofedmid_min_classes",
-                coverage_floor,
-            )
-        )
-        maximum = max(coverage_floor, min(self.num_classes, maximum))
-        minimum = max(coverage_floor, min(maximum, minimum))
-        progress = round_index / max(1, self.total_rounds - 1)
-        size = max(minimum, round(maximum - (maximum - minimum) * progress))
-        self._assign_cofedmid_class_subsets(participants, size, round_index)
-        return self._class_assignments[key]
-
-    def _assign_cofedmid_class_subsets(
-        self, participants: list[int], size: int, round_index: int
-    ) -> None:
-        """Assign bounded-overlap class subsets for one CoFedMID round."""
-        generator = torch.Generator().manual_seed(
-            self.seed + 1009 * int(round_index) + 211
-        )
-        coalition_size = len(participants)
-        order = torch.randperm(self.num_classes, generator=generator).tolist()
-        total_slots = coalition_size * size
-        base_repeats = total_slots // self.num_classes
-        extra_repeats = total_slots % self.num_classes
-        subsets = [set() for _ in participants]
-        loads = [0 for _ in participants]
-        overlaps = torch.zeros(
-            (coalition_size, coalition_size), dtype=torch.int64
-        )
-        combinations_by_repeat = {
-            repeat: list(itertools.combinations(range(coalition_size), repeat))
-            for repeat in range(1, coalition_size + 1)
-        }
-
-        for position, class_id in enumerate(order):
-            repeat = base_repeats + int(position < extra_repeats)
-            if repeat <= 0:
-                continue
-            repeat = min(repeat, coalition_size)
-            best_combo = None
-            best_score = None
-            for combo in combinations_by_repeat[repeat]:
-                prospective_loads = list(loads)
-                over_capacity = 0
-                for client_position in combo:
-                    prospective_loads[client_position] += 1
-                    over_capacity += max(
-                        0, prospective_loads[client_position] - size
-                    )
-                prospective_overlaps = overlaps.clone()
-                for left, right in itertools.combinations(combo, 2):
-                    prospective_overlaps[left, right] += 1
-                    prospective_overlaps[right, left] += 1
-                score = (
-                    over_capacity,
-                    max(prospective_loads),
-                    max(prospective_loads) - min(prospective_loads),
-                    int(prospective_overlaps.max()),
-                    int(prospective_overlaps.sum()),
-                    combo,
-                )
-                if best_score is None or score < best_score:
-                    best_score = score
-                    best_combo = combo
-            if best_combo is None:
-                raise RuntimeError("CoFedMID could not assign class subset.")
-            for client_position in best_combo:
-                subsets[client_position].add(class_id)
-                loads[client_position] += 1
-            for left, right in itertools.combinations(best_combo, 2):
-                overlaps[left, right] += 1
-                overlaps[right, left] += 1
-
-        for position, user_id in enumerate(participants):
-            self._class_assignments[(user_id, round_index)] = subsets[position]
+        return self.cofedmid.assignments[client_id]
 
     def _cofedmid_training(
         self, user, model, optimizer, round_index: int, code_poison: bool
     ) -> None:
-        intervals = int(self.config.get("cofedmid_intervals", 4))
-        recycle_ratio = float(self.config.get("cofedmid_recycle_ratio", 0.1))
-        entropy_weight = float(self.config.get("cofedmid_entropy_weight", 0.05))
-        exp3_gamma = float(self.config.get("cofedmid_exp3_gamma", 0.2))
-        assigned_classes = self._cofedmid_classes(user.id, round_index)
-        weights = self.cofedmid_interval_weights.setdefault(
-            user.id, torch.ones(intervals, dtype=torch.float64)
-        )
-        probabilities = (1.0 - exp3_gamma) * weights / weights.sum()
-        probabilities += exp3_gamma / intervals
-        generator = torch.Generator().manual_seed(
-            self.seed + 1000003 * int(user.id) + 1009 * int(round_index) + 307
-        )
-        selected_arm = int(
-            torch.multinomial(probabilities.float(), 1, generator=generator)
-        )
-        before_validation = _mean_loader_loss(model, user.testloader, self.device)
+        if user.id not in self.cofedmid.clients:
+            self._standard_training(user, model, optimizer, round_index, code_poison)
+            return
+        if code_poison:
+            raise ValueError("CoFedMID does not implement active code-poison training.")
 
-        for _ in range(user.local_epochs):
-            for images, labels in user.trainloader:
-                images = images.to(self.device)
-                labels = labels.to(self.device)
-                optimizer.zero_grad(set_to_none=True)
-                logits = model(images)
-                losses = F.cross_entropy(logits, labels, reduction="none")
-                if code_poison:
-                    losses = losses + self._secret_losses(user, model, images, labels)
-                assigned = torch.zeros_like(labels, dtype=torch.bool)
-                for class_id in assigned_classes:
-                    assigned |= labels == class_id
-                excluded = ~assigned
-                recycled = torch.zeros_like(assigned)
-                excluded_indices = torch.nonzero(excluded, as_tuple=False).flatten()
-                if excluded_indices.numel() > 0 and recycle_ratio > 0:
-                    sorted_indices = excluded_indices[
-                        losses.detach()[excluded_indices].argsort()
-                    ]
-                    chunks = torch.tensor_split(sorted_indices, intervals)
-                    candidates = chunks[selected_arm]
-                    cap = max(1, int(math.floor(recycle_ratio * labels.numel())))
-                    candidates = candidates[:cap]
-                    recycled[candidates] = True
-                selected = assigned | recycled
-                if not bool(selected.any()):
-                    selected[losses.detach().argmax()] = True
-                loss = losses[selected].mean()
-                if bool(recycled.any()):
-                    recycled_logits = logits[recycled]
-                    probabilities_out = torch.softmax(recycled_logits, dim=1)
-                    confidence = (
-                        probabilities_out.gather(1, labels[recycled].view(-1, 1))
-                        .detach()
-                        .clamp(1.0 / self.num_classes, 0.999)
-                    )
-                    targets = (1.0 - confidence) / max(1, self.num_classes - 1)
-                    targets = targets.expand(-1, self.num_classes).clone()
-                    targets.scatter_(1, labels[recycled].view(-1, 1), confidence)
-                    cr = F.kl_div(
-                        F.log_softmax(recycled_logits, dim=1),
-                        targets,
-                        reduction="batchmean",
-                    )
-                    entropy = (
-                        -(probabilities_out * probabilities_out.clamp_min(1e-12).log())
-                        .sum(dim=1)
-                        .mean()
-                    )
-                    loss = loss + cr - entropy_weight * entropy
-                loss.backward()
-                optimizer.step()
-                self.steps[user.id] += 1
-                self._record(
-                    "cofedmid_selected_fraction", float(selected.float().mean())
-                )
+        def record_step():
+            self.steps[user.id] += 1
 
-        after_validation = _mean_loader_loss(model, user.testloader, self.device)
-        reward = max(-1.0, min(1.0, before_validation - after_validation))
-        probability = float(probabilities[selected_arm])
-        weights[selected_arm] *= math.exp(
-            exp3_gamma * reward / max(intervals * probability, 1e-12)
-        )
-        self.cofedmid_selected_arm[user.id] = (
-            selected_arm,
-            probability,
-            reward,
-        )
+        self.cofedmid.train(user, model, optimizer, round_index, record_step)
 
     def after_local_training(
         self,
@@ -1790,11 +1577,29 @@ class DefenseController:
         updated_states: dict[int, dict[str, torch.Tensor]],
         selected_ids: list[int],
         round_index: int,
+        client_gradients: dict | None = None,
+        aggregation_weights: dict | None = None,
+        learning_rate: float | None = None,
     ) -> None:
         if self.name == "mist":
             self._mist_refinement(users, updated_states, selected_ids, round_index)
         elif self.name == "cofedmid":
-            self._cofedmid_perturb(updated_states, selected_ids, round_index)
+            if self.federated_method == "fedsgd":
+                if client_gradients is None or aggregation_weights is None:
+                    raise ValueError("CoFedMID FedSGD requires uploaded gradients and actual weights.")
+                self.cofedmid.perturb(
+                    client_gradients, aggregation_weights, round_index,
+                    learning_rate=learning_rate,
+                )
+                for user_id in selected_ids:
+                    users[user_id].last_update_gradients = {
+                        name: tensor.detach().cpu().clone()
+                        for name, tensor in client_gradients[user_id].items()
+                    }
+            else:
+                self._cofedmid_perturb(
+                    updated_states, selected_ids, round_index, aggregation_weights
+                )
         elif self.name == "perturb":
             self._fedmia_perturb_updates(
                 base_state, updated_states, selected_ids, round_index
@@ -1892,37 +1697,9 @@ class DefenseController:
         client_id: int,
         round_index: int = 0,
     ) -> None:
-        """Expose the defended upload, rather than an unprotected local model, to active probes."""
-        if self.name != "cofedmid":
-            return
-        sigma = float(self.config.get("cofedmid_noise_std", 0.05))
-        ratio = float(self.config.get("cofedmid_perturb_ratio", 0.1))
-        if sigma <= 0 or ratio <= 0:
-            return
-        with torch.no_grad():
-            parameters = [
-                (name, parameter)
-                for name, parameter in model.named_parameters()
-                if parameter.requires_grad
-            ]
-            for parameter_index, (_name, parameter) in enumerate(parameters):
-                count = parameter.numel()
-                perturb_count = max(1, min(count, int(math.floor(ratio * count))))
-                generator = self._generator(
-                    client_id,
-                    round_index,
-                    503 + 31 * parameter_index,
-                )
-                noise = (
-                    torch.randn(
-                        perturb_count,
-                        generator=generator,
-                        device=parameter.device,
-                        dtype=parameter.dtype,
-                    )
-                    * sigma
-                )
-                parameter.reshape(-1)[-perturb_count:].add_(noise)
+        """Single-client active probes cannot simulate coalition cancellation."""
+        if self.name == "cofedmid":
+            raise ValueError("CoFedMID does not support isolated active client probes.")
 
     def _mist_refinement(
         self,
@@ -1987,54 +1764,12 @@ class DefenseController:
             }
 
     def _cofedmid_perturb(
-        self,
-        updated_states: dict[int, dict[str, torch.Tensor]],
-        selected_ids: list[int],
-        round_index: int,
+        self, updated_states, selected_ids, round_index, aggregation_weights=None
     ) -> None:
-        if len(selected_ids) < 2:
-            return
-        sigma = float(self.config.get("cofedmid_noise_std", 0.05))
-        ratio = float(self.config.get("cofedmid_perturb_ratio", 0.1))
-        if sigma <= 0 or ratio <= 0:
-            return
-        sample_counts = torch.tensor(
-            [self.samples_num[user_id] for user_id in selected_ids],
-            dtype=torch.float64,
-        )
-        weights = sample_counts / sample_counts.sum()
-        weight_norm_sq = float(weights.square().sum())
-        parameter_names = list(updated_states[selected_ids[0]])
-        for name_index, name in enumerate(parameter_names):
-            shape = updated_states[selected_ids[0]][name].shape
-            count = updated_states[selected_ids[0]][name].numel()
-            perturb_count = max(1, min(count, int(math.floor(ratio * count))))
-            preliminary = []
-            for position, user_id in enumerate(selected_ids):
-                generator = self._generator(
-                    user_id, round_index, 401 + 31 * name_index + position
-                )
-                preliminary.append(
-                    torch.randn(
-                        perturb_count,
-                        generator=generator,
-                        device=updated_states[user_id][name].device,
-                        dtype=updated_states[user_id][name].dtype,
-                    )
-                    * sigma
-                )
-            weighted_sum = sum(
-                float(weights[index]) * preliminary[index]
-                for index in range(len(selected_ids))
-            )
-            for index, user_id in enumerate(selected_ids):
-                projected = (
-                    preliminary[index]
-                    - (float(weights[index]) / weight_norm_sq) * weighted_sum
-                )
-                flat = updated_states[user_id][name].reshape(-1).clone()
-                flat[-perturb_count:] += projected
-                updated_states[user_id][name] = flat.view(shape)
+        if aggregation_weights is None:
+            total = sum(self.samples_num[i] for i in selected_ids)
+            aggregation_weights = {i: self.samples_num[i] / total for i in selected_ids}
+        self.cofedmid.perturb(updated_states, aggregation_weights, round_index)
 
     def conservative_dp_epsilon(self) -> float | None:
         if self.name == "record_dp":
@@ -2103,6 +1838,8 @@ class DefenseController:
             "steps_per_client": {str(key): value for key, value in self.steps.items()},
             "metrics": averaged,
         }
+        if self.cofedmid is not None:
+            summary["cofedmid"] = self.cofedmid.summary()
         if self.name == "iclr":
             periodic_post_round = self.iclr_analysis_timing == "post_round"
             completed_rounds = (
@@ -2274,6 +2011,8 @@ class DefenseController:
 
     def save_summary(self, results_dir: str) -> dict:
         summary = self.summary()
+        if self.cofedmid is not None:
+            self.cofedmid.save(results_dir)
         if self.name == "iclr" and self._iclr_round_metrics:
             self.save_iclr_round_metrics(results_dir)
             summary["iclr"]["round_metrics_artifact"] = (
