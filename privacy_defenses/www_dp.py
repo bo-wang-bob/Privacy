@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from scipy.special import betainc
 from utils.per_sample_gradients import clipped_sum_from_losses, resolve_grad_sample_backend
+from utils.performance import measure_stage
 
 from utils.privacy_accounting import (
     calibrate_poisson_sampled_gaussian_noise,
@@ -242,20 +243,22 @@ class WWWPrivacy:
         parameters = [p for p in model.parameters() if p.requires_grad]
         optimizer.zero_grad(set_to_none=True)
         max_norm = float(self.config["max_grad_norm"])
-        sums = weighted_clipped_sum(model, images, labels, parameters, max_norm,
-                                    weights, extra_loss,
-                                    backend=self.config["grad_sample_backend"],
-                                    microbatch_size=int(self.config["microbatch_size"]))
+        with measure_stage(self, "train.record_gradients"):
+            sums = weighted_clipped_sum(model, images, labels, parameters, max_norm,
+                                        weights, extra_loss,
+                                        backend=self.config["grad_sample_backend"],
+                                        microbatch_size=int(self.config["microbatch_size"]))
         # A fixed-length INO tail preserves the add/remove bound C, including
         # changes in other records' weights. Empty draws release pure noise.
         noise_std = self.noise_multiplier * max_norm
         denominator = self.expected_batch_sizes[user.id]
-        with torch.no_grad():
-            for parameter, gradient_sum in zip(parameters, sums):
-                noise = torch.randn(parameter.shape, generator=generator,
-                                    device=parameter.device, dtype=parameter.dtype)
-                parameter.grad = (gradient_sum + noise * noise_std) / denominator
-        optimizer.step()  # FedSGD's pre-hook captures only the privatized gradient.
+        with measure_stage(self, "train.noise_and_step"):
+            with torch.no_grad():
+                for parameter, gradient_sum in zip(parameters, sums):
+                    noise = torch.randn(parameter.shape, generator=generator,
+                                        device=parameter.device, dtype=parameter.dtype)
+                    parameter.grad = (gradient_sum + noise * noise_std) / denominator
+            optimizer.step()  # FedSGD's pre-hook captures only the privatized gradient.
 
     def summary(self, steps):
         epsilons = {i: self.epsilon(int(steps.get(i, 0)), i) for i in self.planned_steps}

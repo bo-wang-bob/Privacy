@@ -15,6 +15,7 @@ from scripts.run_privacy_experiments import (
     run_task,
     validate_resolved_config,
     TaskResult,
+    write_outputs,
 )
 from servers.serverbase import _format_round_progress
 
@@ -354,3 +355,39 @@ def test_overview_uses_final_task_metric_and_marks_failed_and_partial_runs(tmp_p
     assert "PARTIAL" in display and "FAILED" in display and "N/A" in display
     assert "01:02:03" in display
     assert (task.run_dir / "training_metrics.csv").read_text() == metrics
+
+
+def test_sweep_csv_preserves_reportable_primary_scores_and_resolution(tmp_path):
+    import csv
+    import json
+
+    tasks, _ = build_tasks(CATALOG, _args(
+        "--models", "bert_adapter", "--datasets", "cola", "--attacks", "all",
+        "--results-root", str(tmp_path),
+    ))
+    task = tasks[0]
+    (task.run_dir / "privacy_audit").mkdir(parents=True)
+    (task.run_dir / "training_metrics.csv").write_text("round,accuracy,mcc\n500,0.8,0.6\n")
+    attacks = [{
+        "attack": name, "primary_metric": "tpr_at_fpr_0.01", "primary_score": .99,
+        "auc": .97, "tpr_at_fpr_0.001": .98,
+        "member_count": 32, "nonmember_count": 320, "fpr_resolution": 1/320,
+        "reportable_metrics": {"auc": .61, "tpr_at_fpr_0.01": value,
+                               "tpr_at_fpr_0.1": .4, "tpr_at_fpr_0.001": None},
+    } for name, value in [("projres", .125), ("grad_cosine", 0.), ("gradient_diff", None)]]
+    path = task.run_dir / "privacy_audit/summary.json"
+    original = json.dumps({"attacks": attacks})
+    path.write_text(original)
+    _, output = write_outputs([TaskResult(task, 0, "", "")], tmp_path, "test")
+    with output.open() as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["primary_score"] for row in rows] == ["0.125", "0.0", ""]
+    assert [row["primary_metric_reportable"] for row in rows] == ["True", "True", "False"]
+    for row in rows:
+        assert row["primary_score"] == row["tpr_at_fpr_0.01"]
+        assert row["primary_metric"] == "tpr_at_fpr_0.01"
+        assert row["auc"] == "0.61" and row["tpr_at_fpr_0.001"] == ""
+        assert row["member_count"] == "32" and row["nonmember_count"] == "320"
+        assert float(row["fpr_resolution"]) == 1/320
+        assert row["final_metric"] == "mcc" and row["final_metric_value"] == "0.6"
+    assert path.read_text() == original

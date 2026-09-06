@@ -131,7 +131,7 @@ def individual_audit_reference(model, x, y, updates, difference_indices):
     return {"cosine": torch.stack(cosines).T, "gradient_difference": torch.stack(differences).T}
 
 
-@pytest.mark.parametrize("model_type", ["bert_adapter", "bert_lora", "gpt2_adapter"])
+@pytest.mark.parametrize("model_type", ["clip_mlp", "clip_adapter", "clip_lora", "bert_adapter", "bert_lora", "gpt2_adapter"])
 @pytest.mark.parametrize("device", ["cpu", "cuda:1"])
 def test_streamed_audit_preserves_both_losses_signs_scales_and_target_order(model_type, device, monkeypatch):
     if device.startswith("cuda") and torch.cuda.device_count() < 2:

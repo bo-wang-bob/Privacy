@@ -81,6 +81,7 @@
 - `runs` 在汇总表中表示同一数据集/攻击分组包含的独立训练任务数量，不是额外的目录层级。代码仍可读取历史 `.../runs/...` 布局，但新实验不得继续生成该布局。
 - 每个 `run.log` 开头只记录一次时间、训练任务、模型、数据集、防御、阶段和 GPU；后续子进程日志不再为每行重复这些固定字段。不要输出逐通信轮次的训练状态，只在配置的正式评估轮次和最终轮输出 `Progress`，记录轮次、loss、accuracy/MCC、学习率、参与客户端和审计累计数。不要重新引入只有脚本名而没有任务身份的日志命名。
 - 每个任务结束后由共享服务器输出一次 `RUN RESULTS`：最终任务指标、精简隐私会计和对齐的攻击指标表；批量入口末尾输出 `EXPERIMENT OVERVIEW`，区分 OK/FAILED/PARTIAL 并显示最终主指标和耗时。不要把完整防御字典或逐客户端状态打印到控制台，它们保存在 `defense_summary.json`。显示值统一精度，Accuracy/TPR 显示百分比、MCC/AUC 显示小数；攻击优先读取 `reportable_metrics`，不可报告的值显示 `N/A`，不能回退到原始低 FPR TPR。
+- 批量 CSV 保存 `primary_metric`、`primary_score`、`primary_metric_reportable` 和三个 FPR 下的 TPR，附成员/非成员数量及 FPR 分辨率。CSV 和控制台共用可报告性判断；不可报告的值留空，真实零值保留。固定候选池 Gradient-Diff 与真实 Batch 路径一样，直接使用 FedSGD 梯度；只有模型 delta 才按符号及学习率转换一次。
 
 ## 分析现有结果时的注意事项
 
@@ -102,6 +103,8 @@
 
 - 主要耗时来自余弦类攻击的逐样本梯度计算；候选样本数和逐轮攻击数量决定大部分审计时间。若继续优化，优先考虑 CLIP-MLP/Adapter 可解析或向量化的梯度余弦、批量客户端前向和在线聚合，且必须保持攻击定义不变。
 - 文本审计默认 `audit.grad_sample_backend=auto`、`audit.grad_sample_chunk_size=4`，分块计算逐记录梯度，在每次信号计算内缓存上传向量的 float64 表示并批量点积。缓存不超过 `audit.gradient_update_cache_mb=2048` 且不超过当前空闲显存四分之一时放在 GPU，否则使用 CPU；设为 0 强制 CPU。不得跨客户端状态/轮次复用缓存；余弦继续求真实标签 CE 梯度，Gradient-Diff 继续求所有标签损失之和的梯度。`audit.grad_sample_backend=loop` 可回到逐记录求导。
+- 三个 CLIP 模型的常规余弦/Gradient-Diff 审计也使用上述分块与 float64 归约，MLP/Adapter 复用缓存图像特征，LoRA 直接计算原始图像梯度；不再保留整个候选池的梯度或计算未使用的梯度特征。`signal_storage=full` 需要额外信号时保留原完整信号路径。
+- BERT Adapter/LoRA 与 GPT2 Adapter 默认 `performance.evaluation_backend=shared`，全局评估只加载一次共享模型，保留各客户端测试分区、batch 边界及本地状态；`clients` 可复核原逐客户端加载路径。默认 `performance.enabled=true`、`performance.cuda_events=true`，在 `performance_summary.json` 记录累计阶段耗时。CUDA event 延迟读取，避免每块求导强制同步；父子阶段为包含关系，不能直接相加。计时覆盖服务器训练过程及文件输出，不包含模型/数据加载。
 - 修改实验配置后先干运行核对最终参数：
   - `python scripts/run_privacy_experiments.py --dry-run --max-runs 1`
 - 当前干运行应看到：MLP/Adapter/LoRA 均为 `federated.aggregator: fedsgd` 和 `federated.aggregation_weighting: uniform`；MLP/Adapter 为每类 16-shot，LoRA 使用完整训练集；三者均启用统一 ProjRes。

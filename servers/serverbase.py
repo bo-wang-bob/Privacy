@@ -25,6 +25,7 @@ from privacy_defenses.cofedmid import reserve_validation, validate_cofedmid
 from users.user import UserBase
 from utils.privacy_accounting import planned_private_probe_steps
 from utils.result_formatting import format_run_summary
+from utils.performance import timed_torch_save, StageTimings, measure_stage, timed_stage, validate_performance_config
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,7 @@ class ServerBase:
         defense_config: dict | None = None,
         method_config: dict | None = None,
         client_gradient_observer=None,
+        performance_config: dict | None = None,
     ):
         if total_users <= 1:
             raise ValueError("total_users must be greater than one.")
@@ -209,6 +211,11 @@ class ServerBase:
         if learning_rate_decay_interval <= 0:
             raise ValueError("learning_rate_decay_interval must be positive.")
         self.device = device
+        self.performance_config = validate_performance_config({"performance": dict(performance_config or {})})
+        self.timings = StageTimings(
+            device, enabled=self.performance_config["enabled"],
+            cuda_events=self.performance_config["cuda_events"],
+        )
         self.dataset_name = dataset_name
         self.primary_metric_name = (
             "mcc" if str(dataset_name).lower() == "cola" else "accuracy"
@@ -319,7 +326,7 @@ class ServerBase:
         )
         os.makedirs(results_dir, exist_ok=True)
         self.metrics_path = os.path.join(results_dir, "training_metrics.csv")
-        with open(self.metrics_path, "w", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(self.metrics_path, "w", newline="", encoding="utf-8") as file:
             csv.writer(file).writerow(
                 (
                     "round",
@@ -364,7 +371,7 @@ class ServerBase:
         self.defense_validation_manifest = validation_manifest
         if validation_manifest is not None:
             manifest_path = os.path.join(results_dir, "defense_validation_split.json")
-            with open(manifest_path, "w", encoding="utf-8") as handle:
+            with measure_stage(self, "outputs.write"), open(manifest_path, "w", encoding="utf-8") as handle:
                 json.dump(validation_manifest, handle, indent=2)
         if self.defense.cofedmid is not None:
             self.defense.cofedmid.validation_manifest = validation_manifest
@@ -444,6 +451,10 @@ class ServerBase:
             federated_method=self.federated_method,
             num_classes=self.num_classes,
         )
+        self.auditor.timings = self.timings
+        self.defense.timings = self.timings
+        if self.defense.www_privacy is not None:
+            self.defense.www_privacy.timings = self.timings
         self.required_audit_client_ids = (
             list(self.auditor.audit_client_ids) if self.ensure_target else []
         )
@@ -510,12 +521,46 @@ class ServerBase:
         )
         return sorted([*self.required_audit_client_ids, *selected])
 
-    def _evaluate(
-        self,
-        round_index: int,
-        selected_ids: list[int],
-        learning_rate: float,
-    ) -> None:
+    @torch.no_grad()
+    def _evaluate_shared_model(self):
+        """Evaluate one global Transformer over the unchanged client loaders."""
+        evaluation_state = self.ctx.new_model_state.get(0, self.ctx.base_model_state[0])
+        restore_state = {
+            name: parameter.detach().clone()
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
+        was_training = self.model.training
+        total_loss = torch.zeros((), device=self.device, dtype=torch.float64)
+        total_correct = torch.zeros((), device=self.device, dtype=torch.long)
+        confusion = (torch.zeros((self.num_classes, self.num_classes), device=self.device,
+                                 dtype=torch.long) if self.primary_metric_name == "mcc" else None)
+        total_samples = 0
+        try:
+            self.model.load_state_dict(evaluation_state, strict=False)
+            self.model.eval()
+            # Keeping each loader and its batch boundaries preserves sampling,
+            # padding, evaluation partitions, and any deterministic transforms.
+            for user in self.ctx.users:
+                for images, labels in user.testloader:
+                    labels = labels.to(self.device)
+                    logits = self.model(images.to(self.device))
+                    predictions = logits.argmax(dim=1)
+                    total_loss.add_(torch.nn.functional.cross_entropy(logits, labels, reduction="sum").double())
+                    total_correct.add_((predictions == labels).sum())
+                    total_samples += labels.numel()
+                    if confusion is not None:
+                        confusion.add_(torch.bincount(
+                            labels.long() * self.num_classes + predictions,
+                            minlength=self.num_classes * self.num_classes,
+                        ).reshape(self.num_classes, self.num_classes))
+        finally:
+            self.model.load_state_dict(restore_state, strict=False)
+            self.model.train(was_training)
+        return (float(total_loss.cpu()), int(total_correct.cpu()), total_samples,
+                confusion.cpu() if confusion is not None else None)
+
+    def _evaluate_clients(self):
         total_loss = 0.0
         total_correct = 0
         total_samples = 0
@@ -557,6 +602,24 @@ class ServerBase:
             total_loss += loss
             total_correct += correct
             total_samples += samples
+        return total_loss, total_correct, total_samples, total_confusion
+
+    @timed_stage("evaluation")
+    def _evaluate(
+        self,
+        round_index: int,
+        selected_ids: list[int],
+        learning_rate: float,
+    ) -> None:
+        use_shared = (
+            self.performance_config["evaluation_backend"] == "shared"
+            and str(getattr(self.model, "model_type", "")) in {
+                "bert_adapter", "bert_lora", "gpt2_adapter",
+            }
+        )
+        total_loss, total_correct, total_samples, total_confusion = (
+            self._evaluate_shared_model() if use_shared else self._evaluate_clients()
+        )
         mcc = (
             _matthews_correlation(total_confusion)
             if total_confusion is not None
@@ -571,7 +634,7 @@ class ServerBase:
             "learning_rate": float(learning_rate),
         }
         self.training_metrics.append(metrics)
-        with open(self.metrics_path, "a", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(self.metrics_path, "a", newline="", encoding="utf-8") as file:
             csv.writer(file).writerow(
                 (
                     metrics["round"],
@@ -684,7 +747,7 @@ class ServerBase:
             ),
             "best_primary_metric": max(primary_values) if primary_values else None,
         }
-        with open(
+        with measure_stage(self, "outputs.write"), open(
             os.path.join(self.results_dir, "training_health.json"),
             "w",
             encoding="utf-8",
@@ -702,12 +765,24 @@ class ServerBase:
         path = os.path.join(self.results_dir, "saved_models")
         os.makedirs(path, exist_ok=True)
         state = self.ctx.new_model_state.get(0, self.ctx.base_model_state[0])
-        torch.save(
+        timed_torch_save(self,
             self._clone_state(state, cpu=True),
             os.path.join(path, f"global_round_{round_index}.pt"),
         )
 
     def train(self) -> list[dict]:
+        status = "failed"
+        try:
+            with self.timings.measure("run"):
+                summaries = self._train()
+            status = "completed"
+            return summaries
+        finally:
+            self.timings.save(
+                os.path.join(self.results_dir, "performance_summary.json"), status=status,
+            )
+
+    def _train(self) -> list[dict]:
         self.ctx.set_base_model_state(
             self._clone_state(self.ctx.users[0].get_parameters())
         )
@@ -781,10 +856,11 @@ class ServerBase:
                 use_code_poison = (
                     self.code_poison_enabled and user_id == self.target_client_id
                 )
-                user.train(
-                    code_poison=use_code_poison,
-                    round_index=round_index,
-                )
+                with self.timings.measure("train.client_update"):
+                    user.train(
+                        code_poison=use_code_poison,
+                        round_index=round_index,
+                    )
                 if self.federated_method == "fedsgd":
                     if (
                         user.last_update_sample_count <= 0
@@ -923,7 +999,7 @@ class ServerBase:
                         self.results_dir, "privacy_audit"
                     )
                     os.makedirs(privacy_audit_dir, exist_ok=True)
-                    with open(
+                    with measure_stage(self, "outputs.write"), open(
                         os.path.join(privacy_audit_dir, "projres_strict.json"),
                         "w",
                         encoding="utf-8",
@@ -938,7 +1014,7 @@ class ServerBase:
                             ),
                         }
                     )
-                    with open(
+                    with measure_stage(self, "outputs.write"), open(
                         os.path.join(privacy_audit_dir, "projres_series.json"),
                         "w",
                         encoding="utf-8",
@@ -965,7 +1041,8 @@ class ServerBase:
                         )
                         file.write("\n")
 
-            self.aggregator.aggregate(self.ctx)
+            with self.timings.measure("train.aggregation"):
+                self.aggregator.aggregate(self.ctx)
             protocol_client_states = self.ctx.updated_model_state
             if self.federated_method == "fedsgd":
                 protocol_client_states = {
@@ -1013,6 +1090,7 @@ class ServerBase:
                     ),
                     round_index=round_index,
                 )
+            self.timings.flush()
             self._save_round(round_index + 1)
             if _is_evaluation_round(
                 round_index, self.num_glob_iters, self.eval_interval
@@ -1028,7 +1106,7 @@ class ServerBase:
             initial_target_state, final_state
         )
         self.model.load_state_dict(final_state, strict=False)
-        torch.save(
+        timed_torch_save(self,
             self._clone_state(final_state, cpu=True),
             os.path.join(
                 self.results_dir,
@@ -1111,7 +1189,7 @@ class ServerBase:
                 "shared_frozen_backbone": True,
                 "aggregation": "uniform_fedsgd",
             }
-        with open(
+        with measure_stage(self, "outputs.write"), open(
             os.path.join(self.results_dir, "federated_method_summary.json"),
             "w",
             encoding="utf-8",

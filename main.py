@@ -18,6 +18,7 @@ from privacy_defenses import FEDMIA_BASELINE_DEFENSES, SUPPORTED_DEFENSES
 from privacy_defenses.cofedmid import validate_cofedmid
 from privacy_defenses.www_dp import validate_www
 from servers.serverbase import ServerBase
+from utils.performance import validate_performance_config
 from utils.data_loader import (
     generate_dirichlet_split,
     generate_iid_split,
@@ -121,6 +122,7 @@ def normalize_clip_adapter_config(config: dict) -> None:
 
 
 def validate_config(config: dict) -> None:
+    validate_performance_config(config)
     normalize_clip_adapter_config(config)
     model_type = str(config.get("model_type", "prompt")).lower()
     if model_type not in {
@@ -1316,6 +1318,7 @@ def run(config: dict) -> list[dict]:
         projres_config=config.get("projres", {"enabled": False}),
         defense_config=config.get("defense", {"name": "none"}),
         method_config=method_config,
+        performance_config=config.get("performance"),
     )
     return server.train()
 

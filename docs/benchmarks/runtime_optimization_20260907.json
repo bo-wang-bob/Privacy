@@ -1,0 +1,153 @@
+{
+  "device": "cuda:1",
+  "torch": "2.7.1+cu128",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "repeats": 5,
+  "warmups": 2,
+  "clients": 30,
+  "sequence_length": 128,
+  "chunk_size": 4,
+  "classes": 10,
+  "seed": 42,
+  "cpu_threads": 4,
+  "clip_path": "/root/DistributedFL/checkpoints/clip-vit-base-patch32",
+  "bert_path": "/root/DistributedFL/checkpoints/bert-base-uncased",
+  "scope": "Local pretrained models with synthetic data. CLIP reference is the pre-optimization path; optimized audit includes default timing instrumentation. Evaluation preserves each client loader and batch. No training or membership-effectiveness experiment.",
+  "measurements": [
+    {
+      "stage": "clip_mlp_cosine_audit",
+      "candidates": 64,
+      "parameters": 267786,
+      "cached_features": true,
+      "reference_gradient_tensor_bytes": 17138304,
+      "optimized_gradient_tensor_bytes": 4284576,
+      "reference": {
+        "median_seconds": 0.30500013497658074,
+        "seconds": [
+          0.47519863909110427,
+          0.2524116749409586,
+          0.30500013497658074,
+          0.22735386015847325,
+          0.5106047778390348
+        ],
+        "peak_allocated_mib": 596.43017578125
+      },
+      "optimized": {
+        "median_seconds": 0.1355988308787346,
+        "seconds": [
+          0.13640514202415943,
+          0.14295445196330547,
+          0.12039890792220831,
+          0.1355988308787346,
+          0.1269293879158795
+        ],
+        "peak_allocated_mib": 774.3525390625
+      },
+      "speedup": 2.2492829252292075,
+      "equivalence": {
+        "max_abs_error": 1.909211277961731e-08,
+        "relative_l2_error": 2.385378992383891e-06
+      }
+    },
+    {
+      "stage": "clip_adapter_cosine_audit",
+      "candidates": 64,
+      "parameters": 262144,
+      "cached_features": true,
+      "reference_gradient_tensor_bytes": 16777216,
+      "optimized_gradient_tensor_bytes": 4194304,
+      "reference": {
+        "median_seconds": 0.49472517101094127,
+        "seconds": [
+          0.49472517101094127,
+          0.2777775258291513,
+          0.3256515939719975,
+          0.7857678399886936,
+          0.5348590209614486
+        ],
+        "peak_allocated_mib": 598.00732421875
+      },
+      "optimized": {
+        "median_seconds": 0.10902081010863185,
+        "seconds": [
+          0.09576903306879103,
+          0.20737413014285266,
+          0.08887253189459443,
+          0.12223432608880103,
+          0.10902081010863185
+        ],
+        "peak_allocated_mib": 691.97509765625
+      },
+      "speedup": 4.537896668700051,
+      "equivalence": {
+        "max_abs_error": 6.100162863731384e-08,
+        "relative_l2_error": 8.120018693742447e-06
+      }
+    },
+    {
+      "stage": "clip_lora_cosine_audit",
+      "candidates": 64,
+      "parameters": 184320,
+      "cached_features": false,
+      "reference_gradient_tensor_bytes": 47185920,
+      "optimized_gradient_tensor_bytes": 2949120,
+      "reference": {
+        "median_seconds": 2.8973332380410284,
+        "seconds": [
+          2.597089779097587,
+          3.617436284897849,
+          2.8973332380410284,
+          3.9788499621208757,
+          2.5498450249433517
+        ],
+        "peak_allocated_mib": 671.62939453125
+      },
+      "optimized": {
+        "median_seconds": 1.5674598610494286,
+        "seconds": [
+          1.5847425698302686,
+          1.5391170331276953,
+          1.5620622360147536,
+          1.5674598610494286,
+          1.652132123010233
+        ],
+        "peak_allocated_mib": 774.60693359375
+      },
+      "speedup": 1.8484257938836388,
+      "equivalence": {
+        "max_abs_error": 2.6728957891464233e-07,
+        "relative_l2_error": 2.9346481570580674e-05
+      }
+    },
+    {
+      "stage": "bert_adapter_evaluation",
+      "clients": 30,
+      "records_per_client": 32,
+      "eval_batch_size": 32,
+      "reference": {
+        "median_seconds": 3.4862942239269614,
+        "seconds": [
+          3.4862942239269614,
+          5.312311551067978,
+          3.397543983068317,
+          4.170713130850345,
+          2.598576507065445
+        ],
+        "peak_allocated_mib": 638.03564453125
+      },
+      "optimized": {
+        "median_seconds": 0.963456341996789,
+        "seconds": [
+          0.8792769990395755,
+          0.9875943490769714,
+          0.963456341996789,
+          0.859018858987838,
+          0.9845364768989384
+        ],
+        "peak_allocated_mib": 638.0380859375
+      },
+      "speedup": 3.618528491598824,
+      "equivalence": "identical loss sum, correct count, sample count and confusion matrix"
+    }
+  ]
+}

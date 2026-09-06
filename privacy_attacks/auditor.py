@@ -42,6 +42,7 @@ from privacy_defenses.www_validation import (
 )
 from utils.data_loader import group_idx_by_class
 from utils.per_sample_gradients import gradients_from_losses, resolve_grad_sample_backend
+from utils.performance import timed_torch_save, measure_stage, timed_stage
 
 logger = logging.getLogger(__name__)
 
@@ -2337,6 +2338,7 @@ class MembershipAuditor:
             },
         }
 
+    @timed_stage("audit.projres")
     def _score_exact_batch_projres(
         self,
         *,
@@ -2980,6 +2982,7 @@ class MembershipAuditor:
             if self._attack_is_due(attack, int(observation["round"]))
         ]
 
+    @timed_stage("audit.forward")
     @torch.no_grad()
     def _candidate_outputs(
         self,
@@ -3175,6 +3178,7 @@ class MembershipAuditor:
             )
         return torch.cat(score_parts).t().contiguous()
 
+    @timed_stage("audit.gradient_measurements")
     def _raw_input_gradient_measurements(
         self,
         model: torch.nn.Module,
@@ -3186,8 +3190,9 @@ class MembershipAuditor:
         gradient_difference_update_indices: list[int] | None = None,
         candidate_inputs: torch.Tensor | None = None,
         candidate_labels: torch.Tensor | None = None,
+        candidate_inputs_are_features: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Stream bounded text-gradient chunks and reuse this call's uploads.
+        """Stream bounded PEFT-gradient chunks and reuse this call's uploads.
 
         Cosine differentiates true-label CE; Gradient-Diff differentiates the
         sum over all labels. Both retain float64 reductions. Small upload caches
@@ -3207,7 +3212,7 @@ class MembershipAuditor:
             set(update) != allowed for update, _, _ in updates
         ):
             raise ValueError(
-                "Text gradient observations and uploaded PEFT updates must "
+                "Gradient observations and uploaded PEFT updates must "
                 "have identical parameter scopes."
             )
         config = getattr(self, "config", {})
@@ -3251,11 +3256,17 @@ class MembershipAuditor:
             raise ValueError("Candidate inputs and labels must have equal length.")
         backend = resolve_grad_sample_backend(model, config.get("grad_sample_backend", "auto"))
         chunk_size = int(config.get("grad_sample_chunk_size", 4)) if backend == "batched" else 1
+        model_forward = model
+        if candidate_inputs_are_features:
+            model_forward = getattr(model, "forward_from_image_features", None)
+            if model_forward is None:
+                raise TypeError("Cached features require forward_from_image_features.")
         model.eval()
         for start in range(0, labels.numel(), chunk_size):
             stop = start + chunk_size
             model.zero_grad(set_to_none=True)
-            logits = model(inputs[start:stop].to(self.device))
+            with measure_stage(self, "audit.forward"):
+                logits = model_forward(inputs[start:stop].to(self.device))
             true_label_loss = F.cross_entropy(
                 logits, labels[start:stop].to(self.device), reduction="none",
             )
@@ -3269,33 +3280,35 @@ class MembershipAuditor:
                 )
                 losses.append(("gradient_difference", sum_label_loss))
             for position, (measurement, differentiated_loss) in enumerate(losses):
-                gradients = gradients_from_losses(
-                    differentiated_loss, parameters, backend=backend,
-                    retain_graph=position + 1 < len(losses),
-                )
-                count = logits.shape[0]
-                gradient_norm_sq = torch.zeros(count, dtype=torch.float64, device=reduction_device)
-                measurement_indices = (
-                    list(range(len(updates)))
-                    if measurement == "cosine"
-                    else difference_indices
-                )
-                dots = torch.zeros(count, len(measurement_indices), dtype=torch.float64, device=reduction_device)
-                for matrix, gradient in zip(update_matrices, gradients):
-                    flat = gradient.reshape(count, -1).to(device=reduction_device, dtype=torch.float64)
-                    gradient_norm_sq.add_(flat.square().sum(dim=1))
-                    selected = matrix if measurement == "cosine" else matrix[measurement_indices]
-                    dots.addmm_(flat, selected.t())
-                    del flat
-                if measurement == "cosine":
-                    gradient_norm = gradient_norm_sq.sqrt().clamp_min(1e-12)
-                    cosine_rows.append(
-                        (dots / (gradient_norm[:, None] * update_norms[None, :])).to(device="cpu", dtype=torch.float32)
+                with measure_stage(self, "audit.backward"):
+                    gradients = gradients_from_losses(
+                        differentiated_loss, parameters, backend=backend,
+                        retain_graph=position + 1 < len(losses),
                     )
-                else:
-                    difference_rows.append(
-                        (2.0 * dots - gradient_norm_sq[:, None]).to(device="cpu", dtype=torch.float32)
+                with measure_stage(self, "audit.gradient_reduce"):
+                    count = logits.shape[0]
+                    gradient_norm_sq = torch.zeros(count, dtype=torch.float64, device=reduction_device)
+                    measurement_indices = (
+                        list(range(len(updates)))
+                        if measurement == "cosine"
+                        else difference_indices
                     )
+                    dots = torch.zeros(count, len(measurement_indices), dtype=torch.float64, device=reduction_device)
+                    for matrix, gradient in zip(update_matrices, gradients):
+                        flat = gradient.reshape(count, -1).to(device=reduction_device, dtype=torch.float64)
+                        gradient_norm_sq.add_(flat.square().sum(dim=1))
+                        selected = matrix if measurement == "cosine" else matrix[measurement_indices]
+                        dots.addmm_(flat, selected.t())
+                        del flat
+                    if measurement == "cosine":
+                        gradient_norm = gradient_norm_sq.sqrt().clamp_min(1e-12)
+                        cosine_rows.append(
+                            (dots / (gradient_norm[:, None] * update_norms[None, :])).to(device="cpu", dtype=torch.float32)
+                        )
+                    else:
+                        difference_rows.append(
+                            (2.0 * dots - gradient_norm_sq[:, None]).to(device="cpu", dtype=torch.float32)
+                        )
                 del gradients
         measurements = {}
         if need_cosine:
@@ -3663,6 +3676,7 @@ class MembershipAuditor:
         )
         return projres_payload
 
+    @timed_stage("audit.observe")
     def observe_round(
         self,
         round_index: int,
@@ -3712,8 +3726,8 @@ class MembershipAuditor:
         sample_gradients = None
         gradient_diff_gradients = None
         signatures = None
-        streaming_text_gradients = bool(
-            self.model_type in {"bert_adapter", "bert_lora", "gpt2_adapter"}
+        streaming_gradients = bool(
+            self.model_type in {"clip_mlp", "clip_adapter", "clip_lora", "bert_adapter", "bert_lora", "gpt2_adapter"}
             and (needs["cosine"] or needs["gradient_diff_score"])
             and not needs["whitebox_features"]
             and not needs["promptres"]
@@ -3722,7 +3736,7 @@ class MembershipAuditor:
         if (
             needs_gradients
             and not self.candidate_inputs_are_features
-            and not streaming_text_gradients
+            and not streaming_gradients
         ):
             self.model.load_state_dict(
                 observable_base_state, strict=False
@@ -3751,7 +3765,7 @@ class MembershipAuditor:
         promptres_updates = []
         promptres_gradients = []
         cached_feature_updates = []
-        streaming_text_updates = []
+        streaming_updates = []
         audited_ids = set(self.audit_client_ids)
         gradient_diff_positions = [
             position
@@ -3779,7 +3793,7 @@ class MembershipAuditor:
             if needs["client_states"]:
                 observable_states[user_id] = state
             if needs_gradients:
-                if streaming_text_gradients and (
+                if streaming_gradients and (
                     self.audit_view == "protocol_plus_released_prompts"
                     and protocol_messages is not None
                     and user_id in protocol_messages
@@ -3800,15 +3814,15 @@ class MembershipAuditor:
                         and learning_rate is not None
                         else 1.0
                     )
-                    streaming_text_updates.append((tensors, sign, scale))
+                    streaming_updates.append((tensors, sign, scale))
                     update = None
-                elif streaming_text_gradients:
+                elif streaming_gradients:
                     if self.audit_view == "released_prompt":
                         raise ValueError(
-                            "Text gradient-cosine attacks require an observable "
+                            "Gradient-cosine attacks require an observable "
                             "client update."
                         )
-                    streaming_text_updates.append(
+                    streaming_updates.append(
                         (
                             {
                                 name: client_base[name] - state[name]
@@ -3850,7 +3864,7 @@ class MembershipAuditor:
                     update = flatten_state_delta(
                         client_base, state, observable_names
                     )
-                if streaming_text_gradients:
+                if streaming_gradients:
                     pass
                 elif self.candidate_inputs_are_features:
                     if (
@@ -3997,7 +4011,7 @@ class MembershipAuditor:
                 pre_true_label_confidence
             )
         if needs["cosine"]:
-            if self.candidate_inputs_are_features:
+            if self.candidate_inputs_are_features and not streaming_gradients:
                 self.model.load_state_dict(observable_base_state, strict=False)
                 self.model.eval()
                 observation["cosine"] = self._cached_feature_gradient_cosines(
@@ -4005,13 +4019,14 @@ class MembershipAuditor:
                     observable_names,
                     cached_feature_updates,
                 )
-            elif streaming_text_gradients:
+            elif streaming_gradients:
                 self.model.load_state_dict(observable_base_state, strict=False)
                 self.model.eval()
                 measurements = self._raw_input_gradient_measurements(
                     self.model,
                     observable_names,
-                    streaming_text_updates,
+                    streaming_updates,
+                    candidate_inputs_are_features=self.candidate_inputs_are_features,
                     need_cosine=True,
                     need_gradient_difference=needs["gradient_diff_score"],
                     gradient_difference_update_indices=gradient_diff_positions,
@@ -4020,13 +4035,11 @@ class MembershipAuditor:
             else:
                 observation["cosine"] = torch.stack(cosine)
         if needs["gradient_diff_score"]:
-            if self.candidate_inputs_are_features:
+            if self.candidate_inputs_are_features and not streaming_gradients:
+                # Model deltas were converted once when the upload was read;
+                # true FedSGD gradients already have the required units.
                 normalized_updates = [
-                    (
-                        cached_feature_updates[position] / float(learning_rate)
-                        if learning_rate is not None
-                        else cached_feature_updates[position]
-                    )
+                    cached_feature_updates[position]
                     for position in gradient_diff_positions
                 ]
                 self.model.load_state_dict(observable_base_state, strict=False)
@@ -4042,14 +4055,15 @@ class MembershipAuditor:
                 observation["gradient_diff_score"][gradient_diff_positions] = (
                     selected_scores
                 )
-            elif streaming_text_gradients:
+            elif streaming_gradients:
                 if not needs["cosine"]:
                     self.model.load_state_dict(observable_base_state, strict=False)
                     self.model.eval()
                     measurements = self._raw_input_gradient_measurements(
                         self.model,
                         observable_names,
-                        streaming_text_updates,
+                        streaming_updates,
+                        candidate_inputs_are_features=self.candidate_inputs_are_features,
                         need_cosine=False,
                         need_gradient_difference=True,
                         gradient_difference_update_indices=(
@@ -4955,7 +4969,7 @@ class MembershipAuditor:
             for key in row:
                 if key not in fieldnames:
                     fieldnames.append(key)
-        with open(path, "w", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
@@ -5038,7 +5052,7 @@ class MembershipAuditor:
         round_path = os.path.join(
             self.results_dir, "www_candidate_round_scores.csv"
         )
-        with open(round_path, "w", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(round_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             writer.writerow(
                 (
@@ -5086,7 +5100,7 @@ class MembershipAuditor:
         sample_path = os.path.join(
             self.results_dir, "www_candidate_scores.csv"
         )
-        with open(sample_path, "w", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(sample_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.writer(file)
             writer.writerow(
                 (
@@ -5191,7 +5205,7 @@ class MembershipAuditor:
         relationship_path = os.path.join(
             self.results_dir, "www_candidate_relationship.json"
         )
-        with open(relationship_path, "w", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(relationship_path, "w", encoding="utf-8") as file:
             json.dump(payload, file, indent=2, allow_nan=False)
             file.write("\n")
         logger.info(
@@ -5201,6 +5215,7 @@ class MembershipAuditor:
         )
         return payload
 
+    @timed_stage("audit.finalize")
     def finalize(
         self,
         final_model: torch.nn.Module,
@@ -5213,12 +5228,12 @@ class MembershipAuditor:
             self, "low_fpr_candidate_selection", None
         )
         if low_fpr_candidate_selection is not None:
-            torch.save(
+            timed_torch_save(self,
                 low_fpr_candidate_selection,
                 os.path.join(self.results_dir, "candidate_selection.pt"),
             )
         if self.exact_batch_candidate_selections:
-            torch.save(
+            timed_torch_save(self,
                 {
                     "membership_definition": (
                         self._exact_batch_membership_definition()
@@ -5437,7 +5452,7 @@ class MembershipAuditor:
                     "status": "error",
                     "error": self.errors["www_validation"],
                 }
-        with open(
+        with measure_stage(self, "outputs.write"), open(
             os.path.join(self.results_dir, "summary.json"), "w", encoding="utf-8"
         ) as file:
             json.dump(
@@ -5671,7 +5686,7 @@ class MembershipAuditor:
                 file,
                 indent=2,
             )
-        with open(
+        with measure_stage(self, "outputs.write"), open(
             os.path.join(self.results_dir, "predictions.csv"),
             "w",
             newline="",
@@ -5708,7 +5723,7 @@ class MembershipAuditor:
                         )
                     )
         if self.signal_storage != "none":
-            torch.save(
+            timed_torch_save(self,
                 {
                     "candidate_labels": self.labels.detach().cpu(),
                     "candidate_client_ids": self.candidate_client_ids,

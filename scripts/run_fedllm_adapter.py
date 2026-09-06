@@ -26,6 +26,7 @@ from aggregator.aggregator_builder import build_aggregator
 from privacy_defenses.cofedmid import validate_cofedmid
 from privacy_defenses.www_dp import validate_www
 from servers.serverbase import ServerBase
+from utils.performance import validate_performance_config
 from trainmodel.transformer_adapter import TransformerAdapterClassifier
 from trainmodel.transformer_lora import TransformerLoRAClassifier
 from utils.text_data_loader import (
@@ -200,6 +201,7 @@ def load_config(args: argparse.Namespace) -> dict:
 
 
 def validate_config(config: dict) -> None:
+    validate_performance_config(config)
     architecture = str(config.get("architecture", "")).lower()
     if architecture not in {"bert", "gpt2"}:
         raise ValueError("architecture must be bert or gpt2.")
@@ -957,6 +959,7 @@ def main() -> None:
         projres_config=projres_config,
         defense_config=defense_config,
         method_config=method_config,
+        performance_config=config.get("performance"),
     )
     server.train()
 

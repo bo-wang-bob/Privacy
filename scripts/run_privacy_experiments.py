@@ -29,7 +29,8 @@ _PRINT_LOCK = threading.Lock()
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from utils.result_formatting import format_sweep_summary
+from utils.result_formatting import format_sweep_summary, reportable_metric
+from utils.performance import validate_performance_config
 
 
 @dataclass(frozen=True)
@@ -220,7 +221,7 @@ def resolve_model_config(
         config["dataset_path"] = f"./data/huggingface/{dataset}"
 
     audit = config.setdefault("audit", {})
-    if profile["runner"] == "text":
+    if model in {"clip_mlp", "clip_adapter", "clip_lora", "bert_adapter", "bert_lora", "gpt2_adapter"}:
         audit.setdefault("grad_sample_backend", "auto")
         audit.setdefault("grad_sample_chunk_size", 4)
         audit.setdefault("gradient_update_cache_mb", 2048)
@@ -283,6 +284,7 @@ def resolve_model_config(
         elif path.startswith("projres."):
             explicit_projres_keys.add(path.split(".")[1])
     _resolve_projres_candidate_defaults(config, explicit_projres_keys)
+    validate_performance_config(config)
     return config
 
 
@@ -779,7 +781,8 @@ def write_outputs(
         if not attacks:
             attacks = [{"attack": "none"}]
         for attack in attacks:
-            reportable = attack.get("reportable_metrics", attack)
+            primary_metric = attack.get("primary_metric", "tpr_at_fpr_0.01")
+            primary_score = reportable_metric(attack, primary_metric)
             rows.append(
                 {
                     "run_id": result.task.run_id,
@@ -791,8 +794,16 @@ def write_outputs(
                     "attack": attack.get("attack", "none"),
                     "final_metric": metric_name,
                     "final_metric_value": metric_value,
-                    "auc": reportable.get("auc", attack.get("auc")),
-                    "tpr_at_fpr_0.001": reportable.get("tpr_at_fpr_0.001"),
+                    "primary_metric": primary_metric,
+                    "primary_score": primary_score,
+                    "primary_metric_reportable": primary_score is not None,
+                    "auc": reportable_metric(attack, "auc"),
+                    "tpr_at_fpr_0.1": reportable_metric(attack, "tpr_at_fpr_0.1"),
+                    "tpr_at_fpr_0.01": reportable_metric(attack, "tpr_at_fpr_0.01"),
+                    "tpr_at_fpr_0.001": reportable_metric(attack, "tpr_at_fpr_0.001"),
+                    "member_count": attack.get("member_count"),
+                    "nonmember_count": attack.get("nonmember_count"),
+                    "fpr_resolution": attack.get("fpr_resolution"),
                     "returncode": result.returncode,
                     "result_dir": str(result.task.run_dir),
                 }

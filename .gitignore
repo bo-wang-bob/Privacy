@@ -18,6 +18,7 @@ tests/*
 !tests/test_fedsgd_gradient_optimization.py
 !tests/test_result_formatting.py
 !tests/test_main_logging.py
+!tests/test_runtime_optimization.py
 paper/
 
 # Local model weights and experiment artifacts

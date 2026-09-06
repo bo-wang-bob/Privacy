@@ -249,6 +249,14 @@ python scripts/run_privacy_experiments.py \
 按任务列出模型、数据集、防御、seed/目标客户端、状态、最终主指标和耗时，方便比较多组实验。
 Accuracy/TPR 使用百分比，MCC/AUC 使用四位小数；无法报告的值显示 `N/A`。
 完整防御状态保留在 `defense_summary.json`，原始 CSV/JSON 继续保留计算精度。
+批量 `experiment_summary_*.csv` 同时保存 `primary_metric`、`primary_score`、
+`primary_metric_reportable`、三个 FPR 下的 TPR，以及成员/非成员数量和 FPR 分辨率；
+不可报告的值留空，真实零值保留为 0。
+
+六个 PEFT 模型的常规梯度审计默认分块求导并立即归约；BERT/GPT2 全局评估默认共享一次
+参数加载。每个任务默认生成 `performance_summary.json`，分别记录 WWW 排序、逐记录梯度、
+加噪、审计前向/求导/归约、评估和文件输出耗时。配置与独立基准见
+[`docs/fedsgd_performance.md`](docs/fedsgd_performance.md)。
 
 ResNet18 基线保持完整 CIFAR100、随机等量 IID、10 客户端全参与、300 轮
 FedAvg 和每轮 `0.99` 学习率衰减。CLIP-MLP/Adapter 为 16-shot one-batch 等权

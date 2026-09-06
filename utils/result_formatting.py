@@ -31,7 +31,7 @@ def format_table(headers: list[str], rows: list[list[str]], *, numeric=()) -> st
     return "\n".join([border, line(headers), border, *(line(row) for row in cells), border])
 
 
-def _reportable_metric(summary: dict, key: str):
+def reportable_metric(summary: dict, key: str):
     availability = summary.get("metric_availability", {}).get(key, {})
     if availability.get("resolvable") is False:
         return None
@@ -58,8 +58,8 @@ def format_attack_table(summaries: list[dict]) -> str:
             name += "*"
         rows.append([
             name,
-            format_number(_reportable_metric(summary, "auc")),
-            *(format_number(_reportable_metric(summary, f"tpr_at_fpr_{fpr}"), percent=True)
+            format_number(reportable_metric(summary, "auc")),
+            *(format_number(reportable_metric(summary, f"tpr_at_fpr_{fpr}"), percent=True)
               for fpr in ("0.01", "0.001", "0.1")),
             str(summary.get("member_count", "N/A")),
             str(summary.get("nonmember_count", "N/A")),

@@ -18,6 +18,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
+from utils.performance import measure_stage
 from utils.per_sample_gradients import (
     GRAD_SAMPLE_BACKENDS, clipped_sum_from_losses, resolve_grad_sample_backend,
 )
@@ -684,20 +685,21 @@ class DefenseController:
         generator = self.www_privacy.generator(user.id, round_index)
         sampling_generator = self.www_privacy.sampling_generator(user.id, round_index)
         for images, labels, local_indices in user.iter_www_local_batches(sampling_generator):
-            restore_state = user.get_parameters()
-            own_state, other_state = (
-                reference_states if reference_states is not None
-                else (restore_state, restore_state)
-            )
-            ranking = rank_loss_differences(
-                model=model,
-                batches=[(images, labels)],
-                own_state=own_state,
-                other_state=other_state,
-                restore_state=restore_state,
-                device=self.device,
-                sample_indices=local_indices,
-            )
+            with measure_stage(self, "train.www_ranking"):
+                restore_state = user.get_parameters()
+                own_state, other_state = (
+                    reference_states if reference_states is not None
+                    else (restore_state, restore_state)
+                )
+                ranking = rank_loss_differences(
+                    model=model,
+                    batches=[(images, labels)],
+                    own_state=own_state,
+                    other_state=other_state,
+                    restore_state=restore_state,
+                    device=self.device,
+                    sample_indices=local_indices,
+                )
             self._record_www_ranking(
                 user=user,
                 ranking=ranking,
@@ -1346,50 +1348,52 @@ class DefenseController:
             images = images.to(self.device)
             labels = labels.to(self.device)
             optimizer.zero_grad(set_to_none=True)
-            clipped_sum = [torch.zeros_like(parameter) for parameter in parameters]
-            all_factors = []
-            for start in range(0, labels.numel(), microbatch_size):
-                stop = min(labels.numel(), start + microbatch_size)
-                batch_images = images[start:stop]
-                batch_labels = labels[start:stop]
-                if backend == "vmap" and not code_poison:
-                    partial_sum, factors = _vmap_clipped_gradient_sum(
-                        model,
-                        batch_images,
-                        batch_labels,
-                        max_norm,
-                    )
-                else:
-                    losses = F.cross_entropy(
-                        model(batch_images), batch_labels, reduction="none"
-                    )
-                    if code_poison:
-                        losses = losses + self._secret_losses(
-                            user, model, batch_images, batch_labels
+            with measure_stage(self, "train.record_gradients"):
+                clipped_sum = [torch.zeros_like(parameter) for parameter in parameters]
+                all_factors = []
+                for start in range(0, labels.numel(), microbatch_size):
+                    stop = min(labels.numel(), start + microbatch_size)
+                    batch_images = images[start:stop]
+                    batch_labels = labels[start:stop]
+                    if backend == "vmap" and not code_poison:
+                        partial_sum, factors = _vmap_clipped_gradient_sum(
+                            model,
+                            batch_images,
+                            batch_labels,
+                            max_norm,
                         )
-                    if backend == "batched" and not code_poison:
-                        partial_sum, factors = clipped_sum_from_losses(losses, parameters, max_norm)
                     else:
-                        partial_sum, factors = _loop_clipped_gradient_sum(losses, parameters, max_norm)
-                with torch.no_grad():
-                    for destination, partial in zip(clipped_sum, partial_sum):
-                        destination.add_(partial)
-                all_factors.append(factors)
+                        losses = F.cross_entropy(
+                            model(batch_images), batch_labels, reduction="none"
+                        )
+                        if code_poison:
+                            losses = losses + self._secret_losses(
+                                user, model, batch_images, batch_labels
+                            )
+                        if backend == "batched" and not code_poison:
+                            partial_sum, factors = clipped_sum_from_losses(losses, parameters, max_norm)
+                        else:
+                            partial_sum, factors = _loop_clipped_gradient_sum(losses, parameters, max_norm)
+                    with torch.no_grad():
+                        for destination, partial in zip(clipped_sum, partial_sum):
+                            destination.add_(partial)
+                    all_factors.append(factors)
 
-            with torch.no_grad():
-                for parameter, gradient_sum in zip(parameters, clipped_sum):
-                    noise = torch.randn(
-                        parameter.shape,
-                        generator=noise_generator,
-                        device=parameter.device,
-                        dtype=parameter.dtype,
-                    )
-                    parameter.grad = (
-                        gradient_sum
-                        + noise
-                        * (self.record_dp_noise_multiplier * max_norm)
-                    ) / expected_batch_size
-            optimizer.step()
+            with measure_stage(self, "train.noise_and_step"):
+                with torch.no_grad():
+                    for parameter, gradient_sum in zip(parameters, clipped_sum):
+                        noise = torch.randn(
+                            parameter.shape,
+                            generator=noise_generator,
+                            device=parameter.device,
+                            dtype=parameter.dtype,
+                        )
+                        parameter.grad = (
+                            gradient_sum
+                            + noise
+                            * (self.record_dp_noise_multiplier * max_norm)
+                        ) / expected_batch_size
+                optimizer.step()
             self.steps[user.id] += 1
             if bool(self.config.get("release_private_diagnostics", False)):
                 self._record("record_dp_batch_size", float(labels.numel()))
@@ -2060,7 +2064,7 @@ class DefenseController:
                 ),
                 "summary": "privacy_audit/www_projres_relationship.json",
             }
-        with open(
+        with measure_stage(self, "outputs.write"), open(
             os.path.join(results_dir, "defense_summary.json"),
             "w",
             encoding="utf-8",
@@ -2074,7 +2078,7 @@ class DefenseController:
             return
         os.makedirs(results_dir, exist_ok=True)
         metric_path = os.path.join(results_dir, "www_round_metrics.csv")
-        with open(metric_path, "w", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(metric_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
                 file,
                 fieldnames=list(self._www_round_metrics[0]),
@@ -2082,7 +2086,7 @@ class DefenseController:
             writer.writeheader()
             writer.writerows(self._www_round_metrics)
         sample_path = os.path.join(results_dir, "www_round_samples.csv")
-        with open(sample_path, "w", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(sample_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
                 file,
                 fieldnames=list(self._www_round_samples[0]),
@@ -2095,7 +2099,7 @@ class DefenseController:
                 for row in self._www_round_metrics
             }
         )
-        with open(
+        with measure_stage(self, "outputs.write"), open(
             os.path.join(results_dir, "www_series.json"),
             "w",
             encoding="utf-8",
@@ -2387,7 +2391,7 @@ class DefenseController:
             return
         os.makedirs(output_dir, exist_ok=True)
         sample_path = os.path.join(output_dir, "www_projres_samples.csv")
-        with open(sample_path, "w", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(sample_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
                 file,
                 fieldnames=list(self._www_projres_samples[0]),
@@ -2397,7 +2401,7 @@ class DefenseController:
         metric_path = os.path.join(
             output_dir, "www_projres_relationship.csv"
         )
-        with open(metric_path, "w", newline="", encoding="utf-8") as file:
+        with measure_stage(self, "outputs.write"), open(metric_path, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(
                 file,
                 fieldnames=list(self._www_projres_metrics[0]),
@@ -2410,7 +2414,7 @@ class DefenseController:
                 for row in self._www_projres_metrics
             }
         )
-        with open(
+        with measure_stage(self, "outputs.write"), open(
             os.path.join(output_dir, "www_projres_relationship.json"),
             "w",
             encoding="utf-8",
