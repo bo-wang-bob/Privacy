@@ -17,6 +17,7 @@
 - `--attacks all` 按模型解析能力集：ResNet18 只有 `fedmia_loss`，PEFT 模型为全部 11 种；`--attacks none` 是纯训练。
 - `--defenses all` 只展开模型正式支持的防御。显式攻击与模型不兼容时跳过该模型并打印原因；显式防御或数据集不兼容时跳过对应组合。
 - `configs/experiment_catalog.yaml` 维护能力矩阵、防御深度覆盖和别名；`configs/models/` 下 7 个基线维护模型训练与默认候选协议。不要重新为数据集、攻击或防御复制整份模型 YAML。
+- 统一入口在应用全部 `--set` 后自动推导启用的 exact-batch ProjRes 候选参数：普通训练使用最终 batch 大小及成员/非成员比例，`record_dp`/`www` 使用 `0/0/0` 动态候选。改变 `batch_size` 或混跑 `none,record_dp,www` 无需手动同步这三个值。显式传入的 ProjRes 候选参数保留并接受协议校验；干运行显示最终候选参数。
 - CLIP 默认学习率由模型基线设置：CLIP-MLP 为 `0.1`，CLIP-Adapter 为 `0.001`，CLIP-LoRA 为 `0.0002`。应以统一脚本干运行打印的最终参数为准。
 - 三个 CLIP 基线均显式使用 IID。不要在正常 IID 实验中传 `--dirichlet-alpha`；仅传该参数会自动切换为 `dirichlet`。如同时显式传 `--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha 仅作为未使用的配置值保留。
 - CLIP-MLP 和 CLIP-Adapter 使用每类 16 张训练图像的 Few-shot 训练集；CLIP-LoRA 使用完整训练集。Few-shot 先在全局训练分区内按类确定性抽取，再进行客户端划分；独立 evaluation/test 分区不截断。
@@ -28,9 +29,10 @@
 ## 当前 WWW 防御（原 ICLR）
 
 - 原观测型 `iclr` 已更名并更新为实际参与训练的 `www`；配置和新产物使用 `www_*`，历史 `results/` 与 `iclr_*` 产物不改写。
-- 支持三个 CLIP 模型及 BERT Adapter/LoRA。每个真实训练 batch 按上一轮防御后模型的 `M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 升序排序，按固定期望 batch 大小 b 预设尾部宽度 `ceil(0.2 * b)`，实际 batch 有 n 条样本时，尾部包含最后 `min(n, ceil(0.2*b))` 条；短于尾部的 batch 使用重要性函数的最右侧区间。首轮或缺少上一轮参考状态时统一裁剪并加噪。
+- 支持三个 CLIP 模型及 BERT Adapter/LoRA。每个真实训练 batch 按上一轮防御后模型的 `M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 升序排序，默认 `defense.www_tail_fraction=0.8`，按固定期望 batch 大小 b 预设尾部宽度 `ceil(0.8 * b)`，实际 batch 有 n 条样本时，尾部包含最后 `min(n, ceil(0.8*b))` 条；短于尾部的 batch 使用重要性函数的最右侧区间。首轮或缺少上一轮参考状态时统一裁剪并加噪。
 - 所有样本联合 L2 裁剪到默认 `defense.max_grad_norm=8`，再乘 INO-SGD 的 Beta 尾部函数积分权重；默认 Beta(1,1)。先裁剪再缩放，不能替换成直接裁剪到缩放后的阈值。
 - 默认全程预算 `defense.target_epsilon=3`、`delta=1e-5`。与普通 `record_dp` 共用 Poisson 采样，按 `add_remove`、敏感度 C 和 Poisson sampled-Gaussian RDP 校准全程噪声；梯度和加噪后除以固定期望 batch 大小。空 batch 不重抽，仍上传纯噪声并计入预算。防御每轮运行，诊断间隔不影响训练保护。
+- WWW 与 BERT Adapter Record-DP 默认 `defense.grad_sample_backend=auto`、`defense.microbatch_size=4`，使用分块 batched VJP；分块只影响计算，整个真实 batch 汇总后仍只加一次噪声和执行一次 FedSGD step。共享 Transformer 启用 gradient checkpointing 时 `auto` 选择 `loop`；ResNet18 保留原 `vmap`。性能说明和独立基准见 `docs/fedsgd_performance.md`。
 - 默认不导出未私有化分数诊断；固定噪声或 `release_private_diagnostics=true` 将使 `formal_dp_enabled=false`。受保护发布范围为防御后的上传与模型，审计私有信号与标签属于本地研究资料。
 - WWW 下 ProjRes 按真实 Poisson batch 动态构造候选，三个候选规模参数均为 0；取消无噪声 batch 秩上限，`paper_fedsgd_exact=false`。空 batch 跳过真实 Batch 攻击并记录原因，固定候选攻击继续执行。入口与完整公式见 `docs/defenses.md`。
 
@@ -78,6 +80,7 @@
 - 一次任务所需文件放在同一目录内，主要包括 `run_config.yaml`、`run.log`、模型/训练指标，以及 `privacy_audit/` 下的 `summary.json`、`predictions.csv`、`signals.pt`、`candidate_selection.pt` 和 `exact_batch_candidate_selection.pt`（按实际启用项生成）。三种 CLIP 模型的统一 ProjRes 复用这些输出；只有独立 ProjRes 路径生成 `projres_strict.json`。进程内日志写入同一 `run.log`，不要重新创建独立 `projres_strict.log`。
 - `runs` 在汇总表中表示同一数据集/攻击分组包含的独立训练任务数量，不是额外的目录层级。代码仍可读取历史 `.../runs/...` 布局，但新实验不得继续生成该布局。
 - 每个 `run.log` 开头只记录一次时间、训练任务、模型、数据集、防御、阶段和 GPU；后续子进程日志不再为每行重复这些固定字段。不要输出逐通信轮次的训练状态，只在配置的正式评估轮次和最终轮输出 `Progress`，记录轮次、loss、accuracy/MCC、学习率、参与客户端和审计累计数。不要重新引入只有脚本名而没有任务身份的日志命名。
+- 每个任务结束后由共享服务器输出一次 `RUN RESULTS`：最终任务指标、精简隐私会计和对齐的攻击指标表；批量入口末尾输出 `EXPERIMENT OVERVIEW`，区分 OK/FAILED/PARTIAL 并显示最终主指标和耗时。不要把完整防御字典或逐客户端状态打印到控制台，它们保存在 `defense_summary.json`。显示值统一精度，Accuracy/TPR 显示百分比、MCC/AUC 显示小数；攻击优先读取 `reportable_metrics`，不可报告的值显示 `N/A`，不能回退到原始低 FPR TPR。
 
 ## 分析现有结果时的注意事项
 
@@ -98,6 +101,7 @@
 ## 性能与验证
 
 - 主要耗时来自余弦类攻击的逐样本梯度计算；候选样本数和逐轮攻击数量决定大部分审计时间。若继续优化，优先考虑 CLIP-MLP/Adapter 可解析或向量化的梯度余弦、批量客户端前向和在线聚合，且必须保持攻击定义不变。
+- 文本审计默认 `audit.grad_sample_backend=auto`、`audit.grad_sample_chunk_size=4`，分块计算逐记录梯度，在每次信号计算内缓存上传向量的 float64 表示并批量点积。缓存不超过 `audit.gradient_update_cache_mb=2048` 且不超过当前空闲显存四分之一时放在 GPU，否则使用 CPU；设为 0 强制 CPU。不得跨客户端状态/轮次复用缓存；余弦继续求真实标签 CE 梯度，Gradient-Diff 继续求所有标签损失之和的梯度。`audit.grad_sample_backend=loop` 可回到逐记录求导。
 - 修改实验配置后先干运行核对最终参数：
   - `python scripts/run_privacy_experiments.py --dry-run --max-runs 1`
 - 当前干运行应看到：MLP/Adapter/LoRA 均为 `federated.aggregator: fedsgd` 和 `federated.aggregation_weighting: uniform`；MLP/Adapter 为每类 16-shot，LoRA 使用完整训练集；三者均启用统一 ProjRes。

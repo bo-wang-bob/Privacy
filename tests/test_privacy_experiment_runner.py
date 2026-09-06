@@ -1,6 +1,8 @@
 import datetime as dt
 from pathlib import Path
 
+import pytest
+
 from scripts.run_privacy_experiments import (
     _forward_child_line,
     _task_header,
@@ -8,9 +10,11 @@ from scripts.run_privacy_experiments import (
     build_tasks,
     load_yaml,
     parse_args,
+    print_result_overview,
     resolve_model_config,
     run_task,
     validate_resolved_config,
+    TaskResult,
 )
 from servers.serverbase import _format_round_progress
 
@@ -154,6 +158,61 @@ def test_training_only_filters_attack_specific_configuration(tmp_path):
     assert config["projres"]["enabled"] is False
 
 
+def test_batch32_bert_sweep_automatically_resolves_each_defense_projres(tmp_path):
+    tasks, skipped = build_tasks(
+        CATALOG,
+        _args(
+            "--models", "bert_adapter", "--datasets", "cola,imdb",
+            "--defenses", "none,record_dp,www", "--attacks", "all",
+            "--set", "batch_size=32", "--set", "defense.target_epsilon=16",
+            "--set", "defense.max_grad_norm=8", "--results-root", str(tmp_path),
+        ),
+    )
+    assert not skipped and len(tasks) == 6
+    for task in tasks:
+        assert task.config["batch_size"] == 32 and len(task.attacks) == 11
+        bounds = task.config["projres"]
+        actual = tuple(bounds[k] for k in ("max_candidates", "min_nonmembers", "max_nonmembers"))
+        assert actual == ((32, 320, 320) if task.defense == "none" else (0, 0, 0))
+        assert task.config["defense"]["target_epsilon"] == 16
+    assert list(tmp_path.iterdir()) == [], "config resolution must not create runs"
+
+
+@pytest.mark.parametrize("model", ["clip_mlp", "clip_adapter", "clip_lora", "bert_lora", "gpt2_adapter"])
+def test_projres_defaults_follow_final_batch_and_ratio_for_other_peft_models(model, tmp_path):
+    tasks, skipped = build_tasks(
+        CATALOG,
+        _args(
+            "--models", model, "--datasets", CATALOG["models"][model]["default_datasets"][0],
+            "--defenses", "none,cofedmid", "--attacks", "all",
+            "--set", "batch_size=7",
+            "--set", "audit.exact_batch_nonmember_to_member_ratio=5",
+            "--results-root", str(tmp_path),
+        ),
+    )
+    assert not skipped and len(tasks) == 2
+    for task in tasks:
+        bounds = task.config["projres"]
+        assert bounds["max_candidates"] == 7
+        assert bounds["min_nonmembers"] == bounds["max_nonmembers"] == 35
+
+
+@pytest.mark.parametrize("override", [
+    ("projres.max_candidates", 16),
+    ("projres", {"enabled": True, "max_candidates": 16}),
+])
+def test_explicit_projres_bounds_are_preserved_and_invalid_protocol_is_rejected(override, tmp_path):
+    config = resolve_model_config(
+        CATALOG, model="bert_adapter", dataset="cola", attacks=["projres"],
+        defense="none", seed=42, target_client_id=0, results_dir=tmp_path,
+        dotted_overrides=[("batch_size", 32), override],
+    )
+    assert config["projres"]["max_candidates"] == 16
+    assert config["projres"]["min_nonmembers"] == config["projres"]["max_nonmembers"] == 320
+    with pytest.raises(ValueError, match="complete real training batch"):
+        validate_resolved_config(config, "text")
+
+
 def test_run_ids_are_first_level_task_directories(tmp_path):
     tasks, _ = build_tasks(
         CATALOG,
@@ -275,3 +334,23 @@ def test_evaluation_progress_keeps_metrics_and_partial_client_ids():
     assert "lr=0.005" in line
     assert "selected=[0,2]" in line
     assert "audit_snapshots=55" in line
+
+
+def test_overview_uses_final_task_metric_and_marks_failed_and_partial_runs(tmp_path, capsys):
+    tasks, _ = build_tasks(CATALOG, _args(
+        "--models", "bert_adapter", "--datasets", "cola,imdb",
+        "--defenses", "none", "--attacks", "none", "--results-root", str(tmp_path),
+    ))
+    task = tasks[0]
+    (task.run_dir / "privacy_audit").mkdir(parents=True)
+    metrics = "round,loss,accuracy,mcc\n50,0.7,0.8,0.5\n100,0.8,0.7,-0.03\n"
+    (task.run_dir / "training_metrics.csv").write_text(metrics)
+    (task.run_dir / "privacy_audit/summary.json").write_text('{"errors":{"projres":"failed"}}')
+    results = [TaskResult(t, code, "2026-09-06T10:00:00+00:00", "2026-09-06T11:02:03+00:00")
+               for t, code in zip(tasks, [0, 1])]
+    print_result_overview(results)
+    display = capsys.readouterr().out
+    assert "MCC" in display and "-0.0300" in display and "0.5000" not in display
+    assert "PARTIAL" in display and "FAILED" in display and "N/A" in display
+    assert "01:02:03" in display
+    assert (task.run_dir / "training_metrics.csv").read_text() == metrics

@@ -50,10 +50,10 @@ def test_exact_loss_difference_sign_order_and_model_restoration():
 
 
 @pytest.mark.parametrize("count", [1, 2, 5, 10, 16, 32])
-def test_highest_twenty_percent_and_linear_tif_exact_integrals(count):
+def test_highest_eighty_percent_and_linear_tif_exact_integrals(count):
     scores = torch.arange(count, dtype=torch.float64).flip(0)
     weights, positions, tail = ino_weights(scores, expected_batch_size=count)
-    m = math.ceil(count * 0.2)
+    m = math.ceil(count * 0.8)
     assert int(tail.sum()) == m
     assert torch.equal(scores[positions], scores.sort().values)
     assert torch.equal(tail, torch.arange(count) < m)
@@ -73,11 +73,11 @@ def test_beta_integral_matches_independent_quadrature():
     torch.testing.assert_close(weights[positions[-m:]], expected, atol=1e-12, rtol=1e-9)
 
 
-@pytest.mark.parametrize("actual", [0, 1, 2, 3, 4, 8, 16, 25])
+@pytest.mark.parametrize("actual", [0, 1, 2, 3, 4, 8, 12, 13, 14, 16, 25])
 def test_fixed_tail_uses_expected_batch_and_right_aligns_small_draws(actual):
     weights, order, tail = ino_weights(torch.arange(actual).float(), expected_batch_size=16)
-    m = 4
-    expected = torch.tensor([0.875, 0.625, 0.375, 0.125], dtype=torch.float64)
+    m = 13
+    expected = 1 - (torch.arange(m, dtype=torch.float64) + 0.5) / m
     assert int(tail.sum()) == min(actual, m)
     assert weights.numel() == actual
     if actual:
@@ -214,9 +214,9 @@ def test_post_round_diagnostics_do_not_disable_pre_update_defense():
     controller.prepare_client_training(user, global_state, 0.5, source_round=0)
     user.set_parameters(global_state)
     user.train(round_index=1)
-    assert int(user.www_tail_mask.sum()) == min(user.last_update_sample_count, 1)
+    assert int(user.www_tail_mask.sum()) == min(user.last_update_sample_count, 4)
     assert user.www_source_round == 0
-    assert int((user.www_importance_weights < 1).sum()) == min(user.last_update_sample_count, 1)
+    assert int((user.www_importance_weights < 1).sum()) == min(user.last_update_sample_count, 4)
 
 
 def test_www_and_record_dp_share_sampling_calibration_and_warmup_upload():
@@ -392,7 +392,7 @@ def test_five_peft_models_private_training_and_all_attacks(model_type, monkeypat
         assert user.last_gradient_capture_count == 1
         assert user.last_update_sample_count == user.last_train_indices.numel()
         assert user.www_ranking_round == 2
-        assert int(user.www_tail_mask.sum()) == min(user.last_update_sample_count, 1)
+        assert int(user.www_tail_mask.sum()) == min(user.last_update_sample_count, 4)
         assert user.www_source_round == 1
         assert torch.equal(user.www_ranked_scores, user.www_scores.sort().values)
         for name, tensor in server.ctx.protocol_messages[user.id]["tensors"].items():

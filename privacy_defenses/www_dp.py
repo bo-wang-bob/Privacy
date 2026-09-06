@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.special import betainc
+from utils.per_sample_gradients import clipped_sum_from_losses, resolve_grad_sample_backend
 
 from utils.privacy_accounting import (
     calibrate_poisson_sampled_gaussian_noise,
@@ -26,7 +27,7 @@ DEFAULTS = {
     "max_grad_norm": 8.0,
     "delta": 1e-5,
     "noise_multiplier": "auto",
-    "www_tail_fraction": 0.2,
+    "www_tail_fraction": 0.8,
     "www_beta_alpha": 1.0,
     "www_beta_beta": 1.0,
     "www_analysis_interval": 1,
@@ -38,6 +39,8 @@ DEFAULTS = {
     "sampling": "poisson",
     "reproducible_dp_noise": False,
     "release_private_diagnostics": False,
+    "grad_sample_backend": "auto",
+    "microbatch_size": 4,
 }
 
 
@@ -67,11 +70,16 @@ def validate_www(config: dict) -> None:
             raise ValueError(f"WWW requires defense.{key}={DEFAULTS[key]}.")
     if config["www_feature_statistics"] and not config["release_private_diagnostics"]:
         raise ValueError("WWW feature statistics require release_private_diagnostics=true.")
+    if str(config["grad_sample_backend"]).lower() not in {"auto", "loop", "batched"}:
+        raise ValueError("WWW grad_sample_backend must be auto, loop, or batched.")
+    chunk = config["microbatch_size"]
+    if isinstance(chunk, bool) or not isinstance(chunk, int) or chunk <= 0:
+        raise ValueError("WWW microbatch_size must be a positive integer.")
 
 
 def ino_weights(
     scores: torch.Tensor,
-    tail_fraction: float = 0.2,
+    tail_fraction: float = DEFAULTS["www_tail_fraction"],
     beta_alpha: float = 1.0,
     beta_beta: float = 1.0,
     *,
@@ -114,15 +122,31 @@ def ino_weights(
 
 
 def weighted_clipped_sum(model, images, labels, parameters, max_norm, weights,
-                         extra_loss=None):
+                         extra_loss=None, *, backend="loop", microbatch_size=4):
     """Algorithm 1: rho_i * g_i / max(1, ||g_i||_2 / C), jointly over parameters.
 
-    One sample graph at a time avoids materializing B full PEFT gradients and
-    prevents batch-dependent layers from mixing different records' gradients.
+    The batched backend bounds gradient storage by microbatch_size; all chunks
+    contribute to one sum before noise or the optimizer step. Supported PEFT
+    models have no batch-dependent normalization. Loop remains a reference.
     """
     if weights.numel() != labels.numel():
         raise ValueError("WWW weights must align with the actual training batch.")
+    backend = resolve_grad_sample_backend(model, backend)
     sums = [torch.zeros_like(p) for p in parameters]
+    if backend == "batched" and extra_loss is None:
+        for start in range(0, labels.numel(), microbatch_size):
+            stop = start + microbatch_size
+            losses = F.cross_entropy(model(images[start:stop]), labels[start:stop], reduction="none")
+            partial, _ = clipped_sum_from_losses(
+                losses, parameters, max_norm, weights[start:stop],
+            )
+            with torch.no_grad():
+                for destination, value in zip(sums, partial):
+                    destination.add_(value)
+        return sums
+    if backend not in {"loop", "batched"}:
+        raise ValueError("WWW gradient backend must resolve to loop or batched.")
+    weights = weights.to(device=images.device)
     for index in range(labels.numel()):
         inputs, targets = images[index:index + 1], labels[index:index + 1]
         loss = F.cross_entropy(model(inputs), targets)
@@ -219,7 +243,9 @@ class WWWPrivacy:
         optimizer.zero_grad(set_to_none=True)
         max_norm = float(self.config["max_grad_norm"])
         sums = weighted_clipped_sum(model, images, labels, parameters, max_norm,
-                                    weights, extra_loss)
+                                    weights, extra_loss,
+                                    backend=self.config["grad_sample_backend"],
+                                    microbatch_size=int(self.config["microbatch_size"]))
         # A fixed-length INO tail preserves the add/remove bound C, including
         # changes in other records' weights. Empty draws release pure noise.
         noise_std = self.noise_multiplier * max_norm
@@ -248,6 +274,8 @@ class WWWPrivacy:
             "noise_std_on_sum": (None if self.noise_multiplier is None else
                                  self.noise_multiplier * float(self.config["max_grad_norm"])),
             "normalization": "fixed_expected_batch_size",
+            "grad_sample_backend": self.config["grad_sample_backend"],
+            "microbatch_size": int(self.config["microbatch_size"]),
             "client_upload_is_private": True,
             "formal_dp_enabled": not self.reproducible
                                  and not self.config["release_private_diagnostics"],

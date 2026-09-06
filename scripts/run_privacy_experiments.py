@@ -29,6 +29,8 @@ _PRINT_LOCK = threading.Lock()
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
+from utils.result_formatting import format_sweep_summary
+
 
 @dataclass(frozen=True)
 class ExperimentTask:
@@ -161,6 +163,37 @@ def _disable_resnet_paper_protocol(config: dict[str, Any]) -> None:
     config.setdefault("audit", {})["www_candidate_scoring"] = False
 
 
+def _resolve_projres_candidate_defaults(
+    config: dict[str, Any], explicit_keys: set[str]
+) -> None:
+    """Derive unified ProjRes bounds from the final batch/sampling protocol.
+
+    Model YAMLs describe their baseline batch, so their candidate counts become
+    stale after --set batch_size. Explicit ProjRes overrides remain subject to
+    the runner's protocol validation; independent/disabled ProjRes is untouched.
+    """
+    audit = config.get("audit", {})
+    projres = config.get("projres", {})
+    if (
+        "projres" not in audit.get("exact_batch_membership_attacks", [])
+        or not projres.get("enabled", False)
+    ):
+        return
+    defense = str(config.get("defense", {}).get("name", "none")).lower()
+    if defense in {"record_dp", "www"}:
+        members = nonmembers = 0
+    else:
+        members = int(config["batch_size"])
+        nonmembers = members * int(audit.get("exact_batch_nonmember_to_member_ratio", 10))
+    for key, value in {
+        "max_candidates": members,
+        "min_nonmembers": nonmembers,
+        "max_nonmembers": nonmembers,
+    }.items():
+        if key not in explicit_keys:
+            projres[key] = value
+
+
 def resolve_model_config(
     catalog: dict[str, Any],
     *,
@@ -187,6 +220,10 @@ def resolve_model_config(
         config["dataset_path"] = f"./data/huggingface/{dataset}"
 
     audit = config.setdefault("audit", {})
+    if profile["runner"] == "text":
+        audit.setdefault("grad_sample_backend", "auto")
+        audit.setdefault("grad_sample_chunk_size", 4)
+        audit.setdefault("gradient_update_cache_mb", 2048)
     exact_supported = set(catalog["attacks"]["exact_batch"])
     audit["enabled"] = bool(attacks)
     audit["attacks"] = list(attacks)
@@ -238,8 +275,14 @@ def resolve_model_config(
     ):
         _disable_resnet_paper_protocol(config)
 
+    explicit_projres_keys: set[str] = set()
     for path, value in dotted_overrides or []:
         set_dotted(config, path, copy.deepcopy(value))
+        if path == "projres" and isinstance(value, dict):
+            explicit_projres_keys = set(value)
+        elif path.startswith("projres."):
+            explicit_projres_keys.add(path.split(".")[1])
+    _resolve_projres_candidate_defaults(config, explicit_projres_keys)
     return config
 
 
@@ -496,6 +539,18 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             f"partition:{partition} data:{data_view}"
         )
         defense_config = config.get("defense", {})
+        if "projres" in config.get("audit", {}).get("exact_batch_membership_attacks", []):
+            bounds = config["projres"]
+            print(
+                f"      projres=members:{bounds['max_candidates']} "
+                f"nonmembers:{bounds['min_nonmembers']}/{bounds['max_nonmembers']} "
+                "(0=dynamic actual batch)"
+            )
+        if task.defense in {"www", "record_dp"}:
+            print(
+                f"      per_record_gradients=backend:{defense_config.get('grad_sample_backend', 'auto')} "
+                f"chunk:{defense_config.get('microbatch_size', 4)}"
+            )
         if task.defense == "www":
             print(
                 f"      www=epsilon:{defense_config['target_epsilon']} "
@@ -657,6 +712,30 @@ def _last_training_metric(
     return None, None
 
 
+def print_result_overview(results: list[TaskResult]) -> None:
+    records = []
+    for result in results:
+        task = result.task
+        metric, value = _last_training_metric(task.run_dir, task.config.get("primary_metric"))
+        status = "OK" if result.returncode == 0 else "FAILED"
+        audit_file = task.run_dir / "privacy_audit" / "summary.json"
+        if status == "OK" and audit_file.exists():
+            with audit_file.open(encoding="utf-8") as handle:
+                if (json.load(handle) or {}).get("errors"):
+                    status = "PARTIAL"
+        try:
+            seconds = (dt.datetime.fromisoformat(result.finished_at)
+                       - dt.datetime.fromisoformat(result.started_at)).total_seconds()
+        except (TypeError, ValueError):
+            seconds = None
+        records.append({
+            "model": task.model, "dataset": task.dataset, "defense": task.defense,
+            "seed": task.seed, "target_client_id": task.target_client_id,
+            "status": status, "metric": metric, "value": value, "seconds": seconds,
+        })
+    print("\n" + format_sweep_summary(records) + "\n")
+
+
 def write_outputs(
     results: list[TaskResult], results_root: Path, invocation_id: str
 ) -> tuple[Path, Path]:
@@ -795,6 +874,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     failed = [result for result in results if result.returncode != 0]
     not_started = len(tasks) - len(results)
+    print_result_overview(results)
     print(
         f"DONE | completed={len(results) - len(failed)} failed={len(failed)} "
         f"not_started={not_started}"

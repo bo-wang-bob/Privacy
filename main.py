@@ -43,46 +43,6 @@ def _build_logging_handlers(result_dir: str) -> list[logging.Handler]:
     return handlers
 
 
-def _format_privacy_audit_summary(summaries: list[dict]) -> str:
-    """Format the final audit log without dumping full result metadata."""
-    if not summaries:
-        return "Privacy audit completed: no attack results."
-
-    lines = ["Privacy audit completed:"]
-    for summary in summaries:
-        reportable = summary.get("reportable_metrics", {})
-        auc = reportable.get("auc", summary.get("auc"))
-        primary_metric = summary.get("primary_metric", "tpr_at_fpr_0.01")
-        primary_score = summary.get("primary_score")
-        if primary_score is None:
-            primary_score = reportable.get(primary_metric)
-
-        auc_text = "n/a" if auc is None else f"{float(auc):.4f}"
-        primary_text = (
-            "n/a"
-            if primary_score is None
-            else f"{100.0 * float(primary_score):.2f}%"
-        )
-        primary_label = {
-            "tpr_at_fpr_0.1": "TPR@10%FPR",
-            "tpr_at_fpr_0.01": "TPR@1%FPR",
-            "tpr_at_fpr_0.001": "TPR@0.1%FPR",
-        }.get(primary_metric, primary_metric)
-        lines.append(
-            "  %s | AUC=%s | %s=%s | samples=%s (members=%s, non-members=%s)"
-            % (
-                summary.get("attack", "unknown"),
-                auc_text,
-                primary_label,
-                primary_text,
-                summary.get("num_samples", "n/a"),
-                summary.get("member_count", "n/a"),
-                summary.get("nonmember_count", "n/a"),
-            )
-        )
-    return "\n".join(lines)
-
-
 def _result_run_id(
     now: datetime.datetime | None = None, process_id: int | None = None
 ) -> str:
@@ -1357,9 +1317,7 @@ def run(config: dict) -> list[dict]:
         defense_config=config.get("defense", {"name": "none"}),
         method_config=method_config,
     )
-    summaries = server.train()
-    logger.info("%s", _format_privacy_audit_summary(summaries))
-    return summaries
+    return server.train()
 
 
 def default_config() -> dict:

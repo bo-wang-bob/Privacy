@@ -41,6 +41,7 @@ from privacy_defenses.www_validation import (
     validate_www_attack_relationships,
 )
 from utils.data_loader import group_idx_by_class
+from utils.per_sample_gradients import gradients_from_losses, resolve_grad_sample_backend
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +176,14 @@ class MembershipAuditor:
         num_classes: int | None = None,
     ):
         self.config = config or {}
+        if str(self.config.get("grad_sample_backend", "auto")).lower() not in {"auto", "loop", "batched"}:
+            raise ValueError("audit.grad_sample_backend must be auto, loop, or batched.")
+        chunk_size = self.config.get("grad_sample_chunk_size", 4)
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("audit.grad_sample_chunk_size must be a positive integer.")
+        cache_mb = self.config.get("gradient_update_cache_mb", 2048)
+        if isinstance(cache_mb, bool) or not isinstance(cache_mb, (int, float)) or not math.isfinite(cache_mb) or cache_mb < 0:
+            raise ValueError("audit.gradient_update_cache_mb must be finite and nonnegative.")
         self.defense_config = dict(defense_config or {"name": "none"})
         self.defense_name = str(self.defense_config.get("name", "none")).lower()
         self.federated_method = str(federated_method).lower()
@@ -3178,7 +3187,13 @@ class MembershipAuditor:
         candidate_inputs: torch.Tensor | None = None,
         candidate_labels: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Stream exact text-sample gradients without retaining the full pool."""
+        """Stream bounded text-gradient chunks and reuse this call's uploads.
+
+        Cosine differentiates true-label CE; Gradient-Diff differentiates the
+        sum over all labels. Both retain float64 reductions. Small upload caches
+        stay on CUDA if memory permits; larger caches use CPU.
+        Upload caches are local to this call, so no client/round state is stale.
+        """
         if not updates:
             raise ValueError("At least one client update is required.")
         allowed = set(parameter_names)
@@ -3188,22 +3203,37 @@ class MembershipAuditor:
             if parameter.requires_grad and name in allowed
         ]
         parameters = [parameter for _, parameter in named_parameters]
-        if not parameters or any(
+        if not parameters or {name for name, _ in named_parameters} != allowed or any(
             set(update) != allowed for update, _, _ in updates
         ):
             raise ValueError(
                 "Text gradient observations and uploaded PEFT updates must "
                 "have identical parameter scopes."
             )
-        update_norms = []
-        for update, _, scale in updates:
-            norm_sq = torch.zeros((), dtype=torch.float64)
-            for name in parameter_names:
-                values = (
-                    update[name].detach().cpu().to(torch.float64) * float(scale)
-                )
-                norm_sq += values.square().sum()
-            update_norms.append(norm_sq.sqrt().clamp_min(1e-12))
+        config = getattr(self, "config", {})
+        reduction_device = torch.device("cpu")
+        cache_bytes = len(updates) * sum(p.numel() for p in parameters) * 8
+        cache_limit = float(config.get("gradient_update_cache_mb", 2048)) * 2**20
+        if self.device.type == "cuda" and cache_bytes <= cache_limit:
+            free_bytes, _ = torch.cuda.mem_get_info(self.device)
+            # Leave at least 75% of current free memory for the forward graph,
+            # per-record gradients and other work on the device.
+            if cache_bytes <= free_bytes // 4:
+                reduction_device = self.device
+        update_matrices = []
+        update_norm_sq = torch.zeros(len(updates), dtype=torch.float64, device=reduction_device)
+        signs = torch.tensor([sign for _, sign, _ in updates], dtype=torch.float64, device=reduction_device)
+        scales = torch.tensor([scale for _, _, scale in updates], dtype=torch.float64, device=reduction_device)
+        for name, _ in named_parameters:
+            matrix = torch.stack([
+                update[name].detach().reshape(-1).cpu()
+                for update, _, _ in updates
+            ]).to(device=reduction_device, dtype=torch.float64)
+            # Norm includes scale, but not the observation sign, as before.
+            update_norm_sq.add_((matrix * scales[:, None]).square().sum(dim=1))
+            matrix.mul_((signs * scales)[:, None])
+            update_matrices.append(matrix)
+        update_norms = update_norm_sq.sqrt().clamp_min(1e-12)
         cosine_rows = []
         difference_rows = []
         difference_indices = (
@@ -3213,16 +3243,21 @@ class MembershipAuditor:
         )
         if need_gradient_difference and not difference_indices:
             raise ValueError("Gradient-Diff requires a target client update.")
+        if any(index < 0 or index >= len(updates) for index in difference_indices):
+            raise ValueError("Gradient-Diff target update index is out of range.")
         inputs = self.images if candidate_inputs is None else candidate_inputs
         labels = self.labels if candidate_labels is None else candidate_labels
         if inputs.shape[0] != labels.numel():
             raise ValueError("Candidate inputs and labels must have equal length.")
+        backend = resolve_grad_sample_backend(model, config.get("grad_sample_backend", "auto"))
+        chunk_size = int(config.get("grad_sample_chunk_size", 4)) if backend == "batched" else 1
         model.eval()
-        for candidate_input, candidate_label in zip(inputs, labels):
+        for start in range(0, labels.numel(), chunk_size):
+            stop = start + chunk_size
             model.zero_grad(set_to_none=True)
-            logits = model(candidate_input.unsqueeze(0).to(self.device))
+            logits = model(inputs[start:stop].to(self.device))
             true_label_loss = F.cross_entropy(
-                logits, candidate_label.view(1).to(self.device)
+                logits, labels[start:stop].to(self.device), reduction="none",
             )
             losses = []
             if need_cosine:
@@ -3231,61 +3266,45 @@ class MembershipAuditor:
                 sum_label_loss = (
                     logits.shape[1] * torch.logsumexp(logits, dim=1)
                     - logits.sum(dim=1)
-                ).sum()
+                )
                 losses.append(("gradient_difference", sum_label_loss))
             for position, (measurement, differentiated_loss) in enumerate(losses):
-                gradients = torch.autograd.grad(
-                    differentiated_loss,
-                    parameters,
+                gradients = gradients_from_losses(
+                    differentiated_loss, parameters, backend=backend,
                     retain_graph=position + 1 < len(losses),
                 )
-                gradient_norm_sq = torch.zeros((), dtype=torch.float64)
+                count = logits.shape[0]
+                gradient_norm_sq = torch.zeros(count, dtype=torch.float64, device=reduction_device)
                 measurement_indices = (
                     list(range(len(updates)))
                     if measurement == "cosine"
                     else difference_indices
                 )
-                dots = [
-                    torch.zeros((), dtype=torch.float64)
-                    for _ in measurement_indices
-                ]
-                for (name, _), gradient in zip(named_parameters, gradients):
-                    flat = gradient.detach().flatten().cpu().to(torch.float64)
-                    gradient_norm_sq += flat.square().sum()
-                    for index, update_index in enumerate(measurement_indices):
-                        update, sign, scale = updates[update_index]
-                        dots[index] += (
-                            flat
-                            * update[name]
-                            .detach()
-                            .flatten()
-                            .cpu()
-                            .to(torch.float64)
-                        ).sum() * float(sign) * float(scale)
+                dots = torch.zeros(count, len(measurement_indices), dtype=torch.float64, device=reduction_device)
+                for matrix, gradient in zip(update_matrices, gradients):
+                    flat = gradient.reshape(count, -1).to(device=reduction_device, dtype=torch.float64)
+                    gradient_norm_sq.add_(flat.square().sum(dim=1))
+                    selected = matrix if measurement == "cosine" else matrix[measurement_indices]
+                    dots.addmm_(flat, selected.t())
                     del flat
                 if measurement == "cosine":
                     gradient_norm = gradient_norm_sq.sqrt().clamp_min(1e-12)
                     cosine_rows.append(
-                        torch.stack(
-                            [
-                                dot / (gradient_norm * norm)
-                                for dot, norm in zip(dots, update_norms)
-                            ]
-                        ).to(torch.float32)
+                        (dots / (gradient_norm[:, None] * update_norms[None, :])).to(device="cpu", dtype=torch.float32)
                     )
                 else:
                     difference_rows.append(
-                        torch.stack(
-                            [2.0 * dot - gradient_norm_sq for dot in dots]
-                        ).to(torch.float32)
+                        (2.0 * dots - gradient_norm_sq[:, None]).to(device="cpu", dtype=torch.float32)
                     )
                 del gradients
         measurements = {}
         if need_cosine:
-            measurements["cosine"] = torch.stack(cosine_rows).t().contiguous()
+            measurements["cosine"] = (torch.cat(cosine_rows).t().contiguous()
+                                      if cosine_rows else torch.empty(len(updates), 0))
         if need_gradient_difference:
             measurements["gradient_difference"] = (
-                torch.stack(difference_rows).t().contiguous()
+                torch.cat(difference_rows).t().contiguous()
+                if difference_rows else torch.empty(len(difference_indices), 0)
             )
         return measurements
 

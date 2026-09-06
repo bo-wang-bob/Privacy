@@ -15,6 +15,9 @@ tests/*
 !tests/test_cofedmid.py
 !tests/test_www_dp.py
 !tests/test_www_feature_statistics.py
+!tests/test_fedsgd_gradient_optimization.py
+!tests/test_result_formatting.py
+!tests/test_main_logging.py
 paper/
 
 # Local model weights and experiment artifacts

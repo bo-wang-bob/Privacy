@@ -168,9 +168,11 @@ defense_overrides:
         max_grad_norm: 8.0
         delta: 1.0e-5
         noise_multiplier: auto
-        www_tail_fraction: 0.2
+        www_tail_fraction: 0.8
         www_beta_alpha: 1.0
         www_beta_beta: 1.0
+        grad_sample_backend: auto
+        microbatch_size: 4
         www_analysis_interval: 1
         www_analysis_timing: pre_update
         www_feature_statistics: false
@@ -215,8 +217,8 @@ defense_overrides:
           target_epsilon: 3.0
           delta: 1.0e-5
           noise_multiplier: auto
-          grad_sample_backend: loop
-          microbatch_size: 16
+          grad_sample_backend: auto
+          microbatch_size: 4
           reproducible_noise: false
           release_private_diagnostics: false
         projres:

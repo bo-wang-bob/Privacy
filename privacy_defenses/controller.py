@@ -18,6 +18,9 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
+from utils.per_sample_gradients import (
+    GRAD_SAMPLE_BACKENDS, clipped_sum_from_losses, resolve_grad_sample_backend,
+)
 from utils.privacy_accounting import (
     calibrate_gaussian_noise,
     calibrate_poisson_sampled_gaussian_noise,
@@ -197,7 +200,7 @@ def _loop_clipped_gradient_sum(
         factor = (max_norm / norm).clamp(max=1.0)
         with torch.no_grad():
             for destination, gradient in zip(accumulated, gradients):
-                destination.add_(gradient, alpha=float(factor))
+                destination.add_(gradient * factor.to(gradient))
         factors.append(factor.detach())
     return accumulated, torch.stack(factors)
 
@@ -402,12 +405,13 @@ class DefenseController:
             backend = str(
                 self.config.get("grad_sample_backend", "auto")
             ).lower()
-            if backend not in {"auto", "loop", "vmap"}:
+            if backend not in GRAD_SAMPLE_BACKENDS:
                 raise ValueError(
-                    "Record-DP grad_sample_backend must be auto, loop, or vmap."
+                    "Record-DP grad_sample_backend must be auto, loop, batched, or vmap."
                 )
-            if int(self.config.get("microbatch_size", 1)) <= 0:
-                raise ValueError("Record-DP microbatch_size must be positive.")
+            chunk_size = self.config.get("microbatch_size", 4)
+            if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+                raise ValueError("Record-DP microbatch_size must be a positive integer.")
         if self.name == "local_client_dp":
             privacy_unit = str(self.config.get("privacy_unit", "client")).lower()
             adjacency = str(self.config.get("adjacency", "add_remove")).lower()
@@ -1335,11 +1339,8 @@ class DefenseController:
         configured_backend = str(
             self.config.get("grad_sample_backend", "auto")
         ).lower()
-        model_type = str(getattr(model, "model_type", "")).lower()
-        backend = configured_backend
-        if backend == "auto":
-            backend = "vmap" if model_type == "resnet18" else "loop"
-        microbatch_size = int(self.config.get("microbatch_size", 1))
+        backend = resolve_grad_sample_backend(model, configured_backend)
+        microbatch_size = int(self.config.get("microbatch_size", 4))
 
         for images, labels in user.iter_record_dp_batches(sampling_generator):
             images = images.to(self.device)
@@ -1366,11 +1367,10 @@ class DefenseController:
                         losses = losses + self._secret_losses(
                             user, model, batch_images, batch_labels
                         )
-                    partial_sum, factors = _loop_clipped_gradient_sum(
-                        losses,
-                        parameters,
-                        max_norm,
-                    )
+                    if backend == "batched" and not code_poison:
+                        partial_sum, factors = clipped_sum_from_losses(losses, parameters, max_norm)
+                    else:
+                        partial_sum, factors = _loop_clipped_gradient_sum(losses, parameters, max_norm)
                 with torch.no_grad():
                     for destination, partial in zip(clipped_sum, partial_sum):
                         destination.add_(partial)

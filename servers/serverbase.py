@@ -24,6 +24,7 @@ from privacy_defenses import (
 from privacy_defenses.cofedmid import reserve_validation, validate_cofedmid
 from users.user import UserBase
 from utils.privacy_accounting import planned_private_probe_steps
+from utils.result_formatting import format_run_summary
 
 logger = logging.getLogger(__name__)
 
@@ -1041,7 +1042,6 @@ class ServerBase:
             ),
         )
         defense_summary = self.defense.save_summary(self.results_dir)
-        logger.info("Privacy defense completed: %s", defense_summary)
         method_summary = {
             "federated_method": self.federated_method,
             "model_type": str(getattr(self.model, "model_type", "prompt")),
@@ -1124,4 +1124,14 @@ class ServerBase:
             and privacy_accounting.get("privacy_unit") == "record"
             else None
         )
-        return self.auditor.finalize(self.model, final_state)
+        summaries = self.auditor.finalize(self.model, final_state)
+        logger.info("\n%s", format_run_summary(
+            model=str(getattr(self.model, "model_type", "prompt")),
+            dataset=self.dataset_name, method=self.federated_method,
+            metrics=self.training_metrics[-1] if self.training_metrics else {},
+            total_rounds=self.num_glob_iters, defense=defense_summary,
+            attacks=summaries, results_dir=self.results_dir,
+            audit_enabled=bool(self.audit_config.get("enabled", True)),
+            audit_errors=getattr(self.auditor, "errors", {}),
+        ))
+        return summaries

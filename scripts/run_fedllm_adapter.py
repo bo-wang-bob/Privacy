@@ -458,12 +458,13 @@ def validate_config(config: dict) -> None:
         if str(defense.get("accountant", "rdp")).lower() != "rdp":
             raise ValueError("Record-DP currently requires accountant=rdp.")
         backend = str(defense.get("grad_sample_backend", "auto")).lower()
-        if backend not in {"auto", "loop", "vmap"}:
+        if backend not in {"auto", "loop", "batched", "vmap"}:
             raise ValueError(
-                "Record-DP grad_sample_backend must be auto, loop, or vmap."
+                "Record-DP grad_sample_backend must be auto, loop, batched, or vmap."
             )
-        if int(defense.get("microbatch_size", 1)) <= 0:
-            raise ValueError("Record-DP microbatch_size must be positive.")
+        chunk_size = defense.get("microbatch_size", 4)
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size <= 0:
+            raise ValueError("Record-DP microbatch_size must be a positive integer.")
         target_epsilon = defense.get("target_epsilon")
         noise = defense.get(
             "noise_multiplier", defense.get("dp_noise_multiplier")
@@ -958,7 +959,6 @@ def main() -> None:
         method_config=method_config,
     )
     server.train()
-    logger.info("Training complete: %s", result_dir)
 
 
 if __name__ == "__main__":

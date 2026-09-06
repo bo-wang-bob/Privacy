@@ -234,10 +234,21 @@ python scripts/run_privacy_experiments.py \
 `--defenses all` 同样只展开模型正式支持的防御。可用 `--seeds 1,2,3`、
 `--target-clients 0,1` 和可重复的 `--set path=value` 扩展或覆盖最终配置。
 
+启用统一 exact-batch ProjRes 时，入口会按最终 batch 大小和非成员比例自动同步候选参数；
+`record_dp`/`www` 自动使用 `0/0/0` 动态候选。改变 `batch_size` 或同时运行
+`--defenses none,record_dp,www` 无需手动填写 ProjRes 的三个候选数量参数。
+显式填写的值仍接受原协议校验；干运行会显示每组最终值。
+
 配置分为两层：[`configs/experiment_catalog.yaml`](configs/experiment_catalog.yaml)
 维护能力矩阵、防御覆盖和别名；[`configs/models/`](configs/models/) 下 7 个 YAML
 维护模型训练与默认候选协议。每个实际任务仍会把完整解析结果保存为自己的
 `run_config.yaml`。
+
+每个任务结束会统一打印 `RUN RESULTS`：最终 loss、Accuracy/MCC、简短隐私会计，
+以及包含 AUC、TPR 和成员/非成员数量的对齐攻击表。批量结束后的 `EXPERIMENT OVERVIEW`
+按任务列出模型、数据集、防御、seed/目标客户端、状态、最终主指标和耗时，方便比较多组实验。
+Accuracy/TPR 使用百分比，MCC/AUC 使用四位小数；无法报告的值显示 `N/A`。
+完整防御状态保留在 `defense_summary.json`，原始 CSV/JSON 继续保留计算精度。
 
 ResNet18 基线保持完整 CIFAR100、随机等量 IID、10 客户端全参与、300 轮
 FedAvg 和每轮 `0.99` 学习率衰减。CLIP-MLP/Adapter 为 16-shot one-batch 等权
@@ -307,7 +318,7 @@ python scripts/run_privacy_experiments.py --models clip_mlp --defenses none,cofe
 
 原 ICLR 方法已更名为 WWW，并改为实际参与训练的差分隐私防御。每个客户端每轮按
 `M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 升序排列真实 Poisson batch，
-以期望 batch 大小的 20%（向上取整）固定尾部宽度，选取最高分样本，
+以期望 batch 大小的 80%（向上取整）固定尾部宽度，选取最高分样本，
 按 INO-SGD 的重要性函数积分缩放逐样本裁剪梯度后加高斯噪声。
 采样、`add_remove` 邻接、Poisson RDP 核算和固定期望 batch 归一化均与普通样本级 DP 一致。
 默认全程隐私预算 `epsilon=3`、初始裁剪阈值 `C=8`、`delta=1e-5`；

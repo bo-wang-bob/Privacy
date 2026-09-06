@@ -39,11 +39,11 @@ M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)
 
 与普通 `record_dp` 共用 Poisson 采样器：每条本地记录独立以固定概率 `q=b/N` 进入当前 batch，其中 `b=min(configured_batch_size,N)` 在训练前确定。每步重新抽取，实际样本数 `n` 可以小于或大于 `b`，也可以为 0；空抽样不会重抽，仍执行一次纯噪声更新并计入预算。样本本地索引随 batch 保留，以便真实 Batch 攻击精确配对。
 
-对真实 batch 按 `M_i` 稳定升序排序。尾部宽度在每个客户端训练前固定为 `m=ceil(0.2*b)` 个长度为 C 的区间，实际落入尾部的样本数为 `min(n,m)`，仍是损失差最大的样本。同分保持原顺序。这里 20% 以**固定期望 batch 大小**计算，不能每次按随机的 `n` 重算尾部宽度，否则不能直接沿用论文的 C 增删敏感度界。比如期望 batch=16 时尾部宽度固定为 4；实际抽到 20 条时仍取最后 4 条，抽到 2 条时使用完整尾部最后两个区间。
+对真实 batch 按 `M_i` 稳定升序排序。默认 `defense.www_tail_fraction=0.8`，尾部宽度在每个客户端训练前固定为 `m=ceil(0.8*b)` 个长度为 C 的区间，实际落入尾部的样本数为 `min(n,m)`，仍是损失差最大的样本。同分保持原顺序。这里 80% 以**固定期望 batch 大小**计算，不能每次按随机的 `n` 重算尾部宽度，否则不能直接沿用论文的 C 增删敏感度界。比如期望 batch=32 时尾部宽度固定为 26；实际抽到 35 条时仍取最后 26 条，抽到 20 条时全部使用完整尾部最右侧的 20 个区间。期望 batch=16 时尾部宽度为 13。
 
 首轮没有历史参考模型，统一以 C 裁剪并加噪；部分参与时，缺少紧邻上一轮上传的客户端也使用这一回退规则。
 
-**INO-SGD 自适应裁剪。** 使用 [Tian 等，INO-SGD](https://arxiv.org/abs/2605.07930) 的 Algorithm 1、Definition 3.2 和 Appendix C.2.3。WWW 将论文默认的 loss 降序替换为上述 `M_i` 升序；其它排序的适用性见 Appendix C.2.2。设所有样本初始阈值为 `C`，累计阈值 `c_j=jC`，固定尾部长度 `gamma=ceil(0.2b)C`，其中 b 是期望 batch 大小，n 是实际抽样大小。尾部重要性函数为翻转的 Beta CDF：
+**INO-SGD 自适应裁剪。** 使用 [Tian 等，INO-SGD](https://arxiv.org/abs/2605.07930) 的 Algorithm 1、Definition 3.2 和 Appendix C.2.3。WWW 将论文默认的 loss 降序替换为上述 `M_i` 升序；其它排序的适用性见 Appendix C.2.2。设所有样本初始阈值为 `C`，累计阈值 `c_j=jC`，固定尾部长度 `gamma=ceil(0.8b)C`，其中 b 是期望 batch 大小，n 是实际抽样大小。尾部重要性函数为翻转的 Beta CDF：
 
 ```text
 f_tail(u) = I_(1-u/gamma)(alpha, beta)
@@ -54,7 +54,7 @@ g_bar_i = g_i / max(1, ||g_i||_2 / C)
 g_private = (sum_i rho_i * g_bar_i + Normal(0, sigma_sum^2 I)) / b
 ```
 
-梯度范数联合覆盖所有可训练参数，冻结主干不参与。采用“先裁剪到 C，再乘 rho”的论文算法，故 `rho_i*C` 是最终贡献范数上界；并非直接把原始梯度裁剪到 `rho_i*C`，两者对小梯度的处理不同。默认 `alpha=beta=1`，尾部函数为线性下降。当实际 batch 小于尾部宽度时，依照 Appendix C.2.3 使用尾部函数最右侧的区间。比如 `b=10` 且实际 batch 至少含两条样本时，最后两个样本的权重为 `0.75、0.25`，其余为 `1`；`C=8` 时相应上界为 `6、2`。
+梯度范数联合覆盖所有可训练参数，冻结主干不参与。采用“先裁剪到 C，再乘 rho”的论文算法，故 `rho_i*C` 是最终贡献范数上界；并非直接把原始梯度裁剪到 `rho_i*C`，两者对小梯度的处理不同。默认 `alpha=beta=1`，尾部函数为线性下降。当实际 batch 小于尾部宽度时，依照 Appendix C.2.3 使用尾部函数最右侧的区间。比如 `b=10` 且实际 batch 有 10 条样本时，前两条权重为 `1`，最后八条权重依次为 `0.9375、0.8125、0.6875、0.5625、0.4375、0.3125、0.1875、0.0625`；`C=8` 时尾部贡献范数上界依次为 `7.5、6.5、5.5、4.5、3.5、2.5、1.5、0.5`。
 
 **全程隐私预算。** 默认 `defense.target_epsilon=3` 为整个训练任务预算，`max_grad_norm=8` 为基准阈值，`delta=1e-5`。WWW 与普通 `record_dp` 使用相同的 `add_remove` 邻接、客户端采样率、计划更新步数、Poisson sampled-Gaussian RDP 校准函数和固定期望 batch 归一化：
 
@@ -80,7 +80,7 @@ epsilon_run = max_i epsilon_i
 | `max_grad_norm` | `8.0` | 初始联合 L2 裁剪阈值 |
 | `delta` | `1e-5` | DP 的 delta |
 | `noise_multiplier` | `auto` | 相对于 `C` 的噪声倍数 |
-| `www_tail_fraction` | `0.2` | 固定期望 batch 的尾部宽度比例，向上取整 |
+| `www_tail_fraction` | `0.8` | 固定期望 batch 的尾部宽度比例，向上取整 |
 | `www_beta_alpha`, `www_beta_beta` | `1.0`, `1.0` | 尾部函数形状 |
 | `reproducible_dp_noise` | `false` | 仅调试时固定噪声种子 |
 | `release_private_diagnostics` | `false` | 是否导出未私有化的分数诊断 |
@@ -98,6 +98,8 @@ python scripts/run_privacy_experiments.py --models bert_adapter --datasets cola 
   --defenses www,record_dp --attacks all \
   --set defense.target_epsilon=8 --set defense.max_grad_norm=8
 ```
+
+**计算后端。** WWW 默认 `defense.grad_sample_backend=auto`、`defense.microbatch_size=4`，在现有 PEFT 模型上使用分块 batched VJP 求逐记录梯度。每块仍逐记录计算联合 L2 范数、裁剪并乘 INO 权重，汇总整个真实 Poisson batch 后才加一次噪声、执行一次 optimizer step。计算块不参与尾部排序，也不改变期望 batch、隐私会计和客户端等权 FedSGD。可设 `defense.grad_sample_backend=loop` 使用原逐记录实现；启用 Transformer gradient checkpointing 时 `auto` 也会选择 `loop`。性能基准与审计加速参数见 [FedSGD 计算优化](fedsgd_performance.md)。
 
 **输出与审计。** `defense_summary.json` 保存算法、目标/实际 epsilon、delta、噪声尺度和每客户端采样率、期望 batch 大小、固定尾部宽度和计划/实际步数。随机噪声默认使用不写入配置的系统随机种子。形式化保证的范围是防御后上传与模型；审计成员标签、私有信号、原始训练数据和可选诊断均为本地研究资料，不属于受保护发布内容。打开固定噪声或未私有化诊断时，汇总会明确设置 `formal_dp_enabled=false`。
 
@@ -180,9 +182,9 @@ microbatch 只改变计算方式；所有 microbatch 累加后仅添加一次噪
 - `target_epsilon` 与数值 `noise_multiplier` 二选一。选择目标 epsilon 时，运行前按
   最坏客户端计划自动反推一个共享 noise multiplier。
 - `delta`：目标近似 DP 参数。
-- `grad_sample_backend`：`vmap`、`loop` 或 `auto`。ResNet18 默认使用分块
-  `vmap`；共享 Transformer Adapter 使用通用逐记录参考实现。
-- `microbatch_size`：一次保留的逐记录计算块大小，不是新的 DP batch。
+- `grad_sample_backend`：`batched`、`vmap`、`loop` 或 `auto`。ResNet18 保留分块
+  `vmap`；BERT Adapter 默认 `auto` 使用真实前向图上的 batched VJP，兼容共享主干与客户端 PEFT 参数。
+- `microbatch_size`：一次保留的逐记录计算块大小，不是新的 DP batch，BERT Adapter 默认 4。
 - `reproducible_noise`：仅测试可设为 `true`；此时输出会明确标记
   `formal_dp_enabled: false`。
 

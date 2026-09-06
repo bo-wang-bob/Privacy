@@ -1,0 +1,172 @@
+{
+  "torch": "2.7.1+cu128",
+  "device": "cuda:1",
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "model_path": "/root/DistributedFL/checkpoints/bert-base-uncased",
+  "cpu_threads": 4,
+  "sequence_length": 128,
+  "chunk_size": 4,
+  "clients": 30,
+  "audit_candidates": 16,
+  "warmups": 2,
+  "repeats": 5,
+  "scope": "Synthetic compute stages; excludes WWW ranking, DP noise, optimizer, uploads, aggregation and other attacks. Gradient timing uses train mode; numerical checks and audit use eval mode.",
+  "measurements": [
+    {
+      "stage": "www_clipped_gradient",
+      "records": 16,
+      "reference": {
+        "median_seconds": 0.15961447777226567,
+        "seconds": [
+          0.22475506202317774,
+          0.3698182189837098,
+          0.15179464500397444,
+          0.1333009940572083,
+          0.15961447777226567
+        ],
+        "peak_allocated_mib": 619.845703125
+      },
+      "optimized": {
+        "median_seconds": 0.08929998893290758,
+        "seconds": [
+          0.08929998893290758,
+          0.08909517689608037,
+          0.09723260183818638,
+          0.08923660987056792,
+          0.09370471793226898
+        ],
+        "peak_allocated_mib": 845.130859375
+      },
+      "speedup": 1.7873963891774547,
+      "equivalence_eval": {
+        "max_abs_error": 5.998415872454643e-06,
+        "relative_l2_error": 8.740805958078497e-06
+      }
+    },
+    {
+      "stage": "record_dp_clipped_gradient",
+      "records": 16,
+      "reference": {
+        "median_seconds": 0.2608920519705862,
+        "seconds": [
+          0.2592637580819428,
+          0.26233029598370194,
+          0.2598865639884025,
+          0.2636898879427463,
+          0.2608920519705862
+        ],
+        "peak_allocated_mib": 1438.9775390625
+      },
+      "optimized": {
+        "median_seconds": 0.09527253010310233,
+        "seconds": [
+          0.09618876106105745,
+          0.08944848109968007,
+          0.09870426799170673,
+          0.0896536111831665,
+          0.09527253010310233
+        ],
+        "peak_allocated_mib": 845.130859375
+      },
+      "speedup": 2.738376441648534,
+      "equivalence_eval": {
+        "max_abs_error": 2.410711022093892e-05,
+        "relative_l2_error": 1.5625917520835472e-05
+      }
+    },
+    {
+      "stage": "www_clipped_gradient",
+      "records": 32,
+      "reference": {
+        "median_seconds": 0.2918511410243809,
+        "seconds": [
+          0.29817276913672686,
+          0.273610063130036,
+          0.26966637396253645,
+          0.2918511410243809,
+          0.3188107991591096
+        ],
+        "peak_allocated_mib": 619.876953125
+      },
+      "optimized": {
+        "median_seconds": 0.19049859000369906,
+        "seconds": [
+          0.19288551108911633,
+          0.1800463639665395,
+          0.18813308305107057,
+          0.19158231792971492,
+          0.19049859000369906
+        ],
+        "peak_allocated_mib": 847.537109375
+      },
+      "speedup": 1.5320383264711503,
+      "equivalence_eval": {
+        "max_abs_error": 3.859167918562889e-05,
+        "relative_l2_error": 3.0393472352014777e-05
+      }
+    },
+    {
+      "stage": "record_dp_clipped_gradient",
+      "records": 32,
+      "reference": {
+        "median_seconds": 0.5195125278551131,
+        "seconds": [
+          0.5201001700479537,
+          0.5185983940027654,
+          0.5195125278551131,
+          0.5215980089269578,
+          0.5138602508231997
+        ],
+        "peak_allocated_mib": 1439.0087890625
+      },
+      "optimized": {
+        "median_seconds": 0.1849075930658728,
+        "seconds": [
+          0.1889736249577254,
+          0.18453549197874963,
+          0.1849075930658728,
+          0.19256722903810441,
+          0.18001970509067178
+        ],
+        "peak_allocated_mib": 847.537109375
+      },
+      "speedup": 2.809579202461623,
+      "equivalence_eval": {
+        "max_abs_error": 7.265713065862656e-06,
+        "relative_l2_error": 6.5733549133924455e-06
+      }
+    },
+    {
+      "stage": "text_cosine_and_gradient_difference_audit",
+      "records": 16,
+      "reference": {
+        "median_seconds": 4.016448591137305,
+        "seconds": [
+          3.7738728751428425,
+          4.111949931131676,
+          3.5390469529666007,
+          4.016448591137305,
+          4.269391518086195
+        ],
+        "peak_allocated_mib": 617.0234375
+      },
+      "optimized": {
+        "median_seconds": 1.115775614976883,
+        "seconds": [
+          1.115775614976883,
+          1.146940154954791,
+          1.1160391520243138,
+          1.068349020788446,
+          0.9410882608499378
+        ],
+        "peak_allocated_mib": 2518.47705078125
+      },
+      "speedup": 3.5996920323630834,
+      "equivalence_eval": {
+        "max_abs_error": 6.103515625e-05,
+        "relative_l2_error": 4.153270687152455e-07
+      }
+    }
+  ],
+  "trainable_parameters": 7093250
+}
