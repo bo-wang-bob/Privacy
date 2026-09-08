@@ -141,7 +141,7 @@ def rank_loss_differences(
     if sample_indices.numel() != labels.numel():
         raise ValueError("WWW sample_indices must align one-to-one with the batch stream.")
     if labels.numel() == 0:
-        # Poisson empty draws still execute a noise-only private optimizer step.
+        # Preserve alignment for empty diagnostic inputs without a forward pass.
         empty = torch.empty(0)
         return WWWRanking(empty, empty.clone(), empty.clone(),
                           torch.empty(0, dtype=torch.long), labels, sample_indices)

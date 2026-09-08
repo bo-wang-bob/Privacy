@@ -3,7 +3,7 @@
 Batched VJPs keep the real forward graph and parameter objects. This matters
 for FedSGD clients whose PEFT parameters are bound into a shared Transformer:
 functional_call/vmap over the wrapper cannot safely replace those parameters.
-The caller chunks records, then clips/sums all chunks before its one DP step.
+The caller chunks records, then clips/sums all chunks before its optimizer step.
 """
 from __future__ import annotations
 
@@ -68,15 +68,25 @@ def gradients_from_losses(
     return [torch.stack(values) for values in rows]
 
 
-def clipped_sum_from_losses(losses, parameters, max_norm, weights=None, *, backend="batched"):
-    """Joint L2 clip, optionally apply detached WWW weights, then sum records."""
+def clipped_sum_from_losses(losses, parameters, max_norm, weights=None, *, backend="batched",
+                            clip_mask=None, return_norms=False):
+    """Joint L2 clip, optionally exempt records/apply weights, then sum.
+
+    Ordinary DP omits clip_mask and clips every record. Diagnostics reuse the
+    norms required for clipping; return_norms adds them as a third return value.
+    """
     gradients = gradients_from_losses(losses, parameters, backend=backend)
     norm_sq = torch.zeros(losses.numel(), device=losses.device, dtype=torch.float32)
     for gradient in gradients:
         norm_sq.add_(gradient.float().reshape(losses.numel(), -1).square().sum(dim=1))
     if not torch.isfinite(norm_sq).all():
         raise ValueError("Non-finite per-record gradient norm.")
-    factors = (float(max_norm) / norm_sq.sqrt().clamp_min(1e-12)).clamp(max=1)
+    norms = norm_sq.sqrt()
+    factors = (float(max_norm) / norms.clamp_min(1e-12)).clamp(max=1)
+    if clip_mask is not None:
+        if clip_mask.shape != losses.shape or clip_mask.dtype != torch.bool:
+            raise ValueError("Clipping mask must be boolean and align with the loss vector.")
+        factors = torch.where(clip_mask.to(factors.device), factors, torch.ones_like(factors))
     weighted = factors
     if weights is not None:
         if weights.numel() != losses.numel():
@@ -88,4 +98,6 @@ def clipped_sum_from_losses(losses, parameters, max_norm, weights=None, *, backe
             shape = (losses.numel(),) + (1,) * (gradient.ndim - 1)
             # Some autograd kernels return expanded views; do not mutate them.
             sums.append((gradient * weighted.to(gradient.dtype).view(shape)).sum(dim=0))
+    if return_norms:
+        return sums, factors.detach(), norms.detach()
     return sums, factors.detach()

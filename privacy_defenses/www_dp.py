@@ -1,8 +1,8 @@
-"""WWW's INO-SGD weighting and Poisson record-level privacy accounting.
+"""WWW's risk-controlled prediction loss, without clipping or noise.
 
-The ranking is ascending loss difference, replacing the paper's descending loss.
-The tail has ceil(expected_batch_size * fraction) fixed intervals of length C.
-Algorithm 1 clips to C first, then multiplies by the interval's average BIF.
+Historical INO/clipping helpers remain available for old standalone benchmarks;
+the current WWW training path never calls them. The module/class names are kept
+for compatibility with experiment entry points.
 """
 
 from __future__ import annotations
@@ -13,31 +13,29 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.special import betainc
-from utils.per_sample_gradients import clipped_sum_from_losses, resolve_grad_sample_backend
+from utils.per_sample_gradients import (
+    clipped_sum_from_losses, gradients_from_losses, resolve_grad_sample_backend,
+)
 from utils.performance import measure_stage
 
-from utils.privacy_accounting import (
-    calibrate_poisson_sampled_gaussian_noise,
-    poisson_sampled_gaussian_epsilon,
-    private_generator,
-)
-
-
 DEFAULTS = {
-    "target_epsilon": 3.0,
-    "max_grad_norm": 8.0,
-    "delta": 1e-5,
-    "noise_multiplier": "auto",
+    "target_epsilon": None,
+    "max_grad_norm": None,
+    "delta": None,
+    "noise_multiplier": 0.0,
     "www_tail_fraction": 0.8,
-    "www_beta_alpha": 1.0,
-    "www_beta_beta": 1.0,
+    "www_tail_basis": "actual_batch",
+    "www_beta_alpha": None,
+    "www_beta_beta": None,
+    "www_regularization_weight": 1.0,
     "www_analysis_interval": 1,
     "www_analysis_timing": "pre_update",
     "www_feature_statistics": False,
+    "www_record_diagnostics": True,
     "www_validation_top_fraction": 0.2,
-    "adjacency": "add_remove",
-    "accountant": "rdp",
-    "sampling": "poisson",
+    "adjacency": None,
+    "accountant": None,
+    "sampling": "shuffled_batches",
     "reproducible_dp_noise": False,
     "release_private_diagnostics": False,
     "grad_sample_backend": "auto",
@@ -46,29 +44,33 @@ DEFAULTS = {
 
 
 def validate_www(config: dict) -> None:
-    """Resolve defaults and reject invalid budgets before any training starts."""
+    """Validate risk-loss settings and disable legacy clipping/DP parameters.
+
+    Shared sweep overrides (e.g. target_epsilon for Record-DP) and old WWW
+    configurations remain loadable, but cannot enable noise or a DP claim.
+    """
     if str(config.get("name", "none")).lower() != "www":
         return
     for key, value in DEFAULTS.items():
         config.setdefault(key, value)
-    for key in ("target_epsilon", "max_grad_norm", "www_beta_alpha", "www_beta_beta"):
-        value = float(config[key])
-        if not math.isfinite(value) or value <= 0:
-            raise ValueError(f"defense.{key} must be finite and positive.")
-        config[key] = value
-    for key in ("delta", "www_tail_fraction"):
+    for key in ("target_epsilon", "delta", "noise_multiplier", "adjacency", "accountant",
+                "max_grad_norm", "www_beta_alpha", "www_beta_beta"):
+        config[key] = DEFAULTS[key]
+    strength = config["www_regularization_weight"]
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)) or not math.isfinite(strength) or strength < 0:
+        raise ValueError("defense.www_regularization_weight must be finite and nonnegative.")
+    config["www_regularization_weight"] = float(strength)
+    for key in ("www_tail_fraction",):
         value = float(config[key])
         if not math.isfinite(value) or not 0 < value < 1:
             raise ValueError(f"defense.{key} must be in (0, 1).")
         config[key] = value
-    noise = config["noise_multiplier"]
-    if noise != "auto" and (
-        not math.isfinite(float(noise)) or float(noise) <= 0
-    ):
-        raise ValueError("defense.noise_multiplier must be 'auto' or finite and positive.")
-    for key in ("adjacency", "accountant", "sampling"):
-        if config[key] != DEFAULTS[key]:
-            raise ValueError(f"WWW requires defense.{key}={DEFAULTS[key]}.")
+    if config["sampling"] != "shuffled_batches":
+        raise ValueError("WWW requires defense.sampling=shuffled_batches.")
+    if config["www_tail_basis"] not in {"actual_batch", "expected_batch"}:
+        raise ValueError("WWW www_tail_basis must be actual_batch or expected_batch.")
+    if not isinstance(config["www_record_diagnostics"], bool):
+        raise ValueError("WWW www_record_diagnostics must be a boolean.")
     if config["www_feature_statistics"] and not config["release_private_diagnostics"]:
         raise ValueError("WWW feature statistics require release_private_diagnostics=true.")
     if str(config["grad_sample_backend"]).lower() not in {"auto", "loop", "batched"}:
@@ -78,6 +80,83 @@ def validate_www(config: dict) -> None:
         raise ValueError("WWW microbatch_size must be a positive integer.")
 
 
+def risk_regularization_weights(scores, tail_fraction=0.8, *, expected_batch_size,
+                                tail_basis="actual_batch"):
+    """Freeze stable risk ranks; only the upper tail receives an increasing loss weight.
+
+    Actual-tail rank j=1..m receives (j-.5)/m. The historical expected_batch
+    option right-aligns short batches in that fixed width. This is not an INO
+    multiplier on CE gradients: CE remains present for every record.
+    """
+    scores = scores.detach().cpu().double().flatten()
+    if not torch.isfinite(scores).all():
+        raise ValueError("WWW requires finite sample scores.")
+    if not math.isfinite(tail_fraction) or not 0 < tail_fraction < 1:
+        raise ValueError("WWW tail_fraction must be in (0, 1).")
+    if isinstance(expected_batch_size, bool) or int(expected_batch_size) != expected_batch_size or expected_batch_size <= 0:
+        raise ValueError("WWW expected_batch_size must be a positive integer.")
+    if tail_basis not in {"actual_batch", "expected_batch"}:
+        raise ValueError("WWW tail_basis must be actual_batch or expected_batch.")
+    count = scores.numel()
+    positions = torch.argsort(scores, stable=True)
+    weights, tail = torch.zeros_like(scores), torch.zeros(count, dtype=torch.bool)
+    if count:
+        width = math.ceil((count if tail_basis == "actual_batch" else expected_batch_size) * tail_fraction)
+        selected = min(count, width)
+        indices = positions[-selected:]
+        weights[indices] = (torch.arange(width-selected, width, dtype=torch.float64) + .5) / width
+        tail[indices] = True
+    return weights, positions, tail
+
+
+def risk_controlled_losses(logits, labels, risk_weights, reference_probability, strength):
+    """CE + lambda*r*|p_y-q_y|; teacher and ranks never receive gradients.
+
+    exp(-CE) is the true-label softmax probability, from the same student graph.
+    The signed CE-gradient factor is diagnostic only, never a gradient rewrite.
+    """
+    ce = F.cross_entropy(logits, labels, reduction="none")
+    weights = risk_weights.detach().to(ce)
+    teacher = reference_probability.detach().to(ce)
+    if weights.shape != ce.shape or teacher.shape != ce.shape:
+        raise ValueError("WWW risk weights and teacher probabilities must align with the batch.")
+    if (not torch.isfinite(weights).all() or not torch.isfinite(teacher).all()
+            or (weights < 0).any() or (weights > 1).any()
+            or (teacher < 0).any() or (teacher > 1).any()):
+        raise ValueError("WWW risk weights and teacher probabilities must be finite in [0, 1].")
+    if not math.isfinite(strength) or strength < 0:
+        raise ValueError("WWW regularization strength must be finite and nonnegative.")
+    probability = ce.neg().exp()
+    gap = probability - teacher
+    regularizer = float(strength) * weights * gap.abs()
+    total = ce + regularizer
+    if not torch.isfinite(total).all():
+        raise ValueError("WWW encountered a non-finite training loss.")
+    return {
+        "ce_loss": ce, "current_probability": probability,
+        "reference_probability": teacher, "confidence_gap": gap,
+        "cross_difference": gap.abs(), "regularization_loss": regularizer,
+        "total_loss": total,
+        "ce_gradient_factor": (1 - float(strength) * weights * probability * gap.sign()).detach(),
+    }
+
+
+def _diagnostic_norms(losses, parameters, backend, chunk_size):
+    """Bound per-record gradient storage and preserve the graph for training backward."""
+    parts = []
+    for start in range(0, losses.numel(), chunk_size):
+        chunk = losses[start:start + chunk_size]
+        gradients = gradients_from_losses(chunk, parameters, backend=backend, retain_graph=True)
+        squared = torch.zeros_like(chunk, dtype=torch.float32)
+        for gradient in gradients:
+            squared.add_(gradient.float().reshape(chunk.numel(), -1).square().sum(dim=1))
+        if not torch.isfinite(squared).all():
+            raise ValueError("WWW encountered a non-finite diagnostic gradient norm.")
+        parts.append(squared.sqrt())
+        del gradients
+    return torch.cat(parts)
+
+
 def ino_weights(
     scores: torch.Tensor,
     tail_fraction: float = DEFAULTS["www_tail_fraction"],
@@ -85,13 +164,14 @@ def ino_weights(
     beta_beta: float = 1.0,
     *,
     expected_batch_size: int,
+    tail_basis: str = "actual_batch",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Integrate the flipped Beta CDF on each equal-C gradient interval.
 
     Return weights in original sample order, ascending positions, and tail mask.
-    Equal scores retain batch order. The fixed-length tail is right-aligned with
-    the actual batch, including batches shorter than the tail (paper C.2.3).
-    Changing its length with the sampled batch would invalidate the C bound.
+    Equal scores retain batch order. The legacy expected_batch basis retains
+    its fixed tail and right-aligns smaller draws (paper C.2.3). Neither basis
+    provides a DP sensitivity bound when low-risk gradients are exempt.
     """
     scores = scores.detach().cpu().double().flatten()
     if not torch.isfinite(scores).all():
@@ -103,7 +183,9 @@ def ino_weights(
     if any(not math.isfinite(x) or x <= 0 for x in (beta_alpha, beta_beta)):
         raise ValueError("WWW Beta shape parameters must be finite and positive.")
     count = scores.numel()
-    tail_length = math.ceil(expected_batch_size * tail_fraction)
+    if tail_basis not in {"actual_batch", "expected_batch"}:
+        raise ValueError("WWW tail_basis must be actual_batch or expected_batch.")
+    tail_length = math.ceil((count if tail_basis == "actual_batch" else expected_batch_size) * tail_fraction)
     tail_count = min(count, tail_length)
     positions = torch.argsort(scores, stable=True)
     if count == 0:
@@ -123,31 +205,61 @@ def ino_weights(
 
 
 def weighted_clipped_sum(model, images, labels, parameters, max_norm, weights,
-                         extra_loss=None, *, backend="loop", microbatch_size=4):
-    """Algorithm 1: rho_i * g_i / max(1, ||g_i||_2 / C), jointly over parameters.
+                         extra_loss=None, *, backend="loop", microbatch_size=4,
+                         clip_mask=None, return_diagnostics=False):
+    """Clip masked records jointly, apply INO weights, then sum contributions.
 
     The batched backend bounds gradient storage by microbatch_size; all chunks
-    contribute to one sum before noise or the optimizer step. Supported PEFT
+    contribute to one sum before the optimizer step. Supported PEFT
     models have no batch-dependent normalization. Loop remains a reference.
+    With no mask every record is clipped (warmup/reference calculations).
+    return_diagnostics reuses clipping norms without another backward pass.
     """
     if weights.numel() != labels.numel():
         raise ValueError("WWW weights must align with the actual training batch.")
+    if clip_mask is not None and (clip_mask.shape != labels.shape or clip_mask.dtype != torch.bool):
+        raise ValueError("WWW clipping mask must be boolean and align with the actual batch.")
     backend = resolve_grad_sample_backend(model, backend)
     sums = [torch.zeros_like(p) for p in parameters]
+    norm_parts, factor_parts = [], []
+
+    def result():
+        if not return_diagnostics:
+            return sums
+        norms = torch.cat(norm_parts) if norm_parts else images.new_empty(0, dtype=torch.float32)
+        factors = torch.cat(factor_parts) if factor_parts else norms.clone()
+        clipped = norms * factors
+        importance = weights.detach().to(norms)
+        return sums, {
+            "raw_grad_norm": norms,
+            "clip_factor": factors,
+            "clipped_grad_norm": clipped,
+            "weighted_grad_norm": clipped * importance,
+            "effective_factor": factors * importance,
+        }
+
     if backend == "batched" and extra_loss is None:
         for start in range(0, labels.numel(), microbatch_size):
             stop = start + microbatch_size
             losses = F.cross_entropy(model(images[start:stop]), labels[start:stop], reduction="none")
-            partial, _ = clipped_sum_from_losses(
+            output = clipped_sum_from_losses(
                 losses, parameters, max_norm, weights[start:stop],
+                clip_mask=None if clip_mask is None else clip_mask[start:stop],
+                return_norms=return_diagnostics,
             )
+            partial = output[0]
+            if return_diagnostics:
+                norm_parts.append(output[2])
+                factor_parts.append(output[1])
             with torch.no_grad():
                 for destination, value in zip(sums, partial):
                     destination.add_(value)
-        return sums
+        return result()
     if backend not in {"loop", "batched"}:
         raise ValueError("WWW gradient backend must resolve to loop or batched.")
     weights = weights.to(device=images.device)
+    if clip_mask is not None:
+        clip_mask = clip_mask.to(device=images.device)
     for index in range(labels.numel()):
         inputs, targets = images[index:index + 1], labels[index:index + 1]
         loss = F.cross_entropy(model(inputs), targets)
@@ -157,17 +269,26 @@ def weighted_clipped_sum(model, images, labels, parameters, max_norm, weights,
         norm_sq = sum(g.detach().float().square().sum() for g in gradients if g is not None)
         if not torch.isfinite(norm_sq):
             raise ValueError("WWW encountered a non-finite per-sample gradient.")
-        factor = (max_norm / norm_sq.sqrt().clamp_min(1e-12)).clamp(max=1)
+        norm = norm_sq.sqrt()
+        factor = (max_norm / norm.clamp_min(1e-12)).clamp(max=1)
+        if clip_mask is not None:
+            factor = torch.where(clip_mask[index], factor, torch.ones_like(factor))
+        if return_diagnostics:
+            norm_parts.append(norm.detach().reshape(1))
+            factor_parts.append(factor.detach().reshape(1))
         factor = factor * weights[index].to(factor)
         with torch.no_grad():
             for destination, gradient in zip(sums, gradients):
                 if gradient is not None:
                     destination.add_(gradient * factor.to(gradient))
-    return sums
+    return result()
 
 
 class WWWPrivacy:
-    """Use the same Poisson sampling schedules and RDP calibration as Record-DP."""
+    """Optimize risk-controlled loss on shuffled mini-batches, with no DP guarantee.
+
+    The historical class/module names are retained for existing integrations.
+    """
 
     def __init__(self, config, total_rounds, device, seed):
         validate_www(config)
@@ -176,9 +297,8 @@ class WWWPrivacy:
         self.device = device
         self.seed = seed
         self.planned_steps = {}
-        self.sample_rates = {}
-        self.expected_batch_sizes = {}
-        self.noise_multiplier = None
+        self.batch_sizes = {}
+        self.noise_multiplier = 0.0
 
     def configure(self, users, additional_private_steps=0):
         if additional_private_steps:
@@ -190,108 +310,96 @@ class WWWPrivacy:
                 raise ValueError("WWW requires linear FedSGD or FedAvg.")
             if any(isinstance(m, torch.nn.modules.batchnorm._BatchNorm)
                    for m in user.model.modules()):
-                raise ValueError("WWW does not support private BatchNorm running statistics.")
-            self.planned_steps[user.id] = self.total_rounds * user.record_dp_steps_per_update
-            self.sample_rates[user.id] = float(user.record_dp_sample_rate)
-            self.expected_batch_sizes[user.id] = int(user.record_dp_expected_batch_size)
+                raise ValueError("WWW does not support batch-dependent BatchNorm.")
+            per_round = 1 if user.federated_method == "fedsgd" else user.local_epochs * len(user.www_trainloader)
+            self.planned_steps[user.id] = self.total_rounds * per_round
+            self.batch_sizes[user.id] = min(int(user.batch_size), user.train_samples)
         if not self.planned_steps or min(self.planned_steps.values()) <= 0:
             raise ValueError("WWW requires a positive training schedule.")
-        schedules = [(self.sample_rates[i], self.planned_steps[i])
-                     for i in sorted(self.planned_steps)]
-        noise = self.config["noise_multiplier"]
-        self.noise_multiplier = (
-            calibrate_poisson_sampled_gaussian_noise(
-                self.config["target_epsilon"], schedules, self.config["delta"],
-            )
-            if noise == "auto" else float(noise)
-        )
-        if any(self.epsilon(self.planned_steps[i], i) > float(self.config["target_epsilon"]) + 1e-10
-               for i in self.planned_steps):
-            raise ValueError("WWW noise_multiplier is too small for the planned privacy budget.")
 
-    def epsilon(self, steps, client_id=None):
-        if self.noise_multiplier is None:
-            raise RuntimeError("WWW privacy accounting must be configured first.")
-        rates = ([self.sample_rates[client_id]] if client_id is not None
-                 else self.sample_rates.values())
-        return max(poisson_sampled_gaussian_epsilon(
-            self.noise_multiplier, rate, steps, float(self.config["delta"]),
-        ) for rate in rates)
-
-    @property
-    def reproducible(self):
-        return bool(self.config.get("reproducible_noise", self.config["reproducible_dp_noise"]))
-
-    def sampling_generator(self, client_id, round_index):
-        return private_generator(
-            torch.device("cpu"), self.reproducible,
-            self.seed + 1000003 * client_id + 1009 * round_index + 17011,
-        )
-
-    def generator(self, client_id, round_index):
-        return private_generator(
-            self.device, self.reproducible,
-            self.seed + 1000003 * client_id + 1009 * round_index + 29009,
-        )
-
-    def step(self, user, model, optimizer, images, labels, weights, steps, generator,
-             extra_loss=None):
-        if self.noise_multiplier is None:
+    def step(self, user, model, optimizer, images, labels, weights, steps,
+             extra_loss=None, *, reference_probability):
+        if user.id not in self.planned_steps:
             raise RuntimeError("WWW must be configured before training.")
         if steps >= self.planned_steps[user.id]:
-            raise RuntimeError("WWW cannot exceed the calibrated training schedule.")
+            raise RuntimeError("WWW cannot exceed the configured training schedule.")
+        if not labels.numel():
+            raise ValueError("WWW shuffled batches must be nonempty.")
         parameters = [p for p in model.parameters() if p.requires_grad]
         optimizer.zero_grad(set_to_none=True)
-        max_norm = float(self.config["max_grad_norm"])
-        with measure_stage(self, "train.record_gradients"):
-            sums = weighted_clipped_sum(model, images, labels, parameters, max_norm,
-                                        weights, extra_loss,
-                                        backend=self.config["grad_sample_backend"],
-                                        microbatch_size=int(self.config["microbatch_size"]))
-        # A fixed-length INO tail preserves the add/remove bound C, including
-        # changes in other records' weights. Empty draws release pure noise.
-        noise_std = self.noise_multiplier * max_norm
-        denominator = self.expected_batch_sizes[user.id]
-        with measure_stage(self, "train.noise_and_step"):
-            with torch.no_grad():
-                for parameter, gradient_sum in zip(parameters, sums):
-                    noise = torch.randn(parameter.shape, generator=generator,
-                                        device=parameter.device, dtype=parameter.dtype)
-                    parameter.grad = (gradient_sum + noise * noise_std) / denominator
-            optimizer.step()  # FedSGD's pre-hook captures only the privatized gradient.
+        with measure_stage(self, "train.www_loss_forward"):
+            terms = risk_controlled_losses(
+                model(images), labels, weights, reference_probability,
+                self.config["www_regularization_weight"],
+            )
+            additional = extra_loss(images, labels) if extra_loss is not None else torch.zeros_like(terms["ce_loss"])
+            if additional.shape != labels.shape or not torch.isfinite(additional).all():
+                raise ValueError("WWW additional loss must be finite and sample-aligned.")
+            terms["additional_loss"] = additional
+            terms["total_loss"] = terms["total_loss"] + additional
+            if not torch.isfinite(terms["total_loss"]).all():
+                raise ValueError("WWW encountered a non-finite combined training loss.")
+        if self.config["www_record_diagnostics"]:
+            with measure_stage(self, "train.www_gradient_diagnostics"):
+                backend = resolve_grad_sample_backend(model, self.config["grad_sample_backend"])
+                chunk = int(self.config["microbatch_size"])
+                raw = _diagnostic_norms(terms["ce_loss"], parameters, backend, chunk)
+                factor = terms["ce_gradient_factor"]
+                # For ordinary WWW the regularizer gradient is exactly collinear
+                # with CE; derive its norm without another set of VJPs. A code-
+                # poisoning loss has a different direction and must be measured.
+                terms["raw_grad_norm"] = raw
+                # Avoid cancellation in (factor - 1) for small penalties.
+                regularizer_scale = (self.config["www_regularization_weight"] * weights.to(raw)
+                                     * terms["current_probability"].detach()
+                                     * terms["confidence_gap"].detach().ne(0))
+                terms["regularizer_grad_norm"] = regularizer_scale * raw
+                terms["total_grad_norm"] = (factor.abs() * raw if extra_loss is None else
+                    _diagnostic_norms(terms["total_loss"], parameters, backend, chunk))
+        with measure_stage(self, "train.www_backward_step"):
+            terms["total_loss"].mean().backward()
+            finite = [torch.isfinite(p.grad).all() for p in parameters if p.grad is not None]
+            if not finite or not torch.stack(finite).all():
+                raise ValueError("WWW encountered a non-finite batch gradient.")
+            optimizer.step()  # Exactly one FedSGD upload, from the actual total loss.
+        return {name: value.detach() for name, value in terms.items()}
 
     def summary(self, steps):
-        epsilons = {i: self.epsilon(int(steps.get(i, 0)), i) for i in self.planned_steps}
         return {
-            "privacy_unit": "record",
-            "adjacency": "add_remove",
-            "accountant": "poisson_sampled_gaussian_rdp",
-            "sampling": "poisson",
-            "subsampling_amplification": True,
-            "target_epsilon": float(self.config["target_epsilon"]),
-            "epsilon_upper_bound": max(epsilons.values(), default=0.0),
-            "delta": float(self.config["delta"]),
-            "max_grad_norm": float(self.config["max_grad_norm"]),
-            "sum_sensitivity": float(self.config["max_grad_norm"]),
+            "mechanism": "risk_controlled_loss",
+            "privacy_unit": None,
+            "adjacency": None,
+            "accountant": None,
+            "sampling": "shuffled_batches",
+            "subsampling_amplification": False,
+            "target_epsilon": None,
+            "epsilon_upper_bound": None,
+            "delta": None,
+            "max_grad_norm": None,
+            "clipping_enabled": False,
+            "regularization_weight": self.config["www_regularization_weight"],
+            "loss": "mean(CE + lambda * risk_weight * abs(p_y - stopgrad(q_y)))",
+            "teacher": "exp(-previous_round_other_client_aggregate_CE)",
             "noise_multiplier": self.noise_multiplier,
-            "noise_std_on_sum": (None if self.noise_multiplier is None else
-                                 self.noise_multiplier * float(self.config["max_grad_norm"])),
-            "normalization": "fixed_expected_batch_size",
+            "noise_std_on_sum": 0.0,
+            "noise_enabled": False,
+            "normalization": "actual_batch_size",
             "grad_sample_backend": self.config["grad_sample_backend"],
             "microbatch_size": int(self.config["microbatch_size"]),
-            "client_upload_is_private": True,
-            "formal_dp_enabled": not self.reproducible
-                                 and not self.config["release_private_diagnostics"],
-            "private_diagnostics_released": bool(self.config["release_private_diagnostics"]),
+            "per_sample_gradients_for_training": False,
+            "per_sample_gradients_for_diagnostics": self.config["www_record_diagnostics"],
+            "client_upload_is_private": False,
+            "formal_dp_enabled": False,
+            "non_dp_reason": "noise_disabled",
+            "private_diagnostics_released": bool(self.config["release_private_diagnostics"]
+                                                 or self.config["www_record_diagnostics"]),
             "per_client": {str(i): {"actual_steps": int(steps.get(i, 0)),
                                     "planned_steps": self.planned_steps[i],
-                                    "sample_rate": self.sample_rates[i],
-                                    "expected_batch_size": self.expected_batch_sizes[i],
-                                    "tail_length_samples": math.ceil(self.expected_batch_sizes[i] * self.config["www_tail_fraction"]),
-                                    "epsilon": epsilons[i]} for i in epsilons},
-            "scope": "Defended uploads/models; fixed public per-client sampling rates, "
-                     "expected batch sizes and tail lengths; disjoint client datasets. "
-                     "Sampling identities and realized batch sizes are not DP releases. "
-                     "Audit labels, private signals, training data and optional diagnostics "
-                     "are local research artifacts and are not DP releases.",
+                                    "batch_size": self.batch_sizes[i],
+                                    "tail_length_samples": (math.ceil(self.batch_sizes[i] * self.config["www_tail_fraction"])
+                                                            if self.config["www_tail_basis"] == "expected_batch" else None),
+                                    "epsilon": None} for i in self.planned_steps},
+            "scope": "Risk-controlled prediction regularization only. No clipping or noise "
+                     "is applied and no differential privacy guarantee is provided for "
+                     "client uploads, models, sampling identities or diagnostics.",
         }

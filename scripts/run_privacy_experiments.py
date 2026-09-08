@@ -181,7 +181,7 @@ def _resolve_projres_candidate_defaults(
     ):
         return
     defense = str(config.get("defense", {}).get("name", "none")).lower()
-    if defense in {"record_dp", "www"}:
+    if defense == "record_dp":
         members = nonmembers = 0
     else:
         members = int(config["batch_size"])
@@ -549,17 +549,21 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
                 "(0=dynamic actual batch)"
             )
         if task.defense in {"www", "record_dp"}:
+            purpose = "diagnostics" if task.defense == "www" else "training"
             print(
-                f"      per_record_gradients=backend:{defense_config.get('grad_sample_backend', 'auto')} "
+                f"      per_record_gradients=purpose:{purpose} "
+                f"enabled:{defense_config.get('www_record_diagnostics', True) if task.defense == 'www' else True} "
+                f"backend:{defense_config.get('grad_sample_backend', 'auto')} "
                 f"chunk:{defense_config.get('microbatch_size', 4)}"
             )
         if task.defense == "www":
             print(
-                f"      www=epsilon:{defense_config['target_epsilon']} "
-                f"clip:{defense_config['max_grad_norm']} delta:{defense_config['delta']} "
-                f"tail:{defense_config['www_tail_fraction']}*expected_batch ranking:ascending "
-                f"noise:{defense_config['noise_multiplier']} "
-                "sampling:poisson adjacency:add_remove accounting:poisson_sampled_gaussian_rdp"
+                "      www=risk_controlled_loss "
+                f"lambda:{defense_config['www_regularization_weight']} "
+                f"tail:{defense_config['www_tail_fraction']}*{defense_config['www_tail_basis']} ranking:ascending "
+                f"diagnostics:{defense_config['www_record_diagnostics']} "
+                "low_risk:CE_only teacher:previous_other_aggregate "
+                "clipping:disabled noise:disabled sampling:shuffled_batches formal_dp:false epsilon:N/A"
             )
         if task.defense == "cofedmid":
             print(

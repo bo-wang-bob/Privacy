@@ -96,7 +96,25 @@ def format_run_summary(
         ),
     ]
     accounting = defense.get("privacy_accounting")
-    if isinstance(accounting, dict):
+    if isinstance(accounting, dict) and accounting.get("mechanism") == "risk_controlled_loss":
+        lines.extend([
+            "", "WWW: risk-controlled loss | Clipping: disabled | Noise: disabled | Formal DP: no",
+            f"  Regularization weight: {format_number(accounting.get('regularization_weight'))} | "
+            "Epsilon/Delta: N/A (no DP guarantee)",
+        ])
+        diagnostics = defense.get("www", {}).get("gradient_diagnostics", {})
+        if diagnostics.get("files"):
+            lines.append(f"  Risk/loss/gradient diagnostics: www_diagnostics/ ({diagnostics['sample_rows']} sample visits)")
+    elif isinstance(accounting, dict) and accounting.get("mechanism") == "risk_weighted_clipping":
+        lines.extend([
+            "", "WWW: risk-weighted clipping only | Noise: disabled | Formal DP: no",
+            f"  Clip norm: {format_number(accounting.get('max_grad_norm'))} | "
+            "Epsilon/Delta: N/A (no DP guarantee)",
+        ])
+        diagnostics = defense.get("www", {}).get("gradient_diagnostics", {})
+        if diagnostics.get("files"):
+            lines.append(f"  Risk/gradient diagnostics: www_diagnostics/ ({diagnostics['sample_rows']} sample visits)")
+    elif isinstance(accounting, dict):
         delta = accounting.get("delta")
         try:
             delta_text = f"{float(delta):.2g}" if math.isfinite(float(delta)) else "N/A"

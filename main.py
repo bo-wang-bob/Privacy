@@ -812,7 +812,7 @@ def validate_config(config: dict) -> None:
         max_nonmembers = int(projres.get("max_nonmembers", 20000))
         poisson_projres = unified_projres and str(
             config.get("defense", {}).get("name", "none")
-        ).lower() == "www"
+        ).lower() == "record_dp"
         minimum_required_nonmembers = (
             int(config["batch_size"]) * int(configured_exact_batch_ratio)
             if unified_projres
@@ -835,7 +835,7 @@ def validate_config(config: dict) -> None:
         if unified_projres:
             if poisson_projres and any((max_candidates, min_nonmembers, max_nonmembers)):
                 raise ValueError(
-                    "WWW Poisson batches require dynamic unified ProjRes "
+                    "Poisson DP batches require dynamic unified ProjRes "
                     "candidate bounds (all three bounds must be zero)."
                 )
             expected_nonmembers = int(config["batch_size"]) * int(

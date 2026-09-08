@@ -106,9 +106,9 @@ def test_bert_dataset_schedule_keeps_all_privacy_evaluations_enabled(
     assert config["projres"]["enabled"] is True
     assert config["projres"]["evaluation_interval"] == 50
     assert "evaluation_round" not in config["projres"]
-    assert config["projres"]["max_candidates"] == 0
-    assert config["projres"]["min_nonmembers"] == 0
-    assert config["projres"]["max_nonmembers"] == 0
+    assert config["projres"]["max_candidates"] == 16
+    assert config["projres"]["min_nonmembers"] == 160
+    assert config["projres"]["max_nonmembers"] == 160
     from privacy_defenses.www_dp import DEFAULTS
     assert config["defense"] == {"name": "www", **DEFAULTS}
 

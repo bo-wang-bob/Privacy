@@ -17,7 +17,7 @@
 - `--attacks all` 按模型解析能力集：ResNet18 只有 `fedmia_loss`，PEFT 模型为全部 11 种；`--attacks none` 是纯训练。
 - `--defenses all` 只展开模型正式支持的防御。显式攻击与模型不兼容时跳过该模型并打印原因；显式防御或数据集不兼容时跳过对应组合。
 - `configs/experiment_catalog.yaml` 维护能力矩阵、防御深度覆盖和别名；`configs/models/` 下 7 个基线维护模型训练与默认候选协议。不要重新为数据集、攻击或防御复制整份模型 YAML。
-- 统一入口在应用全部 `--set` 后自动推导启用的 exact-batch ProjRes 候选参数：普通训练使用最终 batch 大小及成员/非成员比例，`record_dp`/`www` 使用 `0/0/0` 动态候选。改变 `batch_size` 或混跑 `none,record_dp,www` 无需手动同步这三个值。显式传入的 ProjRes 候选参数保留并接受协议校验；干运行显示最终候选参数。
+- 统一入口在应用全部 `--set` 后自动推导启用的 exact-batch ProjRes 候选参数：普通训练和 WWW 使用最终 batch 大小及成员/非成员比例，`record_dp` 使用 `0/0/0` 动态候选。改变 `batch_size` 或混跑 `none,record_dp,www` 无需手动同步这三个值。显式传入的 ProjRes 候选参数保留并接受协议校验；干运行显示最终候选参数。
 - CLIP 默认学习率由模型基线设置：CLIP-MLP 为 `0.1`，CLIP-Adapter 为 `0.001`，CLIP-LoRA 为 `0.0002`。应以统一脚本干运行打印的最终参数为准。
 - 三个 CLIP 基线均显式使用 IID。不要在正常 IID 实验中传 `--dirichlet-alpha`；仅传该参数会自动切换为 `dirichlet`。如同时显式传 `--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha 仅作为未使用的配置值保留。
 - CLIP-MLP 和 CLIP-Adapter 使用每类 16 张训练图像的 Few-shot 训练集；CLIP-LoRA 使用完整训练集。Few-shot 先在全局训练分区内按类确定性抽取，再进行客户端划分；独立 evaluation/test 分区不截断。
@@ -29,12 +29,13 @@
 ## 当前 WWW 防御（原 ICLR）
 
 - 原观测型 `iclr` 已更名并更新为实际参与训练的 `www`；配置和新产物使用 `www_*`，历史 `results/` 与 `iclr_*` 产物不改写。
-- 支持三个 CLIP 模型及 BERT Adapter/LoRA。每个真实训练 batch 按上一轮防御后模型的 `M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 升序排序，默认 `defense.www_tail_fraction=0.8`，按固定期望 batch 大小 b 预设尾部宽度 `ceil(0.8 * b)`，实际 batch 有 n 条样本时，尾部包含最后 `min(n, ceil(0.8*b))` 条；短于尾部的 batch 使用重要性函数的最右侧区间。首轮或缺少上一轮参考状态时统一裁剪并加噪。
-- 所有样本联合 L2 裁剪到默认 `defense.max_grad_norm=8`，再乘 INO-SGD 的 Beta 尾部函数积分权重；默认 Beta(1,1)。先裁剪再缩放，不能替换成直接裁剪到缩放后的阈值。
-- 默认全程预算 `defense.target_epsilon=3`、`delta=1e-5`。与普通 `record_dp` 共用 Poisson 采样，按 `add_remove`、敏感度 C 和 Poisson sampled-Gaussian RDP 校准全程噪声；梯度和加噪后除以固定期望 batch 大小。空 batch 不重抽，仍上传纯噪声并计入预算。防御每轮运行，诊断间隔不影响训练保护。
-- WWW 与 BERT Adapter Record-DP 默认 `defense.grad_sample_backend=auto`、`defense.microbatch_size=4`，使用分块 batched VJP；分块只影响计算，整个真实 batch 汇总后仍只加一次噪声和执行一次 FedSGD step。共享 Transformer 启用 gradient checkpointing 时 `auto` 选择 `loop`；ResNet18 保留原 `vmap`。性能说明和独立基准见 `docs/fedsgd_performance.md`。
-- 默认不导出未私有化分数诊断；固定噪声或 `release_private_diagnostics=true` 将使 `formal_dp_enabled=false`。受保护发布范围为防御后的上传与模型，审计私有信号与标签属于本地研究资料。
-- WWW 下 ProjRes 按真实 Poisson batch 动态构造候选，三个候选规模参数均为 0；取消无噪声 batch 秩上限，`paper_fedsgd_exact=false`。空 batch 跳过真实 Batch 攻击并记录原因，固定候选攻击继续执行。入口与完整公式见 `docs/defenses.md`。
+- 支持三个 CLIP 模型及 BERT Adapter/LoRA。每个真实训练 batch 按上一轮防御后模型的 `M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 稳定升序排序。默认 `defense.www_tail_fraction=0.8`、`www_tail_basis=actual_batch`，高风险尾部为最后 `m=ceil(0.8*n)` 条；尾部升序第 j 条权重为 `r_i=(j-0.5)/m`，其余低风险样本权重为 0。batch=32 时为 6 条仅用 CE、26 条加正则。`expected_batch` 可显式沿用历史固定尾部宽度并右对齐短批次。首轮或缺少上一轮参考状态时所有 r 为 0，仅用 CE，诊断标记风险不可用。
+- 当前损失为 `mean(CE_i + lambda*r_i*abs(p_i-q_i))`，默认 `defense.www_regularization_weight=1.0`，必须有限且非负，0 可做普通 CE 消融。`p_i=exp(-当前CE_i)` 参与求导；`q_i=exp(-上一轮theta_-k的CE_i)` 及风险权重停止梯度。这是受 MIST 启发的单步 FedSGD 适配：参考为其他客户端的参数聚合模型，不是平均客户端预测，也不是严格从未见过目标数据的 leave-one-out 模型。所有样本保留 CE，不裁剪、不使用 INO 权重、不加噪。
+- 当前 WWW 使用 `sampling=shuffled_batches`，按普通 FedSGD 的种子规则打乱后分批，每轮取下一批，遍历结束再打乱；短 batch 保留并按实际样本数求均值。不提供 DP 保证。旧配置或混合 sweep 的 `target_epsilon`、`delta`、`adjacency`、`accountant`、`max_grad_norm`、`www_beta_alpha`、`www_beta_beta` 清空为 `null`，`noise_multiplier` 固定为 0；显式旧 `sampling=poisson` 会被拒绝。普通 DP 保留 Poisson 及原预算校准。历史 WWW 结果不改写，须区分带噪、Poisson 裁剪、尾部免裁剪与当前风险损失版本。
+- WWW 训练直接对整批组合损失执行一次 backward/optimizer step 并上传实际梯度，逐样本求导只用于可选范数诊断。WWW 诊断与 BERT Adapter Record-DP 默认 `defense.grad_sample_backend=auto`、`defense.microbatch_size=4`，使用分块 batched VJP；WWW 诊断复用同一个完整 batch 前向图和 dropout，块大小仅控制逐样本梯度存储。共享 Transformer 启用 gradient checkpointing 时 `auto` 选择 `loop`；ResNet18 Record-DP 保留原 `vmap`。性能说明见 `docs/fedsgd_performance.md`。
+- 默认 `www_record_diagnostics=true`，在任务目录的 `www_diagnostics/` 流式记录 `sample_gradients.csv`、`batch_summary.csv`、`summary.json`（schema_version=2）：每次训练访问的风险、样本身份、风险权重、真实类预测差异、CE/正则/总损失，以及对应的联合梯度范数；批次和风险分组保存分位数及 Pearson/Spearman 相关系数。记录 CE 梯度的有符号系数和方向反转数，避免把范数减小误判为方向不变。每批 flush，内存不随轮数增长；首轮风险、教师差异及不可定义的相关系数留空。关闭诊断不改变训练并省去额外逐样本求导，旧 `release_private_diagnostics` 只控制旧版额外诊断。
+- WWW 始终记录 `formal_dp_enabled=false`、`client_upload_is_private=false` 和空的 epsilon/delta，不输出 DP 攻击理论上界。旧 `reproducible_dp_noise` 在 WWW 中不再生效。新记录只影响新启动任务，不能补录旧进程未保存的范数。
+- WWW 下 ProjRes 与普通训练一样按 batch size 推导候选上限，完整 batch=32 时为 `32/320/320`，短 batch 仍按真实 n/10n 候选计算；当前真实类概率正则的逐样本梯度与 CE 共线，保留 batch 秩上限，`attacked_parameter_perturbed=false`，因修改训练损失仍标记 `paper_fedsgd_exact=false`。不要声称该损失必然防住 ProjRes。LoRA 初始化等导致被攻击层上传为零时，仅跳过 ProjRes 并记录 `zero_observed_update`，其余攻击继续执行。入口与完整公式见 `docs/defenses.md`。
 
 ## 当前 CoFedMID 防御
 

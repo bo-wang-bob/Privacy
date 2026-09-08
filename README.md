@@ -235,7 +235,7 @@ python scripts/run_privacy_experiments.py \
 `--target-clients 0,1` 和可重复的 `--set path=value` 扩展或覆盖最终配置。
 
 启用统一 exact-batch ProjRes 时，入口会按最终 batch 大小和非成员比例自动同步候选参数；
-`record_dp`/`www` 自动使用 `0/0/0` 动态候选。改变 `batch_size` 或同时运行
+`record_dp` 自动使用 `0/0/0` 动态候选，WWW 与普通训练按最终 batch 大小推导。改变 `batch_size` 或同时运行
 `--defenses none,record_dp,www` 无需手动填写 ProjRes 的三个候选数量参数。
 显式填写的值仍接受原协议校验；干运行会显示每组最终值。
 
@@ -306,7 +306,7 @@ python scripts/validate_projres_mlp_real.py \
 ## 隐私防御与 WWW 分析
 
 仓库保留更新扰动、稀疏化、Mixup、采样、数据增强、CoFedMID、Prompt-DP、
-MIST、SOFT、HAMP 和 WWW 等实现。当前 CLIP 三模型正式支持 `none`、差分隐私防御
+MIST、SOFT、HAMP 和 WWW 等实现。当前 CLIP 三模型正式支持 `none`、风险损失防御
 `www` 与 `cofedmid`；BERT Adapter/LoRA 和 GPT2 Adapter 也支持 CoFedMID。
 具体兼容性由 `configs/experiment_catalog.yaml` 维护。
 
@@ -324,24 +324,33 @@ python scripts/run_privacy_experiments.py --models clip_mlp --defenses none,cofe
 六个模型已通过无下载小模型端到端测试；真实数据集上的隐私与效用效果仍需实验测量。
 详细参数和论文适配边界见 [CoFedMID 文档](docs/defenses.md#cofedmid)。
 
-原 ICLR 方法已更名为 WWW，并改为实际参与训练的差分隐私防御。每个客户端每轮按
-`M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 升序排列真实 Poisson batch，
-以期望 batch 大小的 80%（向上取整）固定尾部宽度，选取最高分样本，
-按 INO-SGD 的重要性函数积分缩放逐样本裁剪梯度后加高斯噪声。
-采样、`add_remove` 邻接、Poisson RDP 核算和固定期望 batch 归一化均与普通样本级 DP 一致。
-默认全程隐私预算 `epsilon=3`、初始裁剪阈值 `C=8`、`delta=1e-5`；
+原 ICLR 方法已更名为 WWW，当前使用风险控制损失。每个客户端每轮按
+`M_i = loss(theta_-k, z_i) - loss(theta_k, z_i)` 升序排列真实 batch。
+当前使用普通打乱后分批，每轮取下一批；所有样本保留交叉熵，最高风险约 80%
+额外加入 `lambda * r_i * |p_i - q_i|`，其中 `p_i` 是当前模型真实类别概率，
+`q_i` 是上一轮其他客户端参数聚合参考模型的冻结概率，尾部权重 `r_i` 按风险递增。
+默认 `defense.www_regularization_weight=1.0`；完整 batch=32 时为 6 条仅用交叉熵、
+26 条加入正则，短 batch 按实际数量划分并求均值。**不裁剪、不使用 Poisson、不加噪声，
+不提供差分隐私保证**。WWW 不使用 epsilon/delta 或隐私会计；
 支持三个 CLIP 模型及 BERT Adapter/LoRA。统一入口的 BERT Adapter 默认启用 WWW，
-其余模型默认防御不变。首轮先执行统一裁剪及加噪。
+其余模型默认防御不变。首轮缺少风险参考时仅用交叉熵，并在诊断中标记风险不可用。
 
 ```bash
 python scripts/run_privacy_experiments.py --models clip_mlp --defenses www
-# 覆盖全程预算和初始裁剪阈值
+# 覆盖风险正则系数；设为 0 可做普通交叉熵消融
 python scripts/run_privacy_experiments.py --models clip_mlp --defenses www \
-  --set defense.target_epsilon=5 --set defense.max_grad_norm=4
+  --set defense.www_regularization_weight=3
 ```
 
-`defense_summary.json` 记录实际预算、噪声尺度和裁剪协议。WWW 默认关闭非隐私逐样本
-诊断文件；历史结果及其 `iclr_*` 文件保持原样。
+`defense_summary.json` 记录 `risk_controlled_loss`、`clipping_enabled=false`、
+`formal_dp_enabled=false`、零噪声及空的 epsilon/delta。混跑 `record_dp,www` 时，
+共享的预算和裁剪阈值只影响普通 DP；WWW 会清空旧预算、裁剪阈值和 Beta 参数。
+默认生成 `www_diagnostics/sample_gradients.csv`，保存每次训练访问的风险、标签、
+本地索引、预测差异、正则权重及交叉熵/正则项/总损失梯度范数；`batch_summary.csv`
+保存分位数和按 batch、风险分组的 Pearson／Spearman 相关系数，`summary.json` 保存
+字段定义和状态。范数诊断需要额外逐样本求导；可用
+`--set defense.www_record_diagnostics=false` 关闭，训练本身只需整批损失的一次反向传播。
+历史结果保持原样，需区分协议版本。
 防御与威胁模型说明见 [`docs/defenses.md`](docs/defenses.md)。
 
 ### 记录级 DP-SGD

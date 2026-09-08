@@ -35,7 +35,8 @@ from privacy_attacks.code_poison import (
     generate_membership_encoding_samples,
 )
 from privacy_defenses.cofedmid import CoFedMID
-from privacy_defenses.www_dp import WWWPrivacy, ino_weights
+from privacy_defenses.www_dp import WWWPrivacy, risk_regularization_weights
+from privacy_defenses.www_diagnostics import WWWGradientRecorder
 from privacy_defenses.www import (
     encode_training_batches,
     infer_other_clients_state,
@@ -351,6 +352,7 @@ class DefenseController:
             WWWPrivacy(self.config, self.total_rounds, self.device, self.seed)
             if self.name == "www" else None
         )
+        self.www_gradient_recorder = None
         self.cofedmid = (
             CoFedMID(
                 self.config, self.total_users, self.num_classes,
@@ -680,11 +682,10 @@ class DefenseController:
         round_index: int,
         code_poison: bool,
     ) -> None:
-        """Rank every real batch, apply INO clipping, then privatize the upload."""
+        """Rank the real batch and optimize CE plus a frozen-teacher risk loss."""
         reference_states = self._www_pending_states.pop(user.id, None)
-        generator = self.www_privacy.generator(user.id, round_index)
-        sampling_generator = self.www_privacy.sampling_generator(user.id, round_index)
-        for images, labels, local_indices in user.iter_www_local_batches(sampling_generator):
+        for images, labels, local_indices in user.iter_www_local_batches():
+            source_round = int(user.www_source_round) if reference_states is not None else -1
             with measure_stage(self, "train.www_ranking"):
                 restore_state = user.get_parameters()
                 own_state, other_state = (
@@ -713,29 +714,52 @@ class DefenseController:
                 ),
             )
             if reference_states is None:
-                weights = torch.ones(labels.numel(), dtype=torch.float64)
+                weights = torch.zeros(labels.numel(), dtype=torch.float64)
                 tail = torch.zeros(labels.numel(), dtype=torch.bool)
             else:
-                weights, _, tail = ino_weights(
+                weights, _, tail = risk_regularization_weights(
                     ranking.scores, float(self.config["www_tail_fraction"]),
-                    float(self.config["www_beta_alpha"]),
-                    float(self.config["www_beta_beta"]),
-                    expected_batch_size=user.record_dp_expected_batch_size,
+                    expected_batch_size=min(user.batch_size, user.train_samples),
+                    tail_basis=self.config["www_tail_basis"],
                 )
-            user.www_importance_weights = weights
+            # Only regularizer strength is risk-dependent. CE is never clipped,
+            # scaled by INO, or removed, including the first round and short batches.
+            user.www_risk_weights = weights
             user.www_tail_mask = tail
-            user.www_effective_clip_norms = weights * float(
-                self.config["max_grad_norm"]
-            )
             user.www_tail_local_indices = local_indices[tail].clone()
+            reference_probability = ranking.other_losses.neg().exp().detach()
+            user.www_reference_probability = reference_probability if reference_states is not None else None
             extra_loss = (
                 lambda inputs, targets: self._secret_losses(user, model, inputs, targets)
             ) if code_poison else None
-            self.www_privacy.step(
+            diagnostics = self.www_privacy.step(
                 user, model, optimizer, images.to(self.device), labels.to(self.device),
-                weights, self.steps[user.id], generator, extra_loss,
+                weights, self.steps[user.id], extra_loss,
+                reference_probability=reference_probability,
             )
             self.steps[user.id] += 1
+            means = torch.stack([diagnostics[name].mean() for name in
+                                 ("ce_loss", "regularization_loss", "total_loss")]).cpu().tolist()
+            for name, value in zip(("www_ce_loss", "www_regularization_loss", "www_total_loss"), means):
+                self._record(name, value)
+            if self.www_gradient_recorder is not None:
+                with measure_stage(self, "train.www_diagnostics"):
+                    self.www_gradient_recorder.record(
+                        user=user, ranking=ranking, diagnostics=diagnostics,
+                        weights=weights, tail=tail,
+                        round_index=round_index, client_step=self.steps[user.id],
+                        source_round=source_round, has_reference=reference_states is not None,
+                        regularization_weight=self.config["www_regularization_weight"],
+                    )
+
+    def start_www_gradient_diagnostics(self, results_dir):
+        if self.name == "www" and self.config["www_record_diagnostics"]:
+            self.www_gradient_recorder = WWWGradientRecorder(results_dir)
+
+    def finish_www_gradient_diagnostics(self, status):
+        if self.www_gradient_recorder is not None:
+            with measure_stage(self, "outputs.write"):
+                self.www_gradient_recorder.close(status)
 
     def _record_www_ranking(
         self,
@@ -1789,8 +1813,6 @@ class DefenseController:
         self.cofedmid.perturb(updated_states, aggregation_weights, round_index)
 
     def conservative_dp_epsilon(self) -> float | None:
-        if self.www_privacy is not None:
-            return self.www_privacy.summary(self.steps)["epsilon_upper_bound"]
         if self.name == "record_dp":
             epsilons = self.record_dp_epsilons()
             return max(epsilons.values()) if epsilons else None
@@ -1874,18 +1896,29 @@ class DefenseController:
             summary["www"] = {
                 "score": "L(x; theta_-k) - L(x; theta_k)",
                 "ranking": "ascending",
-                "training_action": "ino_weighted_per_sample_clipping_and_gaussian_noise",
+                "training_action": "risk_controlled_prediction_loss",
+                "loss": "mean(CE + lambda * risk_weight * abs(p_y - stopgrad(q_y)))",
+                "clipping_enabled": False,
+                "regularization_weight": self.config["www_regularization_weight"],
+                "noise_enabled": False,
                 "tail_fraction": self.config["www_tail_fraction"],
-                "tail_count": "min(actual_batch_size, ceil(expected_batch_size * tail_fraction))",
-                "tail_length": "fixed_per_client_expected_batch_size",
+                "tail_count": ("ceil(actual_batch_size * tail_fraction)"
+                               if self.config["www_tail_basis"] == "actual_batch" else
+                               "min(actual_batch_size, ceil(expected_batch_size * tail_fraction))"),
+                "tail_length": self.config["www_tail_basis"],
+                "low_risk_action": "cross_entropy_only",
                 "tail_selection": "largest_loss_differences",
-                "initial_clip_norm": self.config["max_grad_norm"],
-                "importance_function": "flipped_beta_cdf_interval_average",
-                "beta_alpha": self.config["www_beta_alpha"],
-                "beta_beta": self.config["www_beta_beta"],
+                "risk_weight_function": "ascending_tail_midpoint_rank",
                 "defense_interval": 1,
                 "reference": "previous_round_defended_local_and_other_client_models",
-                "missing_reference": "uniform_clipping_and_noise",
+                "teacher_probability": "exp(-previous_round_other_client_aggregate_CE)",
+                "reference_is_exact_leave_one_out": False,
+                "mist_adaptation": "lagged_parameter_aggregate_teacher; combined_loss_single_step",
+                "missing_reference": "cross_entropy_only",
+                "gradient_diagnostics": (
+                    self.www_gradient_recorder.summary() if self.www_gradient_recorder is not None
+                    else {"enabled": self.config["www_record_diagnostics"], "sample_rows": 0}
+                ),
                 "analysis_timing": self.www_analysis_timing,
                 "analysis_interval": self.www_analysis_interval,
                 "scheduled_rounds": (
@@ -1928,10 +1961,10 @@ class DefenseController:
                 },
             }
         epsilon = self.conservative_dp_epsilon()
+        if self.www_privacy is not None:
+            summary["privacy_accounting"] = self.www_privacy.summary(self.steps)
         if epsilon is not None:
-            if self.www_privacy is not None:
-                summary["privacy_accounting"] = self.www_privacy.summary(self.steps)
-            elif self.name == "record_dp":
+            if self.name == "record_dp":
                 epsilons = self.record_dp_epsilons()
                 summary["privacy_accounting"] = {
                     "privacy_unit": "record",

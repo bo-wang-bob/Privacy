@@ -174,8 +174,12 @@ def test_batch32_bert_sweep_automatically_resolves_each_defense_projres(tmp_path
         assert task.config["batch_size"] == 32 and len(task.attacks) == 11
         bounds = task.config["projres"]
         actual = tuple(bounds[k] for k in ("max_candidates", "min_nonmembers", "max_nonmembers"))
-        assert actual == ((32, 320, 320) if task.defense == "none" else (0, 0, 0))
-        assert task.config["defense"]["target_epsilon"] == 16
+        assert actual == ((0, 0, 0) if task.defense == "record_dp" else (32, 320, 320))
+        if task.defense == "www":
+            assert task.config["defense"]["target_epsilon"] is None
+            assert task.config["defense"]["noise_multiplier"] == 0
+        else:
+            assert task.config["defense"]["target_epsilon"] == 16
     assert list(tmp_path.iterdir()) == [], "config resolution must not create runs"
 
 

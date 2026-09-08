@@ -67,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-grad-norm",
         type=float,
-        help="Override the Record-DP or WWW per-sequence clipping threshold C.",
+        help="Override the Record-DP per-sequence clipping threshold C; ignored by WWW.",
     )
     parser.add_argument(
         "--max-client-update-norm",
@@ -539,7 +539,7 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "audit exact-batch ProjRes requires projres.enabled=true."
             )
-        if defense_name in {"record_dp", "www"}:
+        if defense_name == "record_dp":
             if any(
                 int(projres.get(key, 0)) != 0
                 for key in (
@@ -747,8 +747,8 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
             defense.get("www_analysis_interval"),
         ),
         ("www.analysis_timing", defense.get("www_analysis_timing")),
-        ("www.target_epsilon", defense.get("target_epsilon") if defense.get("name") == "www" else None),
-        ("www.max_grad_norm", defense.get("max_grad_norm") if defense.get("name") == "www" else None),
+        ("www.mode", "risk_controlled_loss" if defense.get("name") == "www" else None),
+        ("www.regularization_weight", defense.get("www_regularization_weight")),
         ("www.tail_fraction", defense.get("www_tail_fraction")),
         ("record_dp.enabled", defense.get("name", "none") == "record_dp"),
         ("record_dp.target_epsilon", defense.get("target_epsilon")),

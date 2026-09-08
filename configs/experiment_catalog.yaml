@@ -164,28 +164,27 @@ defense_overrides:
     common:
       defense:
         name: www
-        target_epsilon: 3.0
-        max_grad_norm: 8.0
-        delta: 1.0e-5
-        noise_multiplier: auto
+        target_epsilon: null
+        max_grad_norm: null
+        delta: null
+        noise_multiplier: 0.0
         www_tail_fraction: 0.8
-        www_beta_alpha: 1.0
-        www_beta_beta: 1.0
+        www_tail_basis: actual_batch
+        www_beta_alpha: null
+        www_beta_beta: null
+        www_regularization_weight: 1.0
         grad_sample_backend: auto
         microbatch_size: 4
         www_analysis_interval: 1
         www_analysis_timing: pre_update
         www_feature_statistics: false
+        www_record_diagnostics: true
         www_validation_top_fraction: 0.2
-        adjacency: add_remove
-        sampling: poisson
-        accountant: rdp
+        adjacency: null
+        sampling: shuffled_batches
+        accountant: null
         reproducible_dp_noise: false
         release_private_diagnostics: false
-      projres:
-        max_candidates: 0
-        min_nonmembers: 0
-        max_nonmembers: 0
 
   record_dp:
     models:

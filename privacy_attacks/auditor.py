@@ -2353,8 +2353,8 @@ class MembershipAuditor:
         updated_state: dict[str, torch.Tensor],
         protocol_message: dict | None,
         learning_rate: float | None,
-    ) -> tuple[torch.Tensor, dict, dict]:
-        """Run ProjRes on the shared exact-batch candidate view."""
+    ) -> tuple[torch.Tensor | None, dict, dict | None]:
+        """Run ProjRes, or return a skip reason for a zero WWW upload."""
         member_count = int((membership == 1).sum())
         nonmember_count = int((membership == 0).sum())
         if member_count + nonmember_count != labels.numel():
@@ -2424,8 +2424,17 @@ class MembershipAuditor:
                 - updated_state[parameter_name].detach().cpu().float()
             )
             update_source = "base_minus_client_post_state"
+        if (getattr(self, "defense_name", "none") == "www"
+                and not bool(torch.count_nonzero(observed_update))):
+            # With noise removed, e.g. zero-initialized LoRA B can make A's
+            # first upload exactly zero. ProjRes has no informative subspace;
+            # retain the other attacks and explicitly record this omission.
+            return None, {"reason": "zero_observed_update",
+                          "attacked_parameter": parameter_name}, None
         cofedmid = self._cofedmid_metadata()
-        parameter_perturbed = getattr(self, "defense_name", "none") == "www"
+        # WWW only scales each record's gradient, preserving the batch-rank
+        # bound. Its former Gaussian upload noise has been removed.
+        parameter_perturbed = False
         if cofedmid and cofedmid["upload_perturbed"]:
             # The unperturbed batch-rank bound need not hold after upload noise.
             # Reconstruct the public mask from the shared trainable parameter order.
@@ -3514,9 +3523,9 @@ class MembershipAuditor:
                 "client did not upload."
             )
         retained_batch = self.users[target_id].last_train_batch
-        if (self.defense_name in {"www", "record_dp"}
+        if (self.defense_name == "record_dp"
                 and retained_batch is not None and retained_batch[1].numel() == 0):
-            # The noise-only upload is a valid accounted step, but has no true
+            # A noise-only Record-DP step has no true
             # batch members on which to define these six membership attacks.
             self.exact_batch_skipped_rounds.append({
                 "communication_round": int(round_index) + 1,
@@ -3661,8 +3670,18 @@ class MembershipAuditor:
                     learning_rate=learning_rate,
                 )
             )
-            observation["projres"] = projres_scores.unsqueeze(0)
-            observation["projres_diagnostics"] = projres_diagnostics
+            if projres_scores is None:
+                self.exact_batch_skipped_rounds.append({
+                    "communication_round": int(round_index) + 1,
+                    "client_id": int(target_id),
+                    "attacks": ["projres"],
+                    **projres_diagnostics,
+                })
+                attacks.remove("projres")
+                observation["attacks"] = sorted(attacks)
+            else:
+                observation["projres"] = projres_scores.unsqueeze(0)
+                observation["projres_diagnostics"] = projres_diagnostics
 
         self.exact_batch_observations.append(observation)
         self.exact_batch_candidate_selections.append(candidates["selection"])

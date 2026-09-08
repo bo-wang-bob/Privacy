@@ -99,13 +99,14 @@ PEFT/分类头参数
 16 成员/160 非成员，只
 统计 AUC、TPR@10%FPR 与 TPR@1%FPR，不生成 TPR@0.1%FPR。
 
-BERT Adapter 的统一入口默认启用 WWW 差分隐私防御，BERT-LoRA 可通过
+BERT Adapter 的统一入口默认启用 WWW 风险损失防御，BERT-LoRA 可通过
 `--defenses www` 显式启用。每个真实 batch 按上一轮防御模型间的逐样本损失差升序排序，
-使用与普通样本级 DP 相同的 Poisson 抽样，以期望 batch 的 20% 固定尾部宽度，
-执行 INO-SGD 积分权重缩放、联合逐样本裁剪和高斯加噪。邻接关系为 add_remove，
-使用采样 RDP 核算并除以固定期望 batch 大小；空抽样仍上传纯噪声并计步。
-默认全程 epsilon=3、初始裁剪阈值 C=8、delta=1e-5；防御每轮执行，任务评估和攻击频次不变。
-首轮或缺少上一轮客户端参考状态时仍以统一阈值裁剪并加噪。算法与预算核算详见
+使用普通打乱后分批，每轮取下一批；最高风险的 `ceil(0.8*n)` 条额外加入
+`lambda*r_i*abs(p_i-q_i)`，其中 `r_i` 按尾部风险名次递增，`q_i` 为上一轮其他客户端
+参数聚合参考模型的冻结真实类概率。默认 lambda=1；所有样本保留交叉熵，
+整批损失按实际样本数求均值并执行一次 FedSGD 更新，不裁剪、不加噪、不提供 DP 保证。
+预算、裁剪阈值和旧 Beta 参数在 WWW 中清空，不影响普通 Record-DP。
+首轮或缺少上一轮客户端参考状态时仅用交叉熵。算法及诊断字段详见
 [WWW 文档](defenses.md#www)。GPT2-Large 当前保持 `defense.name: none`。
 
 严格 ProjRes 每 50 个已完成通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
@@ -113,8 +114,9 @@ down-projection 权重更新构造子空间，并在同一全局模型下提取�
 表示。BERT Adapter、BERT-LoRA 与 GPT2-Large 的成员和非成员直接复用共享真实 Batch 候选视图，即当轮
 `N` 个成员及按标签匹配的 `10N` 个从未训练 evaluation 样本；完整 Batch 时为
 16/160。结果与其他攻击统一写入审计器输出，`projres.max_candidates: 16` 不会截断
-实际上传 Batch。无噪声且满足原论文梯度条件时 `paper_fedsgd_exact=true`；WWW 上传加噪，
-该字段为 `false`，同时取消无噪声 batch 秩上限，成员身份仍由真实 batch 确定。
+实际上传 Batch。无噪声且满足原论文梯度条件时 `paper_fedsgd_exact=true`；WWW 修改了
+训练损失，该字段为 `false`。当前概率差异正则的逐样本梯度与 CE 共线，仍保留 batch
+秩上限，且 `attacked_parameter_perturbed=false`，成员身份仍由真实 batch 确定。
 
 ## 攻击可见性
 

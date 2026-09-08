@@ -144,8 +144,10 @@ def main():
               "sequence_length": args.sequence_length, "chunk_size": args.chunk_size,
               "clients": args.clients, "audit_candidates": args.audit_candidates,
               "www_tail_fraction": DEFAULTS["www_tail_fraction"],
+              "www_tail_basis": DEFAULTS["www_tail_basis"],
+              "www_low_risk_action": "unmodified_per_sample_gradient",
               "warmups": args.warmups, "repeats": args.repeats,
-              "scope": "Synthetic compute stages; excludes WWW ranking, DP noise, optimizer, uploads, aggregation and other attacks. Gradient timing uses train mode; numerical checks and audit use eval mode.",
+              "scope": "Synthetic compute stages; excludes WWW ranking and diagnostics, DP noise, optimizer, uploads, aggregation and other attacks. Gradient timing uses train mode; numerical checks and audit use eval mode.",
               "measurements": []}
 
     def data(count):
@@ -176,10 +178,11 @@ def main():
         report["trainable_parameters"] = sum(p.numel() for p in parameters)
         for batch in batches:
             x, y = data(batch)
-            weights = ino_weights(torch.arange(batch).float(), tail_fraction=report["www_tail_fraction"], expected_batch_size=batch)[0].to(device)
+            weights, _, tail = ino_weights(torch.arange(batch).float(), tail_fraction=report["www_tail_fraction"], expected_batch_size=batch)
+            weights, tail = weights.to(device), tail.to(device)
             compare("www_clipped_gradient", batch,
-                    lambda: weighted_clipped_sum(client, x, y, parameters, 8., weights, backend="loop"),
-                    lambda: weighted_clipped_sum(client, x, y, parameters, 8., weights, backend="batched", microbatch_size=args.chunk_size), True)
+                    lambda: weighted_clipped_sum(client, x, y, parameters, 8., weights, backend="loop", clip_mask=tail),
+                    lambda: weighted_clipped_sum(client, x, y, parameters, 8., weights, backend="batched", microbatch_size=args.chunk_size, clip_mask=tail), True)
             compare("record_dp_clipped_gradient", batch,
                     lambda: legacy_record_sum(client, x, y, parameters, 8.),
                     lambda: batched_record_sum(client, x, y, parameters, 8., args.chunk_size), True)

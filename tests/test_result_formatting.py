@@ -69,6 +69,21 @@ def test_empty_results_and_constant_scores_are_explicit():
     assert "No reported attack results" in format_attack_table([])
 
 
+def test_www_risk_loss_summary_explicitly_reports_no_clipping_or_dp_guarantee():
+    from privacy_defenses.controller import DefenseController
+
+    defense = DefenseController({"name": "www", "target_epsilon": 16}, torch.device("cpu"), 2, 2, 1)
+    display = format_run_summary(
+        model="bert_adapter", dataset="cola", method="fedsgd", total_rounds=1,
+        metrics={}, defense=defense.summary(), attacks=[], results_dir="/tmp/toy",
+    )
+    assert "Noise: disabled" in display and "Formal DP: no" in display
+    assert "risk-controlled loss" in display and "Clipping: disabled" in display
+    assert "Regularization weight: 1.0000" in display
+    assert "Epsilon/Delta: N/A" in display
+    assert "Privacy accounting (unit: record)" not in display
+
+
 @pytest.mark.parametrize("model_type", ["clip_mlp", "bert_adapter"])
 def test_completed_server_emits_one_shared_result_block(model_type, tmp_path, monkeypatch, caplog):
     from aggregator.aggregator_builder import build_aggregator

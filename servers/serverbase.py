@@ -774,13 +774,17 @@ class ServerBase:
         status = "failed"
         try:
             with self.timings.measure("run"):
+                self.defense.start_www_gradient_diagnostics(self.results_dir)
                 summaries = self._train()
             status = "completed"
             return summaries
         finally:
-            self.timings.save(
-                os.path.join(self.results_dir, "performance_summary.json"), status=status,
-            )
+            try:
+                self.defense.finish_www_gradient_diagnostics(status)
+            finally:
+                self.timings.save(
+                    os.path.join(self.results_dir, "performance_summary.json"), status=status,
+                )
 
     def _train(self) -> list[dict]:
         self.ctx.set_base_model_state(
@@ -864,14 +868,14 @@ class ServerBase:
                 if self.federated_method == "fedsgd":
                     if (
                         user.last_update_sample_count <= 0
-                        and self.defense.name not in {"record_dp", "www"}
+                        and self.defense.name != "record_dp"
                     ):
                         raise RuntimeError(
                             f"FedSGD client {user_id} did not consume a mini-batch."
                         )
                     self.ctx.update_sample_counts[user_id] = (
                         user.record_dp_expected_batch_size
-                        if self.defense.name in {"record_dp", "www"}
+                        if self.defense.name == "record_dp"
                         else user.last_update_sample_count
                     )
                     if (

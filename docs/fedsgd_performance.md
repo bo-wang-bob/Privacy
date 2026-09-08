@@ -2,25 +2,30 @@
 
 优化以 WWW Poisson DP 实现 `d63b5a6` 为基准，覆盖 WWW、BERT Adapter 普通样本级 DP 的梯度计算，以及 BERT/GPT2 的文本梯度审计。
 
+当前 WWW 使用普通打乱后分批采样，对 CE 加风险加权的预测差异正则，不裁剪、不加噪、不做 DP 会计。训练本身只需一次整批反向传播；默认启用的风险与范数诊断另需逐样本求导。下文历史裁剪基准数据保持原样，不能视为当前版本的训练耗时。
+
 ## 默认行为
 
 | 配置 | 默认值 | 作用 |
 | --- | --- | --- |
-| `defense.grad_sample_backend` | `auto` | WWW 与 BERT Adapter Record-DP 使用 batched VJP |
-| `defense.microbatch_size` | `4` | 一次求导保留的记录数 |
+| `defense.grad_sample_backend` | `auto` | WWW 范数诊断与 BERT Adapter Record-DP 训练使用 batched VJP |
+| `defense.microbatch_size` | `4` | 一次逐样本求导保留的记录数；WWW 训练前向仍使用完整 batch |
+| `defense.www_record_diagnostics` | `true` | 关闭可省去 WWW 范数诊断的逐样本求导及 CSV 输出 |
 | `audit.grad_sample_backend` | `auto` | 文本余弦/Gradient-Diff 审计使用 batched VJP |
 | `audit.grad_sample_chunk_size` | `4` | 一次审计求导保留的候选数 |
 | `audit.gradient_update_cache_mb` | `2048` | 上传向量 GPU 缓存上限（MiB），0 表示使用 CPU |
 
-原来的循环逐个调用 backward。新的实现先对最多 4 条完整记录前向，得到各自的 loss，再用 batched VJP 一次求出这些 loss 对客户端可训练参数的独立梯度。文本中的一条记录仍是完整序列。它直接使用当前计算图和客户端参数对象，兼容 BERT 共享主干的参数绑定；不通过 functional_call 替换共享模型参数。
+普通 DP 和常规梯度审计先对最多 4 条完整记录前向，再用 batched VJP 一次求出各条 loss 对可训练参数的独立梯度。文本中的一条记录仍是完整序列。它直接使用当前计算图和客户端参数对象，兼容 BERT 共享主干的参数绑定；不通过 functional_call 替换共享模型参数。
 
-每条梯度仍在全部可训练参数上计算联合 L2 范数。普通 DP 裁剪到 C；WWW 在此基础上乘该记录的 INO 积分权重。所有块累加后才添加一次噪声，除以固定期望 batch 大小，执行一次 optimizer step 并捕获一次上传。服务器继续对参与客户端等权聚合。实际 Poisson batch 可能跨越任意多个计算块；尾部排序仍基于整个实际 batch，尾部宽度仍由期望 batch 决定。空 batch 保留纯噪声更新和一次会计步数。
+普通 DP 对全部可训练参数计算每条梯度的联合 L2 范数并裁剪到 C；所有块累加后添加一次噪声，除以固定期望 batch 大小。Poisson 空 batch 保留纯噪声更新和会计步数。WWW 使用非空的普通打乱批次，先确定冻结的风险权重和参考预测，再对完整 batch 前向，构造 `mean(CE + lambda*r*abs(p_y-q_y))`，直接 backward。两者均执行一次 optimizer step 并捕获一次上传，服务器继续等权聚合。
+
+WWW 范数诊断复用本次完整 batch 前向图和同一 dropout，实现按 loss 切片分块求导，不写入参数 `.grad`。计算 CE 范数后，用正则对 CE 的有符号系数推得正则/总损失范数；存在额外 code-poison 损失时实际计算总损失梯度范数。诊断需要额外反向计算，只保留当前块的逐样本梯度，但仍保留完整 batch 前向图，因此 `microbatch_size` 不限制前向激活显存。每批一次小张量 CPU 传输及 CSV 写盘，记录内存不随轮数增长。关闭诊断不会改变本次训练图或上传梯度，也不会关闭独立攻击审计。
 
 文本审计在一次信号计算内缓存各客户端上传向量的 float64 表示，并对一块样本一起计算点积。缓存不超过配置上限且不超过当前空闲显存四分之一时，放在 GPU 上，避免每块梯度搬回 CPU；其余情况使用 CPU。缓存会在该次调用结束后释放，避免复用过期模型/上传。余弦使用真实标签交叉熵梯度；Gradient-Diff 使用所有标签损失之和的梯度，目标客户端顺序、上传符号、学习率缩放与 float64 归约保持原定义。30 个客户端、约 709 万个可训练参数时，缓存约占 **1.59 GiB**，不随候选池大小增长；逐记录梯度仅保留当前块。
 
-`auto` 在启用 Transformer gradient checkpointing 时选择 `loop`。ResNet18 保留原 functional `vmap` 后端。自定义额外逐记录损失走已有循环实现。显式 `loop` 可用于复核或处理新模型不支持的批量求导算子。没有静默捕获 OOM 后跳过记录的行为。
+`auto` 在启用 Transformer gradient checkpointing 时选择 `loop`。ResNet18 Record-DP 保留原 functional `vmap` 后端。Record-DP 自定义额外逐记录损失走已有循环实现。显式 `loop` 可用于复核或处理新模型不支持的批量求导算子。没有静默捕获 OOM 后跳过记录的行为。
 
-FP32 下改变批矩阵计算与求和顺序会产生小数值差异；存在 dropout 时，相同公开 seed 也不保证分块前后抽到完全相同的随机掩码。实现保留 dropout 配置和私有采样/噪声生成器，不能据此承诺逐位一致的训练轨迹。
+FP32 下改变批矩阵计算与求和顺序会产生小数值差异；普通 DP/审计改变前向分块还可能改变 dropout 掩码。当前 WWW 诊断始终复用同一个完整 batch 前向图，因此诊断开关及求导块大小不改变训练时使用的 dropout；这不表示它与历史分块裁剪版本有相同训练轨迹。
 
 ## 运行
 
@@ -33,9 +38,9 @@ python scripts/run_privacy_experiments.py \
   --set defense.target_epsilon=8 --set defense.max_grad_norm=8
 ```
 
-将期望 batch 调整为 32 时加 `--set batch_size=32`；预算改为 16 时把 epsilon 参数改为 `--set defense.target_epsilon=16`。计算块默认仍为 4。实际采样率和对应噪声会按最终配置重新校准。
+将期望 batch 调整为 32 时加 `--set batch_size=32`；普通 DP 预算改为 16 时把 epsilon 参数改为 `--set defense.target_epsilon=16`，WWW 忽略此预算并保持零噪声。计算块默认仍为 4。实际采样率按最终 batch 配置确定，普通 DP 的噪声据此重新校准。
 
-统一入口会在应用全部覆盖参数后自动匹配 ProjRes 候选配置。普通训练按最终 batch 大小和成员/非成员比例推导，WWW/Record-DP 使用 `0/0/0` 表示真实 Poisson batch 的动态候选；无需分别填写这些参数。显式指定的候选值仍保留，不符合协议时由现有校验报错。以下一条命令比较无 DP、普通 DP、WWW，共六个训练任务：
+统一入口会在应用全部覆盖参数后自动匹配 ProjRes 候选配置。普通训练和 WWW 按最终 batch 大小及成员/非成员比例推导，Record-DP 使用 `0/0/0` 表示真实 Poisson batch 的动态候选；无需分别填写这些参数。显式指定的候选值仍保留，不符合协议时由现有校验报错。以下一条命令比较无 DP、普通 DP、WWW，共六个训练任务：
 
 ```bash
 python scripts/run_privacy_experiments.py \
@@ -61,7 +66,7 @@ python scripts/run_privacy_experiments.py \
   --output /tmp/fedsgd_gradient_benchmark.json
 ```
 
-默认读取仓库本地 BERT-Base 权重，使用 batch 16/32、序列长度 128、计算块 4、30 个合成客户端上传向量。每个阶段先在 eval 模式检查梯度/信号一致性，再预热并重复测量；梯度计时使用 train 模式，审计使用 eval 模式。旧普通 DP 与旧审计算法保留在基准脚本中作为对照。脚本不读取真实训练记录、不训练 500 轮，也不修改 `results/`；JSON 已存在时拒绝覆盖。
+默认读取仓库本地 BERT-Base 权重，使用 batch 16/32、序列长度 128、计算块 4、30 个合成客户端上传向量。每个阶段先在 eval 模式检查梯度/信号一致性，再预热并重复测量；梯度计时使用 train 模式，审计使用 eval 模式。该脚本中的 WWW 项仍测量历史 INO 裁剪辅助函数，不测量当前风险损失训练。旧普通 DP 与旧审计算法保留作为对照。脚本不读取真实训练记录、不训练 500 轮，也不修改 `results/`；JSON 已存在时拒绝覆盖。
 
 报告包括每次耗时、中位数、GPU 峰值已分配显存、eval 最大绝对误差与相对 L2 误差。测量范围是逐记录梯度/裁剪及文本梯度审计，**不包括 WWW 排序、加噪、optimizer、上传、服务器聚合或其余攻击**，因此阶段加速倍数不能直接当作完整实验加速倍数。
 
@@ -125,8 +130,12 @@ BERT Adapter/LoRA 和 GPT2 Adapter 在评估时只加载一次全局参数，随
 | `run` | `ServerBase.train`，包括训练前评估、训练、审计和最终输出；不含模型/数据加载 |
 | `train.client_update` | 客户端完整训练调用，包括参数绑定、采样和防御 |
 | `train.www_ranking` | WWW 参考状态切换与两次 loss 计算、排序 |
-| `train.record_gradients` | WWW/Record-DP 逐记录前向、求导、裁剪及加权归约 |
-| `train.noise_and_step` | 添加一次噪声、归一化及一次 optimizer step |
+| `train.record_gradients` | Record-DP 逐记录前向、求导、裁剪归约；历史 WWW 版本也使用此阶段 |
+| `train.noise_and_step` | Record-DP 添加一次噪声、归一化及一次 optimizer step |
+| `train.www_loss_forward` | WWW 当前 batch 的前向、CE 与风险正则构造 |
+| `train.www_gradient_diagnostics` | WWW 可选的逐样本梯度范数计算 |
+| `train.www_backward_step` | WWW 平均组合损失的一次 backward 和 optimizer step |
+| `train.www_diagnostics` | WWW 按 batch 导出风险/范数、分组分位数与相关系数 |
 | `train.aggregation` | 服务器聚合 |
 | `audit.observe` | 一轮审计信号采集 |
 | `audit.gradient_measurements` | 上传缓存、梯度前向、求导、归约的总耗时 |

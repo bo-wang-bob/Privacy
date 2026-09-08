@@ -148,15 +148,20 @@ def test_shared_evaluation_restores_global_state_on_forward_error(tmp_path, monk
 
 
 @pytest.mark.parametrize("defense", ["www", "record_dp"])
-def test_private_step_timings_include_ranking_gradients_and_noise(defense, tmp_path, monkeypatch):
+def test_step_timings_distinguish_www_loss_from_record_dp_noise(defense, tmp_path, monkeypatch):
     server = make_server(tmp_path, monkeypatch, "bert_adapter", defense=defense)
     server.train()
     stages = json.loads((tmp_path / "performance_summary.json").read_text())["stages"]
-    assert stages["train.record_gradients"]["calls"] == 2
-    assert stages["train.noise_and_step"]["calls"] == 2
     assert stages["evaluation"]["calls"] == 2
     if defense == "www":
         assert stages["train.www_ranking"]["calls"] == 2
+        assert stages["train.www_backward_step"]["calls"] == 2
+        assert stages["train.www_gradient_diagnostics"]["calls"] == 2
+        assert "train.clipping_step" not in stages and "train.record_gradients" not in stages
+        assert "train.noise_and_step" not in stages
+    else:
+        assert stages["train.record_gradients"]["calls"] == 2
+        assert stages["train.noise_and_step"]["calls"] == 2
 
 
 def test_timings_record_failure_and_can_be_disabled(tmp_path):

@@ -113,6 +113,16 @@ class UserBase:
             if self._www_enabled
             else None
         )
+        self.www_trainloader = (
+            DataLoader(
+                _IndexedDataset(train_data), batch_size=batch_size, shuffle=True,
+                collate_fn=self._collate_indexed_batch, drop_last=False,
+                generator=torch.Generator().manual_seed(
+                    int(self.method_config.get("seed", 42)) + 1000003 * int(self.id)
+                ),
+            ) if self._www_enabled else None
+        )
+        self._www_train_iterator = None
         self.testloader = DataLoader(
             test_data,
             batch_size=eval_batch_size,
@@ -142,9 +152,9 @@ class UserBase:
         self.www_ranked_labels: torch.Tensor | None = None
         self.www_local_indices: torch.Tensor | None = None
         self.www_ranked_local_indices: torch.Tensor | None = None
-        self.www_importance_weights: torch.Tensor | None = None
+        self.www_risk_weights: torch.Tensor | None = None
+        self.www_reference_probability: torch.Tensor | None = None
         self.www_tail_mask: torch.Tensor | None = None
-        self.www_effective_clip_norms: torch.Tensor | None = None
         self.www_tail_local_indices: torch.Tensor | None = None
         self.www_score_count: torch.Tensor | None = None
         self.www_score_sum: torch.Tensor | None = None
@@ -222,11 +232,28 @@ class UserBase:
         self._record_train_batch(images, labels)
         return images, labels
 
-    def iter_www_local_batches(self, generator: torch.Generator):
-        """Yield the same Poisson draws as Record-DP with stable local indices."""
+    def iter_www_local_batches(self):
+        """Yield indexed shuffled batches; FedSGD cycles one batch per round."""
         if not self._www_enabled:
             raise RuntimeError("Indexed WWW training is not enabled for this client.")
-        yield from self.iter_poisson_batches(generator)
+        if self.federated_method == "fedsgd":
+            if self._www_train_iterator is None:
+                self._www_train_iterator = iter(self.www_trainloader)
+            try:
+                batch = next(self._www_train_iterator)
+            except StopIteration:
+                self._www_train_iterator = iter(self.www_trainloader)
+                batch = next(self._www_train_iterator)
+            images, labels, indices = batch
+            self._record_train_batch(images, labels)
+            self.last_train_indices = indices.detach().cpu().long().clone()
+            yield images, labels, self.last_train_indices.clone()
+            return
+        for _ in range(self.local_epochs):
+            for images, labels, indices in self.www_trainloader:
+                self._record_train_batch(images, labels)
+                self.last_train_indices = indices.detach().cpu().long().clone()
+                yield images, labels, self.last_train_indices.clone()
 
     def iter_www_statistics_batches(self):
         """Yield the complete local training set once in stable index order."""
@@ -295,8 +322,8 @@ class UserBase:
         Empty draws are retained because conditioning on a non-empty draw would
         not match the sampled-Gaussian privacy accountant.
         """
-        if not (self._record_dp_enabled or self._www_enabled):
-            raise RuntimeError("Poisson batches require defense.name=record_dp or www.")
+        if not self._record_dp_enabled:
+            raise RuntimeError("Poisson batches require defense.name=record_dp.")
         if self.train_samples <= 0 or self.record_dp_sample_rate <= 0:
             raise ValueError(f"Client {self.id} has no local training records.")
         for _ in range(self.record_dp_steps_per_update):
