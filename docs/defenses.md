@@ -1,12 +1,21 @@
 # 联邦成员隐私防御
 
+## FedSGD / FedAvg 适配说明
+
+六种 PEFT 模型可在统一入口用 `--methods` 切换。WWW、CoFedMID 和 BERT Adapter
+Record-DP 已接入 FedAvg 多 batch/多 epoch 本地训练；`local_client_dp` 仍只支持
+FedSGD。FedAvg 对原始完整客户端训练集做成员评价，不能把防御选择的最后一个
+batch 当作整个上传的成员集合；CoFedMID 的选择/回收曝光另存，Record-DP 按
+多步 Poisson 训练校准预算。下文 one-batch 默认值描述 FedSGD；FedAvg 的损失、
+参考状态、上传扰动和攻击适配详见 [联邦方法文档](federated_methods.md)。
+
 仓库支持多种彼此独立的防御。一次实验只能选择一个 `defense.name`，不会在后台组合其他防御。
 
 | 运行名 | 方法 | 当前适配 |
 |---|---|---|
 | `cofedmid` | [CoFedMID](https://www.usenix.org/conference/usenixsecurity26/presentation/bai)，USENIX Security 2026 | 六个 PEFT 模型的动态类别分配、EXP3 回收、软目标正则、聚合中性上传扰动；默认全客户端联盟 |
 | `prompt_dp` | [Differentially Private Prompt Learning](https://proceedings.neurips.cc/paper_files/paper/2023/hash/f26119b4ffe38c24d97e4c49d334b99e-Abstract-Conference.html)，NeurIPS 2023 | 逐样本 prompt 梯度裁剪和高斯噪声，冻结 CLIP 参数不参与隐私优化 |
-| `record_dp` | 客户端侧记录级 DP-SGD | Poisson 记录采样、完整可训练参数联合梯度裁剪、sampled-Gaussian RDP 会计；支持 ResNet18 FedAvg 与 BERT Adapter one-batch FedSGD |
+| `record_dp` | 客户端侧记录级 DP-SGD | Poisson 记录采样、完整可训练参数联合梯度裁剪、sampled-Gaussian RDP 会计；支持 ResNet18 FedAvg 与 BERT Adapter FedSGD/FedAvg |
 | `mist` | [MIST](https://www.usenix.org/conference/usenixsecurity24/presentation/li-jiacheng)，USENIX Security 2024 | 将客户端数据分区视为 MIST 子空间，先本地训练，再以其他客户端预测作为反事实目标做 cross-difference 更新 |
 | `soft` | [SOFT](https://www.usenix.org/conference/usenixsecurity25/presentation/zhang-kaiyuan)，USENIX Security 2025 | 第一轮 warm-up；随后用客户端验证损失均值选择低损失高风险样本，并以视觉翻转和噪声替代文本 paraphrase |
 | `hamp` | [HAMP](https://www.ndss-symposium.org/wp-content/uploads/2024-14-paper.pdf)，NDSS 2024 | 高熵软标签、预测熵正则，以及可微且保持 `argmax` 的温度输出映射 |

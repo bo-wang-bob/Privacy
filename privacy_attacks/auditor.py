@@ -41,6 +41,7 @@ from privacy_defenses.www_validation import (
     validate_www_attack_relationships,
 )
 from utils.data_loader import group_idx_by_class
+from utils.federated_protocol import resolve_membership_protocol, update_membership_attacks
 from utils.per_sample_gradients import gradients_from_losses, resolve_grad_sample_backend
 from utils.performance import timed_torch_save, measure_stage, timed_stage
 
@@ -188,6 +189,7 @@ class MembershipAuditor:
         self.defense_config = dict(defense_config or {"name": "none"})
         self.defense_name = str(self.defense_config.get("name", "none")).lower()
         self.federated_method = str(federated_method).lower()
+        resolve_membership_protocol(self.config, self.federated_method)
         self.model_type = str(getattr(model, "model_type", "prompt"))
         self.audit_view = str(
             self.config.get("audit_view", "protocol_plus_released_prompts")
@@ -402,9 +404,8 @@ class MembershipAuditor:
             raise ValueError(
                 "audit.nonmember_to_member_ratio must be positive."
             )
-        configured_batch_attacks = self.config.get(
-            "exact_batch_membership_attacks", []
-        )
+        resolve_membership_protocol(self.config, self.federated_method)
+        configured_batch_attacks = update_membership_attacks(self.config)
         if not isinstance(configured_batch_attacks, list):
             raise ValueError(
                 "audit.exact_batch_membership_attacks must be a list."
@@ -454,6 +455,9 @@ class MembershipAuditor:
             self.nonmember_to_member_ratio,
         )
         self.exact_batch_nonmember_ratio = int(configured_exact_batch_ratio)
+        if getattr(self, "federated_method", "fedsgd") == "fedavg":
+            configured_exact_batch_ratio = self.nonmember_to_member_ratio
+            self.exact_batch_nonmember_ratio = int(configured_exact_batch_ratio)
         if (
             isinstance(configured_exact_batch_ratio, bool)
             or self.exact_batch_nonmember_ratio < 1
@@ -1011,7 +1015,7 @@ class MembershipAuditor:
             "clip_mlp",
             "clip_adapter",
             "visual_adapter",
-        }:
+        } or getattr(self.model, "adapter_variant", "feature") == "transformer":
             raise ValueError(
                 "low_fpr_full currently requires a frozen-CLIP feature model."
             )
@@ -2185,7 +2189,58 @@ class MembershipAuditor:
     def _exact_batch_membership_definition(self) -> str:
         if getattr(self, "federated_method", "fedsgd") == "fedsgd":
             return "current_round_exact_upload_batch"
-        return "current_round_last_local_training_batch"
+        return "target_client_original_training_set"
+
+    def _update_candidate_file(self) -> str:
+        return ("client_train_update_candidate_selection.pt"
+                if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                else "exact_batch_candidate_selection.pt")
+
+    def _update_fpr_targets(self) -> tuple[float, ...]:
+        return ((0.1, 0.01, 0.001)
+                if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                else _EXACT_BATCH_REPORTED_FPR_TARGETS)
+
+    def _update_label_matching_mode(self) -> str:
+        if getattr(self, "federated_method", "fedsgd") == "fedavg":
+            return (self.low_fpr_candidate_selection or {}).get("label_matching_mode")
+        return "exact_batch_histogram_ratio"
+
+    def _build_client_train_candidates(self, round_index: int) -> dict:
+        """Audit original dataset membership on a fixed, complete local pool.
+
+        For selected-pool/Poisson defenses this is dataset membership, not a
+        claim that every member was visited during this round. Repeated local
+        epochs do not duplicate members or improve the nominal FPR resolution.
+        """
+        member_mask = self.membership == 1
+        selection = self.low_fpr_candidate_selection
+        indices = selection["member_pool_indices"].clone()
+        recycled = torch.zeros(indices.numel(), dtype=torch.bool)
+        return {
+            "inputs": self.images,
+            "inputs_are_features": self.candidate_inputs_are_features,
+            "member_inputs": self.images[member_mask],
+            "nonmember_inputs": self.images[~member_mask],
+            "labels": self.labels,
+            "membership": self.membership,
+            "member_local_indices": indices,
+            "member_recycled": recycled,
+            "nonmember_pool_indices": selection["nonmember_pool_indices"],
+            "selection": {
+                **selection,
+                "communication_round": int(round_index) + 1,
+                "target_client_id": int(self.target_client_id),
+                "membership_definition": self._exact_batch_membership_definition(),
+                "nonmember_training_exposure": "never_trained",
+                "member_count": int(member_mask.sum()),
+                "nonmember_count": int((~member_mask).sum()),
+                "nonmember_to_member_ratio": self.exact_batch_nonmember_ratio,
+                "member_local_indices": indices,
+                "member_recycled": recycled,
+                "candidate_selection_file": "candidate_selection.pt",
+            },
+        }
 
     def _cofedmid_metadata(self) -> dict | None:
         if getattr(self, "defense_name", "none") != "cofedmid":
@@ -2209,6 +2264,8 @@ class MembershipAuditor:
 
     def _build_exact_batch_candidates(self, round_index: int) -> dict:
         """Pair the target client's real upload batch with matched holdouts."""
+        if getattr(self, "federated_method", "fedsgd") == "fedavg":
+            return self._build_client_train_candidates(round_index)
         target = self.users[self.target_client_id]
         if target.last_train_batch is None:
             raise ValueError(
@@ -2321,7 +2378,7 @@ class MembershipAuditor:
                     self._exact_batch_membership_definition()
                 ),
                 "nonmember_training_exposure": "never_trained",
-                "label_matching_mode": "exact_batch_histogram_ratio",
+                "label_matching_mode": self._update_label_matching_mode(),
                 "sampling_seed": int(sampling_seed),
                 "nonmember_to_member_ratio": int(ratio),
                 "member_count": int(member_labels.numel()),
@@ -2354,7 +2411,7 @@ class MembershipAuditor:
         protocol_message: dict | None,
         learning_rate: float | None,
     ) -> tuple[torch.Tensor | None, dict, dict | None]:
-        """Run ProjRes, or return a skip reason for a zero WWW upload."""
+        """Run ProjRes, or return a skip reason for an uninformative zero upload."""
         member_count = int((membership == 1).sum())
         nonmember_count = int((membership == 0).sum())
         if member_count + nonmember_count != labels.numel():
@@ -2385,12 +2442,21 @@ class MembershipAuditor:
                 )
         self.model.load_state_dict(base_state, strict=False)
         extractor = self.model.get_projres_representations
-        member_representations, hidden_vector_count = extractor(
-            member_inputs,
-            parameter_name=parameter_name,
-            token_reduction=token_reduction,
-        )
-        representation_parts = [member_representations.detach().cpu().float()]
+        representation_parts = []
+        hidden_vector_count = 0
+        for start in range(0, member_count, self.audit_batch_size):
+            member_chunk = member_inputs[start:start + self.audit_batch_size]
+            representations, vector_count = extractor(
+                member_chunk,
+                parameter_name=parameter_name,
+                token_reduction=token_reduction,
+            )
+            if self.model_type == "clip_lora":
+                # CLIP-LoRA returns tokens per image; text extractors already
+                # return the total active-token count for the complete chunk.
+                vector_count *= int(member_chunk.shape[0])
+            hidden_vector_count += int(vector_count)
+            representation_parts.append(representations.detach().cpu().float())
         for start in range(0, nonmember_count, self.audit_batch_size):
             stop = start + self.audit_batch_size
             representations, _ = extractor(
@@ -2418,14 +2484,16 @@ class MembershipAuditor:
                 )
             observed_update = tensors[parameter_name].detach().cpu().float()
             update_source = "uploaded_client_gradient"
+        elif protocol_message is not None and protocol_message.get("kind") == "model_update":
+            observed_update = -protocol_message["tensors"][parameter_name].detach().cpu().float()
+            update_source = "negative_uploaded_model_delta"
         else:
             observed_update = (
                 base_state[parameter_name].detach().cpu().float()
                 - updated_state[parameter_name].detach().cpu().float()
             )
             update_source = "base_minus_client_post_state"
-        if (getattr(self, "defense_name", "none") == "www"
-                and not bool(torch.count_nonzero(observed_update))):
+        if not bool(torch.count_nonzero(observed_update)):
             # With noise removed, e.g. zero-initialized LoRA B can make A's
             # first upload exactly zero. ProjRes has no informative subspace;
             # retain the other attacks and explicitly record this omission.
@@ -2453,7 +2521,8 @@ class MembershipAuditor:
                     parameter_perturbed = offset + width > tail_start
                     break
                 offset += width
-        rank_bound = None if parameter_perturbed else int(hidden_vector_count)
+        rank_bound = (None if parameter_perturbed or getattr(self, "federated_method", "fedsgd") == "fedavg"
+                      else int(hidden_vector_count))
         attack = strict_mlp_projres(
             observed_update,
             candidate_representations,
@@ -2467,11 +2536,12 @@ class MembershipAuditor:
             sample_indices=torch.arange(labels.numel()),
         )
         summary = attack_result.to_summary(
-            fpr_targets=_EXACT_BATCH_REPORTED_FPR_TARGETS
+            fpr_targets=self._update_fpr_targets()
         )
         paper_fedsgd_exact = (
             getattr(self, "federated_method", "fedsgd") == "fedsgd"
             and getattr(self, "defense_name", "none") != "www"
+            and not getattr(self.model, "projres_token_aggregate", False)
         )
         if cofedmid and (cofedmid["upload_perturbed"] or cofedmid["custom_training_loss"]):
             paper_fedsgd_exact = False
@@ -2479,7 +2549,9 @@ class MembershipAuditor:
             sample_representation = "clip_image_feature_input_to_first_mlp_projection"
         elif self.model_type in {"clip_adapter", "visual_adapter"}:
             sample_representation = (
-                "clip_image_feature_input_to_adapter_down_projection"
+                f"{token_reduction}_token_input_to_visual_transformer_adapter_down_projection"
+                if getattr(self.model, "adapter_variant", "feature") == "transformer"
+                else "clip_image_feature_input_to_adapter_down_projection"
             )
         elif self.model_type in {"clip_lora", "bert_lora"}:
             sample_representation = (
@@ -2496,21 +2568,31 @@ class MembershipAuditor:
             "sample_representation": sample_representation,
             "membership_definition": self._exact_batch_membership_definition(),
             "nonmember_training_exposure": "never_trained",
-            "label_matching_mode": "exact_batch_histogram_ratio",
+            "label_matching_mode": self._update_label_matching_mode(),
             "nonmember_to_member_ratio": self.exact_batch_nonmember_ratio,
             "communication_round": int(round_index) + 1,
-            "observed_hidden_vector_count": int(hidden_vector_count),
+            "candidate_hidden_vector_count": int(hidden_vector_count),
+            "observed_hidden_vector_count": (
+                None if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                else int(hidden_vector_count)
+            ),
             "observed_update_norm": float(observed_update.norm()),
             "update_source": update_source,
             "learning_rate": (
                 None if learning_rate is None else float(learning_rate)
             ),
             "paper_fedsgd_exact": paper_fedsgd_exact,
+            "interpretation": ("empirical_multistep_model_delta_projection"
+                               if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                               else "empirical_token_aggregate_gradient_projection"
+                               if getattr(self.model, "projres_token_aggregate", False)
+                               else "observed_batch_gradient_projection"),
+            "representation_state": "round_start_global_model",
             "cofedmid": cofedmid,
             "attacked_parameter_perturbed": parameter_perturbed,
             "batch_rank_bound": rank_bound,
             "reported_fpr_targets": list(
-                _EXACT_BATCH_REPORTED_FPR_TARGETS
+                self._update_fpr_targets()
             ),
         }
         batch_positions = list(range(member_count))
@@ -2520,9 +2602,11 @@ class MembershipAuditor:
             "threat_model": {
                 "communication_round": int(round_index) + 1,
                 "member_definition": (
-                    "present_in_the_observed_target_client_fedsgd_batch"
+                    self._exact_batch_membership_definition()
                 ),
-                "execution": "unified_exact_batch_auditor",
+                "execution": ("unified_client_train_auditor"
+                              if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                              else "unified_exact_batch_auditor"),
                 "paper_fedsgd_exact": paper_fedsgd_exact,
             },
             "dimensions": {
@@ -2531,7 +2615,7 @@ class MembershipAuditor:
                 "nonmember_candidate_count": nonmember_count,
                 "input_dimension": int(attacked_layer.in_features),
                 "first_layer_output_dimension": int(attacked_layer.out_features),
-                "observed_hidden_vector_count": int(hidden_vector_count),
+                "observed_hidden_vector_count": metadata["observed_hidden_vector_count"],
             },
             "optimization": {
                 "learning_rate": (
@@ -2548,10 +2632,15 @@ class MembershipAuditor:
                 "predictions": None,
             },
             "candidate_controls": {
-                "label_matched_nonmembers": True,
-                "label_matching_mode": "exact_batch_histogram_ratio",
+                "label_matched_nonmembers": torch.equal(
+                    torch.bincount(labels[member_count:], minlength=int(labels.max()) + 1),
+                    torch.bincount(labels[:member_count], minlength=int(labels.max()) + 1)
+                    * self.exact_batch_nonmember_ratio,
+                ),
+                "label_matching_mode": self._update_label_matching_mode(),
                 "member_labels": labels[:member_count].tolist(),
-                "member_batch_positions": batch_positions,
+                ("member_candidate_positions" if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                 else "member_batch_positions"): batch_positions,
                 "member_local_indices": member_local_indices.tolist(),
                 "nonmember_labels": labels[member_count:].tolist(),
                 "nonmember_pool_indices": nonmember_pool_indices.tolist(),
@@ -3406,6 +3495,16 @@ class MembershipAuditor:
             self.audit_view == "protocol_plus_released_prompts"
             and self.federated_method in {"fedavg", "promptfl"}
         ):
+            if base_state is not None and protocol_message is not None:
+                if protocol_message.get("kind") not in {"model_update", "global_prompt_update"}:
+                    raise ValueError("FedAvg auditing requires a model-update protocol message.")
+                tensors = protocol_message.get("tensors", {})
+                if set(tensors) != set(base_state):
+                    raise ValueError("FedAvg update tensors must match the trainable base state.")
+                return {
+                    name: value.detach() + tensors[name].detach().to(value)
+                    for name, value in base_state.items()
+                }
             # The full FedAvg model update is itself a protocol message.
             return updated_state
         if not released_states:
@@ -3523,7 +3622,7 @@ class MembershipAuditor:
                 "client did not upload."
             )
         retained_batch = self.users[target_id].last_train_batch
-        if (self.defense_name == "record_dp"
+        if (self.federated_method == "fedsgd" and self.defense_name == "record_dp"
                 and retained_batch is not None and retained_batch[1].numel() == 0):
             # A noise-only Record-DP step has no true
             # batch members on which to define these six membership attacks.
@@ -3575,7 +3674,7 @@ class MembershipAuditor:
                 require_representation=False,
                 candidate_inputs=inputs,
                 candidate_labels=labels,
-                candidate_inputs_are_features=False,
+                candidate_inputs_are_features=candidates.get("inputs_are_features", False),
             )
             observation["confidence"] = (-post_losses).unsqueeze(0)
             if attacks & {"score_diff", "score_ratio"}:
@@ -3586,7 +3685,7 @@ class MembershipAuditor:
                     require_representation=False,
                     candidate_inputs=inputs,
                     candidate_labels=labels,
-                    candidate_inputs_are_features=False,
+                    candidate_inputs_are_features=candidates.get("inputs_are_features", False),
                 )
                 observation["pre_confidence"] = (-pre_losses).unsqueeze(0)
 
@@ -3639,6 +3738,7 @@ class MembershipAuditor:
                 need_gradient_difference="gradient_diff" in attacks,
                 candidate_inputs=inputs,
                 candidate_labels=labels,
+                candidate_inputs_are_features=candidates.get("inputs_are_features", False),
             )
             if "grad_cosine" in attacks:
                 observation["cosine"] = measurements["cosine"]
@@ -3686,9 +3786,9 @@ class MembershipAuditor:
         self.exact_batch_observations.append(observation)
         self.exact_batch_candidate_selections.append(candidates["selection"])
         logger.info(
-            "Collected exact-batch membership signals for round %d: "
+            "Collected %s membership signals for round %d: "
             "attacks=%s, members=%d, nonmembers=%d",
-            round_index + 1,
+            self._exact_batch_membership_definition(), round_index + 1,
             ",".join(sorted(attacks)),
             int((candidates["membership"] == 1).sum()),
             int((candidates["membership"] == 0).sum()),
@@ -4528,12 +4628,17 @@ class MembershipAuditor:
                     self._exact_batch_membership_definition()
                 ),
                 "nonmember_training_exposure": "never_trained",
-                "label_matching_mode": "exact_batch_histogram_ratio",
+                "label_matching_mode": self._update_label_matching_mode(),
                 "nonmember_to_member_ratio": (
                     self.exact_batch_nonmember_ratio
                 ),
                 "communication_round": int(observation["round"]) + 1,
                 "cofedmid": self._cofedmid_metadata(),
+                "federated_method": getattr(self, "federated_method", "fedsgd"),
+                "gradient_update_interpretation": (
+                    "negative_model_delta_divided_by_round_learning_rate_cumulative_proxy"
+                    if getattr(self, "federated_method", "fedsgd") == "fedavg" else "uploaded_single_batch_gradient"
+                ),
                 "temporal_information": "single_round",
                 "round_reduction": "none",
                 "member_local_indices": observation[
@@ -4922,7 +5027,7 @@ class MembershipAuditor:
                     )
                     summary = result.to_summary(
                         fpr_targets=(
-                            _EXACT_BATCH_REPORTED_FPR_TARGETS
+                            self._update_fpr_targets()
                             if attack in self.exact_batch_membership_attacks
                             else (0.1, 0.01, 0.001)
                         )
@@ -4960,7 +5065,7 @@ class MembershipAuditor:
                     "fpr_resolution": summary["fpr_resolution"],
                     "score_degenerate": summary["score_degenerate"],
                 }
-                if attack not in self.exact_batch_membership_attacks:
+                if attack not in self.exact_batch_membership_attacks or self.federated_method == "fedavg":
                     row["tpr_at_fpr_0.001"] = reportable[
                         "tpr_at_fpr_0.001"
                     ]
@@ -5262,7 +5367,7 @@ class MembershipAuditor:
                     "rounds": self.exact_batch_candidate_selections,
                 },
                 os.path.join(
-                    self.results_dir, "exact_batch_candidate_selection.pt"
+                    self.results_dir, self._update_candidate_file()
                 ),
             )
         final_model = (
@@ -5286,6 +5391,12 @@ class MembershipAuditor:
                     torch.cuda.empty_cache()
                 result = self._run(attack, final_model, final_state)
                 result.metadata.setdefault("model_type", self.model_type)
+                result.metadata.setdefault("federated_method", self.federated_method)
+                if getattr(self, "federated_method", "fedsgd") == "fedavg":
+                    result.metadata.setdefault("membership_definition", "target_client_original_training_set")
+                    result.metadata.setdefault("gradient_update_interpretation",
+                                               "negative_model_delta_divided_by_round_learning_rate_cumulative_proxy")
+                    result.metadata.setdefault("local_epochs", self.users[self.target_client_id].local_epochs)
                 if self.model_type == "clip_mlp":
                     result.metadata.setdefault("trainable_scope", "mlp_only")
                     if attack == "promptmia":
@@ -5295,6 +5406,9 @@ class MembershipAuditor:
                 elif self.model_type in {"clip_adapter", "visual_adapter"}:
                     result.metadata.setdefault(
                         "trainable_scope", trainable_scope_name(final_model)
+                    )
+                    result.metadata.setdefault(
+                        "adapter_variant", getattr(final_model, "adapter_variant", "feature")
                     )
                     if attack == "promptmia":
                         result.metadata.setdefault(
@@ -5336,7 +5450,7 @@ class MembershipAuditor:
         record_dp_accounting = getattr(self, "record_dp_accounting", None)
         for result in self.results:
             fpr_targets = (
-                _EXACT_BATCH_REPORTED_FPR_TARGETS
+                self._update_fpr_targets()
                 if result.name in self.exact_batch_membership_attacks
                 else (0.1, 0.01, 0.001)
             )
@@ -5485,11 +5599,13 @@ class MembershipAuditor:
                         else "single_client"
                     ),
                     "defense": self.defense_name,
-                    "exact_batch_skipped_rounds": self.exact_batch_skipped_rounds,
+                    ("client_train_update_skipped_rounds" if self.federated_method == "fedavg"
+                     else "exact_batch_skipped_rounds"): self.exact_batch_skipped_rounds,
                     "cofedmid": self._cofedmid_metadata(),
                     "defense_validation_split_sha256": getattr(self.users[0], "defense_validation_split_sha256", None),
-                    "federated_method": self.federated_method,
+                    "federated_method": getattr(self, "federated_method", "fedsgd"),
                     "model_type": self.model_type,
+                    "federated_method": self.federated_method,
                     "audit_view": self.audit_view,
                     "signal_storage": {
                         "mode": self.signal_storage,
@@ -5525,7 +5641,8 @@ class MembershipAuditor:
                             else None
                         ),
                         "periodic_metric_rows": periodic_metric_rows,
-                        "exact_batch_membership": {
+                        ("client_train_membership" if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                         else "exact_batch_membership"): {
                             "enabled": bool(
                                 self.exact_batch_membership_attacks
                             ),
@@ -5536,17 +5653,15 @@ class MembershipAuditor:
                                 self._exact_batch_membership_definition()
                             ),
                             "nonmember_training_exposure": "never_trained",
-                            "label_matching_mode": (
-                                "exact_batch_histogram_ratio"
-                            ),
+                            "label_matching_mode": self._update_label_matching_mode(),
                             "nonmember_to_member_ratio": (
                                 self.exact_batch_nonmember_ratio
                             ),
                             "reported_fpr_targets": list(
-                                _EXACT_BATCH_REPORTED_FPR_TARGETS
+                                self._update_fpr_targets()
                             ),
                             "candidate_selection_file": (
-                                "exact_batch_candidate_selection.pt"
+                                self._update_candidate_file()
                                 if self.exact_batch_candidate_selections
                                 else None
                             ),
@@ -5748,7 +5863,8 @@ class MembershipAuditor:
                     "candidate_client_ids": self.candidate_client_ids,
                     "membership": self.membership,
                     "observations": self.observations,
-                    "exact_batch_observations": self.exact_batch_observations,
+                    ("client_train_update_observations" if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                     else "exact_batch_observations"): self.exact_batch_observations,
                     "storage_mode": self.signal_storage,
                 },
                 os.path.join(self.results_dir, "signals.pt"),

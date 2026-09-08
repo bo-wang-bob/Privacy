@@ -41,6 +41,67 @@ def make_server(tmp_path, monkeypatch, model_type, *, method="fedsgd", lr=.1,
     )
 
 
+@pytest.mark.parametrize("model_type,defense", [
+    (model, defense)
+    for model in ["clip_lora", "bert_adapter", "bert_lora", "gpt2_adapter"]
+    for defense in ["none", "cofedmid", "www"]
+    if not (model == "gpt2_adapter" and defense == "www")
+] + [("bert_adapter", "record_dp")])
+def test_multibatch_fedavg_shared_backbones_and_defenses(
+    model_type, defense, monkeypatch, tmp_path
+):
+    from test_clip_peft_fedsgd import _audit_config, ATTACKS
+    torch.manual_seed(42)
+    model = tiny_model(model_type, monkeypatch)
+    # Exercise nonzero LoRA/Adapter inner projections. Tiny first-round BERT
+    # query updates otherwise vanish when subtracting float32 model states.
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.requires_grad:
+                parameter.add_(torch.randn_like(parameter) * .02)
+    frozen = {n: p.detach().clone() for n, p in model.named_parameters() if not p.requires_grad}
+    audit = _audit_config()
+    audit["audit_batch_size"] = 4
+    audit["training_health_check"] = False
+    server = ServerBase(
+        device=torch.device("cpu"), dataset_name="toy", model=model,
+        train_sets=[toy_dataset(model_type, 2+i, 20+i) for i in range(2)],
+        test_sets=[toy_dataset(model_type, 12+i, 30+i) for i in range(2)],
+        class_names=["0", "1", "2"], batch_size=4, eval_batch_size=8,
+        learning_rate=.05, num_glob_iters=2, local_epochs=2, total_users=2,
+        results_dir=str(tmp_path), user_per_round=2, eval_interval=1,
+        aggregator=build_aggregator("fedavg", aggregation_weighting="sample_count"),
+        audit_config=audit,
+        projres_config={"enabled": True, "evaluation_interval": 1, "token_reduction": "mean"},
+        defense_config={"name": defense, "noise_multiplier": 0.5,
+                        "max_grad_norm": 1., "reproducible_noise": True,
+                        "www_record_diagnostics": False, "cofedmid_init_round": 1,
+                        "cofedmid_intervals": 1, "cofedmid_reproducible_noise": True},
+        method_config={"client_optimizer": "sgd", "seed": 42},
+    )
+    summaries = server.train()
+    assert server.auditor.errors == {}
+    missing = ATTACKS - {s["attack"] for s in summaries}
+    assert missing <= {"projres"}
+    if missing:
+        skipped = server.auditor.exact_batch_skipped_rounds
+        assert len(skipped) == 2
+        assert all(row["reason"] == "zero_observed_update" and row["attacks"] == ["projres"] for row in skipped)
+    assert all(s["member_count"] == 6 and s["nonmember_count"] == 6 for s in summaries)
+    assert server.ctx.aggregation_weights == {0: .4, 1: .6}
+    assert all(m["kind"] == "model_update" for m in server.ctx.protocol_messages.values())
+    for n, p in model.named_parameters():
+        if n in frozen:
+            torch.testing.assert_close(p, frozen[n], rtol=0, atol=0)
+    if defense in {"none", "www"}:
+        assert [u.last_update_sample_count for u in server.ctx.users] == [12, 18]
+    if defense == "record_dp":
+        assert dict(server.defense.steps) == {0: 8, 1: 12}
+        assert server.defense.record_dp_planned_steps == {0: 8, 1: 12}
+    metadata = json.loads((tmp_path / "federated_method_summary.json").read_text())
+    assert metadata["model_update_protocol"]["local_epochs"] == 2
+
+
 @pytest.mark.parametrize("model_type", ["clip_mlp", "clip_adapter", "clip_lora"])
 @pytest.mark.parametrize("method", ["fedsgd", "fedavg"])
 @pytest.mark.parametrize("lr", [.1, .005])

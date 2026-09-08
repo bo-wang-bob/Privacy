@@ -1,7 +1,7 @@
 # Federated PEFT Membership-Inference Benchmark
 
 本仓库用于研究联邦学习与参数高效微调（PEFT）中的成员隐私泄漏。当前维护的实验
-覆盖 ResNet18、CLIP-MLP、双侧 CLIP-Adapter、CLIP-LoRA、BERT-Base Adapter、
+覆盖 ResNet18、CLIP-MLP、逐层视觉 CLIP-Adapter、CLIP-LoRA、BERT-Base Adapter、
 BERT-Base LoRA 和 GPT2-Large Adapter，并在统一训练任务中完成模型训练、成员推理审计、低 FPR
 指标计算、候选集留档和结果汇总。
 
@@ -11,19 +11,32 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 
 ## 当前实验协议
 
+下表为默认协议。六种 CLIP/BERT/GPT2 PEFT 模型均可通过统一入口切换 FedSGD/FedAvg：
+
+```bash
+python scripts/run_privacy_experiments.py --models clip_mlp,clip_adapter,clip_lora,bert_adapter,bert_lora,gpt2_adapter --methods fedsgd,fedavg --defenses none
+```
+
+仅跑 FedAvg 使用 `--methods fedavg`，默认 **100 轮**，每轮 1 个完整本地 epoch、按本地样本数
+加权；可用 `--local-epochs` 和 `--aggregation-weighting` 调整。FedSGD 保持 one-batch
+协议。追加 `--dry-run` 可先核对配置。
+FedAvg 的 11 种攻击使用完整客户端训练集/独立 evaluation 固定候选；ProjRes 作为
+无单 batch 秩约束的经验性攻击。候选定义、更新量、评价边界和兼容性详见
+[`docs/federated_methods.md`](docs/federated_methods.md#统一切换-fedsgd--fedavg)。
+
 | 模型 | 可训练部分 | 联邦方法 | 每轮客户端训练 | 默认轮数 | 默认学习率 | 默认攻击 |
 | --- | --- | --- | --- | ---: | ---: | --- |
 | ResNet18 / CIFAR100 | 完整 CIFAR ResNet18（GroupNorm） | FedAvg | 1 个完整 local epoch | 300 | 0.1，逐轮乘 0.99 | FedMIA-Loss |
 | CLIP-MLP | 冻结 CLIP 图像编码器后的两层 MLP | FedSGD | 1 个 mini-batch / 1 次 SGD step | 150 | 0.1 | 11 种攻击 |
-| CLIP-Adapter | 图像、文本两侧瓶颈 Adapter | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.001 | 11 种攻击 |
-| CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.0002 | 11 种攻击 |
+| CLIP-Adapter | 视觉 Transformer 各 block 后的残差 Adapter；文本编码器冻结 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.01 | 11 种攻击 |
+| CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.01 | 11 种攻击 |
 | BERT-Base Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.005 | 11 种攻击 |
 | BERT-Base LoRA | 各层注意力 Query/Value 的 LoRA 因子和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.015 | 11 种攻击 |
 | GPT2-Large Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.001 | 11 种攻击 |
 
-当前正式 sweep 的共同约定：
+默认 FedSGD sweep 的共同约定：
 
-- CLIP 三种模型使用 10 个客户端、batch size 32、IID 划分和参与客户端等权 FedSGD；CLIP-MLP 与 CLIP-Adapter 使用每类 16 张训练图像，CLIP-LoRA 使用完整训练集。
+- CLIP 三种模型使用 10 个客户端、batch size 32、IID 划分和参与客户端等权 FedSGD，默认均使用全局每类 16 张训练图像。Adapter/LoRA 可通过配置切换全量或其他 few-shot 数量。
 - BERT/GPT2 使用 30 个客户端、IID 划分和 one-batch 等权 FedSGD。
 - BERT-LoRA 默认只展开 CoLA；SST-5 与 IMDb 仍可通过 `--datasets` 显式选择。
 - FedSGD 客户端上传各自的可训练参数梯度；服务器先等权聚合梯度，再执行一次
@@ -35,6 +48,44 @@ SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，�
 
 `main.py` 仍保留通用 CLIP prompt 和 PromptFL 兼容入口，但当前重点维护和批量
 复现的是上表中的七类模型。
+
+CLIP-Adapter 当前默认 `clip_adapter.variant: transformer`：在 ViT-B/32 的 12 个视觉
+block 后加入 `768 → 384 → 768` 残差 Adapter，上投影零初始化，保留 CLIP 文本相似度
+分类。图像、文本均实时编码，不预计算或缓存 feature；只保存类别提示词 token。
+客户端共享一个骨干，独立保存 Adapter 参数。旧末端双侧 Adapter 仍由 `variant: feature`
+选择；缺少 variant 的旧配置也按 feature 解释。结构、运行方式及审计边界见
+[`docs/clip_transformer_adapter.md`](docs/clip_transformer_adapter.md)。
+
+CLIP-Adapter/LoRA 的数据规模由各自 `configs/models/` 基线中的两个字段控制，
+FedSGD 与 FedAvg 使用相同规则：
+
+| 训练数据 | `use_full_dataset` | `fpl_shots` |
+| --- | --- | --- |
+| 默认全局每类 16 张 | `false` | `16` |
+| 全局每类 K 张 | `false` | 正整数 K |
+| 完整训练分区 | `true` | `null` |
+
+Few-shot 先从完整训练分区按类抽样，再分给客户端，不是每客户端各取 K 张。
+IID 划分要求每类训练样本数至少等于客户端数；更小的 K 需相应减少客户端数。
+两种数据规模都保留完整独立 evaluation/test 分区；防御若预留验证集，仍按其协议
+划分。新 Adapter/LoRA 任务不再使用旧 CIFAR100/Food101 的 50 张/类测试子集，
+few-shot 也不再先经过旧 200 张/类训练子集。历史结果保持原协议，应核对
+`run_config.yaml` 和日志中的实际样本数后再比较。
+
+可以直接修改模型 YAML，也可在统一入口覆盖：
+
+```bash
+# 两个模型默认均为 16-shot
+python scripts/run_privacy_experiments.py --models clip_adapter,clip_lora
+
+# 两个模型都使用完整训练分区
+python scripts/run_privacy_experiments.py --models clip_adapter,clip_lora \
+  --set use_full_dataset=true --set fpl_shots=null
+
+# 两个模型都使用全局每类 32 张
+python scripts/run_privacy_experiments.py --models clip_adapter,clip_lora \
+  --set use_full_dataset=false --set fpl_shots=32
+```
 
 ## 成员推理攻击
 
@@ -202,8 +253,10 @@ python scripts/run_privacy_experiments.py --list
 python scripts/run_privacy_experiments.py --dry-run --max-runs 1
 ```
 
-不指定模型时保持原 CLIP 统一入口的默认范围：CLIP-MLP、CLIP-Adapter、
-CLIP-LoRA 和五个图像数据集。常用组合如下：
+不指定模型时默认运行 CLIP-MLP、CLIP-Adapter、CLIP-LoRA，各模型依次运行
+CIFAR100、Food101；FedSGD/FedAvg 使用相同默认数据集范围。
+Caltech101、OxfordPets、Flowers102 仍可通过 `--datasets` 显式选择，
+`--datasets all` 展开全部五个支持的图像数据集。常用组合如下：
 
 ```bash
 # 单模型、单数据集、多个攻击
@@ -215,6 +268,16 @@ python scripts/run_privacy_experiments.py \
 python scripts/run_privacy_experiments.py \
   --models bert_adapter,bert_lora --datasets sst5,cola \
   --attacks all --defenses none,www
+
+# 六种 PEFT 模型的 FedAvg；统一默认 100 轮，其他参数沿用模型配置
+python scripts/run_privacy_experiments.py \
+  --models clip_mlp,clip_adapter,clip_lora,bert_adapter,bert_lora,gpt2_adapter \
+  --methods fedavg --attacks all --defenses none
+
+# CLIP/BERT 的 FedAvg：普通训练与 WWW 对照，各运行 100 轮
+python scripts/run_privacy_experiments.py \
+  --models clip_mlp,clip_adapter,clip_lora,bert_adapter,bert_lora \
+  --methods fedavg --attacks all --defenses none,www
 
 # 运行仓库全部模型以及每个模型正式支持的全部攻击/防御
 python scripts/run_privacy_experiments.py \
@@ -233,6 +296,9 @@ python scripts/run_privacy_experiments.py \
 模型选择全部 11 种攻击。显式指定不兼容攻击时，该模型不会生成任务并打印原因；
 `--defenses all` 同样只展开模型正式支持的防御。可用 `--seeds 1,2,3`、
 `--target-clients 0,1` 和可重复的 `--set path=value` 扩展或覆盖最终配置。
+
+`--methods fedsgd,fedavg` 混跑时，FedAvg 默认 100 轮，FedSGD 使用各模型原有轮数。
+显式 `--rounds 80` 会覆盖本次所选全部方法的轮数；只想缩短 FedAvg 时无需加 `--rounds`。
 
 启用统一 exact-batch ProjRes 时，入口会按最终 batch 大小和非成员比例自动同步候选参数；
 `record_dp` 自动使用 `0/0/0` 动态候选，WWW 与普通训练按最终 batch 大小推导。改变 `batch_size` 或同时运行
@@ -259,8 +325,8 @@ Accuracy/TPR 使用百分比，MCC/AUC 使用四位小数；无法报告的值�
 [`docs/fedsgd_performance.md`](docs/fedsgd_performance.md)。
 
 ResNet18 基线保持完整 CIFAR100、随机等量 IID、10 客户端全参与、300 轮
-FedAvg 和每轮 `0.99` 学习率衰减。CLIP-MLP/Adapter 为 16-shot one-batch 等权
-FedSGD，CLIP-LoRA 使用完整训练集；BERT Adapter/LoRA 与 GPT2 Adapter 使用文本
+FedAvg 和每轮 `0.99` 学习率衰减。三个 CLIP 模型默认为 16-shot one-batch 等权
+FedSGD，Adapter/LoRA 可配置全量训练；BERT Adapter/LoRA 与 GPT2 Adapter 使用文本
 one-batch 等权 FedSGD。
 
 独立严格 ProjRes 诊断仍可直接调用分析工具：
@@ -276,8 +342,11 @@ python scripts/validate_projres_mlp_real.py \
 
 审计器按攻击所需信号调度计算，不会无条件生成全部梯度和前向结果：
 
-- 三种 CLIP 模型的六种 exact-batch 攻击每 10 轮使用该轮真实上传
+- FedSGD 下三种 CLIP 模型的六种 exact-batch 攻击每 10 轮使用该轮真实上传
   batch 独立评估；五种固定候选攻击也每 10 轮统计一次。
+- FedAvg 下三个 CLIP 模型与 BERT 同频：Blackbox-Loss、Grad-Cosine、Gradient-Diff、
+  Score-Diff、Score-Ratio、ProjRes 每 50 轮；Loss-Series、Avg-Cosine、FedMIA-Loss、
+  FedMIA-Cosine、FTA 每 10 轮。100 轮训练分别对应 2 次和 10 次测量。
 - BERT 的 `loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine` 和 `fta`
   每 10 轮统计一次，六种真实 Batch 攻击每 50 轮统计一次；GPT2 的全部配置攻击
   仍每 50 轮统计一次。逐轮结果保存在 `attack_round_metrics.csv`。
@@ -467,7 +536,7 @@ results/
     ├── training_health.json
     ├── federated_method_summary.json
     ├── defense_summary.json
-    ├── final_mlp.pt | final_clip_adapter.pt
+    ├── final_mlp.pt | final_clip_adapter.pt | final_clip_transformer_adapter.pt
     │   | final_clip_lora.pt | final_transformer_adapter.pt
     │   | final_transformer_lora.pt
     └── privacy_audit/
@@ -517,6 +586,8 @@ results/
 - 历史 CLIP-MLP 可能按本地样本数加权并执行完整 local epoch FedAvg；当前为每类 16-shot、one-batch、参与客户端等权 FedSGD。
 - 历史 CLIP-Adapter 可能遍历完整 local epoch 并使用 FedAvg；当前为 one-batch
   等权 FedSGD。
+- CLIP-Adapter 旧末端双侧结构与当前逐层视觉结构不可直接混为同一基线；核对
+  `clip_adapter.variant`、`trainable_scope` 和训练预算。缺少 variant 的旧配置为 feature。
 - 非 IID 结果可能受到成员/非成员标签分布不匹配影响。报告攻击有效性时，应同时
   检查类别直方图、按类别指标以及类内/类别条件 AUC。
 - “客户端分布泄漏”不等同于“同类别内具体样本的 record-level membership”。

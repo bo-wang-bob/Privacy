@@ -26,6 +26,7 @@ from aggregator.aggregator_builder import build_aggregator
 from privacy_defenses.cofedmid import validate_cofedmid
 from privacy_defenses.www_dp import validate_www
 from servers.serverbase import ServerBase
+from utils.federated_protocol import resolve_federated_protocol, update_membership_attacks
 from utils.performance import validate_performance_config
 from trainmodel.transformer_adapter import TransformerAdapterClassifier
 from trainmodel.transformer_lora import TransformerLoRAClassifier
@@ -47,6 +48,9 @@ def parse_args() -> argparse.Namespace:
         default="configs/models/bert_adapter.yaml",
         help="YAML configuration for this single training task.",
     )
+    parser.add_argument("--aggregator", choices=("fedsgd", "fedavg"))
+    parser.add_argument("--local-epochs", type=int)
+    parser.add_argument("--aggregation-weighting", choices=("uniform", "sample_count"))
     parser.add_argument("--gpu", type=int)
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--seed", type=int)
@@ -119,6 +123,9 @@ def load_config(args: argparse.Namespace) -> dict:
     with config_path.open("r", encoding="utf-8") as file:
         config = yaml.safe_load(file) or {}
     config["config_path"] = str(config_path)
+    for key in ("aggregator", "local_epochs", "aggregation_weighting"):
+        if getattr(args, key, None) is not None:
+            config[key] = getattr(args, key)
     if args.gpu is not None:
         config["gpu"] = args.gpu
     if args.rounds is not None:
@@ -194,6 +201,12 @@ def load_config(args: argparse.Namespace) -> dict:
                 )
                 if attack != "projres"
             ]
+    if args.attacks is not None or args.projres is False:
+        audit = config.setdefault("audit", {})
+        audit["client_train_membership_attacks"] = [
+            a for a in audit.get("client_train_membership_attacks", [])
+            if a in audit.get("attacks", [])
+        ]
     if args.require_cuda is not None:
         config["require_cuda"] = args.require_cuda
     validate_config(config)
@@ -201,6 +214,8 @@ def load_config(args: argparse.Namespace) -> dict:
 
 
 def validate_config(config: dict) -> None:
+    resolve_federated_protocol(config)
+    method = config.get("aggregator", "fedsgd")
     validate_performance_config(config)
     architecture = str(config.get("architecture", "")).lower()
     if architecture not in {"bert", "gpt2"}:
@@ -263,13 +278,8 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "BERT-LoRA layers must be all, last_half, or a list."
             )
-    if str(config.get("aggregation_weighting", "uniform")) != "uniform":
-        raise ValueError("Paper FedSGD aggregates client updates uniformly.")
-    optimization = dict(config.get("optimization", {}))
-    if str(optimization.get("client_optimizer", "sgd")).lower() != "sgd":
-        raise ValueError("FedLLM privacy runs require one-batch SGD uploads.")
-    if float(optimization.get("max_grad_norm", 0.0)) < 0:
-        raise ValueError("max_grad_norm must be non-negative.")
+    if str(config.get("aggregation_weighting", "uniform")) not in {"uniform", "sample_count"}:
+        raise ValueError("aggregation_weighting must be uniform or sample_count.")
     supported_attacks = {
         "blackbox_loss",
         "loss_series",
@@ -292,7 +302,7 @@ def validate_config(config: dict) -> None:
             + ". Unsupported: "
             + ", ".join(unknown_attacks)
         )
-    exact_batch_attacks = audit.get("exact_batch_membership_attacks", [])
+    exact_batch_attacks = update_membership_attacks(audit)
     if not isinstance(exact_batch_attacks, list):
         raise ValueError(
             "audit.exact_batch_membership_attacks must be a list."
@@ -539,7 +549,7 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "audit exact-batch ProjRes requires projres.enabled=true."
             )
-        if defense_name == "record_dp":
+        if method == "fedavg" or defense_name == "record_dp":
             if any(
                 int(projres.get(key, 0)) != 0
                 for key in (
@@ -651,7 +661,7 @@ def make_result_dir(config: dict) -> Path:
             if max_update_norm is not None:
                 clipping_suffix = f"_s{float(max_update_norm):g}"
     run_name = (
-        f"{timestamp}_{config['model_type']}_{config['dataset_name']}_fedsgd_"
+        f"{timestamp}_{config['model_type']}_{config['dataset_name']}_{config.get('aggregator', 'fedsgd')}_"
         f"{defense}{epsilon_suffix}_seed{int(config['seed'])}_"
         f"target{target_client}{clipping_suffix}"
     )
@@ -710,7 +720,8 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
         ("device", config["device"]),
         ("model_path", config["model_path"]),
         ("dataset_path", config["dataset_path"]),
-        ("federated.aggregator", "fedsgd"),
+        ("federated.aggregator", config.get("aggregator", "fedsgd")),
+        ("federated.local_epochs", config.get("local_epochs", 1)),
         ("federated.aggregation_weighting", config["aggregation_weighting"]),
         ("federated.total_users", config["total_users"]),
         ("federated.sample_users", config["sample_users"]),
@@ -730,14 +741,15 @@ def log_task_configuration(logger: logging.Logger, config: dict) -> None:
             "optimization.max_grad_norm",
             config.get("optimization", {}).get("max_grad_norm", 0.0),
         ),
+        ("privacy_audit.membership_protocol", audit.get("membership_protocol")),
         ("privacy_audit.attacks", ", ".join(audit.get("attacks", []))),
         (
-            "privacy_audit.exact_batch_membership_attacks",
-            ", ".join(audit.get("exact_batch_membership_attacks", [])),
+            "privacy_audit.update_membership_attacks",
+            ", ".join(update_membership_attacks(audit)),
         ),
         (
-            "privacy_audit.exact_batch_nonmember_ratio",
-            audit.get("exact_batch_nonmember_to_member_ratio"),
+            "privacy_audit.update_nonmember_ratio",
+            audit.get("nonmember_to_member_ratio") if config.get("aggregator") == "fedavg" else audit.get("exact_batch_nonmember_to_member_ratio"),
         ),
         ("privacy_audit.target_client_id", audit.get("target_client_id", 0)),
         ("privacy_audit.candidate_sampling", audit.get("candidate_sampling")),
@@ -943,14 +955,14 @@ def main() -> None:
             config.get("learning_rate_decay_interval", 1)
         ),
         num_glob_iters=int(config["num_global_iters"]),
-        local_epochs=1,
+        local_epochs=int(config.get("local_epochs", 1)),
         total_users=int(config["total_users"]),
         results_dir=str(result_dir),
         user_per_round=int(config["sample_users"]),
         aggregator=build_aggregator(
-            "fedsgd",
+            config.get("aggregator", "fedsgd"),
             device=device,
-            aggregation_weighting="uniform",
+            aggregation_weighting=config.get("aggregation_weighting", "uniform"),
         ),
         save_models=bool(config.get("save_models", False)),
         collate_fn=data.collate_fn,

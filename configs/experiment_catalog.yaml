@@ -4,6 +4,29 @@ version: 1
 defaults:
   models: [clip_mlp, clip_adapter, clip_lora]
 
+# Preserve model data and learning rates; FedAvg uses a shorter 100-round run.
+method_overrides:
+  fedsgd:
+    aggregator: fedsgd
+    local_epochs: 1
+    aggregation_weighting: uniform
+  fedavg:
+    aggregator: fedavg
+    num_global_iters: 100
+    local_epochs: 1
+    aggregation_weighting: sample_count
+    models:
+      clip_mlp: &clip_fedavg_audit
+        audit:
+          attack_audit_intervals:
+            {blackbox_loss: 50, loss_series: 10, grad_cosine: 50, avg_cosine: 10,
+             fedmia_loss: 10, fedmia_cosine: 10, gradient_diff: 50,
+             score_diff: 50, score_ratio: 50, fta: 10, projres: 50}
+        projres:
+          evaluation_interval: 50
+      clip_adapter: *clip_fedavg_audit
+      clip_lora: *clip_fedavg_audit
+
 attacks:
   all: &all_attacks
     - blackbox_loss
@@ -53,6 +76,7 @@ models:
   resnet18:
     config: configs/models/resnet18.yaml
     runner: vision
+    supported_methods: [fedavg]
     datasets: [cifar100]
     default_datasets: [cifar100]
     supported_attacks: [fedmia_loss]
@@ -64,8 +88,9 @@ models:
   clip_mlp:
     config: configs/models/clip_mlp.yaml
     runner: vision
+    supported_methods: [fedsgd, fedavg]
     datasets: &clip_datasets [caltech101, oxfordpets, flowers, food101, cifar100]
-    default_datasets: *clip_datasets
+    default_datasets: &clip_default_datasets [cifar100, food101]
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
     supported_defenses: &clip_defenses [none, www, cofedmid]
@@ -75,8 +100,9 @@ models:
   clip_adapter:
     config: configs/models/clip_adapter.yaml
     runner: vision
+    supported_methods: [fedsgd, fedavg]
     datasets: *clip_datasets
-    default_datasets: *clip_datasets
+    default_datasets: *clip_default_datasets
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
     supported_defenses: *clip_defenses
@@ -86,8 +112,9 @@ models:
   clip_lora:
     config: configs/models/clip_lora.yaml
     runner: vision
+    supported_methods: [fedsgd, fedavg]
     datasets: *clip_datasets
-    default_datasets: *clip_datasets
+    default_datasets: *clip_default_datasets
     supported_attacks: *all_attacks
     default_attacks: *all_attacks
     supported_defenses: *clip_defenses
@@ -97,6 +124,7 @@ models:
   bert_adapter:
     config: configs/models/bert_adapter.yaml
     runner: text
+    supported_methods: [fedsgd, fedavg]
     datasets: &text_datasets [sst5, cola, imdb]
     default_datasets: *text_datasets
     supported_attacks: *all_attacks
@@ -108,6 +136,7 @@ models:
   bert_lora:
     config: configs/models/bert_lora.yaml
     runner: text
+    supported_methods: [fedsgd, fedavg]
     datasets: *text_datasets
     default_datasets: [cola]
     supported_attacks: *all_attacks
@@ -119,6 +148,7 @@ models:
   gpt2_adapter:
     config: configs/models/gpt2_adapter.yaml
     runner: text
+    supported_methods: [fedsgd, fedavg]
     datasets: *text_datasets
     default_datasets: *text_datasets
     supported_attacks: *all_attacks

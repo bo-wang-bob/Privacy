@@ -23,10 +23,157 @@ from servers.serverbase import _format_round_progress
 CATALOG = load_yaml("configs/experiment_catalog.yaml")
 
 
+def test_method_sweep_resolves_all_peft_models_and_candidate_protocols(tmp_path):
+    args = _args("--models", "all", "--methods", "fedsgd,fedavg",
+                 "--defenses", "none", "--results-root", str(tmp_path))
+    tasks, skipped = build_tasks(CATALOG, args)
+    assert any("resnet18" in item and "fedsgd" in item for item in skipped)
+    for task in tasks:
+        config = task.config
+        method = config["aggregator"]
+        assert f"_{method}_" in task.run_id
+        baseline = load_yaml(CATALOG["models"][task.model]["config"])
+        assert config["num_global_iters"] == (100 if method == "fedavg" else baseline["num_global_iters"])
+        if task.model == "resnet18":
+            assert config["resnet18"]["paper_protocol"] is False
+            continue
+        assert config["aggregation_weighting"] == ("uniform" if method == "fedsgd" else "sample_count")
+        audit = config["audit"]
+        assert bool(audit["exact_batch_membership_attacks"]) == (method == "fedsgd")
+        assert bool(audit["client_train_membership_attacks"]) == (method == "fedavg")
+        if method == "fedavg":
+            assert config["projres"]["max_candidates"] == 0
+            assert config["projres"]["candidate_scope"] == "full_client_train"
+        if task.model.startswith("clip_"):
+            expected_intervals = (
+                load_yaml(CATALOG["models"]["bert_adapter"]["config"])["audit"]["attack_audit_intervals"]
+                if method == "fedavg" else baseline["audit"]["attack_audit_intervals"]
+            )
+            assert audit["attack_audit_intervals"] == expected_intervals
+            assert config["projres"]["evaluation_interval"] == expected_intervals["projres"]
+        assert "models" not in config
+    assert len({task.run_id for task in tasks}) == len(tasks)
+    assert not list(tmp_path.iterdir())
+
+
+def test_fedavg_epochs_and_weighting_override(tmp_path):
+    tasks, _ = build_tasks(CATALOG, _args(
+        "--models", "bert_lora", "--methods", "fedavg", "--local-epochs", "3",
+        "--rounds", "80", "--aggregation-weighting", "uniform", "--results-root", str(tmp_path)))
+    assert tasks[0].config["local_epochs"] == 3
+    assert tasks[0].config["aggregation_weighting"] == "uniform"
+    assert tasks[0].config["num_global_iters"] == 80
+    with pytest.raises(ValueError, match="local_epochs"):
+        build_tasks(CATALOG, _args("--models", "bert_lora", "--methods", "fedsgd",
+                                  "--local-epochs", "3"))
+
+
+@pytest.mark.parametrize("method", ["fedsgd", "fedavg"])
+def test_clip_lora_projres_uses_mean_and_rejects_constant_cls(method, tmp_path):
+    import copy
+    args = _args("--models", "clip_lora", "--datasets", "cifar100", "--methods", method,
+                 "--attacks", "projres", "--defenses", "none", "--results-root", str(tmp_path))
+    tasks, skipped = build_tasks(CATALOG, args)
+    assert not skipped and len(tasks) == 1
+    config = tasks[0].config
+    assert config["projres"]["token_reduction"] == "mean"
+    for value in [None, "auto"]:
+        automatic = copy.deepcopy(config)
+        if value is None:
+            automatic["projres"].pop("token_reduction")
+        else:
+            automatic["projres"]["token_reduction"] = value
+        validate_resolved_config(automatic, "vision")
+    for value in ["cls", "last", "invalid"]:
+        invalid = copy.deepcopy(config)
+        invalid["projres"]["token_reduction"] = value
+        with pytest.raises(ValueError, match="constant across images|token_reduction"):
+            validate_resolved_config(invalid, "vision")
+
+
+def test_resolved_config_can_switch_back_to_fedsgd_without_stale_candidates(tmp_path):
+    tasks, _ = build_tasks(CATALOG, _args("--models", "bert_lora", "--methods", "fedavg",
+                                        "--results-root", str(tmp_path)))
+    config = tasks[0].config
+    config["aggregator"] = "fedsgd"
+    validate_resolved_config(config, "text")
+    assert config["audit"]["client_train_membership_attacks"] == []
+    assert "projres" in config["audit"]["exact_batch_membership_attacks"]
+    assert config["projres"]["max_candidates"] == 16
+    assert config["projres"]["min_nonmembers"] == 160
+
+
 def _args(*values: str):
     args = parse_args(list(values))
     args.started_at = dt.datetime(2026, 8, 29, 12, 0, 0)
     return args
+
+
+@pytest.mark.parametrize("model", ["clip_adapter", "clip_lora"])
+@pytest.mark.parametrize("method", ["fedsgd", "fedavg"])
+@pytest.mark.parametrize("shots", [16, 32, None])
+def test_clip_training_data_regimes_resolve_and_validate(model, method, shots, tmp_path):
+    overrides = [] if shots == 16 else [
+        "--set", f"use_full_dataset={'true' if shots is None else 'false'}",
+        "--set", f"fpl_shots={'null' if shots is None else shots}",
+    ]
+    tasks, skipped = build_tasks(CATALOG, _args(
+        "--models", model, "--datasets", "cifar100,food101", "--methods", method,
+        "--defenses", "none", "--results-root", str(tmp_path), *overrides,
+    ))
+    assert not skipped and len(tasks) == 2
+    for task in tasks:
+        validate_resolved_config(task.config, "vision")
+        assert task.config["fpl_shots"] == shots
+        assert task.config["use_full_dataset"] is (shots is None)
+        assert task.config["partition_mode"] == "iid"
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("model", ["clip_adapter", "clip_lora"])
+@pytest.mark.parametrize("full,shots", [(True, 16), (False, None), (False, 0),
+                                        (False, -1), (False, 1.5), (False, True)])
+def test_clip_training_data_regimes_reject_ambiguous_or_invalid_caps(model, full, shots):
+    config = load_yaml(f"configs/models/{model}.yaml")
+    config.update(use_full_dataset=full, fpl_shots=shots)
+    with pytest.raises(ValueError, match="fpl_shots"):
+        validate_resolved_config(config, "vision")
+
+
+@pytest.mark.parametrize("model", ["clip_adapter", "clip_lora"])
+@pytest.mark.parametrize("shots", [16, 32, None])
+def test_direct_clip_cli_preserves_configured_data_regime(model, shots, tmp_path, monkeypatch):
+    import sys
+    import yaml
+    from main import parse_args as parse_main_args
+
+    config = load_yaml(f"configs/models/{model}.yaml")
+    config.update(use_full_dataset=shots is None, fpl_shots=shots)
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["main.py", "--config", str(path), "--model_type", model])
+    resolved = parse_main_args()
+    validate_resolved_config(resolved, "vision")
+    assert resolved["use_full_dataset"] is (shots is None)
+    assert resolved["fpl_shots"] == shots
+    assert resolved["partition_mode"] == "iid"
+
+
+@pytest.mark.parametrize("model", ["clip_adapter", "clip_lora"])
+@pytest.mark.parametrize("options,expected_shots", [(["--shots", "32"], 32),
+                                                   (["--use_full_dataset"], None)])
+def test_direct_clip_cli_can_override_data_regime(model, options, expected_shots, monkeypatch):
+    import sys
+    from main import parse_args as parse_main_args
+
+    monkeypatch.setattr(sys, "argv", [
+        "main.py", "--config", f"configs/models/{model}.yaml", "--model_type", model, *options,
+    ])
+    resolved = parse_main_args()
+    validate_resolved_config(resolved, "vision")
+    assert resolved["fpl_shots"] == expected_shots
+    assert resolved["use_full_dataset"] is (expected_shots is None)
+    assert resolved["partition_mode"] == "iid"
 
 
 def test_matrix_bundles_attacks_and_expands_defenses_seeds_and_targets(tmp_path):

@@ -1,5 +1,5 @@
 model_type: clip_lora
-dataset_name: caltech101
+dataset_name: cifar100
 data_root: ./data
 cache_dir: ./checkpoints/clip-vit-base-patch32
 
@@ -9,15 +9,17 @@ num_global_iters: 300
 batch_size: 32
 eval_batch_size: 128
 local_epochs: 1
-learning_rate: 0.0002
+learning_rate: 0.01
 learning_rate_decay: 1.0
 eval_interval: 5
 aggregator: fedsgd
 aggregation_weighting: uniform
 partition_mode: iid
 dirichlet_alpha: 0.1
-use_full_dataset: true
-fpl_shots: null
+# Full training: use_full_dataset: true, fpl_shots: null.
+# Both regimes retain the complete independent evaluation split.
+use_full_dataset: false
+fpl_shots: 16
 
 fedsgd: {client_optimizer: sgd, momentum: 0.0, weight_decay: 0.0}
 clip_lora:
@@ -81,4 +83,4 @@ projres:
   min_nonmembers: 320
   max_nonmembers: 320
   attacked_parameter: clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A
-  token_reduction: cls
+  token_reduction: mean

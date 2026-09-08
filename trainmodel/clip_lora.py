@@ -397,21 +397,55 @@ class CLIPLoRA(nn.Module):
             )
         return candidates[0]
 
+    @staticmethod
+    def resolve_projres_token_reduction(
+        token_reduction: str, parameter_name: str | None = None,
+    ) -> str:
+        """Use image-dependent inputs for the token-wise LoRA projection.
+
+        Before the first attention operation, CLS is a shared embedding plus
+        its position and cannot distinguish images. The token mean includes
+        patch information while preserving the existing per-image score shape.
+        """
+        reduction = str(token_reduction).lower()
+        if reduction == "auto":
+            reduction = "mean"
+        if reduction not in {"cls", "mean"}:
+            raise ValueError(
+                "CLIP-LoRA ProjRes token_reduction must be auto, cls, or mean."
+            )
+        if reduction == "cls" and parameter_name is not None and any(
+            str(parameter_name).endswith(
+                f"vision_model.encoder.layers.0.self_attn.{projection}_proj.lora_A"
+            )
+            for projection in ("q", "k", "v")
+        ):
+            raise ValueError(
+                "CLIP-LoRA ProjRes CLS input to the first Q/K/V projection is "
+                "constant across images; use projres.token_reduction=mean "
+                "(or auto), or select an image-dependent later layer."
+            )
+        return reduction
+
     @torch.no_grad()
     def get_projres_representations(
         self,
         images: torch.Tensor,
         parameter_name: str | None = None,
-        token_reduction: str = "cls",
+        token_reduction: str = "auto",
     ) -> tuple[torch.Tensor, int]:
         """Capture sample representations entering the attacked LoRA layer.
 
         The gradient is formed from every sequence token. For sample-level
-        scoring we use either the CLIP class token or the mean token, while
-        returning the full token count for the paper's rank-condition audit.
+        scoring we default to the token mean. CLS remains available for
+        contextualized layer inputs. The second return value is the token
+        count PER IMAGE, not the number of tokens in the complete batch.
         """
         attacked_parameter, module = self.get_projres_attack_surface(
             parameter_name
+        )
+        reduction = self.resolve_projres_token_reduction(
+            token_reduction, attacked_parameter
         )
         module_name = attacked_parameter[: -len(".lora_A")]
         captured: list[torch.Tensor] = []
@@ -440,13 +474,10 @@ class CLIPLoRA(nn.Module):
             )
         hidden = captured[0]
         token_count = int(hidden.shape[1])
-        reduction = str(token_reduction).lower()
         if reduction == "cls":
             representation = hidden[:, 0]
-        elif reduction == "mean":
-            representation = hidden.mean(dim=1)
         else:
-            raise ValueError("ProjRes token_reduction must be cls or mean.")
+            representation = hidden.mean(dim=1)
         return representation.detach().float(), token_count
 
     def lora_state_dict(self) -> dict[str, torch.Tensor]:

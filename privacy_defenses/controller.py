@@ -612,7 +612,7 @@ class DefenseController:
         model.to(self.device)
         model.train()
         parameters = _trainable_parameters(model)
-        if self.name in {"record_dp", "local_client_dp", "www"}:
+        if self.name in {"none", "cofedmid", "record_dp", "local_client_dp", "www"}:
             optimizer_name = str(
                 self.method_config.get("client_optimizer", "sgd")
             ).lower()
@@ -637,6 +637,11 @@ class DefenseController:
                 raise ValueError("DP client_optimizer must be sgd or adamw.")
         else:
             optimizer = torch.optim.SGD(parameters, lr=user.learning_rate)
+        optimizer_max_norm = float(self.method_config.get("max_grad_norm", 0.0))
+        if optimizer_max_norm > 0 and self.name in {"none", "cofedmid"}:
+            def clip_before_step(_optimizer, _args, _kwargs):
+                torch.nn.utils.clip_grad_norm_(parameters, optimizer_max_norm)
+            optimizer.register_step_pre_hook(clip_before_step)
         if user.federated_method == "fedsgd":
             optimizer.register_step_pre_hook(
                 lambda _optimizer, _args, _kwargs: (
@@ -1881,6 +1886,7 @@ class DefenseController:
         }
         if self.cofedmid is not None:
             summary["cofedmid"] = self.cofedmid.summary()
+            summary["cofedmid"]["implementation"] = f"paper_modules_{self.federated_method}_v1"
         if self.name == "www":
             periodic_post_round = self.www_analysis_timing == "post_round"
             completed_rounds = (

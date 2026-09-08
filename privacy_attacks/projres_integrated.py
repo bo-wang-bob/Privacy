@@ -819,6 +819,11 @@ def run_integrated_projres(
     federated_method: str = "fedavg",
 ) -> dict[str, object]:
     """Run ProjRes on client updates observed in one real training round."""
+    if getattr(model, "adapter_variant", "feature") == "transformer":
+        raise ValueError(
+            "CLIP Transformer Adapter ProjRes uses the unified membership auditor; "
+            "the independent cached-feature entry does not support this variant."
+        )
     if not client_ids:
         raise ValueError("Integrated ProjRes requires at least one client.")
     if str(getattr(model, "model_type", "")) not in {
@@ -930,7 +935,9 @@ def run_integrated_projres(
         attacked_parameter, _ = model.get_projres_attack_surface(
             config.get("attacked_parameter")
         )
-        token_reduction = str(config.get("token_reduction", "cls")).lower()
+        token_reduction = model.resolve_projres_token_reduction(
+            config.get("token_reduction", "auto"), attacked_parameter
+        )
         # Candidate representations must be computed under the released global
         # state that preceded the observed client update. All clients share it.
         model.load_state_dict(base_states[client_ids[0]], strict=False)

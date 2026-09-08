@@ -25,6 +25,7 @@ from privacy_defenses.cofedmid import reserve_validation, validate_cofedmid
 from users.user import UserBase
 from utils.privacy_accounting import planned_private_probe_steps
 from utils.result_formatting import format_run_summary
+from utils.federated_protocol import resolve_membership_protocol, update_membership_attacks, validate_local_optimizer
 from utils.performance import timed_torch_save, StageTimings, measure_stage, timed_stage, validate_performance_config
 
 logger = logging.getLogger(__name__)
@@ -226,16 +227,10 @@ class ServerBase:
         self.num_glob_iters = num_glob_iters
         self.user_per_round = user_per_round
         self.aggregator = aggregator
-        if str(getattr(model, "model_type", "")).lower() in {
-            "clip_mlp",
-            "clip_adapter",
-            "visual_adapter",
-            "clip_lora",
-            "bert_lora",
-        } and hasattr(self.aggregator, "aggregation_weighting"):
-            self.aggregator.aggregation_weighting = "uniform"
         self.federated_method = aggregator.name
         self.method_config = dict(method_config or {})
+        validate_local_optimizer(self.method_config, self.federated_method,
+                                 (defense_config or {}).get("name", "none"))
         if client_gradient_observer is not None and not callable(
             client_gradient_observer
         ):
@@ -249,12 +244,13 @@ class ServerBase:
         self.learning_rate_decay_interval = int(learning_rate_decay_interval)
         self.current_learning_rate = float(learning_rate)
         self.audit_config = dict(audit_config or {"enabled": True})
+        resolve_membership_protocol(self.audit_config, self.federated_method)
         self.audit_config.setdefault("total_rounds", num_glob_iters)
         self.projres_config = dict(projres_config or {"enabled": False})
         self.unified_exact_batch_projres = (
             "projres"
             in set(
-                self.audit_config.get("exact_batch_membership_attacks", [])
+                update_membership_attacks(self.audit_config)
             )
         )
         if self.unified_exact_batch_projres:
@@ -1150,6 +1146,18 @@ class ServerBase:
                 ),
                 "local_batches_per_client_round": 1,
             }
+        if self.federated_method == "fedavg":
+            method_summary["model_update_protocol"] = {
+                "client_upload": "post_local_training_minus_round_base",
+                "server_update": "weighted_mean_of_client_trainable_parameters",
+                "aggregation_weighting": self.aggregator.aggregation_weighting,
+                "local_epochs": self.local_epochs,
+                "optimizer_state": "reset_each_client_round",
+                "local_training_samples_per_client": list(self.ctx.samples_num),
+                "gradient_attack_update": "negative_model_delta_divided_by_round_learning_rate",
+                "gradient_attack_interpretation": "cumulative_update_proxy_not_single_batch_gradient",
+                "membership_definition": "target_client_original_training_set",
+            }
         if str(getattr(self.model, "model_type", "")).lower() in {
             "clip_lora",
             "bert_lora",
@@ -1191,7 +1199,7 @@ class ServerBase:
                 "trainable_scope": "all_block_adapters_and_classification_head",
                 "client_storage": "independent_peft_parameters_on_cpu",
                 "shared_frozen_backbone": True,
-                "aggregation": "uniform_fedsgd",
+                "aggregation": f"{self.aggregator.aggregation_weighting}_{self.federated_method}",
             }
         with measure_stage(self, "outputs.write"), open(
             os.path.join(self.results_dir, "federated_method_summary.json"),

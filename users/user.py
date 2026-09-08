@@ -63,11 +63,9 @@ class UserBase:
         self.defense_controller = defense_controller
         self.federated_method = str(federated_method).lower()
         self.method_config = dict(method_config or {})
-        train_generator = None
-        if self.federated_method == "fedsgd":
-            train_generator = torch.Generator().manual_seed(
-                int(self.method_config.get("seed", 42)) + 1000003 * int(self.id)
-            )
+        train_generator = torch.Generator().manual_seed(
+            int(self.method_config.get("seed", 42)) + 1000003 * int(self.id)
+        )
         self._www_enabled = (
             str(getattr(self.defense_controller, "name", "none")).lower()
             == "www"

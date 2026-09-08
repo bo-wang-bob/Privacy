@@ -7,6 +7,13 @@ Federated Large Language Models: A Projection Residual Approach* 的 Algorithm
 `classifier.0.weight`。CLIP-LoRA 对应视觉编码器首个 Q 投影中的下投影因子
 `clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A`。
 
+上面的末端 Adapter 映射针对旧 `clip_adapter.variant: feature`。当前默认
+`variant: transformer` 在视觉 block 后插入 Adapter，攻击层为
+`clip_model.vision_model.encoder.layers.0.adapter.down.weight`；候选使用 block 输出的
+mean-token 表示，按 token 总数限制 FedSGD 秩，并标记 `paper_fedsgd_exact=false`。
+该结构只使用统一审计入口，不支持本文件的独立缓存特征入口；详见
+[`clip_transformer_adapter.md`](clip_transformer_adapter.md)。
+
 ## 数学映射
 
 冻结 CLIP 产生批表示 `X ∈ R^(p×n)`，它就是 CLIP-Adapter 的输入隐藏
@@ -44,9 +51,17 @@ rowspan(dL/dA) is a subspace of the attacked-layer token inputs
 
 实现从产生该上传之前的全局模型注册 forward hook，捕获进入 Q-LoRA 的
 `[batch, tokens, hidden]` 表示。论文子空间由全部 token 共同形成；当前样本级
-候选使用 CLIP class token 作为 `f(x)`，并将完整的
-`batch_size * tokens_per_sample` 记入论文秩条件。服务端只读取真实上传的
-`lora_A` 参数差，不构造代理梯度或合并后的稠密 `BA` 更新。
+候选默认使用全部 token（CLS 与图像 patch）的均值作为 `f(x)`，`auto` 同样解析为
+`mean`。首层 Q/K/V 的输入 CLS 尚未经过注意力计算，在不同图像间恒定，因此
+显式配置该层的 `token_reduction: cls` 会被拒绝；后层或已混合图像信息的
+attention output projection 仍可显式使用 CLS。
+
+提取器返回每张图像的 token 数；统一审计器按每块实际样本数累计
+`batch_size * tokens_per_sample`，不受候选前向分块大小影响。FedSGD 读取真实
+上传的 `lora_A` 梯度；FedAvg 使用模型 delta 的行空间，不合并稠密 `BA` 更新，
+并保留 `paper_fedsgd_exact=false`、`batch_rank_bound=null` 的多步适配标记。
+mean 表示避免了恒定 CLS 的退化，但不保证满足低秩、多 token 场景下的有利秩条件。
+历史 CLS 分数不改写；修复后需启动新任务获取对应审计结果。
 
 ### 数值稳定性
 
@@ -74,10 +89,10 @@ rowspan(dL/dA) is a subspace of the attacked-layer token inputs
 - CLIP 主干冻结；CLIP-Adapter 只读取首个 down-projection 权重更新，
   CLIP-MLP 对照模型只读取第一层分类 MLP 权重更新，CLIP-LoRA 只读取首个
   视觉 Q 投影的 `lora_A` 更新；
-- 数据协议与对应正常训练保持一致：CLIP-MLP、CLIP-Adapter 使用每类 16-shot，
-  CLIP-LoRA 使用完整训练集；三者均为 one-batch FedSGD。
+- 数据协议与对应正常训练保持一致：三个 CLIP 模型默认使用全局每类 16-shot，
+  CLIP-Adapter/LoRA 可配置完整训练分区或其他 shots；严格实验均为 one-batch FedSGD。
 
-独立入口继续用于 CLIP-MLP 严格复现和 CLIP-LoRA/CLIP-Adapter 的单独诊断；
+独立入口继续用于 CLIP-MLP 严格复现和 CLIP-LoRA/旧 feature Adapter 的单独诊断；
 通用 `promptres` 是余弦代理攻击，不等同于本文的投影残差算法。正式 CLIP 三模型
 sweep 均已将 ProjRes 接入共享多轮审计器，但不改变这里的投影残差公式。
 
@@ -111,16 +126,15 @@ python scripts/validate_projres_mlp_real.py \
   --output results/projres_mlp_client0.json
 ```
 
-CLIP-Adapter 单客户端示例：
+当前默认逐层 CLIP-Adapter 单客户端审计示例：
 
 ```bash
-python scripts/validate_projres_mlp_real.py \
-  --config configs/models/clip_adapter.yaml \
-  --target-client 0 \
-  --output results/projres_clip_adapter_client0.json
+python scripts/run_privacy_experiments.py \
+  --models clip_adapter --datasets cifar100 --attacks projres --defenses none
 ```
 
-输出是 JSON，不生成 HTML。ProjRes 采用 ranking-only 判断：保存原始 L1 残差及其
+统一入口在任务目录的 `privacy_audit/` 保存摘要、分数和信号；独立入口输出 JSON，
+不生成 HTML。ProjRes 采用 ranking-only 判断：保存原始 L1 残差及其
 反向连续分数，通过 AUC 和可解析 FPR 下的 TPR 评价，不生成固定阈值二元预测。
 结果还记录梯度秩、第一层维度，以及模拟上传梯度与参数更新的一致性误差。
 
@@ -136,7 +150,7 @@ batch 中的其他训练样本
 ## 适用边界
 
 论文给出的有利秩条件在这里是 `p <= m` 且 `p < n`：batch 大小 `p` 不超过
-第一层输出维度 `m`，并小于 CLIP 表示维度 `n`。CLIP-Adapter 的默认
+第一层输出维度 `m`，并小于 CLIP 表示维度 `n`。旧 feature CLIP-Adapter 的常用
 down-projection 为 `n=512, m=128`，实际 `p` 是目标客户端首个 batch 的大小。
 若改成多 batch、本地多步、动量、裁剪、噪声或安全聚合，上传更新不再是单个
 batch 梯度的常数倍，就不再属于本入口声明的严格实验设置。

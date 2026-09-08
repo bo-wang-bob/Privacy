@@ -1,4 +1,4 @@
-"""Paper-defined CoFedMID adapted to indexed one-batch FedSGD.
+"""Paper-defined CoFedMID adapted to indexed FedSGD and FedAvg training.
 
 The coalition coordinator handles label IDs and aggregation weights only.
 Client losses, EXP3 state, and unperturbed local models stay in the simulation's

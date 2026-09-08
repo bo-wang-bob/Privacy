@@ -1,8 +1,113 @@
-# 联邦提示训练方法
+# 联邦训练方法与攻击口径
+
+## 统一切换 FedSGD / FedAvg
+
+六个 PEFT 模型（CLIP-MLP/Adapter/LoRA、BERT Adapter/LoRA、GPT2 Adapter）
+均支持两种方法。模型 YAML 保持默认 FedSGD；统一入口按
+模型 × 数据集 × 防御 × seed × 目标客户端 × 方法生成独立任务。
+三个 CLIP 模型在两种方法下均默认只运行 CIFAR100、Food101；其余图像数据集
+通过 `--datasets` 显式选择，`--datasets all` 展开全部五个支持的数据集。
+ResNet18 不传方法选择时保留原有 300 轮 FedAvg 基线；显式 `--methods fedavg`
+也使用 100 轮，并退出要求完整 300 轮的 `paper_protocol` 模式。
+
+```bash
+python scripts/run_privacy_experiments.py --models clip_mlp,clip_adapter,clip_lora,bert_adapter,bert_lora,gpt2_adapter --methods fedsgd,fedavg --defenses none
+```
+
+`--methods fedavg` 只运行 FedAvg；`--methods fedsgd` 切回 FedSGD；`all` 展开
+各模型支持的方法。不传时保持模型基线。运行前可追加 `--dry-run` 核对配置。
+同一模型/数据集/防御/seed/客户端下，两种方法各训练一次，各自共享全部所选攻击。
+
+| 项目 | FedSGD | FedAvg |
+| --- | --- | --- |
+| 默认通信轮数 | CLIP-MLP 150；CLIP-Adapter/LoRA 300；BERT/GPT2 500 | 全部 100 |
+| 本地训练 | 每轮 1 个打乱后的 mini-batch | 每轮遍历 `local_epochs` 个完整本地 epoch，默认 1 |
+| 短批次 | 保留，按实际大小求均值 | 保留，作为本地 optimizer step |
+| 协议消息 | 可训练参数的真实梯度 | 本地训练后参数相对轮初全局参数的 delta |
+| 默认聚合权重 | 等权 | 本地训练集样本数占比 |
+| 优化器状态 | 无动量 SGD | 每客户端每轮重新创建，epoch 之间保留状态 |
+| LoRA 聚合 | 分别聚合同名 A/B 梯度 | 分别聚合同名 A/B 参数，不合成 BA |
+
+`--local-epochs 3` 调整 FedAvg 本地训练次数；FedSGD 仍要求该值为 1。
+`--aggregation-weighting uniform` 可令 FedAvg 等权，便于只对比本地训练协议。
+方法默认值集中在 `configs/experiment_catalog.yaml` 的 `method_overrides`。
+数据划分、few-shot、batch size 和学习率均沿用模型基线。
+FedAvg 的通信轮数统一为 100；FedSGD 继续使用模型基线轮数。`--rounds` 和
+`--set num_global_iters=...` 可显式覆盖轮数，后者优先；混跑时覆盖作用于两种方法。
+只缩短 FedAvg 不需要手动传轮数，也不需要复制模型 YAML。
+FedAvg 下三个 CLIP 模型的攻击间隔与 BERT 一致：`blackbox_loss`、`grad_cosine`、
+`gradient_diff`、`score_diff`、`score_ratio`、`projres` 每 50 轮一次，
+`loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine`、`fta` 每 10 轮一次。
+100 轮中分别测量第 50/100 轮和第 10/20/…/100 轮。ProjRes 的声明间隔同步为 50。
+此覆盖保存在 `method_overrides.fedavg.models`，FedSGD 的 CLIP 基线仍全部每 10 轮。
+相同轮数下 FedAvg 通常执行更多 optimizer steps，比较效果时须同时考虑训练预算。
+
+配置解析顺序为模型基线 → 方法默认值 → 防御覆盖 → CLI 参数 → `--set`。
+最后根据实际 `aggregator` 推导攻击候选协议。`--set aggregator=fedavg` 也可切换，
+但会保留其他基线参数（例如等权）；需要标准方法默认值时用 `--methods`。
+视觉模型优化器配置使用 `fedavg.*` / `fedsgd.*`，文本模型使用 `optimization.*`。
+默认均为无动量、无 weight decay 的 SGD。FedSGD 拒绝会改变真实梯度语义的
+AdamW、动量、weight decay 或优化器侧裁剪；FedAvg 可配置 SGD/AdamW。
+
+兼容性修正：普通 `none` 防御分支现在实际使用所配置的优化器、momentum 和
+weight decay；旧实现曾在该分支固定创建无动量 SGD。这也修正了 ResNet18 的
+配置执行行为。因此旧结果中仅有 `run_config.yaml` 的优化器字段，不足以证明
+这些参数曾实际生效；比较此修改前后的相关实验还应核对代码版本。
+
+### FedAvg 的成员推理评价
+
+全部 11 种攻击使用固定候选：目标客户端原始训练集的完整 `M` 个成员，及全局
+独立 evaluation 池中默认等量 `M` 个从未训练非成员。非成员按类别尽力匹配，
+类别不足时确定性补足；实际直方图、匹配标志及 TV 距离保存在候选文件中。
+不再将本轮最后一个 batch 视作 FedAvg 上传的成员集合，也不按重复 epoch
+重复计数成员。CoFedMID/Poisson-DP 可能只访问部分训练记录，仍评价原始训练集
+成员身份，不能把该身份解释为本轮实际访问；曝光和 DP 步数另按各防御记录。
+
+- `blackbox_loss`、`grad_cosine`、`gradient_diff`、`score_diff`、`score_ratio`、
+  `projres` 使用 `audit.client_train_membership_attacks`，分别计算审计轮的分数，
+  最终报告最后一个实际观测轮。迁移原 `exact_batch_membership_attacks` 配置时自动路由。
+- 另外五种攻击沿用固定候选的时序/跨客户端定义和原审计调度；不从真实标签挑选最佳轮。
+- 损失类攻击的 post-state 是目标客户端本地训练完成的可观测模型；Score-Diff/Ratio
+  的 pre-state 是该轮训练开始的全局模型。
+- 梯度类攻击在轮初模型求候选梯度，客户端向量用 `-delta / round_learning_rate`，
+  只转换一次。普通固定学习率 SGD 下这是各本地步骤梯度之和；多个模型位置上的梯度
+  并不等于单 batch 梯度。使用动量、AdamW 或扰动时只能解释为累计更新代理量。
+  Gradient-Diff 保留 `2<u,g_sum_labels> - ||g_sum_labels||²`；余弦不受正标量缩放影响。
+- ProjRes 用轮初候选表示投影到真实客户端参数 delta 的行空间，按残差排名；
+  `paper_fedsgd_exact=false`、`batch_rank_bound=null`。多个本地步骤及中间表示变化
+  会破坏单步精确条件，因此这是经验性适配。零更新只跳过该轮 ProjRes，记录
+  `zero_observed_update`，其余攻击继续。
+- `projres.max_candidates/min_nonmembers/max_nonmembers` 自动清零，表示使用完整
+  客户端候选，不按 batch 截断。FedAvg 的候选数量与训练 batch size 解耦。
+
+固定候选保存在 `privacy_audit/candidate_selection.pt`，单轮更新攻击的轮次与身份
+保存在 `client_train_update_candidate_selection.pt`；摘要和信号使用
+`client_train_membership` / `client_train_update_observations`。
+FedSGD 继续使用原 `exact_batch_*` 文件及字段；历史结果不改写。
+FedAvg 的全部攻击统一报告 AUC 和 TPR@10%/1%/0.1%FPR；FedSGD 的六种
+真实 batch 攻击继续只报告 10%/1%FPR。所有低 FPR 指标按实际独立非成员数量判定是否可报告，
+重复轮次、重复 epoch 均不提高 FPR 分辨率。
+默认 FedSGD batch 成员与 FedAvg 训练集成员的问题不同，跨方法比较时应同时列出
+候选定义、数量和类别分布；五种固定候选攻击的训练集成员口径相同。
+
+支持原有 WWW、CoFedMID 及 BERT Adapter Record-DP 的 FedAvg 路径。
+WWW 每个本地 batch 使用同一上一通信轮的 own/other 参数参考，逐批更新当前模型；
+诊断与训练步数随 epoch 累计。Record-DP 按实际计划的多步 Poisson 机制重新校准预算。
+CoFedMID 保留实际聚合权重下的参数空间扰动抵消，训练成员标签保持原始分区。
+`local_client_dp` 仅支持 one-batch FedSGD，方法混跑时明确跳过不兼容组合。
+旧 WWW `release_private_diagnostics=true` 的 post-round batch 分析仍只支持 FedSGD；
+默认的 `www_record_diagnostics` 逐批诊断支持两种方法。
+
+任务名、控制台概览、批量 CSV/manifest 均标明方法；CSV 同时记录 `local_epochs`、
+聚合权重和成员定义。`federated_method_summary.json` 保存上传类型、训练协议、
+优化器配置和更新量解释。当前验证覆盖 CPU 小模型端到端，不代表真实数据的攻击效果。
+
+以下模型细节描述默认 FedSGD 协议；选择 FedAvg 时应用上述训练与评价规则。
 
 ## FedAvg (`aggregator: fedavg`)
 
-历史兼容入口。客户端在冻结 CLIP 上训练一组 soft-prompt 参数，服务器按客户端训练样本数聚合。学习 token 会拼接在配置的手工模板之前。
+正式支持上述六个 PEFT 模型的多 batch 本地训练和参数聚合。另保留冻结 CLIP
+上的 soft-prompt 兼容入口，学习 token 拼接在手工模板之前。
 
 ## PromptFL (`aggregator: promptfl`)
 

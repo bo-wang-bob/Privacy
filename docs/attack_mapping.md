@@ -4,6 +4,13 @@
 Score-Diff、Score-Ratio、FTA 和 ProjRes。下文其他攻击的研究实现仍保留在仓库中，
 但已从配置、命令行和公共审计器注册表移除，不能作为新实验攻击启用。
 
+六种正式 PEFT 模型现支持 `--methods fedsgd,fedavg`。下文真实 batch 的描述适用于
+FedSGD；FedAvg 自动将六种单轮更新攻击转到完整客户端训练集/独立 evaluation 的
+固定候选，其他五种保留相同候选及时间/跨客户端定义。FedAvg 的梯度向量为
+`-model_delta / round_learning_rate` 累计更新代理量；ProjRes 不施加 batch 秩上限，
+并标记 `paper_fedsgd_exact=false`。具体公式、成员身份和可比性见
+[联邦方法文档](federated_methods.md#fedavg-的成员推理评价)。
+
 ## 1. Comprehensive Privacy Analysis (Nasr, Shokri, Houmansadr)
 
 论文同时提出被动与主动白盒成员推理。原方法将梯度、隐藏层输出、模型输出、标签和损失交给分组件攻击网络。
@@ -193,15 +200,16 @@ evaluation 非成员。
 
 ## Few-shot CLIP-Adapter 场景
 
-`model_type: clip_adapter` 冻结 CLIP，只通过每客户端每轮一个 mini-batch 的
-FedSGD 训练图像、文本两侧残差瓶颈，并与 CLIP-MLP 一样使用每类 16 张训练图像，
-即 `fpl_shots: 16` 与 `use_full_dataset: false`；服务器对参与客户端梯度直接等权平均。损失、概率、表示、更新余弦、
-Nasr、PromptRes、PIPRA、RMIA、IMIA、YOQO、Canary 和 CodePoison 均复用其原有
-观测协议，但影子模型与 probe 只重置或更新 adapter 参数。
+`model_type: clip_adapter` 默认 `variant: transformer`，在视觉 Transformer 每个
+block 后加入残差 Adapter，冻结其余 CLIP 参数，保留图像/类别文本相似度分类。
+图像和文本均在线编码，训练图像的反向图必须保留，以更新内部 Adapter。
+全局每类 16-shot、FedSGD one-batch 等权协议和注册的 11 种攻击保持不变；
+FedAvg 使用完整客户端训练集候选及累计更新代理。
 
-PromptMIA 使用 adapter 第一层的输入投影向量作为 key-like vectors。普通训练时
-冻结 CLIP 不保留反向图；YOQO 与 Canary 优化输入时会临时保留输入到冻结 CLIP
-的梯度。模型基线见 `configs/models/clip_adapter.yaml`，任务由统一入口生成。
+旧 `variant: feature`（包括缺少 variant 的历史配置）仍表示末端图像/文本 Adapter，
+允许预计算特征。两种结构的权重、上传参数空间和 ProjRes 表示不同，比较结果必须
+记录 variant。模型基线见 `configs/models/clip_adapter.yaml`，详细边界见
+[`clip_transformer_adapter.md`](clip_transformer_adapter.md)。
 
 ### ProjRes 严格单轮入口
 
@@ -215,8 +223,12 @@ batch 的 CLIP 表示子空间，再使用原始 L1 投影残差判定成员。�
 
 统一 sweep 对 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 提供共享 exact-batch ProjRes：
 FedSGD 路径直接读取客户端上传梯度，不再从参数差反推。三者均每 10 轮运行；
-CLIP-MLP 攻击 `classifier.0.weight`，CLIP-Adapter 攻击第一层 down-projection，
-LoRA 攻击视觉 Q 投影的 `lora_A` 下投影因子，并使用各层对应的候选表示。三者真实
-上传均只来自一个 batch，因此与论文 FedSGD 观测一致。ProjRes 以负 L1 残差做
+CLIP-MLP 攻击 `classifier.0.weight`，逐层 CLIP-Adapter 攻击最后视觉 Adapter 的 down-projection，
+LoRA 攻击视觉 Q 投影的 `lora_A` 下投影因子，并使用各层对应的候选表示。逐层视觉
+Adapter 默认自动选择最后层（ViT-B/32 为
+`clip_model.vision_model.encoder.layers.11.adapter.down.weight`），使用进入该层的 CLS；
+最后 Adapter 的 patch 输出不影响 CLS 分类损失。旧 feature Adapter 仍使用
+`adapter.net.0.weight`。成员定义与比例保持原样；保留 `paper_fedsgd_exact=false`，
+FedSGD 沿用输入 token 总数的保守秩上限，FedAvg 无 batch 秩上限。ProjRes 以负 L1 残差做
 ranking-only 评价，不再使用固定残差阈值。CLIP-MLP 的独立严格验证入口仍然保留，
 用于单轮诊断而不是替代统一攻击任务。

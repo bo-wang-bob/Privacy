@@ -11,6 +11,14 @@
 
 ## 当前统一实验入口
 
+- 六个 PEFT 模型（CLIP-MLP/Adapter/LoRA、BERT Adapter/LoRA、GPT2 Adapter）均支持 FedSGD/FedAvg。使用 `--methods fedsgd,fedavg` 展开方法维度；不传保持各模型基线，ResNet18 仍只支持 FedAvg。不要增加尚未实现的 GPT2-LoRA 等模型。
+- `--methods fedavg` 默认全部模型 100 轮、每轮 1 个完整本地 epoch、`aggregation_weighting: sample_count`；可用 `--local-epochs` 和 `--aggregation-weighting uniform` 覆盖。FedSGD 默认仍为 1 个 batch、等权，要求 `local_epochs=1`，原有模型轮数保留。方法默认值集中在 catalog 的 `method_overrides`；模型的数据、few-shot 和学习率保留，CLIP FedAvg 审计间隔使用下文的 BERT 同频设置。显式 `--rounds` 或 `--set num_global_iters=...` 覆盖所选全部方法的轮数。ResNet18 不传方法选择时保持 300 轮；显式选 FedAvg 则用 100 轮并关闭完整论文模式。相同轮数不代表相同训练预算。
+- FedAvg 的 11 种攻击以目标客户端原始完整训练集 M 个成员与默认 M 个独立 evaluation 非成员为固定候选；类别尽力匹配并记录实际直方图/TV。六种单轮更新攻击自动从 `audit.exact_batch_membership_attacks` 转到 `audit.client_train_membership_attacks`，其余五种保持时序/跨客户端定义。不能以最后一个本地 batch 定义整个 FedAvg 上传的成员；重复 epoch 不重复计数。CoFedMID/Record-DP 下仍评价原始训练集身份，不宣称每个成员本轮都被访问。
+- FedAvg 上传模型 delta，梯度类攻击只做一次 `-delta / round_learning_rate` 转换，明确记录为累计更新代理量；候选梯度取轮初模型。ProjRes 作为经验性多步适配，`paper_fedsgd_exact=false`、`batch_rank_bound=null`，候选上限自动为 0/0/0（完整固定池）。任意方法被攻击层上传为零时只跳过该轮 ProjRes，记录 `zero_observed_update`。
+- FedAvg 使用 `client_train_update_candidate_selection.pt`、摘要 `client_train_membership` 和信号 `client_train_update_observations`；FedSGD 继续使用原 `exact_batch_*`。任务名标明方法，local_epochs 和权重进入汇总协议字段；所有低 FPR 可报告性仍依据独立非成员数，历史结果不改写。
+- WWW、CoFedMID 与 BERT Adapter Record-DP 已支持多步 FedAvg，后者按多步 Poisson 机制校准预算；`local_client_dp` 仍只支持 FedSGD，混跑时跳过。旧 WWW post-round 私有 batch 分析仍只支持 FedSGD，默认的逐批 `www_record_diagnostics` 可用于 FedAvg。实现与限制见 `docs/federated_methods.md`。以下 one-batch 规则描述默认 FedSGD 协议。
+- 本次 FedAvg 支持同时修复 `none` 分支忽略所配置 optimizer/momentum/weight_decay 的问题，ResNet18 也受此修正影响。旧结果即使 YAML 写有 momentum/weight_decay，也不能据此认定实际训练已使用这些值，须结合代码版本判断。现有默认 PEFT FedSGD 的 SGD/0/0 行为保持一致。
+
 - 唯一批量入口是 `scripts/run_privacy_experiments.py`。它支持单个或多个模型、数据集、攻击、防御、seed 和目标客户端；模型 × 数据集 × 防御 × seed × 目标客户端展开为独立任务，同一组多攻击共享一次训练。
 - 不传 `--models` 时保持原 CLIP 入口范围，依次运行 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA；`--models all` 覆盖 7 个正式模型。
 - 只运行单个模型时使用 `python scripts/run_privacy_experiments.py --models clip_mlp`；多模型用逗号分隔。
@@ -18,10 +26,11 @@
 - `--defenses all` 只展开模型正式支持的防御。显式攻击与模型不兼容时跳过该模型并打印原因；显式防御或数据集不兼容时跳过对应组合。
 - `configs/experiment_catalog.yaml` 维护能力矩阵、防御深度覆盖和别名；`configs/models/` 下 7 个基线维护模型训练与默认候选协议。不要重新为数据集、攻击或防御复制整份模型 YAML。
 - 统一入口在应用全部 `--set` 后自动推导启用的 exact-batch ProjRes 候选参数：普通训练和 WWW 使用最终 batch 大小及成员/非成员比例，`record_dp` 使用 `0/0/0` 动态候选。改变 `batch_size` 或混跑 `none,record_dp,www` 无需手动同步这三个值。显式传入的 ProjRes 候选参数保留并接受协议校验；干运行显示最终候选参数。
-- CLIP 默认学习率由模型基线设置：CLIP-MLP 为 `0.1`，CLIP-Adapter 为 `0.001`，CLIP-LoRA 为 `0.0002`。应以统一脚本干运行打印的最终参数为准。
+- CLIP 默认学习率由模型基线设置：CLIP-MLP 为 `0.1`，CLIP-Adapter 与 CLIP-LoRA 均为 `0.01`。应以统一脚本干运行打印的最终参数为准。
+- CLIP-Adapter 默认 `clip_adapter.variant: transformer`：视觉 ViT 的每个 block 后插入 BERT 式 `768→384→768` 残差 Adapter（reduction=2、ReLU、上投影零初始化），原始骨干与文本编码器冻结，保留图像/类别文本相似度分类。图像、文本特征均在线计算，只缓存提示词 token；`precompute_features: true` 被拒绝。客户端复用共享骨干、独立保存 Adapter 参数。旧 `variant: feature` 和缺少 variant 的旧配置保持末端特征 Adapter；历史结果不改写。新权重保存到 `final_clip_transformer_adapter.pt`，不是旧末端 Adapter checkpoint。见 `docs/clip_transformer_adapter.md`。
 - 三个 CLIP 基线均显式使用 IID。不要在正常 IID 实验中传 `--dirichlet-alpha`；仅传该参数会自动切换为 `dirichlet`。如同时显式传 `--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha 仅作为未使用的配置值保留。
-- CLIP-MLP 和 CLIP-Adapter 使用每类 16 张训练图像的 Few-shot 训练集；CLIP-LoRA 使用完整训练集。Few-shot 先在全局训练分区内按类确定性抽取，再进行客户端划分；独立 evaluation/test 分区不截断。
-- 默认数据集为 Caltech101、OxfordPets、Flowers102、Food101 和 CIFAR100。
+- 三个 CLIP 模型默认使用每类 16 张训练图像。CLIP-Adapter/LoRA 均可配置 `use_full_dataset: false` 与正整数 `fpl_shots` 选择 few-shot，或 `use_full_dataset: true` 与 `fpl_shots: null` 使用完整训练分区；MLP 仍固定 16-shot。Adapter/LoRA 始终从完整源分区加载，few-shot 只截取训练集，再进行客户端划分；独立 evaluation/test 分区不随 shots 截断。新 Adapter/LoRA 的 CIFAR100/Food101 不再先经过历史 200 张/类训练及 50 张/类测试子集；旧结果不改写，比较时核对实际分区。直接 CLI 的 shots 覆盖也不再隐式把 Adapter/LoRA 切为 Dirichlet。IID 仍要求每类训练样本数至少等于客户端数。
+- 三个 CLIP 模型在 FedSGD/FedAvg 下默认只依次运行 CIFAR100、Food101。Caltech101、OxfordPets、Flowers102 仍支持通过 `--datasets` 显式选择，`--datasets all` 展开全部五个支持的数据集。单任务 CLIP 模型 YAML 的默认数据集为 CIFAR100。
 - 三个模型在全部默认数据集上统一使用 10 个客户端和 batch size 32；CLIP-MLP 使用 150 个通信轮次，CLIP-Adapter/CLIP-LoRA 使用 300 个通信轮次。三者均使用 FedSGD，每个客户端每轮只执行 1 个 mini-batch/1 次 optimizer step；`local_epochs: 1` 是协议校验值，不表示遍历完整本地数据集。
 - 三种微调方式的服务器端聚合都使用 `aggregation_weighting: uniform`，即对本轮参与客户端上传的梯度直接等权平均，不按客户端本地样本数或实际 batch 大小加权。三者任务目录方法名均为 `fedsgd`。
 - 正常任务指标默认按 `eval_interval: 5` 在已完成的第 5、10、15、…轮评估；若总轮数不能被 5 整除，最后一轮仍会额外评估。`training_metrics.csv` 使用相同的一基轮次编号。
@@ -64,15 +73,18 @@
 ## 按需审计频次
 
 - 当前三个 CLIP 配置不设置共享的 `audit_interval`；逐轮攻击全部使用各自的显式间隔。
-- CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 的全部 11 种攻击每 10 轮测量。MLP 测量到第 150 轮，Adapter/LoRA 测量到第 300 轮。
+- FedSGD 下 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 的全部 11 种攻击每 10 轮测量。MLP 测量到第 150 轮，Adapter/LoRA 测量到第 300 轮。
+- FedAvg 下三个 CLIP 模型与 BERT 一致：`blackbox_loss`、`grad_cosine`、`gradient_diff`、`score_diff`、`score_ratio`、`projres` 每 50 轮，`loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine`、`fta` 每 10 轮；默认 100 轮分别测量 2 次和 10 次。覆盖保存在 catalog 的 `method_overrides.fedavg.models`，ProjRes 声明间隔同步为 50，不修改 FedSGD 模型基线。
 - 审计间隔按已完成的通信轮数计数；例如 `attack_audit_intervals: 10` 对应零基内部索引 9、19、…，而不是索引 0、10、…。三者每轮均只训练 1 个真实 batch。
 - 三种 CLIP 模型的 `blackbox_loss` 和 `grad_cosine` 都属于真实 Batch 协议，必须按配置轮次分别审计。
 - 同一任务运行多个攻击时，调度器取各攻击所需轮次的并集，但仍只计算该轮实际需要的信号族。只要包含任一逐轮攻击，对应信号仍会每轮计算，这是协议需求而不是调度失效。
 
 ## ProjRes 特例
 
-- 当前统一入口对 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 执行共享 exact-batch ProjRes；三者每 10 轮读取真实 one-batch FedSGD 上传，分别攻击 `classifier.0.weight`、`adapter.net.0.weight` 与首个视觉 Q 投影的 `lora_A`。
-- 成员严格等于该轮实际 batch，非成员与其他真实 Batch 攻击共享同一 1:10 标签匹配视图，元数据中的 `paper_fedsgd_exact` 应为 `true`。
+- 当前统一入口对 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 执行共享 exact-batch ProjRes；三者每 10 轮读取真实 one-batch FedSGD 上传，分别攻击 `classifier.0.weight`、最后视觉 Adapter 的 down 权重（ViT-B/32 为 `clip_model.vision_model.encoder.layers.11.adapter.down.weight`）与首个视觉 Q 投影的 `lora_A`。旧 feature Adapter 仍攻击 `adapter.net.0.weight`。
+- 逐层视觉 Adapter 的 ProjRes 默认 `attacked_parameter: null` 自动选择实际最后层，使用进入该 Adapter 的 CLS；`token_reduction: auto` 同样解析为 CLS。最后 Adapter 的 patch 输出不影响分类损失。显式层名与 `mean` 仍可复现首层/均值对照，其他审计的 key parameter 保持首层。成员/非成员比例不变：FedAvg 默认 M:M，FedSGD N:10N。为隔离换层变更，FedSGD 仍沿用输入 token 总数的保守秩上限和布局计数，FedAvg 无 batch 秩上限；保留 `paper_fedsgd_exact=false`、轮初表示和原始负 L1 残差。零初始化导致首轮 down 上传为零时仅跳过 ProjRes。新结构只支持统一审计入口，不使用独立的缓存特征 ProjRes 或 `low_fpr_full`。2026-09-09 之前的逐层 Adapter 历史结果使用首层 down + mean，不改写。
+- CLIP-LoRA ProjRes 默认 `token_reduction: mean`，`auto` 同样使用全部图像 token 的均值。首层 Q/K/V 输入的 CLS 在图像间恒定，显式选择该组合会被拒绝；不得把历史恒定 CLS 分数当成隐私保护效果。统一审计器的 token 总数按实际候选样本数 × 每图 token 数计算，FedAvg 仍不施加 batch 秩上限。修复只影响新任务，历史结果不改写。
+- FedSGD 成员严格等于该轮实际 batch，非成员与其他真实 Batch 攻击共享同一 1:10 标签匹配视图。普通无防御 MLP/旧 feature Adapter/LoRA 保留其原 `paper_fedsgd_exact` 标记；逐层视觉 Adapter 的 token 聚合例外如上。FedAvg 仍为完整客户端训练集协议。
 - 三者统一 ProjRes 使用 `max_candidates: 32`、`min_nonmembers: 320`、`max_nonmembers: 320`，并与其他攻击共享 `predictions.csv`。CLIP-MLP 的独立严格入口仍保留用于单独诊断并生成自己的严格 JSON 输出，但不是统一 sweep 的替代品。
 
 ## 结果目录与日志规范
@@ -104,10 +116,10 @@
 
 - 主要耗时来自余弦类攻击的逐样本梯度计算；候选样本数和逐轮攻击数量决定大部分审计时间。若继续优化，优先考虑 CLIP-MLP/Adapter 可解析或向量化的梯度余弦、批量客户端前向和在线聚合，且必须保持攻击定义不变。
 - 文本审计默认 `audit.grad_sample_backend=auto`、`audit.grad_sample_chunk_size=4`，分块计算逐记录梯度，在每次信号计算内缓存上传向量的 float64 表示并批量点积。缓存不超过 `audit.gradient_update_cache_mb=2048` 且不超过当前空闲显存四分之一时放在 GPU，否则使用 CPU；设为 0 强制 CPU。不得跨客户端状态/轮次复用缓存；余弦继续求真实标签 CE 梯度，Gradient-Diff 继续求所有标签损失之和的梯度。`audit.grad_sample_backend=loop` 可回到逐记录求导。
-- 三个 CLIP 模型的常规余弦/Gradient-Diff 审计也使用上述分块与 float64 归约，MLP/Adapter 复用缓存图像特征，LoRA 直接计算原始图像梯度；不再保留整个候选池的梯度或计算未使用的梯度特征。`signal_storage=full` 需要额外信号时保留原完整信号路径。
+- 三个 CLIP 模型的常规余弦/Gradient-Diff 审计也使用上述分块与 float64 归约，MLP/旧 feature Adapter 可复用缓存图像特征，逐层视觉 Adapter/LoRA 直接计算原始图像梯度；不再保留整个候选池的梯度或计算未使用的梯度特征。`signal_storage=full` 需要额外信号时保留原完整信号路径。
 - BERT Adapter/LoRA 与 GPT2 Adapter 默认 `performance.evaluation_backend=shared`，全局评估只加载一次共享模型，保留各客户端测试分区、batch 边界及本地状态；`clients` 可复核原逐客户端加载路径。默认 `performance.enabled=true`、`performance.cuda_events=true`，在 `performance_summary.json` 记录累计阶段耗时。CUDA event 延迟读取，避免每块求导强制同步；父子阶段为包含关系，不能直接相加。计时覆盖服务器训练过程及文件输出，不包含模型/数据加载。
 - 修改实验配置后先干运行核对最终参数：
   - `python scripts/run_privacy_experiments.py --dry-run --max-runs 1`
-- 当前干运行应看到：MLP/Adapter/LoRA 均为 `federated.aggregator: fedsgd` 和 `federated.aggregation_weighting: uniform`；MLP/Adapter 为每类 16-shot，LoRA 使用完整训练集；三者均启用统一 ProjRes。
+- 当前干运行应看到：MLP/Adapter/LoRA 均为 `federated.aggregator: fedsgd` 和 `federated.aggregation_weighting: uniform`；三者默认均为每类 16-shot，Adapter/LoRA 支持配置全量；三者均启用统一 ProjRes。
 - 测试环境使用 `/root/.local/share/mamba/envs/pfedba/bin/python`。小范围修改优先只运行直接相关的测试文件和 `git diff --check`；不要习惯性执行完整套件。
 - `/root/.local/share/mamba/envs/pfedba/bin/python -m pytest -q` 是日常快速核心回归；完整本地套件必须显式使用 `python -m pytest -q tests`，仅在修改共享审计器、聚合核心、候选池协议或准备高风险发布时运行。

@@ -1,5 +1,5 @@
 model_type: clip_mlp
-dataset_name: caltech101
+dataset_name: cifar100
 data_root: ./data
 cache_dir: ./checkpoints/clip-vit-base-patch32
 

@@ -31,6 +31,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 
 from utils.result_formatting import format_sweep_summary, reportable_metric
 from utils.performance import validate_performance_config
+from utils.federated_protocol import resolve_federated_protocol
 
 
 @dataclass(frozen=True)
@@ -211,10 +212,19 @@ def resolve_model_config(
     dirichlet_alpha: float | None = None,
     require_cuda: bool | None = None,
     dotted_overrides: list[tuple[str, Any]] | None = None,
+    method: str | None = None,
+    local_epochs: int | None = None,
+    aggregation_weighting: str | None = None,
 ) -> dict[str, Any]:
     """Resolve one runnable configuration; exposed for focused regression tests."""
     profile = catalog["models"][model]
     config = load_yaml(profile["config"])
+    baseline_rounds = config.get("num_global_iters")
+    if method is not None:
+        method_defaults = dict(catalog.get("method_overrides", {}).get(method, {}))
+        model_defaults = method_defaults.pop("models", {}).get(model, {})
+        config = deep_merge(config, deep_merge(method_defaults, model_defaults))
+        config["aggregator"] = method
     config = deep_merge(config, _defense_override(catalog, model, defense))
     config["dataset_name"] = dataset
     if profile["runner"] == "text":
@@ -273,16 +283,22 @@ def resolve_model_config(
         or learning_rate is not None
         or partition_mode is not None
         or dirichlet_alpha is not None
+        or config.get("num_global_iters") != baseline_rounds
     ):
         _disable_resnet_paper_protocol(config)
 
     explicit_projres_keys: set[str] = set()
+    if local_epochs is not None:
+        config["local_epochs"] = local_epochs
+    if aggregation_weighting is not None:
+        config["aggregation_weighting"] = aggregation_weighting
     for path, value in dotted_overrides or []:
         set_dotted(config, path, copy.deepcopy(value))
         if path == "projres" and isinstance(value, dict):
             explicit_projres_keys = set(value)
         elif path.startswith("projres."):
             explicit_projres_keys.add(path.split(".")[1])
+    resolve_federated_protocol(config)
     _resolve_projres_candidate_defaults(config, explicit_projres_keys)
     validate_performance_config(config)
     return config
@@ -309,11 +325,7 @@ def _task_id(
     digest = hashlib.sha256(
         json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:10]
-    method = (
-        "fedsgd"
-        if "architecture" in config
-        else config.get("aggregator", "fedsgd")
-    )
+    method = config.get("aggregator", "fedsgd")
     target = config.get("audit", {}).get("target_client_id", 0)
     return (
         f"{started:%Y-%m-%d_%H-%M-%S-%f}_{model}_{dataset}_{method}_"
@@ -430,9 +442,28 @@ def build_tasks(
             fraction = cofedmid_config.get("defense", {}).get("cofedmid_validation_fraction", 0.1)
             study_overrides.append((split_path, fraction))
 
-        for dataset, defense, seed, target in itertools.product(
-            datasets, defenses, seeds, targets
+        requested_methods = parse_csv(getattr(args, "methods", "default"))
+        if len(requested_methods) > 1 and set(requested_methods) & {"default", "all"}:
+            raise ValueError("--methods default/all 不能与具体方法混用。")
+        for path, value in dotted_overrides:
+            if path == "aggregator" and requested_methods != ["default"] and requested_methods != [value]:
+                raise ValueError("--set aggregator 与 --methods 冲突；方法 sweep 请只使用 --methods。")
+        supported_methods = profile.get("supported_methods", ["fedsgd"])
+        methods = ([None] if requested_methods == ["default"] else
+                   supported_methods if requested_methods == ["all"] else requested_methods)
+        unknown = set(requested_methods) - {"default", "all", "fedsgd", "fedavg"}
+        if unknown:
+            raise ValueError("未知联邦方法: " + ",".join(sorted(unknown)))
+        for method in methods:
+            if method is not None and method not in supported_methods:
+                skipped.append(f"{model}: 跳过不兼容方法 {method}")
+        methods = [m for m in methods if m is None or m in supported_methods]
+        for dataset, defense, seed, target, method in itertools.product(
+            datasets, defenses, seeds, targets, methods
         ):
+            if method == "fedavg" and defense == "local_client_dp":
+                skipped.append(f"{model}/fedavg: 跳过仅支持 FedSGD 的 local_client_dp")
+                continue
             provisional = results_root / "__pending__"
             config = resolve_model_config(
                 catalog,
@@ -449,6 +480,9 @@ def build_tasks(
                 dirichlet_alpha=args.dirichlet_alpha,
                 require_cuda=args.require_cuda,
                 dotted_overrides=study_overrides,
+                method=method,
+                local_epochs=getattr(args, "local_epochs", None),
+                aggregation_weighting=getattr(args, "aggregation_weighting", None),
             )
             run_id = _task_id(config, model, dataset, defense, started)
             run_dir = results_root / run_id
@@ -493,13 +527,14 @@ def task_command(task: ExperimentTask) -> list[str]:
 
 
 def print_catalog(catalog: dict[str, Any]) -> None:
-    print("MODEL\tRUNNER\tDATASETS\tATTACKS\tDEFENSES")
+    print("MODEL\tRUNNER\tMETHODS\tDATASETS\tATTACKS\tDEFENSES")
     for name, profile in catalog["models"].items():
         print(
             "\t".join(
                 (
                     name,
                     profile["runner"],
+                    ",".join(profile.get("supported_methods", [])),
                     ",".join(profile["datasets"]),
                     ",".join(profile["supported_attacks"]),
                     ",".join(profile["supported_defenses"]),
@@ -515,11 +550,7 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
     for index, task in enumerate(tasks, 1):
         attacks = ",".join(task.attacks) if task.attacks else "none"
         config = task.config
-        method = (
-            "fedsgd"
-            if task.runner == "text"
-            else config.get("aggregator", "unknown")
-        )
+        method = config.get("aggregator", "fedsgd")
         partition = config.get("partition_mode", "iid")
         if config.get("use_full_dataset"):
             data_view = "full"
@@ -537,10 +568,22 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             f"weighting:{config.get('aggregation_weighting', 'uniform')} "
             f"users:{config.get('sample_users')}/{config.get('total_users')} "
             f"rounds:{config.get('num_global_iters')} "
+            f"local_epochs:{config.get('local_epochs', 1)} "
             f"batch:{config.get('batch_size')} lr:{config.get('learning_rate')} "
             f"partition:{partition} data:{data_view}"
         )
         defense_config = config.get("defense", {})
+        if task.model == "clip_adapter":
+            adapter = config.get("clip_adapter", {})
+            variant = adapter.get("variant", "feature")
+            print(
+                f"      adapter=variant:{variant} reduction:{adapter.get('reduction', 4)} "
+                f"precompute_features:{adapter.get('precompute_features', variant == 'feature')} "
+                f"text_adapter:{adapter.get('text_adapter_enabled', False)}"
+            )
+        if method == "fedavg" and config.get("audit", {}).get("client_train_membership_attacks"):
+            print("      audit=client_train vs independent_evaluation; "
+                  "upload:model_delta; projres:empirical_no_batch_rank_bound")
         if "projres" in config.get("audit", {}).get("exact_batch_membership_attacks", []):
             bounds = config["projres"]
             print(
@@ -594,6 +637,7 @@ def _task_header(task: ExperimentTask) -> str:
     """Identify one task once instead of prefixing every child log line."""
     context = (
         f"model={task.model} | dataset={task.dataset} | defense={task.defense} | "
+        f"method={task.config.get('aggregator', 'fedsgd')} | "
         f"run={task.run_id} | phase=train | gpu={task.gpu}"
     )
     return _timestamped_line(f"TASK | {context}")
@@ -736,6 +780,7 @@ def print_result_overview(results: list[TaskResult]) -> None:
             seconds = None
         records.append({
             "model": task.model, "dataset": task.dataset, "defense": task.defense,
+            "method": task.config.get("aggregator", "fedsgd"),
             "seed": task.seed, "target_client_id": task.target_client_id,
             "status": status, "metric": metric, "value": value, "seconds": seconds,
         })
@@ -754,6 +799,9 @@ def write_outputs(
             {
                 "run_id": result.task.run_id,
                 "model": result.task.model,
+                "method": result.task.config.get("aggregator", "fedsgd"),
+                "local_epochs": result.task.config.get("local_epochs", 1),
+                "aggregation_weighting": result.task.config.get("aggregation_weighting"),
                 "dataset": result.task.dataset,
                 "attacks": list(result.task.attacks),
                 "defense": result.task.defense,
@@ -791,6 +839,10 @@ def write_outputs(
                 {
                     "run_id": result.task.run_id,
                     "model": result.task.model,
+                    "method": result.task.config.get("aggregator", "fedsgd"),
+                    "local_epochs": result.task.config.get("local_epochs", 1),
+                    "aggregation_weighting": result.task.config.get("aggregation_weighting"),
+                    "membership_definition": attack.get("metadata", {}).get("membership_definition"),
                     "dataset": result.task.dataset,
                     "defense": result.task.defense,
                     "seed": result.task.seed,
@@ -826,6 +878,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description="统一展开并运行模型 × 数据集 × 防御 × seed × 客户端隐私实验。"
     )
     parser.add_argument("--catalog", default=str(DEFAULT_CATALOG))
+    parser.add_argument("--methods", "--method", default="default",
+                        help="default、all 或 fedsgd,fedavg；默认保持各模型基线。")
+    parser.add_argument("--local-epochs", type=int,
+                        help="FedAvg 每轮完整本地 epoch 数；FedSGD 必须为 1。")
+    parser.add_argument("--aggregation-weighting", choices=("uniform", "sample_count"))
     parser.add_argument(
         "--models", default="default", help="default、all 或逗号分隔模型。"
     )

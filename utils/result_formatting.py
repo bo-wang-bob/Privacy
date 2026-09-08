@@ -159,7 +159,7 @@ def format_sweep_summary(records: list[dict]) -> str:
     for index, record in enumerate(records, 1):
         metric = record.get("metric")
         rows.append([
-            str(index), record["model"], record["dataset"], record["defense"],
+            str(index), record["model"], record.get("method", "N/A"), record["dataset"], record["defense"],
             f"{record['seed']}/{record['target_client_id']}", record["status"],
             {"accuracy": "Accuracy", "test_accuracy": "Accuracy", "mcc": "MCC"}.get(metric, metric or "N/A"),
             format_number(record.get("value"), percent=metric in {"accuracy", "test_accuracy"}),
@@ -167,7 +167,7 @@ def format_sweep_summary(records: list[dict]) -> str:
         ])
     return "\n".join([
         "EXPERIMENT OVERVIEW",
-        format_table(["#", "Model", "Dataset", "Defense", "Seed/Client", "Status", "Metric", "Final value", "Elapsed"],
-                     rows, numeric=(0, 4, 7, 8)),
+        format_table(["#", "Model", "Method", "Dataset", "Defense", "Seed/Client", "Status", "Metric", "Final value", "Elapsed"],
+                     rows, numeric=(0, 5, 8, 9)),
         "Final value: task utility. FAILED/PARTIAL rows may contain incomplete results.",
     ])

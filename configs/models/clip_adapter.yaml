@@ -1,5 +1,5 @@
 model_type: clip_adapter
-dataset_name: caltech101
+dataset_name: cifar100
 data_root: ./data
 cache_dir: ./checkpoints/clip-vit-base-patch32
 
@@ -7,29 +7,27 @@ total_users: 10
 sample_users: 10
 num_global_iters: 300
 batch_size: 32
-eval_batch_size: 512
+eval_batch_size: 32
 local_epochs: 1
-learning_rate: 0.001
+learning_rate: 0.01
 learning_rate_decay: 1.0
 eval_interval: 5
 aggregator: fedsgd
 aggregation_weighting: uniform
 partition_mode: iid
 dirichlet_alpha: 0.1
+# Full training: use_full_dataset: true, fpl_shots: null.
+# Both regimes retain the complete independent evaluation split.
 use_full_dataset: false
 fpl_shots: 16
 
 clip_adapter:
-  feature_dim: 512
-  reduction: 4
-  alpha: 0.2
-  output_relu: true
-  text_adapter_enabled: true
-  text_reduction: 4
-  text_alpha: 0.2
-  text_output_relu: true
-  precompute_features: true
-  precompute_batch_size: 64
+  variant: transformer
+  reduction: 2
+  activation: relu
+  zero_init_up: true
+  text_adapter_enabled: false
+  precompute_features: false
   template: null
 
 gpu: 0
@@ -58,7 +56,7 @@ audit:
   low_fpr_max_members: 0
   low_fpr_max_nonmembers: 0
   match_candidate_labels: true
-  audit_batch_size: 512
+  audit_batch_size: 16
   attack_audit_intervals:
     {blackbox_loss: 10, loss_series: 10, grad_cosine: 10, avg_cosine: 10,
      fedmia_loss: 10, fedmia_cosine: 10, gradient_diff: 10,
@@ -82,3 +80,7 @@ projres:
   max_candidates: 32
   min_nonmembers: 320
   max_nonmembers: 320
+  # null selects the final visual Adapter down weight for variant=transformer;
+  # the legacy feature variant keeps its original terminal Adapter surface.
+  attacked_parameter: null
+  token_reduction: cls

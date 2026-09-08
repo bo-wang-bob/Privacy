@@ -18,6 +18,7 @@ from privacy_defenses import FEDMIA_BASELINE_DEFENSES, SUPPORTED_DEFENSES
 from privacy_defenses.cofedmid import validate_cofedmid
 from privacy_defenses.www_dp import validate_www
 from servers.serverbase import ServerBase
+from utils.federated_protocol import resolve_federated_protocol, update_membership_attacks
 from utils.performance import validate_performance_config
 from utils.data_loader import (
     generate_dirichlet_split,
@@ -116,12 +117,38 @@ def normalize_clip_adapter_config(config: dict) -> None:
         config["model_type"] = "clip_adapter"
         migrated = copy.deepcopy(config.get("clip_adapter", {}))
         migrated.update(copy.deepcopy(config.get("visual_adapter", {})))
+        if "visual_adapter" in config:
+            # A legacy block must not inherit the new inline default variant.
+            migrated["variant"] = config["visual_adapter"].get("variant", "feature")
         config["clip_adapter"] = migrated
     elif "visual_adapter" in config and "clip_adapter" not in config:
         config["clip_adapter"] = copy.deepcopy(config["visual_adapter"])
 
 
+def uses_transformer_clip_adapter(config: dict) -> bool:
+    return (
+        str(config.get("model_type", "")).lower() == "clip_adapter"
+        and str(config.get("clip_adapter", {}).get("variant", "feature")).lower()
+        == "transformer"
+    )
+
+
+def _dataset_split_arguments(config: dict) -> dict:
+    """Keep Adapter/LoRA evaluation complete while capping only training."""
+    model_type = str(config.get("model_type", "prompt")).lower()
+    # The loader flag selects the source splits before fpl_shots is applied.
+    # Bypass its historical CIFAR100/Food101 subsampling for both data regimes.
+    complete_source = model_type in {"clip_adapter", "visual_adapter", "clip_lora"}
+    return {
+        "root_dir": config.get("data_root", "./data"),
+        "fpl": True,
+        "fpl_shots": config.get("fpl_shots"),
+        "use_full_dataset": complete_source or bool(config.get("use_full_dataset", False)),
+    }
+
+
 def validate_config(config: dict) -> None:
+    resolve_federated_protocol(config)
     validate_performance_config(config)
     normalize_clip_adapter_config(config)
     model_type = str(config.get("model_type", "prompt")).lower()
@@ -173,11 +200,18 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "use_full_dataset=true requires fpl_shots=null so training is not capped."
         )
+    if model_type in {"clip_adapter", "clip_lora"} and not bool(
+        config.get("use_full_dataset", False)
+    ):
+        if type(fpl_shots) is not int or fpl_shots <= 0:
+            raise ValueError(
+                f"{model_type} few-shot training requires a positive integer "
+                "fpl_shots; use use_full_dataset=true and fpl_shots=null "
+                "for full training."
+            )
     if model_type == "clip_mlp":
         mlp_config = dict(config.get("clip_mlp", {}))
-        if method != "fedsgd":
-            raise ValueError("clip_mlp requires one-batch aggregator=fedsgd.")
-        if int(config.get("local_epochs", 1)) != 1:
+        if method == "fedsgd" and int(config.get("local_epochs", 1)) != 1:
             raise ValueError("clip_mlp FedSGD requires local_epochs=1.")
         if bool(config.get("use_full_dataset", False)) or int(fpl_shots or 0) != 16:
             raise ValueError(
@@ -192,23 +226,30 @@ def validate_config(config: dict) -> None:
             raise ValueError("clip_mlp.precompute_batch_size must be positive.")
     if model_type == "clip_adapter":
         adapter_config = dict(config.get("clip_adapter", {}))
-        if method != "fedsgd":
-            raise ValueError("clip_adapter requires one-batch aggregator=fedsgd.")
-        if int(config.get("local_epochs", 1)) != 1:
+        variant = str(adapter_config.get("variant", "feature")).lower()
+        if variant not in {"feature", "transformer"}:
+            raise ValueError("clip_adapter.variant must be feature or transformer.")
+        if variant == "transformer":
+            if bool(adapter_config.get("precompute_features", False)):
+                raise ValueError("Transformer CLIP Adapter requires precompute_features=false and raw images.")
+            if bool(adapter_config.get("text_adapter_enabled", False)):
+                raise ValueError("Transformer CLIP Adapter freezes the text encoder; text_adapter_enabled must be false.")
+            if str(adapter_config.get("activation", "relu")).lower() not in {"relu", "gelu"}:
+                raise ValueError("clip_adapter.activation must be relu or gelu.")
+            if bool(adapter_config.get("gradient_checkpointing", False)):
+                raise ValueError("Transformer CLIP Adapter does not yet support gradient_checkpointing.")
+            if config.get("audit", {}).get("candidate_sampling") == "low_fpr_full":
+                raise ValueError("Transformer CLIP Adapter requires raw-image candidates; use balanced_global_holdout.")
+        if method == "fedsgd" and int(config.get("local_epochs", 1)) != 1:
             raise ValueError(
                 "clip_adapter FedSGD requires local_epochs=1 because each "
                 "client performs exactly one mini-batch step per round."
-            )
-        if bool(config.get("use_full_dataset", False)) or int(fpl_shots or 0) != 16:
-            raise ValueError(
-                "clip_adapter requires 16-shot training: "
-                "use_full_dataset=false and fpl_shots=16."
             )
         reduction = int(adapter_config.get("reduction", 4))
         if reduction <= 0:
             raise ValueError("clip_adapter.reduction must be positive.")
         feature_dim = int(adapter_config.get("feature_dim", 512))
-        if feature_dim <= 0 or feature_dim % reduction != 0:
+        if feature_dim <= 0 or (variant == "feature" and feature_dim % reduction != 0):
             raise ValueError(
                 "clip_adapter.feature_dim must be positive and divisible "
                 "by clip_adapter.reduction."
@@ -217,7 +258,7 @@ def validate_config(config: dict) -> None:
         if not 0 <= alpha <= 1:
             raise ValueError("clip_adapter.alpha must be in [0, 1].")
         text_reduction = int(adapter_config.get("text_reduction", reduction))
-        if text_reduction <= 0 or feature_dim % text_reduction != 0:
+        if text_reduction <= 0 or (variant == "feature" and feature_dim % text_reduction != 0):
             raise ValueError(
                 "clip_adapter.feature_dim must be divisible by "
                 "clip_adapter.text_reduction."
@@ -235,11 +276,6 @@ def validate_config(config: dict) -> None:
             raise ValueError("clip_lora requires factor-wise FedAvg or FedSGD.")
         if method == "fedsgd" and int(config["local_epochs"]) != 1:
             raise ValueError("clip_lora FedSGD requires local_epochs=1.")
-        if not bool(config.get("use_full_dataset", False)) or fpl_shots is not None:
-            raise ValueError(
-                "clip_lora uses the full dataset and requires "
-                "use_full_dataset=true and fpl_shots=null."
-            )
         if str(lora_config.get("encoder", "both")).lower() not in {
             "vision",
             "text",
@@ -406,9 +442,7 @@ def validate_config(config: dict) -> None:
             )
     if audit.get("enabled", True) and not attacks:
         raise ValueError("audit.enabled=true requires at least one membership attack.")
-    configured_exact_batch_attacks = audit.get(
-        "exact_batch_membership_attacks", []
-    )
+    configured_exact_batch_attacks = update_membership_attacks(audit)
     if not isinstance(configured_exact_batch_attacks, list):
         raise ValueError(
             "audit.exact_batch_membership_attacks must be a list."
@@ -756,17 +790,19 @@ def validate_config(config: dict) -> None:
             raise ValueError(
                 "Integrated ProjRes requires FedAvg or FedSGD training."
             )
-        if model_type != "clip_lora" and not bool(
+        if model_type != "clip_lora" and not uses_transformer_clip_adapter(config) and not bool(
             config.get(model_type, {}).get("precompute_features", True)
         ):
             raise ValueError(
                 "Integrated ProjRes requires precompute_features=true."
             )
-        if model_type == "clip_lora":
-            if method != "fedsgd":
-                raise ValueError(
-                    "Paper-faithful CLIP-LoRA ProjRes requires one-batch FedSGD."
-                )
+        if uses_transformer_clip_adapter(config):
+            from trainmodel.clip_transformer_adapter import CLIPTransformerAdapter
+
+            if not unified_projres:
+                raise ValueError("Transformer CLIP Adapter ProjRes requires the unified membership auditor.")
+            CLIPTransformerAdapter.resolve_projres_token_reduction(projres.get("token_reduction", "auto"))
+        if model_type == "clip_lora" and method == "fedsgd":
             optimizer_config = dict(config.get("fedsgd", {}))
             if str(optimizer_config.get("client_optimizer", "sgd")).lower() != "sgd":
                 raise ValueError("CLIP-LoRA ProjRes requires vanilla client SGD.")
@@ -781,6 +817,9 @@ def validate_config(config: dict) -> None:
                     "CLIP-LoRA ProjRes requires clip_lora.dropout=0 so the "
                     "observed LoRA input matches the projected representation."
                 )
+        if model_type == "clip_lora":
+            from trainmodel.clip_lora import CLIPLoRA
+
             if str(config.get("clip_lora", {}).get("encoder", "both")).lower() not in {
                 "vision",
                 "both",
@@ -796,11 +835,9 @@ def validate_config(config: dict) -> None:
                 raise ValueError(
                     "projres.attacked_parameter must name a vision lora_A matrix."
                 )
-            if str(projres.get("token_reduction", "cls")).lower() not in {
-                "cls",
-                "mean",
-            }:
-                raise ValueError("projres.token_reduction must be cls or mean.")
+            CLIPLoRA.resolve_projres_token_reduction(
+                projres.get("token_reduction", "auto"), attacked_parameter
+            )
         if projres.get("threshold") is not None:
             raise ValueError(
                 "ProjRes is ranking-only; projres.threshold must be null."
@@ -810,9 +847,9 @@ def validate_config(config: dict) -> None:
         max_candidates = int(projres.get("max_candidates", 32))
         min_nonmembers = int(projres.get("min_nonmembers", 1000))
         max_nonmembers = int(projres.get("max_nonmembers", 20000))
-        poisson_projres = unified_projres and str(
+        poisson_projres = unified_projres and (method == "fedavg" or str(
             config.get("defense", {}).get("name", "none")
-        ).lower() == "record_dp"
+        ).lower() == "record_dp")
         minimum_required_nonmembers = (
             int(config["batch_size"]) * int(configured_exact_batch_ratio)
             if unified_projres
@@ -926,7 +963,7 @@ def validate_config(config: dict) -> None:
         if config["sample_users"] < 2:
             raise ValueError("WWW requires at least two selected clients per round.")
         model_config = dict(config.get(model_type, {}))
-        if model_type != "clip_lora" and not bool(
+        if model_type != "clip_lora" and not uses_transformer_clip_adapter(config) and not bool(
             model_config.get("precompute_features", True)
         ):
             raise ValueError(
@@ -1047,6 +1084,7 @@ def run(config: dict) -> list[dict]:
         CLIPAdapter,
         build_clip_adapter_text_features,
     )
+    from trainmodel.clip_transformer_adapter import CLIPTransformerAdapter
     from trainmodel.clip_feature_cache import (
         collate_clip_features,
         precompute_federated_clip_features,
@@ -1058,12 +1096,6 @@ def run(config: dict) -> list[dict]:
 
     config = copy.deepcopy(config)
     normalize_clip_adapter_config(config)
-    if str(config.get("model_type", "prompt")).lower() in {
-        "clip_mlp",
-        "clip_adapter",
-        "clip_lora",
-    }:
-        config["aggregation_weighting"] = "uniform"
     validate_config(config)
     seed = int(config["seed"])
     random.seed(seed)
@@ -1107,12 +1139,7 @@ def run(config: dict) -> list[dict]:
 
     model_type = str(config.get("model_type", "prompt")).lower()
     partition_mode = str(config.get("partition_mode", "auto")).lower()
-    split_arguments = {
-        "root_dir": config.get("data_root", "./data"),
-        "fpl": True,
-        "fpl_shots": config.get("fpl_shots"),
-        "use_full_dataset": bool(config.get("use_full_dataset", False)),
-    }
+    split_arguments = _dataset_split_arguments(config)
     if model_type == "resnet18":
         train_sets, test_sets, class_names = generate_random_equal_iid_split(
             config["dataset_name"],
@@ -1158,6 +1185,27 @@ def run(config: dict) -> list[dict]:
             dropout=float(mlp_config.get("dropout", 0.0)),
             normalize_features=bool(mlp_config.get("normalize_features", False)),
             device=device,
+        )
+    elif uses_transformer_clip_adapter(config):
+        adapter_config = dict(config.get("clip_adapter", {}))
+        model = CLIPTransformerAdapter(
+            clip_model=clip_model,
+            text_inputs=build_clip_lora_text_inputs(
+                processor=processor,
+                classnames=class_names,
+                dataset_name=config["dataset_name"],
+                template=adapter_config.get("template"),
+            ),
+            classnames=class_names,
+            reduction=int(adapter_config.get("reduction", 2)),
+            activation=str(adapter_config.get("activation", "relu")),
+            zero_init_up=bool(adapter_config.get("zero_init_up", True)),
+            device=device,
+        )
+        logging.getLogger(__name__).info(
+            "Visual Transformer Adapter ready | layers=%d | reduction=%d | trainable=%d | feature_precomputation=false",
+            model.num_adapter_layers, model.reduction,
+            sum(p.numel() for p in model.parameters() if p.requires_grad),
         )
     elif model_type == "clip_adapter":
         adapter_config = dict(config.get("clip_adapter", {}))
@@ -1249,6 +1297,7 @@ def run(config: dict) -> list[dict]:
 
     if (
         model_type in {"clip_mlp", "clip_adapter"}
+        and not uses_transformer_clip_adapter(config)
         and bool(config.get(model_type, {}).get("precompute_features", True))
     ):
         train_sets, test_sets, _feature_summary = (
@@ -1347,16 +1396,12 @@ def default_config() -> dict:
             "precompute_batch_size": 64,
         },
         "clip_adapter": {
-            "feature_dim": 512,
-            "reduction": 4,
-            "alpha": 0.2,
-            "output_relu": True,
-            "text_adapter_enabled": True,
-            "text_reduction": 4,
-            "text_alpha": 0.2,
-            "text_output_relu": True,
-            "precompute_features": True,
-            "precompute_batch_size": 64,
+            "variant": "transformer",
+            "reduction": 2,
+            "activation": "relu",
+            "zero_init_up": True,
+            "text_adapter_enabled": False,
+            "precompute_features": False,
             "template": None,
         },
         "clip_lora": {
@@ -1484,7 +1529,7 @@ def default_config() -> dict:
             "min_nonmembers": 1000,
             "max_nonmembers": 20000,
             "attacked_parameter": None,
-            "token_reduction": "cls",
+            "token_reduction": "auto",
         },
         "defense": {
             "name": "none",
@@ -1539,7 +1584,7 @@ def parse_args() -> dict:
         "--use_full_dataset",
         action="store_true",
         default=None,
-        help="Use complete official train/test splits; requires fpl_shots=null.",
+        help="Use the complete training split and clear the few-shot cap.",
     )
     cuda_group = parser.add_mutually_exclusive_group()
     cuda_group.add_argument(
@@ -1669,20 +1714,29 @@ def parse_args() -> dict:
         config["aggregator"] = "fedsgd"
         config["aggregation_weighting"] = "uniform"
         config["local_epochs"] = 1
-        config["fpl_shots"] = 16
-        config["use_full_dataset"] = False
     elif args.model_type == "clip_lora":
         config["aggregator"] = "fedavg"
         config["aggregation_weighting"] = "uniform"
+    for key in ("aggregator", "aggregation_weighting", "local_epochs"):
+        if getattr(args, key, None) is not None:
+            config[key] = getattr(args, key)
+    if args.use_full_dataset:
+        if args.fpl_shots is not None:
+            parser.error("--use_full_dataset cannot be combined with --fpl_shots.")
         config["fpl_shots"] = None
-        config["use_full_dataset"] = True
-    # A direct few-shot/alpha override denotes the Dirichlet experiment
-    # family unless the caller explicitly selected another partition mode.
     if args.fpl_shots is not None and args.use_full_dataset is None:
         config["use_full_dataset"] = False
+    # Adapter/LoRA data volume is independent of client heterogeneity.
+    # Preserve the historical shots shortcut for other model families.
     if (
         args.partition_mode is None
-        and (args.fpl_shots is not None or args.dirichlet_alpha is not None)
+        and (
+            args.dirichlet_alpha is not None
+            or (
+                args.fpl_shots is not None
+                and config["model_type"] not in {"clip_adapter", "visual_adapter", "clip_lora"}
+            )
+        )
     ):
         config["partition_mode"] = "dirichlet"
     if args.target_client_id is not None:
