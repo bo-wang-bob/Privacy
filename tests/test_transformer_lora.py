@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 from torch.utils.data import TensorDataset
@@ -182,9 +183,11 @@ def test_bert_lora_fedsgd_aggregates_every_factor_independently(monkeypatch):
         assert torch.allclose(context.new_model_state[0][name], value - 1.0)
 
 
-def test_bert_lora_exposes_lora_a_projres_surface(monkeypatch):
+def test_bert_lora_preserves_explicit_first_query_mean(monkeypatch):
     model = _model(monkeypatch)
-    name, layer = model.get_projres_attack_surface()
+    name, layer = model.get_projres_attack_surface(
+        "backbone.encoder.layer.0.attention.self.query.lora_A"
+    )
     packed_inputs = torch.tensor(
         [
             [[1, 2, 0, 0], [1, 1, 0, 0]],
@@ -192,14 +195,14 @@ def test_bert_lora_exposes_lora_a_projres_surface(monkeypatch):
         ]
     )
     representations, active_tokens = model.get_projres_representations(
-        packed_inputs, parameter_name=name, token_reduction="auto"
+        packed_inputs, parameter_name=name, token_reduction="mean"
     )
     mean_representations, _ = model.get_projres_representations(
         packed_inputs, parameter_name=name, token_reduction="mean"
     )
-    cls_representations, _ = model.get_projres_representations(
-        packed_inputs, parameter_name=name, token_reduction="cls"
-    )
+    for reduction in ["cls", "auto"]:
+        with pytest.raises(ValueError, match="constant across texts"):
+            model.get_projres_representations(packed_inputs, name, reduction)
 
     assert name.endswith("query.lora_A")
     assert isinstance(layer, LoRALinear)
@@ -207,7 +210,6 @@ def test_bert_lora_exposes_lora_a_projres_surface(monkeypatch):
     assert active_tokens == 5
     assert torch.allclose(representations, mean_representations)
     assert not torch.allclose(representations[0], representations[1])
-    assert torch.allclose(cls_representations[0], cls_representations[1])
 
 
 def test_bert_lora_runs_one_real_federated_server_round(monkeypatch, tmp_path):
@@ -339,9 +341,7 @@ def test_bert_lora_runs_all_eleven_attacks_with_exact_batch_projres(
             "evaluation_interval": 2,
             "decision_mode": "ranking",
             "threshold": None,
-            "attacked_parameter": (
-                "backbone.encoder.layer.0.attention.self.query.lora_A"
-            ),
+            "attacked_parameter": None,
             "max_candidates": 2,
             "min_nonmembers": 20,
             "max_nonmembers": 20,
@@ -369,7 +369,10 @@ def test_bert_lora_runs_all_eleven_attacks_with_exact_batch_projres(
         summary for summary in summaries if summary["attack"] == "projres"
     )
     assert projres_summary["metadata"]["sample_representation"] == (
-        "mean_token_input_to_lora_down_projection"
+        "cls_token_input_to_lora_down_projection"
+    )
+    assert projres_summary["metadata"]["attacked_parameter"] == (
+        "backbone.encoder.layer.1.attention.self.query.lora_A"
     )
     assert projres_summary["score_degenerate"] is False
     assert (
@@ -394,4 +397,5 @@ def test_bert_lora_default_config_is_valid():
     assert config["lora"]["scaling"] == "rank"
     assert config["learning_rate"] == 0.015
     assert config["aggregation_weighting"] == "uniform"
-    assert config["projres"]["token_reduction"] == "mean"
+    assert config["projres"]["token_reduction"] == "cls"
+    assert config["projres"]["attacked_parameter"] is None

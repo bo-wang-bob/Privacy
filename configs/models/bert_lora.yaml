@@ -23,7 +23,8 @@ lora:
   layers: all
   rank: 16
   alpha: 32.0
-  dropout: 0.1
+  # Isolate LoRA input dropout; keep the rank, scaling and classifier dropout.
+  dropout: 0.0
   scaling: rank
   classifier_dropout: 0.1
   gradient_checkpointing: false
@@ -70,8 +71,9 @@ projres:
   evaluation_interval: 50
   decision_mode: ranking
   threshold: null
-  attacked_parameter: backbone.encoder.layer.0.attention.self.query.lora_A
+  # Resolve the last trained Query from the actual backbone.
+  attacked_parameter: null
   max_candidates: 16
   min_nonmembers: 160
   max_nonmembers: 160
-  token_reduction: mean
+  token_reduction: cls

@@ -355,11 +355,11 @@ class CLIPLoRA(nn.Module):
     def get_projres_attack_surface(
         self, parameter_name: str | None = None
     ) -> tuple[str, LoRALinear]:
-        """Return the vision LoRA down-projection observed by ProjRes.
+        """Default to the last trained vision Query down-projection.
 
-        Deng et al. construct the projection subspace from the gradient of a
-        trainable linear layer. For LoRA, ``lora_A`` is exactly the
-        down-projection whose input is the attention hidden representation.
+        At the final attention block only its CLS Query affects classification;
+        Key/Value still mix multiple token contributions. Explicit A matrices
+        remain available for layer and token-reduction ablations.
         """
         modules = dict(self.named_modules())
         if parameter_name is not None:
@@ -395,13 +395,13 @@ class CLIPLoRA(nn.Module):
             raise ValueError(
                 "CLIP-LoRA ProjRes requires LoRA in the vision encoder."
             )
-        return candidates[0]
+        return candidates[-1]
 
     @staticmethod
     def resolve_projres_token_reduction(
         token_reduction: str, parameter_name: str | None = None,
     ) -> str:
-        """Use image-dependent inputs for the token-wise LoRA projection.
+        """Use CLS for the default last-Query view; retain explicit mean.
 
         Before the first attention operation, CLS is a shared embedding plus
         its position and cannot distinguish images. The token mean includes
@@ -409,7 +409,7 @@ class CLIPLoRA(nn.Module):
         """
         reduction = str(token_reduction).lower()
         if reduction == "auto":
-            reduction = "mean"
+            reduction = "cls"
         if reduction not in {"cls", "mean"}:
             raise ValueError(
                 "CLIP-LoRA ProjRes token_reduction must be auto, cls, or mean."
@@ -423,7 +423,7 @@ class CLIPLoRA(nn.Module):
             raise ValueError(
                 "CLIP-LoRA ProjRes CLS input to the first Q/K/V projection is "
                 "constant across images; use projres.token_reduction=mean "
-                "(or auto), or select an image-dependent later layer."
+                "or select an image-dependent later layer."
             )
         return reduction
 
@@ -437,9 +437,9 @@ class CLIPLoRA(nn.Module):
         """Capture sample representations entering the attacked LoRA layer.
 
         The gradient is formed from every sequence token. For sample-level
-        scoring we default to the token mean. CLS remains available for
-        contextualized layer inputs. The second return value is the token
-        count PER IMAGE, not the number of tokens in the complete batch.
+        scoring we default to CLS at the last trained Query projection.
+        Token means remain available for explicit layer comparisons. The second
+        return value is the token count PER IMAGE, not the complete batch count.
         """
         attacked_parameter, module = self.get_projres_attack_surface(
             parameter_name

@@ -73,7 +73,8 @@ weight decay；旧实现曾在该分支固定创建无动量 SGD。这也修正�
   只转换一次。普通固定学习率 SGD 下这是各本地步骤梯度之和；多个模型位置上的梯度
   并不等于单 batch 梯度。使用动量、AdamW 或扰动时只能解释为累计更新代理量。
   Gradient-Diff 保留 `2<u,g_sum_labels> - ||g_sum_labels||²`；余弦不受正标量缩放影响。
-- ProjRes 用轮初候选表示投影到真实客户端参数 delta 的行空间，按残差排名；
+- ProjRes 使用目标客户端训练后表示：由 `轮初参数 + 目标客户端上传 delta` 重建模型，
+  同一模型提取成员和非成员表示，再投影到该 delta 的行空间，按原始负 L1 残差排名；
   `paper_fedsgd_exact=false`、`batch_rank_bound=null`。多个本地步骤及中间表示变化
   会破坏单步精确条件，因此这是经验性适配。零更新只跳过该轮 ProjRes，记录
   `zero_observed_update`，其余攻击继续。
@@ -127,6 +128,13 @@ A_global = (1 / |S|) sum_k A_k
 B_global = (1 / |S|) sum_k B_k
 ```
 
+2026-09-09 起，模型基线将 `clip_lora.rank` 从 2 提高为 32，保留 `alpha=1`、
+`scaling=sqrt_rank`、dropout `0`、batch size 32 和学习率 `0.01`。
+该配置同时用于图像与文本编码器的全部 Q/K/V LoRA，并由 FedSGD/FedAvg 共用；
+LoRA 因子参数量为原 rank=2 的 16 倍，冻结主干大小不变。这是新的训练配置，
+不保证 ProjRes 的实际上传满秩或攻击效果提升。旧配置对照可通过统一入口传入
+`--set clip_lora.rank=2`；已有结果和 checkpoint 不改写，不同 rank 的权重不能直接互载。
+
 该基础方案不聚合冻结主干，也不先把 `B_k A_k` 合成稠密更新；后者与分别平均
 因子并不数学等价，属于需要另行实现和对照的聚合变体。
 
@@ -170,16 +178,21 @@ checkpoint 均不包含冻结的 BERT/GPT2 参数。
 
 `bert_lora` 使用相同的 30 客户端、one-batch、等权 FedSGD 协议。BERT 主干冻结，
 默认在全部 12 层自注意力的 Query 和 Value 投影中加入
-`W_eff = W_0 + (alpha/r) B A`，使用 `rank=16`、`alpha=32`、LoRA dropout `0.1`，
-并同时训练任务分类头。每个客户端只在 CPU 保存自己的 LoRA 因子和分类头；执行时
+`W_eff = W_0 + (alpha/r) B A`，使用 `rank=16`、`alpha=32`、LoRA dropout `0`，
+并同时训练任务分类头，分类头 dropout 保持 `0.1`。每个客户端只在 CPU 保存自己的 LoRA 因子和分类头；执行时
 临时绑定到共享 BERT 主干。
+
+2026-09-09 起，模型基线仅将 `lora.dropout` 从 `0.1` 改为 `0`，用于隔离 LoRA
+分支随机掩码对训练输入与 ProjRes 审计表示一致性的影响；rank、alpha、缩放规则、
+batch size 和学习率保持不变。FedSGD/FedAvg 共用此默认值；历史结果不改写，
+原 dropout 对照可通过统一入口传入 `--set lora.dropout=0.1`。
 
 聚合与 CLIP-LoRA 一致：服务器分别线性平均每个同名 `lora_A`、`lora_B`，不会先
 合成为稠密的 `BA` 更新；分类头参数也按相同客户端权重线性聚合。FedSGD 下等价于
 分别平均各可训练张量的真实 batch-mean 梯度，再执行一次全局 SGD step。默认配置为
-`configs/models/bert_lora.yaml`，默认数据集为 CoLA，训练 500 轮并使用恒定学习率 `0.015`。ProjRes 观察首个 Query
-投影的 `lora_A` 上传，并使用 attention mask 覆盖的有效 token 输入均值作为样本表示；
-不再使用首层注意力前、对不同文本恒定的 CLS 输入。
+`configs/models/bert_lora.yaml`，默认数据集为 CoLA，训练 500 轮并使用恒定学习率 `0.015`。
+ProjRes 默认观察最后一个已训练 Query 投影的 `lora_A` 上传，并在目标客户端训练后
+模型提取该层输入 CLS；显式首层 Query/Key/Value + CLS 会被拒绝，mean 仍可作对照。
 
 `scripts/run_privacy_experiments.py` 是全仓库统一入口，可按模型、数据集、防御、
 seed 和目标客户端展开独立进程；同一任务所选的多种攻击共享训练。
@@ -214,14 +227,26 @@ BERT Adapter 的统一入口默认启用 WWW 风险损失防御，BERT-LoRA 可�
 首轮或缺少上一轮客户端参考状态时仅用交叉熵。算法及诊断字段详见
 [WWW 文档](defenses.md#www)。GPT2-Large 当前保持 `defense.name: none`。
 
-严格 ProjRes 每 50 个已完成通信轮观察目标客户端真实 one-batch 上传，使用首层 Adapter
-down-projection 权重更新构造子空间，并在同一全局模型下提取进入该层的样本级隐藏
-表示。BERT Adapter、BERT-LoRA 与 GPT2-Large 的成员和非成员直接复用共享真实 Batch 候选视图，即当轮
+ProjRes 每 50 个已完成通信轮观察目标客户端真实 one-batch 上传：BERT/GPT2 Adapter
+默认攻击最后层 down-projection，BERT-LoRA 默认攻击最后一个已训练 Query 的 `lora_A`。
+BERT 使用该层输入 CLS，GPT2 使用最后一个有效 token。候选表示在目标客户端的
+训练后模型下提取；FedSGD 由 `轮初参数 - 学习率 × 上传梯度` 重建公开 SGD 端点。
+BERT Adapter、BERT-LoRA 与 GPT2-Large 的成员和非成员直接复用共享真实 Batch 候选视图，即当轮
 `N` 个成员及按标签匹配的 `10N` 个从未训练 evaluation 样本；完整 Batch 时为
 16/160。结果与其他攻击统一写入审计器输出，`projres.max_candidates: 16` 不会截断
-实际上传 Batch。无噪声且满足原论文梯度条件时 `paper_fedsgd_exact=true`；WWW 修改了
-训练损失，该字段为 `false`。当前概率差异正则的逐样本梯度与 CE 共线，仍保留 batch
+实际上传 Batch。训练后表示可能不同于产生上传梯度时的表示，因此文本模型与
+CLIP Transformer Adapter/LoRA 均标记 `paper_fedsgd_exact=false`。MLP/旧 feature Adapter
+的冻结输入前后相同，保留原论文条件标记。WWW 修改训练损失，也标记 `false`。
+当前概率差异正则的逐样本梯度与 CE 共线，仍保留 batch
 秩上限，且 `attacked_parameter_perturbed=false`，成员身份仍由真实 batch 确定。
+
+所有 ProjRes 结果记录 `representation_state: client_post_update_model`、
+`representation_state_source` 和 `representation_training_invariant`。两个候选组共享同一个
+目标客户端端点；独立入口按客户端重新计算动态非成员表示，提取结束恢复共享模型。
+该端点由目标上传重建，不是聚合后的全局模型。FedSGD 若本地使用 momentum/Adam 等
+优化器，公开梯度只能给出上述 SGD 端点，不能据此恢复隐藏的优化器状态。
+FedAvg 最终状态仍不能还原所有中间本地步骤的表示，不保证残差更小或攻击更强。
+其他梯度攻击继续使用轮初模型。历史结果不改写。
 
 ## 攻击可见性
 

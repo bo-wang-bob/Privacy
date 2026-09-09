@@ -70,12 +70,14 @@ projres:
   为隔离本次攻击面变更，继续沿用输入 token 总数作为保守秩上限；默认每图 50 个
   输入 token，元数据中的 `candidate_hidden_vector_count` 仍为 N×50，并不表示最后层
   有 50 个损失活跃 token。最后层只有 CLS 贡献梯度，本次不增加新的数值截断规则。
-- 保留 `paper_fedsgd_exact=false` 及现有 FedSGD 解释标记
-  `empirical_token_aggregate_gradient_projection`；实际层名与 CLS 表示写入攻击元数据。
+- 保留 `paper_fedsgd_exact=false` 及 FedSGD 解释标记
+  `empirical_post_update_representation_gradient_projection`；实际层名与 CLS 表示写入攻击元数据。
 - 零初始化导致 down 上传为零时只跳过该轮 ProjRes，记录 `zero_observed_update`；
   其他攻击继续。FedAvg 仍使用完整原始客户端训练集及默认 M:M 的独立非成员，
   `batch_rank_bound=null`，使用累计更新。最后层 CLS 在本地多步更新中可能发生表示漂移，
-  因此继续作为经验性多步适配，表示取轮初模型。
+  因此继续作为经验性多步适配。候选表示取目标客户端训练后模型：FedAvg 由轮初
+  参数加上传 delta 重建，FedSGD 由轮初参数减学习率乘上传梯度重建。成员和非成员
+  共享该端点，元数据记录 `representation_state: client_post_update_model`。
 - CoFedMID 扰动覆盖被攻击参数时取消无噪声秩上限。WWW 保留真实 batch 身份和真实上传。
 - 使用统一审计路径；独立缓存特征 ProjRes 和 `low_fpr_full` 不支持这个结构。
 - 分数继续为原始负 L1 投影残差；相对残差、端点插值与中心化没有启用。

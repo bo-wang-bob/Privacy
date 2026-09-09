@@ -26,7 +26,8 @@ clip_lora:
   encoder: both
   target_modules: [q, k, v]
   layers: all
-  rank: 2
+  # Increase the LoRA capacity while retaining the existing sqrt-rank scaling.
+  rank: 32
   alpha: 1.0
   dropout: 0.0
   scaling: sqrt_rank
@@ -82,5 +83,6 @@ projres:
   max_candidates: 32
   min_nonmembers: 320
   max_nonmembers: 320
-  attacked_parameter: clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A
-  token_reduction: mean
+  # Resolve the last trained visual Query from the actual backbone.
+  attacked_parameter: null
+  token_reduction: cls

@@ -366,7 +366,7 @@ class TransformerAdapterClassifier(nn.Module):
     def get_projres_attack_surface(
         self, parameter_name: str | None = None
     ) -> tuple[str, nn.Linear]:
-        """Return the Adapter down-projection exposed by a FedSGD upload."""
+        """Default text ProjRes to the final, classification-pooled Adapter."""
         surfaces = [
             (f"{name}.down.weight", module.down)
             for name, module in self.named_modules()
@@ -375,7 +375,9 @@ class TransformerAdapterClassifier(nn.Module):
         if not surfaces:
             raise RuntimeError("The Transformer has no Adapter attack surface.")
         if parameter_name is None:
-            return surfaces[0]
+            # CLIP subclasses also use this helper for their non-ProjRes key
+            # parameter; retain that first-layer behavior independently.
+            return surfaces[-1] if self.architecture in {"bert", "gpt2"} else surfaces[0]
         matches = [surface for surface in surfaces if surface[0] == parameter_name]
         if not matches:
             available = ", ".join(name for name, _ in surfaces)

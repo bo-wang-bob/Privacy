@@ -67,7 +67,9 @@ projres:
   evaluation_interval: 50
   decision_mode: ranking
   threshold: null
+  # The final Adapter is followed by CLS pooling.
+  attacked_parameter: null
   max_candidates: 16
   min_nonmembers: 160
   max_nonmembers: 160
-  token_reduction: auto
+  token_reduction: cls

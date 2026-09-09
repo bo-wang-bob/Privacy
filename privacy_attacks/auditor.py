@@ -27,6 +27,7 @@ from privacy_attacks.pipra import run_pipra
 from privacy_attacks.promptmia import run_promptmia
 from privacy_attacks.promptres import promptres_round_scores, run_promptres
 from privacy_attacks.projres_mlp import strict_mlp_projres
+from privacy_attacks.projres_state import projres_post_model, projres_uses_frozen_features
 from privacy_attacks.quantile import run_quantile_mia
 from privacy_attacks.query_attacks import run_canary, run_yoqo
 from privacy_attacks.rmia import run_rmia
@@ -2440,33 +2441,37 @@ class MembershipAuditor:
                     if str(getattr(self.model, "architecture", "")) == "bert"
                     else "last"
                 )
-        self.model.load_state_dict(base_state, strict=False)
-        extractor = self.model.get_projres_representations
-        representation_parts = []
-        hidden_vector_count = 0
-        for start in range(0, member_count, self.audit_batch_size):
-            member_chunk = member_inputs[start:start + self.audit_batch_size]
-            representations, vector_count = extractor(
-                member_chunk,
-                parameter_name=parameter_name,
-                token_reduction=token_reduction,
-            )
-            if self.model_type == "clip_lora":
-                # CLIP-LoRA returns tokens per image; text extractors already
-                # return the total active-token count for the complete chunk.
-                vector_count *= int(member_chunk.shape[0])
-            hidden_vector_count += int(vector_count)
-            representation_parts.append(representations.detach().cpu().float())
-        for start in range(0, nonmember_count, self.audit_batch_size):
-            stop = start + self.audit_batch_size
-            representations, _ = extractor(
-                nonmember_inputs[start:stop],
-                parameter_name=parameter_name,
-                token_reduction=token_reduction,
-            )
-            representation_parts.append(
-                representations.detach().cpu().float()
-            )
+        with projres_post_model(
+            self.model, base_state=base_state, updated_state=updated_state,
+            protocol_message=protocol_message, learning_rate=learning_rate,
+            federated_method=getattr(self, "federated_method", "fedsgd"),
+        ) as representation_state_source:
+            extractor = self.model.get_projres_representations
+            representation_parts = []
+            hidden_vector_count = 0
+            for start in range(0, member_count, self.audit_batch_size):
+                member_chunk = member_inputs[start:start + self.audit_batch_size]
+                representations, vector_count = extractor(
+                    member_chunk,
+                    parameter_name=parameter_name,
+                    token_reduction=token_reduction,
+                )
+                if self.model_type == "clip_lora":
+                    # CLIP-LoRA returns tokens per image; text extractors already
+                    # return the total active-token count for the complete chunk.
+                    vector_count *= int(member_chunk.shape[0])
+                hidden_vector_count += int(vector_count)
+                representation_parts.append(representations.detach().cpu().float())
+            for start in range(0, nonmember_count, self.audit_batch_size):
+                stop = start + self.audit_batch_size
+                representations, _ = extractor(
+                    nonmember_inputs[start:stop],
+                    parameter_name=parameter_name,
+                    token_reduction=token_reduction,
+                )
+                representation_parts.append(
+                    representations.detach().cpu().float()
+                )
         candidate_representations = torch.cat(representation_parts)
         if parameter_name not in base_state or parameter_name not in updated_state:
             raise ValueError(
@@ -2541,7 +2546,7 @@ class MembershipAuditor:
         paper_fedsgd_exact = (
             getattr(self, "federated_method", "fedsgd") == "fedsgd"
             and getattr(self, "defense_name", "none") != "www"
-            and not getattr(self.model, "projres_token_aggregate", False)
+            and projres_uses_frozen_features(self.model)
         )
         if cofedmid and (cofedmid["upload_perturbed"] or cofedmid["custom_training_loss"]):
             paper_fedsgd_exact = False
@@ -2584,10 +2589,12 @@ class MembershipAuditor:
             "paper_fedsgd_exact": paper_fedsgd_exact,
             "interpretation": ("empirical_multistep_model_delta_projection"
                                if getattr(self, "federated_method", "fedsgd") == "fedavg"
-                               else "empirical_token_aggregate_gradient_projection"
-                               if getattr(self.model, "projres_token_aggregate", False)
+                               else "empirical_post_update_representation_gradient_projection"
+                               if not projres_uses_frozen_features(self.model)
                                else "observed_batch_gradient_projection"),
-            "representation_state": "round_start_global_model",
+            "representation_state": "client_post_update_model",
+            "representation_state_source": representation_state_source,
+            "representation_training_invariant": projres_uses_frozen_features(self.model),
             "cofedmid": cofedmid,
             "attacked_parameter_perturbed": parameter_perturbed,
             "batch_rank_bound": rank_bound,

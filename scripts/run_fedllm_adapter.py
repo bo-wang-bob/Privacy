@@ -539,6 +539,10 @@ def validate_config(config: dict) -> None:
     if not 0 <= target_client_id < int(config["total_users"]):
         raise ValueError("audit.target_client_id is outside the client range.")
     projres = dict(config.get("projres", {}))
+    if config.get("model_type") == "bert_lora" and "projres" in audit.get("attacks", []):
+        TransformerLoRAClassifier.resolve_projres_token_reduction(
+            projres.get("token_reduction", "auto"), projres.get("attacked_parameter")
+        )
     if projres.get("threshold") is not None:
         raise ValueError("ProjRes is ranking-only; threshold must be null.")
     if str(projres.get("decision_mode", "ranking")).lower() != "ranking":

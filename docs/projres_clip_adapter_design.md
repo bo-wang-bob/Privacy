@@ -1,5 +1,10 @@
 **逐层 CLIP Adapter 的 ProjRes 改进实验设计**
 
+当前实现补充（2026-09-09）：候选表示已统一改用目标客户端的公开训练后端点。
+FedAvg 为 `θ_start + Δ_target`，FedSGD 为 `θ_start - η g_target`，元数据记录
+`representation_state: client_post_update_model`。以下轮初表示比较和漂移数值保留为
+设计背景及历史诊断；插值网格、取多状态最小残差仍未启用。
+
 日期：2026 年 9 月 9 日。实施更新：第一阶段最后层 down + CLS 已设为逐层 CLIP Adapter 的默认 ProjRes；未启动真实数据对照。按用户要求保留现有候选比例（FedAvg 1:1、FedSGD 1:10），第二阶段评分变体仍为设计。
 
 **首选方案：最后一层视觉 Adapter 的 down 权重，配合该层输入的 CLS 表示。**

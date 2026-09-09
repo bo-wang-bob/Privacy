@@ -336,6 +336,12 @@ def _run_client(
             ),
         )
     )
+    # Frozen CLIP inputs are identical before and after the head update.
+    attack.metadata.update(
+        representation_state="client_post_update_model",
+        representation_state_source="frozen_feature_cache",
+        representation_training_invariant=True,
+    )
     metrics = _metric_payload(labels, attack.scores, attack.l1_residuals)
     batch_size = int(member_labels.numel())
     input_dimension = int(first_layer.in_features)

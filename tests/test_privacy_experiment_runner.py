@@ -69,14 +69,15 @@ def test_fedavg_epochs_and_weighting_override(tmp_path):
 
 
 @pytest.mark.parametrize("method", ["fedsgd", "fedavg"])
-def test_clip_lora_projres_uses_mean_and_rejects_constant_cls(method, tmp_path):
+def test_clip_lora_projres_uses_last_cls_and_rejects_constant_cls(method, tmp_path):
     import copy
     args = _args("--models", "clip_lora", "--datasets", "cifar100", "--methods", method,
                  "--attacks", "projres", "--defenses", "none", "--results-root", str(tmp_path))
     tasks, skipped = build_tasks(CATALOG, args)
     assert not skipped and len(tasks) == 1
     config = tasks[0].config
-    assert config["projres"]["token_reduction"] == "mean"
+    assert config["projres"]["token_reduction"] == "cls"
+    assert config["projres"]["attacked_parameter"] is None
     for value in [None, "auto"]:
         automatic = copy.deepcopy(config)
         if value is None:
@@ -84,7 +85,18 @@ def test_clip_lora_projres_uses_mean_and_rejects_constant_cls(method, tmp_path):
         else:
             automatic["projres"]["token_reduction"] = value
         validate_resolved_config(automatic, "vision")
-    for value in ["cls", "last", "invalid"]:
+    legacy = copy.deepcopy(config)
+    legacy["projres"].update(
+        attacked_parameter="clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A",
+        token_reduction="mean",
+    )
+    validate_resolved_config(legacy, "vision")
+    for value in ["cls", "auto"]:
+        invalid = copy.deepcopy(legacy)
+        invalid["projres"]["token_reduction"] = value
+        with pytest.raises(ValueError, match="constant across images"):
+            validate_resolved_config(invalid, "vision")
+    for value in ["last", "invalid"]:
         invalid = copy.deepcopy(config)
         invalid["projres"]["token_reduction"] = value
         with pytest.raises(ValueError, match="constant across images|token_reduction"):

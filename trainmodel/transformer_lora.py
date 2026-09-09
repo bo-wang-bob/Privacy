@@ -177,6 +177,7 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
     def get_projres_attack_surface(
         self, parameter_name: str | None = None
     ) -> tuple[str, LoRALinear]:
+        """Prefer the last trained Query A; preserve explicit legacy views."""
         surfaces = [
             (f"{name}.lora_A", module)
             for name, module in self.named_modules()
@@ -185,7 +186,8 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
         if not surfaces:
             raise RuntimeError("BERT has no LoRA attack surface.")
         if parameter_name is None:
-            return surfaces[0]
+            queries = [surface for surface in surfaces if surface[0].endswith(".query.lora_A")]
+            return (queries or surfaces)[-1]
         matches = [surface for surface in surfaces if surface[0] == parameter_name]
         if not matches:
             available = ", ".join(name for name, _ in surfaces)
@@ -196,23 +198,28 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
         return matches[0]
 
     @staticmethod
-    def resolve_projres_token_reduction(token_reduction: str) -> str:
-        """Resolve the sample view used for a token-wise LoRA projection.
-
-        Query/Value LoRA is applied to every active BERT token. In
-        particular, the CLS input to the first attention layer is constant
-        across examples because it has not yet attended to the sentence.
-        The mask-weighted token mean remains in the span of the actual layer
-        inputs that form the uploaded gradient and yields a sample-specific
-        representation, so it is the BERT-LoRA automatic default.
-        """
+    def resolve_projres_token_reduction(
+        token_reduction: str, parameter_name: str | None = None,
+    ) -> str:
+        """Use CLS at the last Query; reject constant first-attention CLS."""
         reduction = str(token_reduction).lower()
         if reduction == "auto":
-            reduction = "mean"
+            reduction = "cls"
         if reduction not in {"cls", "last", "mean"}:
             raise ValueError(
                 "BERT-LoRA ProjRes token_reduction must be auto, cls, last, "
                 "or mean."
+            )
+        if reduction == "cls" and parameter_name is not None and any(
+            str(parameter_name).endswith(
+                f"backbone.encoder.layer.0.attention.self.{projection}.lora_A"
+            )
+            for projection in ("query", "key", "value")
+        ):
+            raise ValueError(
+                "BERT-LoRA ProjRes CLS input to the first Query/Key/Value "
+                "projection is constant across texts; use "
+                "projres.token_reduction=mean or select a later layer."
             )
         return reduction
 
@@ -225,12 +232,12 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
     ) -> tuple[torch.Tensor, int]:
         """Capture a sample view of inputs to the attacked LoRA projection.
 
-        ``mean`` is attention-mask weighted and therefore excludes padding.
-        It represents all active token inputs that contribute to the
-        token-wise Query/Value LoRA gradient. ``auto`` resolves to ``mean``;
-        explicit ``cls`` and ``last`` remain available for diagnostics.
+        ``auto`` resolves to ``cls`` for the default last-Query view. Explicit
+        ``mean`` remains attention-mask weighted for legacy comparisons.
+        Inputs are extracted in eval mode; training LoRA dropout is not replayed.
         """
-        _, attacked_layer = self.get_projres_attack_surface(parameter_name)
+        attacked_parameter, attacked_layer = self.get_projres_attack_surface(parameter_name)
+        reduction = self.resolve_projres_token_reduction(token_reduction, attacked_parameter)
         captured: list[torch.Tensor] = []
 
         def capture_input(_module, args) -> None:
@@ -253,7 +260,6 @@ class TransformerLoRAClassifier(TransformerAdapterClassifier):
         hidden = captured[0]
         _, attention_mask = self.unpack_inputs(packed_inputs)
         attention_mask = attention_mask.to(hidden.device)
-        reduction = self.resolve_projres_token_reduction(token_reduction)
         if reduction == "cls":
             representations = hidden[:, 0]
         elif reduction == "last":

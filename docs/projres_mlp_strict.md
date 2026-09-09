@@ -4,15 +4,22 @@
 Federated Large Language Models: A Projection Residual Approach* 的 Algorithm
 1。论文中的 adapter down-projection 层在 CLIP-Adapter 中直接对应
 `adapter.net.0.weight`；在 CLIP-MLP 对照模型中对应第一层分类 MLP
-`classifier.0.weight`。CLIP-LoRA 对应视觉编码器首个 Q 投影中的下投影因子
-`clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A`。
+`classifier.0.weight`。CLIP-LoRA 默认对应最后一个已训练视觉 Q 投影的下投影因子；ViT-B/32 全层 LoRA 为
+`clip_model.vision_model.encoder.layers.11.self_attn.q_proj.lora_A`，使用该层输入 CLS。
 
 上面的末端 Adapter 映射针对旧 `clip_adapter.variant: feature`。当前默认
 `variant: transformer` 在视觉 block 后插入 Adapter，攻击层为
-`clip_model.vision_model.encoder.layers.0.adapter.down.weight`；候选使用 block 输出的
-mean-token 表示，按 token 总数限制 FedSGD 秩，并标记 `paper_fedsgd_exact=false`。
+实际最后层的 down 权重（ViT-B/32 为
+`clip_model.vision_model.encoder.layers.11.adapter.down.weight`）；候选使用该层输入 CLS，按 token 总数限制 FedSGD 秩，并标记 `paper_fedsgd_exact=false`。
 该结构只使用统一审计入口，不支持本文件的独立缓存特征入口；详见
 [`clip_transformer_adapter.md`](clip_transformer_adapter.md)。
+
+当前所有 ProjRes 使用目标客户端本轮训练后、由上传可重建的模型提取候选表示。
+FedAvg 使用 `θ_start + Δ_target`，FedSGD 使用 `θ_start - η g_target`；成员和非成员
+共享该状态，独立入口为每个目标客户端重新提取动态表示。结果记录
+`representation_state: client_post_update_model` 和重建来源。对 Transformer Adapter/LoRA，
+该表示可能不同于训练时表示，故 `paper_fedsgd_exact=false`。下面冻结 CLIP + MLP/末端
+Adapter 的输入前后相同，缓存仍然有效，原有分数与条件不受这次状态切换影响。
 
 ## 数学映射
 
@@ -49,18 +56,17 @@ Delta_A = learning_rate * dL/dA
 rowspan(dL/dA) is a subspace of the attacked-layer token inputs
 ```
 
-实现从产生该上传之前的全局模型注册 forward hook，捕获进入 Q-LoRA 的
+实现从目标客户端公开训练后模型注册 forward hook，捕获进入 Q-LoRA 的
 `[batch, tokens, hidden]` 表示。论文子空间由全部 token 共同形成；当前样本级
-候选默认使用全部 token（CLS 与图像 patch）的均值作为 `f(x)`，`auto` 同样解析为
-`mean`。首层 Q/K/V 的输入 CLS 尚未经过注意力计算，在不同图像间恒定，因此
-显式配置该层的 `token_reduction: cls` 会被拒绝；后层或已混合图像信息的
-attention output projection 仍可显式使用 CLS。
+候选默认使用最后一个已训练 Query 的输入 CLS 作为 `f(x)`，`auto` 同样解析为
+`cls`，可显式使用 `mean` 对照。首层 Q/K/V 的输入 CLS 尚未经过注意力计算，
+在不同图像间恒定，因此显式配置该层的 `token_reduction: cls` 会被拒绝。
 
 提取器返回每张图像的 token 数；统一审计器按每块实际样本数累计
 `batch_size * tokens_per_sample`，不受候选前向分块大小影响。FedSGD 读取真实
 上传的 `lora_A` 梯度；FedAvg 使用模型 delta 的行空间，不合并稠密 `BA` 更新，
 并保留 `paper_fedsgd_exact=false`、`batch_rank_bound=null` 的多步适配标记。
-mean 表示避免了恒定 CLS 的退化，但不保证满足低秩、多 token 场景下的有利秩条件。
+后层 CLS 避免了首层恒定输入的退化，但不保证满足低秩、多 token 场景下的有利秩条件。
 历史 CLS 分数不改写；修复后需启动新任务获取对应审计结果。
 
 ### 数值稳定性
@@ -86,8 +92,8 @@ mean 表示避免了恒定 CLS 的退化，但不保证满足低秩、多 token 
   客户端的数据集”；
 - 不使用其他客户端更新、代理梯度、shadow model、学习型攻击头或成员标签
   来构造攻击子空间；
-- CLIP 主干冻结；CLIP-Adapter 只读取首个 down-projection 权重更新，
-  CLIP-MLP 对照模型只读取第一层分类 MLP 权重更新，CLIP-LoRA 只读取首个
+- CLIP 原始主干冻结；旧末端 Adapter 只读取首个 down-projection 权重更新，
+  CLIP-MLP 对照模型只读取第一层分类 MLP 权重更新，CLIP-LoRA 默认读取最后一个已训练
   视觉 Q 投影的 `lora_A` 更新；
 - 数据协议与对应正常训练保持一致：三个 CLIP 模型默认使用全局每类 16-shot，
   CLIP-Adapter/LoRA 可配置完整训练分区或其他 shots；严格实验均为 one-batch FedSGD。

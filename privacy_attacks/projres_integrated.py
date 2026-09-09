@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 from privacy_attacks.metrics import membership_metrics
 from privacy_attacks.projres_mlp import strict_mlp_projres
+from privacy_attacks.projres_state import projres_post_model
 
 
 logger = logging.getLogger(__name__)
@@ -233,7 +234,7 @@ def _run_lora_client(
     attacked_parameter: str,
     token_reduction: str,
 ) -> dict[str, object]:
-    """Run Deng et al.'s ProjRes on a real one-batch LoRA-A upload."""
+    """Project post-update representations onto a real LoRA-A upload."""
     target = users[client_id]
     if target.last_train_batch is None:
         raise ValueError(
@@ -314,7 +315,7 @@ def _run_lora_client(
                 "present_in_the_observed_target_client_fedsgd_batch"
             ),
             "execution": "integrated_from_uploaded_client_gradient",
-            "paper_fedsgd_exact": True,
+            "paper_fedsgd_exact": False,
             "paper_reference": (
                 "Deng et al. (2026), Toward Efficient Membership Inference "
                 "Attacks against Federated Large Language Models"
@@ -443,7 +444,7 @@ def _run_text_adapter_client(
     attacked_parameter: str,
     token_reduction: str,
 ) -> dict[str, object]:
-    """Run paper-faithful ProjRes on one real text Adapter FedSGD upload."""
+    """Project post-update representations onto a real text PEFT upload."""
     target = users[client_id]
     if target.last_train_batch is None:
         raise ValueError(
@@ -534,10 +535,8 @@ def _run_text_adapter_client(
                 "present_in_the_observed_target_client_fedsgd_batch"
             ),
             "execution": "integrated_from_uploaded_client_gradient",
-            # The paper training protocol uses one batch of 16 examples. A
-            # larger one-batch run remains a valid observed-update ProjRes
-            # experiment, but must not be labeled as the exact paper setup.
-            "paper_fedsgd_exact": actual_batch_size == 16,
+            # Post-update hidden inputs differ from those producing the gradient.
+            "paper_fedsgd_exact": False,
             "paper_reference": (
                 "Deng et al. (2026), Toward Efficient Membership Inference "
                 "Attacks against Federated Large Language Models"
@@ -684,6 +683,11 @@ def _run_client(
             torch.zeros(nonmember_labels.numel(), dtype=torch.long),
         )
     )
+    attack.metadata.update(
+        representation_state="client_post_update_model",
+        representation_state_source="frozen_feature_cache",
+        representation_training_invariant=True,
+    )
     metrics = _metric_payload(labels, attack.scores, attack.l1_residuals)
     actual_batch_size = int(member_labels.numel())
     if federated_method == "fedsgd":
@@ -727,7 +731,7 @@ def _run_client(
                 if federated_method == "fedsgd"
                 else "integrated_from_client_post_state"
             ),
-            "paper_fedsgd_exact": local_batches == 1,
+            "paper_fedsgd_exact": federated_method == "fedsgd" and local_batches == 1,
         },
         "dimensions": {
             "candidate_sampling_batch_size": actual_batch_size,
@@ -861,7 +865,7 @@ def run_integrated_projres(
     if model_type in {"bert_adapter", "bert_lora", "gpt2_adapter"}:
         if federated_method != "fedsgd" or int(local_epochs) != 1:
             raise ValueError(
-                "Paper-faithful text PEFT ProjRes requires one-batch FedSGD."
+                "Independent text PEFT ProjRes requires one-batch FedSGD."
             )
         attacked_parameter, _ = model.get_projres_attack_surface(
             config.get("attacked_parameter")
@@ -877,60 +881,72 @@ def run_integrated_projres(
                     if str(getattr(model, "architecture", "")) == "bert"
                     else "last"
                 )
-        model.load_state_dict(base_states[client_ids[0]], strict=False)
         nonmember_datasets = [
             user.test_data for user in users if len(user.test_data)
         ]
         nonmember_source_names = [
             f"independent_test:{user.id}" for user in users if len(user.test_data)
         ]
-        (
-            nonmember_representations,
-            nonmember_labels,
-            nonmember_source_counts,
-        ) = _collect_text_representations(
-            nonmember_datasets,
-            nonmember_source_names,
-            model,
-            users[client_ids[0]].collate_fn,
-            eval_batch_size,
-            None if configured_max_nonmembers == 0 else configured_max_nonmembers,
-            attacked_parameter,
-            token_reduction,
-        )
-        if nonmember_labels.numel() < min_nonmembers:
-            raise ValueError(
-                "Strict text Adapter ProjRes needs at least "
-                f"{min_nonmembers} never-trained non-members; found "
-                f"{nonmember_labels.numel()}."
-            )
         for client_id in client_ids:
-            results.append(
-                _run_text_adapter_client(
-                    client_id,
-                    users,
-                    model,
-                    base_states[client_id],
-                    updated_states[client_id],
-                    client_gradients[client_id],
+            with projres_post_model(
+                model, base_state=base_states[client_id],
+                updated_state=updated_states[client_id],
+                protocol_message={"kind": "gradient", "tensors": client_gradients[client_id]},
+                learning_rate=learning_rate, federated_method=federated_method,
+            ) as state_source:
+                (
                     nonmember_representations,
                     nonmember_labels,
                     nonmember_source_counts,
-                    learning_rate,
-                    round_index,
-                    threshold,
-                    max_candidates,
+                ) = _collect_text_representations(
+                    nonmember_datasets,
+                    nonmember_source_names,
+                    model,
+                    users[client_id].collate_fn,
+                    eval_batch_size,
+                    None if configured_max_nonmembers == 0 else configured_max_nonmembers,
                     attacked_parameter,
                     token_reduction,
                 )
-            )
+                if nonmember_labels.numel() < min_nonmembers:
+                    raise ValueError(
+                        "Strict text Adapter ProjRes needs at least "
+                        f"{min_nonmembers} never-trained non-members; found "
+                        f"{nonmember_labels.numel()}."
+                    )
+                results.append(
+                    _run_text_adapter_client(
+                        client_id,
+                        users,
+                        model,
+                        base_states[client_id],
+                        updated_states[client_id],
+                        client_gradients[client_id],
+                        nonmember_representations,
+                        nonmember_labels,
+                        nonmember_source_counts,
+                        learning_rate,
+                        round_index,
+                        threshold,
+                        max_candidates,
+                        attacked_parameter,
+                        token_reduction,
+                    )
+                )
+                results[-1]["attack"]["metadata"].update(
+                    representation_state="client_post_update_model",
+                    representation_state_source=state_source,
+                    representation_training_invariant=False,
+                    paper_fedsgd_exact=False,
+                    interpretation="empirical_post_update_representation_gradient_projection",
+                )
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
     elif model_type == "clip_lora":
         if federated_method != "fedsgd" or int(local_epochs) != 1:
             raise ValueError(
-                "Paper-faithful CLIP-LoRA ProjRes requires one-batch FedSGD."
+                "Independent CLIP-LoRA ProjRes requires one-batch FedSGD."
             )
         attacked_parameter, _ = model.get_projres_attack_surface(
             config.get("attacked_parameter")
@@ -938,61 +954,71 @@ def run_integrated_projres(
         token_reduction = model.resolve_projres_token_reduction(
             config.get("token_reduction", "auto"), attacked_parameter
         )
-        # Candidate representations must be computed under the released global
-        # state that preceded the observed client update. All clients share it.
-        model.load_state_dict(base_states[client_ids[0]], strict=False)
         nonmember_datasets = [
             user.test_data for user in users if len(user.test_data)
         ]
         nonmember_source_names = [
             f"independent_test:{user.id}" for user in users if len(user.test_data)
         ]
-        (
-            nonmember_representations,
-            nonmember_labels,
-            nonmember_source_counts,
-            nonmember_tokens_per_sample,
-        ) = _collect_lora_representations(
-            nonmember_datasets,
-            nonmember_source_names,
-            model,
-            users[client_ids[0]].collate_fn,
-            eval_batch_size,
-            (
-                None
-                if configured_max_nonmembers == 0
-                else configured_max_nonmembers
-            ),
-            attacked_parameter,
-            token_reduction,
-        )
-        if nonmember_labels.numel() < min_nonmembers:
-            raise ValueError(
-                "Strict CLIP-LoRA ProjRes needs at least "
-                f"{min_nonmembers} never-trained non-members; found "
-                f"{nonmember_labels.numel()}."
-            )
         for client_id in client_ids:
-            results.append(
-                _run_lora_client(
-                    client_id,
-                    users,
-                    model,
-                    base_states[client_id],
-                    updated_states[client_id],
-                    client_gradients[client_id],
+            with projres_post_model(
+                model, base_state=base_states[client_id],
+                updated_state=updated_states[client_id],
+                protocol_message={"kind": "gradient", "tensors": client_gradients[client_id]},
+                learning_rate=learning_rate, federated_method=federated_method,
+            ) as state_source:
+                (
                     nonmember_representations,
                     nonmember_labels,
                     nonmember_source_counts,
                     nonmember_tokens_per_sample,
-                    learning_rate,
-                    round_index,
-                    threshold,
-                    max_candidates,
+                ) = _collect_lora_representations(
+                    nonmember_datasets,
+                    nonmember_source_names,
+                    model,
+                    users[client_id].collate_fn,
+                    eval_batch_size,
+                    (
+                        None
+                        if configured_max_nonmembers == 0
+                        else configured_max_nonmembers
+                    ),
                     attacked_parameter,
                     token_reduction,
                 )
-            )
+                if nonmember_labels.numel() < min_nonmembers:
+                    raise ValueError(
+                        "Strict CLIP-LoRA ProjRes needs at least "
+                        f"{min_nonmembers} never-trained non-members; found "
+                        f"{nonmember_labels.numel()}."
+                    )
+                results.append(
+                    _run_lora_client(
+                        client_id,
+                        users,
+                        model,
+                        base_states[client_id],
+                        updated_states[client_id],
+                        client_gradients[client_id],
+                        nonmember_representations,
+                        nonmember_labels,
+                        nonmember_source_counts,
+                        nonmember_tokens_per_sample,
+                        learning_rate,
+                        round_index,
+                        threshold,
+                        max_candidates,
+                        attacked_parameter,
+                        token_reduction,
+                    )
+                )
+                results[-1]["attack"]["metadata"].update(
+                    representation_state="client_post_update_model",
+                    representation_state_source=state_source,
+                    representation_training_invariant=False,
+                    paper_fedsgd_exact=False,
+                    interpretation="empirical_post_update_representation_gradient_projection",
+                )
             gc.collect()
             if device.type == "cuda":
                 torch.cuda.empty_cache()

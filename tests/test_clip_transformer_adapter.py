@@ -220,7 +220,7 @@ def test_raw_image_federated_training_defenses_and_all_attacks(method, defense, 
     assert meta["paper_fedsgd_exact"] is False
     assert meta["attacked_parameter"] == "clip_model.vision_model.encoder.layers.1.adapter.down.weight"
     assert meta["sample_representation"] == "cls_token_input_to_visual_transformer_adapter_down_projection"
-    assert meta["representation_state"] == "round_start_global_model"
+    assert meta["representation_state"] == "client_post_update_model"
     assert meta["nonmember_to_member_ratio"] == (1 if method == "fedavg" else 10)
     if method == "fedavg" or meta["attacked_parameter_perturbed"]:
         assert meta["batch_rank_bound"] is None

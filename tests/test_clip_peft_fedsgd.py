@@ -113,10 +113,11 @@ def clip_lora_projres_model():
     torch.set_num_threads(previous_threads)
 
 
-def test_clip_lora_projres_default_uses_image_dependent_mean(clip_lora_projres_model):
+def test_clip_lora_projres_default_uses_last_query_cls(clip_lora_projres_model):
     model = clip_lora_projres_model
     images = torch.randn(3, 3, 4, 4)
-    _, layer = model.get_projres_attack_surface()
+    name, layer = model.get_projres_attack_surface()
+    assert name == "clip_model.vision_model.encoder.layers.1.self_attn.q_proj.lora_A"
     captured = []
     hook = layer.register_forward_pre_hook(lambda _module, args: captured.append(args[0].detach()))
     model.eval()
@@ -124,12 +125,10 @@ def test_clip_lora_projres_default_uses_image_dependent_mean(clip_lora_projres_m
         model.clip_model.get_image_features(pixel_values=images)
     hook.remove()
     hidden = captured[0]
-    # Reproduce the old failure with real CLIP attention inputs, not a mock.
-    assert torch.equal(hidden[:, 0], hidden[:1, 0].expand_as(hidden[:, 0]))
-    expected = hidden.mean(dim=1)
+    expected = hidden[:, 0]
     assert not torch.allclose(expected[0], expected[1])
     model.train()
-    for kwargs in [{}, {"token_reduction": "auto"}, {"token_reduction": "mean"}]:
+    for kwargs in [{}, {"token_reduction": "auto"}, {"token_reduction": "cls"}]:
         representations, tokens_per_image = model.get_projres_representations(images, **kwargs)
         torch.testing.assert_close(representations, expected)
         assert tokens_per_image == 5
@@ -137,6 +136,24 @@ def test_clip_lora_projres_default_uses_image_dependent_mean(clip_lora_projres_m
         assert not representations.requires_grad
     chunked = torch.cat([model.get_projres_representations(image[None])[0] for image in images])
     torch.testing.assert_close(chunked, expected)
+    mean, _ = model.get_projres_representations(images, token_reduction="mean")
+    torch.testing.assert_close(mean, hidden.mean(dim=1))
+
+
+def test_clip_lora_projres_preserves_explicit_first_mean(clip_lora_projres_model):
+    model = clip_lora_projres_model
+    images = torch.randn(3, 3, 4, 4)
+    name = "clip_model.vision_model.encoder.layers.0.self_attn.q_proj.lora_A"
+    _, module = model.get_projres_attack_surface(name)
+    captured = []
+    hook = module.register_forward_pre_hook(lambda _m, args: captured.append(args[0].detach()))
+    actual, count = model.get_projres_representations(images, name, "mean")
+    hook.remove()
+    hidden = captured[0]
+    torch.testing.assert_close(actual, hidden.mean(dim=1))
+    assert torch.equal(hidden[:, 0], hidden[:1, 0].expand_as(hidden[:, 0]))
+    assert not torch.allclose(actual[0], actual[1])
+    assert count == 5
 
 
 @pytest.mark.parametrize("projection", ["q", "k", "v"])
@@ -189,14 +206,16 @@ def test_clip_lora_unified_projres_default_scores_and_token_count(
     members = 3 if method == "fedsgd" else 6
     assert result["member_count"] == members
     assert result["nonmember_count"] == 6
-    assert metadata["sample_representation"] == "mean_token_input_to_lora_down_projection"
+    assert metadata["sample_representation"] == "cls_token_input_to_lora_down_projection"
+    assert metadata["attacked_parameter"] == "clip_model.vision_model.encoder.layers.1.self_attn.q_proj.lora_A"
     assert metadata["candidate_hidden_vector_count"] == members * 5
     assert metadata["batch_rank_bound"] == (members * 5 if method == "fedsgd" else None)
-    assert metadata["paper_fedsgd_exact"] == (method == "fedsgd")
+    assert metadata["paper_fedsgd_exact"] is False
+    assert metadata["representation_state"] == "client_post_update_model"
 
 
 @pytest.mark.parametrize("reduction", [None, "auto"])
-def test_clip_lora_independent_projres_resolves_mean(
+def test_clip_lora_independent_projres_resolves_last_query_cls(
     clip_lora_projres_model, reduction, tmp_path,
 ):
     from privacy_attacks.projres_integrated import run_integrated_projres
@@ -223,7 +242,7 @@ def test_clip_lora_independent_projres_resolves_mean(
         output_path=tmp_path / "projres.json", federated_method="fedsgd",
     )
     result = payload["result"]
-    assert result["dimensions"]["sample_representation"] == "mean_token_layer_input"
+    assert result["dimensions"]["sample_representation"] == "cls_token_layer_input"
     assert result["dimensions"]["observed_hidden_vector_count"] == 15
     scores = torch.tensor(result["raw"]["scores"])
     assert torch.isfinite(scores).all() and scores.unique().numel() > 1

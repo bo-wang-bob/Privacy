@@ -27,6 +27,7 @@
 - `configs/experiment_catalog.yaml` 维护能力矩阵、防御深度覆盖和别名；`configs/models/` 下 7 个基线维护模型训练与默认候选协议。不要重新为数据集、攻击或防御复制整份模型 YAML。
 - 统一入口在应用全部 `--set` 后自动推导启用的 exact-batch ProjRes 候选参数：普通训练和 WWW 使用最终 batch 大小及成员/非成员比例，`record_dp` 使用 `0/0/0` 动态候选。改变 `batch_size` 或混跑 `none,record_dp,www` 无需手动同步这三个值。显式传入的 ProjRes 候选参数保留并接受协议校验；干运行显示最终候选参数。
 - CLIP 默认学习率由模型基线设置：CLIP-MLP 为 `0.1`，CLIP-Adapter 与 CLIP-LoRA 均为 `0.01`。应以统一脚本干运行打印的最终参数为准。
+- CLIP-LoRA 自 2026-09-09 起的模型基线使用 `rank=32`（此前为 2），保留 `alpha=1`、`scaling=sqrt_rank`、dropout `0`、图像/文本编码器全部 Q/K/V 和原 batch/学习率；FedSGD/FedAvg 共用。LoRA 因子参数量为此前的 16 倍，不能据此保证 ProjRes 满秩或攻击有效。旧 rank 对照使用 `--set clip_lora.rank=2`，历史结果不改写。
 - CLIP-Adapter 默认 `clip_adapter.variant: transformer`：视觉 ViT 的每个 block 后插入 BERT 式 `768→384→768` 残差 Adapter（reduction=2、ReLU、上投影零初始化），原始骨干与文本编码器冻结，保留图像/类别文本相似度分类。图像、文本特征均在线计算，只缓存提示词 token；`precompute_features: true` 被拒绝。客户端复用共享骨干、独立保存 Adapter 参数。旧 `variant: feature` 和缺少 variant 的旧配置保持末端特征 Adapter；历史结果不改写。新权重保存到 `final_clip_transformer_adapter.pt`，不是旧末端 Adapter checkpoint。见 `docs/clip_transformer_adapter.md`。
 - 三个 CLIP 基线均显式使用 IID。不要在正常 IID 实验中传 `--dirichlet-alpha`；仅传该参数会自动切换为 `dirichlet`。如同时显式传 `--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha 仅作为未使用的配置值保留。
 - 三个 CLIP 模型默认使用每类 16 张训练图像。CLIP-Adapter/LoRA 均可配置 `use_full_dataset: false` 与正整数 `fpl_shots` 选择 few-shot，或 `use_full_dataset: true` 与 `fpl_shots: null` 使用完整训练分区；MLP 仍固定 16-shot。Adapter/LoRA 始终从完整源分区加载，few-shot 只截取训练集，再进行客户端划分；独立 evaluation/test 分区不随 shots 截断。新 Adapter/LoRA 的 CIFAR100/Food101 不再先经过历史 200 张/类训练及 50 张/类测试子集；旧结果不改写，比较时核对实际分区。直接 CLI 的 shots 覆盖也不再隐式把 Adapter/LoRA 切为 Dirichlet。IID 仍要求每类训练样本数至少等于客户端数。
@@ -66,9 +67,9 @@
 ## 当前 BERT PEFT 协议
 
 - BERT-Base Adapter 与 BERT-Base LoRA 均使用 30 个 IID 客户端、batch size 16、one-batch 等权 FedSGD；两者均使用 500 轮，Adapter 默认学习率为 `0.005`，LoRA 默认学习率为 `0.015`。
-- BERT-LoRA 默认在全部 12 层自注意力 Query/Value 投影中训练 `rank=16`、`alpha=32`、dropout `0.1` 的 LoRA 因子，并同时训练分类头；冻结 BERT 主干不上传。服务器与 CLIP-LoRA 一样分别聚合同名 `lora_A`、`lora_B`，不先合成稠密 `BA` 更新。
+- BERT-LoRA 默认在全部 12 层自注意力 Query/Value 投影中训练 `rank=16`、`alpha=32`、`scaling=rank`、LoRA dropout `0` 的因子，并同时训练分类头，分类头 dropout 保持 `0.1`；冻结 BERT 主干不上传。自 2026-09-09 起仅将 LoRA dropout 从 `0.1` 改为 `0`，隔离输入随机掩码的影响；FedSGD/FedAvg 共用，历史结果不改写，旧对照使用 `--set lora.dropout=0.1`。服务器与 CLIP-LoRA 一样分别聚合同名 `lora_A`、`lora_B`，不先合成稠密 `BA` 更新。
 - BERT Adapter/LoRA 均支持全部 11 种注册攻击，并使用上述 5 种固定候选攻击与 6 种真实 Batch 攻击划分；完整真实 Batch 候选为 16/160。
-- BERT-LoRA 默认配置为 `configs/models/bert_lora.yaml`，默认只展开 CoLA，SST-5/IMDb 仍可通过 `--datasets` 显式选择；可由 `scripts/run_privacy_experiments.py --models bert_lora` 启动。ProjRes 观察首层 Query 的 `lora_A` 上传，并以 attention-mask 加权的有效 token 输入均值作为每个样本的表示，避免首层 CLS 在不同文本间恒定导致分数退化。
+- BERT-LoRA 默认配置为 `configs/models/bert_lora.yaml`，默认只展开 CoLA，SST-5/IMDb 仍可通过 `--datasets` 显式选择；可由 `scripts/run_privacy_experiments.py --models bert_lora` 启动。ProjRes 默认观察最后一个已训练 Query 的 `lora_A` 上传，以该层输入 CLS 作为样本表示；显式首层 Query/Key/Value + CLS 会被拒绝，仍可使用 mean 作对照。
 
 ## 按需审计频次
 
@@ -81,10 +82,11 @@
 
 ## ProjRes 特例
 
-- 当前统一入口对 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 执行共享 exact-batch ProjRes；三者每 10 轮读取真实 one-batch FedSGD 上传，分别攻击 `classifier.0.weight`、最后视觉 Adapter 的 down 权重（ViT-B/32 为 `clip_model.vision_model.encoder.layers.11.adapter.down.weight`）与首个视觉 Q 投影的 `lora_A`。旧 feature Adapter 仍攻击 `adapter.net.0.weight`。
-- 逐层视觉 Adapter 的 ProjRes 默认 `attacked_parameter: null` 自动选择实际最后层，使用进入该 Adapter 的 CLS；`token_reduction: auto` 同样解析为 CLS。最后 Adapter 的 patch 输出不影响分类损失。显式层名与 `mean` 仍可复现首层/均值对照，其他审计的 key parameter 保持首层。成员/非成员比例不变：FedAvg 默认 M:M，FedSGD N:10N。为隔离换层变更，FedSGD 仍沿用输入 token 总数的保守秩上限和布局计数，FedAvg 无 batch 秩上限；保留 `paper_fedsgd_exact=false`、轮初表示和原始负 L1 残差。零初始化导致首轮 down 上传为零时仅跳过 ProjRes。新结构只支持统一审计入口，不使用独立的缓存特征 ProjRes 或 `low_fpr_full`。2026-09-09 之前的逐层 Adapter 历史结果使用首层 down + mean，不改写。
-- CLIP-LoRA ProjRes 默认 `token_reduction: mean`，`auto` 同样使用全部图像 token 的均值。首层 Q/K/V 输入的 CLS 在图像间恒定，显式选择该组合会被拒绝；不得把历史恒定 CLS 分数当成隐私保护效果。统一审计器的 token 总数按实际候选样本数 × 每图 token 数计算，FedAvg 仍不施加 batch 秩上限。修复只影响新任务，历史结果不改写。
-- FedSGD 成员严格等于该轮实际 batch，非成员与其他真实 Batch 攻击共享同一 1:10 标签匹配视图。普通无防御 MLP/旧 feature Adapter/LoRA 保留其原 `paper_fedsgd_exact` 标记；逐层视觉 Adapter 的 token 聚合例外如上。FedAvg 仍为完整客户端训练集协议。
+- 所有 ProjRes 默认使用目标客户端本轮训练后、服务器可重建的模型表示（`representation_state: client_post_update_model`）：FedAvg 为 `base + uploaded_delta`，FedSGD 为 `base - lr * uploaded_gradient`。FedSGD 若配置非普通 SGD 的本地优化器，该表示仍是公开梯度对应的 SGD 端点，不读取隐藏优化器状态。成员/非成员使用同一个目标状态，独立入口逐客户端重算动态非成员表示；审计完成后恢复共享模型。MLP/旧 feature Adapter 使用冻结输入缓存，前后表示相同。结果记录 `representation_state_source` 与 `representation_training_invariant`；新默认只影响新运行，旧结果不改写。其他梯度攻击仍取轮初候选梯度。
+- 当前统一入口对 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 执行共享 exact-batch ProjRes；三者每 10 轮读取真实 one-batch FedSGD 上传，分别攻击 `classifier.0.weight`、最后视觉 Adapter 的 down 权重（ViT-B/32 为 `clip_model.vision_model.encoder.layers.11.adapter.down.weight`）与最后一个已训练视觉 Q 投影的 `lora_A`。旧 feature Adapter 仍攻击 `adapter.net.0.weight`。
+- 逐层视觉 Adapter 的 ProjRes 默认 `attacked_parameter: null` 自动选择实际最后层，使用进入该 Adapter 的 CLS；`token_reduction: auto` 同样解析为 CLS。最后 Adapter 的 patch 输出不影响分类损失。显式层名与 `mean` 仍可复现首层/均值对照，其他审计的 key parameter 保持首层。成员/非成员比例不变：FedAvg 默认 M:M，FedSGD N:10N。为隔离换层变更，FedSGD 仍沿用输入 token 总数的保守秩上限和布局计数，FedAvg 无 batch 秩上限；保留 `paper_fedsgd_exact=false`、目标客户端训练后表示和原始负 L1 残差。零初始化导致首轮 down 上传为零时仅跳过 ProjRes。新结构只支持统一审计入口，不使用独立的缓存特征 ProjRes 或 `low_fpr_full`。2026-09-09 之前的逐层 Adapter 历史结果使用首层 down + mean，不改写。
+- CLIP-LoRA ProjRes 默认攻击最后一个已训练视觉 Query 的 `lora_A`，`token_reduction: cls`，`auto` 同样使用 CLS；`mean` 可显式作对照。首层 Q/K/V 输入的 CLS 在图像间恒定，显式选择该组合会被拒绝；不得把历史恒定 CLS 分数当成隐私保护效果。统一审计器的 token 总数按实际候选样本数 × 每图 token 数计算，FedAvg 仍不施加 batch 秩上限。修复只影响新任务，历史结果不改写。
+- FedSGD 成员严格等于该轮实际 batch，非成员与其他真实 Batch 攻击共享同一 1:10 标签匹配视图。普通无防御 MLP/旧 feature Adapter 的输入始终冻结，保留其原 `paper_fedsgd_exact` 标记；其余模型采用训练后表示，均为经验性适配，`paper_fedsgd_exact=false`。FedAvg 仍为完整客户端训练集协议。
 - 三者统一 ProjRes 使用 `max_candidates: 32`、`min_nonmembers: 320`、`max_nonmembers: 320`，并与其他攻击共享 `predictions.csv`。CLIP-MLP 的独立严格入口仍保留用于单独诊断并生成自己的严格 JSON 输出，但不是统一 sweep 的替代品。
 
 ## 结果目录与日志规范
