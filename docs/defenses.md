@@ -89,7 +89,7 @@ WWW 的打乱顺序由实验 seed 和客户端编号决定，与普通 FedSGD �
 | `sampling` | `shuffled_batches` | 打乱后分批，FedSGD 每轮取下一批 |
 | `www_tail_fraction` | `0.8` | 高风险尾部比例，向上取整 |
 | `www_tail_basis` | `actual_batch` | 按实际 batch 划分；`expected_batch` 为历史固定宽度 |
-| `www_record_diagnostics` | `true` | 每个实际训练 batch 记录风险、损失与范数；需要额外逐样本求导 |
+| `www_record_diagnostics` | `false` | 显式开启后，每个实际训练 batch 记录风险、损失与范数；需要额外逐样本求导 |
 | `www_beta_alpha`, `www_beta_beta` | `null`, `null` | 不再使用 INO 权重；旧覆盖值被清空 |
 | `release_private_diagnostics` | `false` | 是否额外启用旧版分数、特征和攻击相关性诊断；不控制新的范数记录 |
 
@@ -107,11 +107,11 @@ python scripts/run_privacy_experiments.py --models bert_adapter --datasets cola 
   --set defense.target_epsilon=8 --set defense.max_grad_norm=8
 ```
 
-**计算后端。** WWW 对当前真实 batch 做一次训练前向，对平均组合损失执行一次 backward 和 optimizer step；训练本身不需要逐样本梯度。默认范数诊断仍启用：`defense.grad_sample_backend=auto`、`defense.microbatch_size=4` 使用分块 batched VJP，在同一个完整 batch 前向图上计算逐样本 CE 梯度范数。正则和总损失范数由有符号系数精确换算；额外启用 code-poison 损失时，总范数单独求导测量。诊断不更换 dropout、不改写上传梯度；块大小控制逐样本梯度存储，不切分训练前向图。显式 `loop` 或启用 Transformer gradient checkpointing 时的 `auto` 使用循环求导。性能说明见 [FedSGD 计算优化](fedsgd_performance.md)。
+**计算后端。** WWW 对当前真实 batch 做一次训练前向，对平均组合损失执行一次 backward 和 optimizer step；训练本身不需要逐样本梯度。范数诊断默认关闭；显式开启后，`defense.grad_sample_backend=auto`、`defense.microbatch_size=4` 使用分块 batched VJP，在同一个完整 batch 前向图上计算逐样本 CE 梯度范数。正则和总损失范数由有符号系数精确换算；额外启用 code-poison 损失时，总范数单独求导测量。诊断不更换 dropout、不改写上传梯度；块大小控制逐样本梯度存储，不切分训练前向图。显式 `loop` 或启用 Transformer gradient checkpointing 时的 `auto` 使用循环求导。性能说明见 [FedSGD 计算优化](fedsgd_performance.md)。
 
 **输出与审计。** `defense_summary.json` 保存风险损失公式、正则系数、教师定义、采样与归一化方式、计划/实际步数及诊断文件路径。兼容字段 `privacy_accounting` 明确记录 `mechanism=risk_controlled_loss`、`clipping_enabled=false`、`formal_dp_enabled=false`、`client_upload_is_private=false`、`noise_enabled=false`，epsilon/delta/accountant 为 `null`，噪声尺度为 0。控制台显示 `risk-controlled loss`、正则系数、裁剪关闭和 `Epsilon/Delta: N/A`；审计不会为 WWW 输出基于 epsilon 的 DP 攻击理论上界。
 
-默认在每个任务目录下生成 `www_diagnostics/`，无需额外命令行参数：
+使用 `--set defense.www_record_diagnostics=true` 开启诊断后，在每个任务目录下生成 `www_diagnostics/`：
 
 - `sample_gradients.csv`：每次实际训练访问一行，以 `(client_id, local_sample_index)` 标识样本，另附一基通信轮次和客户端更新序号。保存风险分数、升序排名、参考轮次、标签、尾部标记、`risk_weight`、`regularization_weight`、当前与教师真实类概率、带符号及绝对概率差、CE/正则/额外损失/总损失、`ce_gradient_factor`。范数列为 `raw_grad_norm`（CE）、`regularizer_grad_norm`、`total_grad_norm`，联合覆盖全部可训练参数；`normalized_contribution_norm` 是总损失范数除以实际 batch 大小。字段不再表示裁剪前后范数。
 - `batch_summary.csv`：每个客户端、batch 分别输出 `all`、`low_risk`、`high_risk` 分组；无参考时使用 `warmup`。包括损失及预测均值、范数均值/中位数/P90/P99/最大值、CE 方向反转数量，以及风险与三种范数的 Pearson／Spearman 相关系数。相关系数不跨客户端或轮次混算；少于 3 条、分数/范数恒定或风险不可用时留空。`all` 与分组行是同一批样本的不同汇总视图，不能相加。

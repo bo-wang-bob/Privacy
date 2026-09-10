@@ -208,7 +208,7 @@ defense_overrides:
         www_analysis_interval: 1
         www_analysis_timing: pre_update
         www_feature_statistics: false
-        www_record_diagnostics: true
+        www_record_diagnostics: false
         www_validation_top_fraction: 0.2
         adjacency: null
         sampling: shuffled_batches

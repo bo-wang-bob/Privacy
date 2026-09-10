@@ -123,9 +123,9 @@ def _args(*values: str):
 
 @pytest.mark.parametrize("model", ["clip_adapter", "clip_lora"])
 @pytest.mark.parametrize("method", ["fedsgd", "fedavg"])
-@pytest.mark.parametrize("shots", [16, 32, None])
+@pytest.mark.parametrize("shots", [100, 16, 32, None])
 def test_clip_training_data_regimes_resolve_and_validate(model, method, shots, tmp_path):
-    overrides = [] if shots == 16 else [
+    overrides = [] if shots == 100 else [
         "--set", f"use_full_dataset={'true' if shots is None else 'false'}",
         "--set", f"fpl_shots={'null' if shots is None else shots}",
     ]

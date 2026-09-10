@@ -95,8 +95,8 @@ rowspan(dL/dA) is a subspace of the attacked-layer token inputs
 - CLIP 原始主干冻结；旧末端 Adapter 只读取首个 down-projection 权重更新，
   CLIP-MLP 对照模型只读取第一层分类 MLP 权重更新，CLIP-LoRA 默认读取最后一个已训练
   视觉 Q 投影的 `lora_A` 更新；
-- 数据协议与对应正常训练保持一致：三个 CLIP 模型默认使用全局每类 16-shot，
-  CLIP-Adapter/LoRA 可配置完整训练分区或其他 shots；严格实验均为 one-batch FedSGD。
+- 数据协议与对应正常训练保持一致：CLIP-MLP 默认全局每类 16 张，CLIP-Adapter/LoRA
+  默认全局每类 100 张，且可配置完整训练分区或其他 shots；严格实验均为 one-batch FedSGD。
 
 独立入口继续用于 CLIP-MLP 严格复现和 CLIP-LoRA/旧 feature Adapter 的单独诊断；
 通用 `promptres` 是余弦代理攻击，不等同于本文的投影残差算法。正式 CLIP 三模型

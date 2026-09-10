@@ -595,7 +595,7 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             purpose = "diagnostics" if task.defense == "www" else "training"
             print(
                 f"      per_record_gradients=purpose:{purpose} "
-                f"enabled:{defense_config.get('www_record_diagnostics', True) if task.defense == 'www' else True} "
+                f"enabled:{defense_config.get('www_record_diagnostics', False) if task.defense == 'www' else True} "
                 f"backend:{defense_config.get('grad_sample_backend', 'auto')} "
                 f"chunk:{defense_config.get('microbatch_size', 4)}"
             )

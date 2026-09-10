@@ -139,12 +139,14 @@ def test_diagnostic_norms_match_actual_dropout_graph_and_do_not_change_training(
     assert result["raw_grad_norm"].max() > 8
 
 
-def test_disabled_diagnostics_never_call_per_sample_gradients(monkeypatch):
+def test_default_diagnostics_never_call_per_sample_gradients(monkeypatch):
     def unexpected(*args, **kwargs):
         raise AssertionError("No per-sample gradients are needed to train WWW risk loss")
     monkeypatch.setattr("privacy_defenses.www_dp.gradients_from_losses", unexpected)
-    user, _ = make_user({"www_record_diagnostics": False, "www_regularization_weight": 0})
+    user, controller = make_user()
     user.train(round_index=0)
+    controller.prepare_client_training(user, user.get_parameters(), .5, source_round=0)
+    user.train(round_index=1)
     assert user.last_gradient_capture_count == 1
 
 
@@ -326,6 +328,7 @@ def test_training_failure_preserves_completed_batch_diagnostics(tmp_path, monkey
     from test_runtime_optimization import make_server
 
     server = make_server(tmp_path, monkeypatch, "bert_adapter", defense="www")
+    server.defense.config["www_record_diagnostics"] = True
     train = server.defense._www_training
     def fail_after_one_batch(*args, **kwargs):
         train(*args, **kwargs)
@@ -413,7 +416,7 @@ def test_fixed_batch_has_no_noise_in_either_reproducibility_mode(monkeypatch):
 @pytest.mark.parametrize("backend", ["loop", "batched"])
 def test_risk_loss_upload_matches_direct_batch_backward_without_clipping_or_noise(backend, monkeypatch):
     user, controller = make_user({"reproducible_dp_noise": True, "grad_sample_backend": backend,
-                                  "www_regularization_weight": 3.})
+                                  "www_regularization_weight": 3., "www_record_diagnostics": True})
     privacy = controller.www_privacy
     # A final short batch must use its actual size, rather than five.
     x, y = next(iter(user.trainloader))
@@ -645,7 +648,7 @@ def test_five_peft_models_risk_loss_training_and_all_attacks(model_type, device,
         projres_config={"enabled": True, "evaluation_interval": 1, "token_reduction": "mean",
                         "max_candidates": 0, "min_nonmembers": 0, "max_nonmembers": 0,
                         "threshold": None, "decision_mode": "ranking"},
-        defense_config={"name": "www", "reproducible_dp_noise": True},
+        defense_config={"name": "www", "reproducible_dp_noise": True, "www_record_diagnostics": True},
         method_config={"client_optimizer": "sgd", "momentum": 0, "weight_decay": 0, "max_grad_norm": 0, "seed": 42},
         client_gradient_observer=observer,
     )

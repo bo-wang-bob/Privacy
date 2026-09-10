@@ -16,7 +16,7 @@
 - FedAvg 的 11 种攻击以目标客户端原始完整训练集 M 个成员与默认 M 个独立 evaluation 非成员为固定候选；类别尽力匹配并记录实际直方图/TV。六种单轮更新攻击自动从 `audit.exact_batch_membership_attacks` 转到 `audit.client_train_membership_attacks`，其余五种保持时序/跨客户端定义。不能以最后一个本地 batch 定义整个 FedAvg 上传的成员；重复 epoch 不重复计数。CoFedMID/Record-DP 下仍评价原始训练集身份，不宣称每个成员本轮都被访问。
 - FedAvg 上传模型 delta，梯度类攻击只做一次 `-delta / round_learning_rate` 转换，明确记录为累计更新代理量；候选梯度取轮初模型。ProjRes 作为经验性多步适配，`paper_fedsgd_exact=false`、`batch_rank_bound=null`，候选上限自动为 0/0/0（完整固定池）。任意方法被攻击层上传为零时只跳过该轮 ProjRes，记录 `zero_observed_update`。
 - FedAvg 使用 `client_train_update_candidate_selection.pt`、摘要 `client_train_membership` 和信号 `client_train_update_observations`；FedSGD 继续使用原 `exact_batch_*`。任务名标明方法，local_epochs 和权重进入汇总协议字段；所有低 FPR 可报告性仍依据独立非成员数，历史结果不改写。
-- WWW、CoFedMID 与 BERT Adapter Record-DP 已支持多步 FedAvg，后者按多步 Poisson 机制校准预算；`local_client_dp` 仍只支持 FedSGD，混跑时跳过。旧 WWW post-round 私有 batch 分析仍只支持 FedSGD，默认的逐批 `www_record_diagnostics` 可用于 FedAvg。实现与限制见 `docs/federated_methods.md`。以下 one-batch 规则描述默认 FedSGD 协议。
+- WWW、CoFedMID 与 BERT Adapter Record-DP 已支持多步 FedAvg，后者按多步 Poisson 机制校准预算；`local_client_dp` 仍只支持 FedSGD，混跑时跳过。旧 WWW post-round 私有 batch 分析仍只支持 FedSGD，可选的逐批 `www_record_diagnostics` 可用于 FedAvg，默认关闭。实现与限制见 `docs/federated_methods.md`。以下 one-batch 规则描述默认 FedSGD 协议。
 - 本次 FedAvg 支持同时修复 `none` 分支忽略所配置 optimizer/momentum/weight_decay 的问题，ResNet18 也受此修正影响。旧结果即使 YAML 写有 momentum/weight_decay，也不能据此认定实际训练已使用这些值，须结合代码版本判断。现有默认 PEFT FedSGD 的 SGD/0/0 行为保持一致。
 
 - 唯一批量入口是 `scripts/run_privacy_experiments.py`。它支持单个或多个模型、数据集、攻击、防御、seed 和目标客户端；模型 × 数据集 × 防御 × seed × 目标客户端展开为独立任务，同一组多攻击共享一次训练。
@@ -30,7 +30,7 @@
 - CLIP-LoRA 自 2026-09-09 起的模型基线使用 `rank=32`（此前为 2），保留 `alpha=1`、`scaling=sqrt_rank`、dropout `0`、图像/文本编码器全部 Q/K/V 和原 batch/学习率；FedSGD/FedAvg 共用。LoRA 因子参数量为此前的 16 倍，不能据此保证 ProjRes 满秩或攻击有效。旧 rank 对照使用 `--set clip_lora.rank=2`，历史结果不改写。
 - CLIP-Adapter 默认 `clip_adapter.variant: transformer`：视觉 ViT 的每个 block 后插入 BERT 式 `768→384→768` 残差 Adapter（reduction=2、ReLU、上投影零初始化），原始骨干与文本编码器冻结，保留图像/类别文本相似度分类。图像、文本特征均在线计算，只缓存提示词 token；`precompute_features: true` 被拒绝。客户端复用共享骨干、独立保存 Adapter 参数。旧 `variant: feature` 和缺少 variant 的旧配置保持末端特征 Adapter；历史结果不改写。新权重保存到 `final_clip_transformer_adapter.pt`，不是旧末端 Adapter checkpoint。见 `docs/clip_transformer_adapter.md`。
 - 三个 CLIP 基线均显式使用 IID。不要在正常 IID 实验中传 `--dirichlet-alpha`；仅传该参数会自动切换为 `dirichlet`。如同时显式传 `--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha 仅作为未使用的配置值保留。
-- 三个 CLIP 模型默认使用每类 16 张训练图像。CLIP-Adapter/LoRA 均可配置 `use_full_dataset: false` 与正整数 `fpl_shots` 选择 few-shot，或 `use_full_dataset: true` 与 `fpl_shots: null` 使用完整训练分区；MLP 仍固定 16-shot。Adapter/LoRA 始终从完整源分区加载，few-shot 只截取训练集，再进行客户端划分；独立 evaluation/test 分区不随 shots 截断。新 Adapter/LoRA 的 CIFAR100/Food101 不再先经过历史 200 张/类训练及 50 张/类测试子集；旧结果不改写，比较时核对实际分区。直接 CLI 的 shots 覆盖也不再隐式把 Adapter/LoRA 切为 Dirichlet。IID 仍要求每类训练样本数至少等于客户端数。
+- 自 2026-09-10 起，CLIP-Adapter/LoRA 默认在客户端划分前每类抽取 100 张训练图像，10 个 IID 客户端时每客户端每类 10 张；MLP 仍固定每类 16 张。CLIP-Adapter/LoRA 均可配置 `use_full_dataset: false` 与正整数 `fpl_shots` 选择每类样本上限，或 `use_full_dataset: true` 与 `fpl_shots: null` 使用完整训练分区；旧 16 张/类对照使用 `--set fpl_shots=16`。Adapter/LoRA 始终从完整源分区加载，每类限额只截取训练集，再进行客户端划分；独立 evaluation/test 分区不随 shots 截断。新 Adapter/LoRA 的 CIFAR100/Food101 不再先经过历史 200 张/类训练及 50 张/类测试子集；旧结果不改写，比较时核对实际分区。直接 CLI 的 shots 覆盖也不再隐式把 Adapter/LoRA 切为 Dirichlet。IID 仍要求每类训练样本数至少等于客户端数。
 - 三个 CLIP 模型在 FedSGD/FedAvg 下默认只依次运行 CIFAR100、Food101。Caltech101、OxfordPets、Flowers102 仍支持通过 `--datasets` 显式选择，`--datasets all` 展开全部五个支持的数据集。单任务 CLIP 模型 YAML 的默认数据集为 CIFAR100。
 - 三个模型在全部默认数据集上统一使用 10 个客户端和 batch size 32；CLIP-MLP 使用 150 个通信轮次，CLIP-Adapter/CLIP-LoRA 使用 300 个通信轮次。三者均使用 FedSGD，每个客户端每轮只执行 1 个 mini-batch/1 次 optimizer step；`local_epochs: 1` 是协议校验值，不表示遍历完整本地数据集。
 - 三种微调方式的服务器端聚合都使用 `aggregation_weighting: uniform`，即对本轮参与客户端上传的梯度直接等权平均，不按客户端本地样本数或实际 batch 大小加权。三者任务目录方法名均为 `fedsgd`。
@@ -43,7 +43,7 @@
 - 当前损失为 `mean(CE_i + lambda*r_i*abs(p_i-q_i))`，默认 `defense.www_regularization_weight=1.0`，必须有限且非负，0 可做普通 CE 消融。`p_i=exp(-当前CE_i)` 参与求导；`q_i=exp(-上一轮theta_-k的CE_i)` 及风险权重停止梯度。这是受 MIST 启发的单步 FedSGD 适配：参考为其他客户端的参数聚合模型，不是平均客户端预测，也不是严格从未见过目标数据的 leave-one-out 模型。所有样本保留 CE，不裁剪、不使用 INO 权重、不加噪。
 - 当前 WWW 使用 `sampling=shuffled_batches`，按普通 FedSGD 的种子规则打乱后分批，每轮取下一批，遍历结束再打乱；短 batch 保留并按实际样本数求均值。不提供 DP 保证。旧配置或混合 sweep 的 `target_epsilon`、`delta`、`adjacency`、`accountant`、`max_grad_norm`、`www_beta_alpha`、`www_beta_beta` 清空为 `null`，`noise_multiplier` 固定为 0；显式旧 `sampling=poisson` 会被拒绝。普通 DP 保留 Poisson 及原预算校准。历史 WWW 结果不改写，须区分带噪、Poisson 裁剪、尾部免裁剪与当前风险损失版本。
 - WWW 训练直接对整批组合损失执行一次 backward/optimizer step 并上传实际梯度，逐样本求导只用于可选范数诊断。WWW 诊断与 BERT Adapter Record-DP 默认 `defense.grad_sample_backend=auto`、`defense.microbatch_size=4`，使用分块 batched VJP；WWW 诊断复用同一个完整 batch 前向图和 dropout，块大小仅控制逐样本梯度存储。共享 Transformer 启用 gradient checkpointing 时 `auto` 选择 `loop`；ResNet18 Record-DP 保留原 `vmap`。性能说明见 `docs/fedsgd_performance.md`。
-- 默认 `www_record_diagnostics=true`，在任务目录的 `www_diagnostics/` 流式记录 `sample_gradients.csv`、`batch_summary.csv`、`summary.json`（schema_version=2）：每次训练访问的风险、样本身份、风险权重、真实类预测差异、CE/正则/总损失，以及对应的联合梯度范数；批次和风险分组保存分位数及 Pearson/Spearman 相关系数。记录 CE 梯度的有符号系数和方向反转数，避免把范数减小误判为方向不变。每批 flush，内存不随轮数增长；首轮风险、教师差异及不可定义的相关系数留空。关闭诊断不改变训练并省去额外逐样本求导，旧 `release_private_diagnostics` 只控制旧版额外诊断。
+- 默认 `www_record_diagnostics=false`，关闭额外逐样本梯度诊断；显式使用 `--set defense.www_record_diagnostics=true` 后，在任务目录的 `www_diagnostics/` 流式记录 `sample_gradients.csv`、`batch_summary.csv`、`summary.json`（schema_version=2）：每次训练访问的风险、样本身份、风险权重、真实类预测差异、CE/正则/总损失，以及对应的联合梯度范数；批次和风险分组保存分位数及 Pearson/Spearman 相关系数。记录 CE 梯度的有符号系数和方向反转数，避免把范数减小误判为方向不变。每批 flush，内存不随轮数增长；首轮风险、教师差异及不可定义的相关系数留空。关闭诊断不改变风险计算和训练，并省去额外逐样本求导，旧 `release_private_diagnostics` 只控制旧版额外诊断。
 - WWW 始终记录 `formal_dp_enabled=false`、`client_upload_is_private=false` 和空的 epsilon/delta，不输出 DP 攻击理论上界。旧 `reproducible_dp_noise` 在 WWW 中不再生效。新记录只影响新启动任务，不能补录旧进程未保存的范数。
 - WWW 下 ProjRes 与普通训练一样按 batch size 推导候选上限，完整 batch=32 时为 `32/320/320`，短 batch 仍按真实 n/10n 候选计算；当前真实类概率正则的逐样本梯度与 CE 共线，保留 batch 秩上限，`attacked_parameter_perturbed=false`，因修改训练损失仍标记 `paper_fedsgd_exact=false`。不要声称该损失必然防住 ProjRes。LoRA 初始化等导致被攻击层上传为零时，仅跳过 ProjRes 并记录 `zero_observed_update`，其余攻击继续执行。入口与完整公式见 `docs/defenses.md`。
 
@@ -101,7 +101,7 @@
 ## 分析现有结果时的注意事项
 
 - 先读取每个任务的 `run_config.yaml` 再判断实验协议。提交 `a789143` 之前产生的许多历史结果使用 Dirichlet `alpha=0.1`，不能默认视为 IID，也不应与新 IID 结果直接合并比较。
-- 2026-08-09 本轮修改前的已有结果均不使用当前协议：历史 MLP 是按本地样本数加权的 FedAvg；历史 Adapter 是遍历完整 local epoch 的 FedAvg，也按样本数加权。新实验则是 MLP/Adapter 每类 16-shot、one-batch、客户端等权 FedSGD。必须依据 `run_config.yaml` 区分，不能直接把历史曲线当作新配置基线。
+- 2026-08-09 修改前的已有结果均不使用当时切换后的协议：历史 MLP 是按本地样本数加权的 FedAvg；历史 Adapter 是遍历完整 local epoch 的 FedAvg，也按样本数加权。2026-08-09 切换后的实验为 MLP/Adapter 每类 16-shot、one-batch、客户端等权 FedSGD；Adapter/LoRA 又于 2026-09-10 将默认每类样本数改为 100。必须依据 `run_config.yaml` 区分，不能直接把历史曲线当作新配置基线。
 - 旧非 IID 实验的 `TPR@0.001FPR` 曾明显受到成员/非成员标签分布不匹配影响。分析攻击有效性时至少同时检查类别直方图、按类别 TPR/FPR、标签匹配或类别加权 ROC，避免把类别识别能力误判为成员识别能力。
 - `match_candidate_labels: false` 在 `low_fpr_full` 下不会执行精确标签配对；当前通过 IID 划分与分别分层抽样缓解标签偏移，但仍应在结果分析中实测标签分布，而不是假定完全一致。
 - “让非成员来自目标客户端相同潜在分布”目前只完成了可行性分析，尚未加入正式候选采样代码。现有 α=0.1 Caltech101 候选池若保持完整成员类别比例，每客户端只能保留约 31–259 个比例匹配非成员，无法解析 `TPR@0.001FPR`；不要声称当前已经实现了低 FPR 精确分布匹配。
@@ -122,6 +122,6 @@
 - BERT Adapter/LoRA 与 GPT2 Adapter 默认 `performance.evaluation_backend=shared`，全局评估只加载一次共享模型，保留各客户端测试分区、batch 边界及本地状态；`clients` 可复核原逐客户端加载路径。默认 `performance.enabled=true`、`performance.cuda_events=true`，在 `performance_summary.json` 记录累计阶段耗时。CUDA event 延迟读取，避免每块求导强制同步；父子阶段为包含关系，不能直接相加。计时覆盖服务器训练过程及文件输出，不包含模型/数据加载。
 - 修改实验配置后先干运行核对最终参数：
   - `python scripts/run_privacy_experiments.py --dry-run --max-runs 1`
-- 当前干运行应看到：MLP/Adapter/LoRA 均为 `federated.aggregator: fedsgd` 和 `federated.aggregation_weighting: uniform`；三者默认均为每类 16-shot，Adapter/LoRA 支持配置全量；三者均启用统一 ProjRes。
+- 当前干运行应看到：MLP/Adapter/LoRA 均为 `federated.aggregator: fedsgd` 和 `federated.aggregation_weighting: uniform`；MLP 默认为每类 16 张，Adapter/LoRA 默认为每类 100 张且支持配置全量；三者均启用统一 ProjRes。
 - 测试环境使用 `/root/.local/share/mamba/envs/pfedba/bin/python`。小范围修改优先只运行直接相关的测试文件和 `git diff --check`；不要习惯性执行完整套件。
 - `/root/.local/share/mamba/envs/pfedba/bin/python -m pytest -q` 是日常快速核心回归；完整本地套件必须显式使用 `python -m pytest -q tests`，仅在修改共享审计器、聚合核心、候选池协议或准备高风险发布时运行。

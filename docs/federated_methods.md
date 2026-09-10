@@ -97,7 +97,7 @@ WWW 每个本地 batch 使用同一上一通信轮的 own/other 参数参考，�
 CoFedMID 保留实际聚合权重下的参数空间扰动抵消，训练成员标签保持原始分区。
 `local_client_dp` 仅支持 one-batch FedSGD，方法混跑时明确跳过不兼容组合。
 旧 WWW `release_private_diagnostics=true` 的 post-round batch 分析仍只支持 FedSGD；
-默认的 `www_record_diagnostics` 逐批诊断支持两种方法。
+可选的 `www_record_diagnostics` 逐批诊断支持两种方法，默认关闭。
 
 任务名、控制台概览、批量 CSV/manifest 均标明方法；CSV 同时记录 `local_epochs`、
 聚合权重和成员定义。`federated_method_summary.json` 保存上传类型、训练协议、

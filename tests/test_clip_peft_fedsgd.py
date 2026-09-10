@@ -361,14 +361,16 @@ def test_clip_peft_runs_all_attacks_with_exact_batch_fedsgd(
 
 
 @pytest.mark.parametrize(
-    "path",
+    "path, expected_shots",
     [
-        "configs/models/clip_mlp.yaml",
-        "configs/models/clip_adapter.yaml",
-        "configs/models/clip_lora.yaml",
+        ("configs/models/clip_mlp.yaml", 16),
+        ("configs/models/clip_adapter.yaml", 100),
+        ("configs/models/clip_lora.yaml", 100),
     ],
 )
-def test_clip_peft_configs_default_to_fedsgd_fewshot_and_bert_candidates(path):
+def test_clip_peft_configs_default_to_fedsgd_fewshot_and_bert_candidates(
+    path, expected_shots
+):
     with open(path, "r", encoding="utf-8") as file:
         config = yaml.safe_load(file)
 
@@ -378,7 +380,7 @@ def test_clip_peft_configs_default_to_fedsgd_fewshot_and_bert_candidates(path):
     assert config["aggregation_weighting"] == "uniform"
     assert config["local_epochs"] == 1
     assert config["use_full_dataset"] is False
-    assert config["fpl_shots"] == 16
+    assert config["fpl_shots"] == expected_shots
     assert set(config["audit"]["attacks"]) == ATTACKS
     assert config["audit"]["candidate_sampling"] == "balanced_global_holdout"
     assert config["audit"]["require_full_target_train_members"] is True

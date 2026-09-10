@@ -31,7 +31,7 @@ DEFAULTS = {
     "www_analysis_interval": 1,
     "www_analysis_timing": "pre_update",
     "www_feature_statistics": False,
-    "www_record_diagnostics": True,
+    "www_record_diagnostics": False,
     "www_validation_top_fraction": 0.2,
     "adjacency": None,
     "accountant": None,

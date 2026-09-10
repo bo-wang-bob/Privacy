@@ -129,3 +129,7 @@ def fit_shrinkage_attack(
     weights = effect[selected]
     scores = (eval_z[:, selected] * weights).mean(dim=1)
     return scores, labels[evaluation], evaluation, selected_count
+
+
+
+# 隐私防御引入动态随机噪声导致后门特征弱化

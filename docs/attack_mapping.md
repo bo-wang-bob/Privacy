@@ -203,7 +203,7 @@ evaluation 非成员。
 `model_type: clip_adapter` 默认 `variant: transformer`，在视觉 Transformer 每个
 block 后加入残差 Adapter，冻结其余 CLIP 参数，保留图像/类别文本相似度分类。
 图像和文本均在线编码，训练图像的反向图必须保留，以更新内部 Adapter。
-全局每类 16-shot、FedSGD one-batch 等权协议和注册的 11 种攻击保持不变；
+默认在客户端划分前每类抽取 100 张训练图像，使用 FedSGD one-batch 等权协议和注册的 11 种攻击；
 FedAvg 使用完整客户端训练集候选及累计更新代理。
 
 旧 `variant: feature`（包括缺少 variant 的历史配置）仍表示末端图像/文本 Adapter，

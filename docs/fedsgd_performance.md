@@ -2,7 +2,7 @@
 
 优化以 WWW Poisson DP 实现 `d63b5a6` 为基准，覆盖 WWW、BERT Adapter 普通样本级 DP 的梯度计算，以及 BERT/GPT2 的文本梯度审计。
 
-当前 WWW 使用普通打乱后分批采样，对 CE 加风险加权的预测差异正则，不裁剪、不加噪、不做 DP 会计。训练本身只需一次整批反向传播；默认启用的风险与范数诊断另需逐样本求导。下文历史裁剪基准数据保持原样，不能视为当前版本的训练耗时。
+当前 WWW 使用普通打乱后分批采样，对 CE 加风险加权的预测差异正则，不裁剪、不加噪、不做 DP 会计。训练本身只需一次整批反向传播；风险与范数诊断默认关闭，显式开启后另需逐样本求导。下文历史裁剪基准数据保持原样，不能视为当前版本的训练耗时。
 
 ## 默认行为
 
@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `defense.grad_sample_backend` | `auto` | WWW 范数诊断与 BERT Adapter Record-DP 训练使用 batched VJP |
 | `defense.microbatch_size` | `4` | 一次逐样本求导保留的记录数；WWW 训练前向仍使用完整 batch |
-| `defense.www_record_diagnostics` | `true` | 关闭可省去 WWW 范数诊断的逐样本求导及 CSV 输出 |
+| `defense.www_record_diagnostics` | `false` | 显式设为 `true` 开启 WWW 范数诊断，增加逐样本求导及 CSV 输出 |
 | `audit.grad_sample_backend` | `auto` | 文本余弦/Gradient-Diff 审计使用 batched VJP |
 | `audit.grad_sample_chunk_size` | `4` | 一次审计求导保留的候选数 |
 | `audit.gradient_update_cache_mb` | `2048` | 上传向量 GPU 缓存上限（MiB），0 表示使用 CPU |

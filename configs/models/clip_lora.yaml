@@ -19,7 +19,8 @@ dirichlet_alpha: 0.1
 # Full training: use_full_dataset: true, fpl_shots: null.
 # Both regimes retain the complete independent evaluation split.
 use_full_dataset: false
-fpl_shots: 16
+# Global per-class training cap, applied before client partitioning.
+fpl_shots: 100
 
 fedsgd: {client_optimizer: sgd, momentum: 0.0, weight_decay: 0.0}
 clip_lora:

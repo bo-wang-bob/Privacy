@@ -36,7 +36,7 @@ FedAvg 的 11 种攻击使用完整客户端训练集/独立 evaluation 固定�
 
 默认 FedSGD sweep 的共同约定：
 
-- CLIP 三种模型使用 10 个客户端、batch size 32、IID 划分和参与客户端等权 FedSGD，默认均使用全局每类 16 张训练图像。Adapter/LoRA 可通过配置切换全量或其他 few-shot 数量。
+- CLIP 三种模型使用 10 个客户端、batch size 32、IID 划分和参与客户端等权 FedSGD。Adapter/LoRA 默认在客户端划分前每类抽取 100 张训练图像，MLP 保持每类 16 张；Adapter/LoRA 可通过配置切换全量或其他每类样本数量。
 - BERT/GPT2 使用 30 个客户端、IID 划分和 one-batch 等权 FedSGD。
 - BERT-LoRA 默认只展开 CoLA；SST-5 与 IMDb 仍可通过 `--datasets` 显式选择。
 - FedSGD 客户端上传各自的可训练参数梯度；服务器先等权聚合梯度，再执行一次
@@ -61,11 +61,14 @@ FedSGD 与 FedAvg 使用相同规则：
 
 | 训练数据 | `use_full_dataset` | `fpl_shots` |
 | --- | --- | --- |
-| 默认全局每类 16 张 | `false` | `16` |
+| 默认全局每类 100 张 | `false` | `100` |
 | 全局每类 K 张 | `false` | 正整数 K |
 | 完整训练分区 | `true` | `null` |
 
-Few-shot 先从完整训练分区按类抽样，再分给客户端，不是每客户端各取 K 张。
+每类限额先从完整训练分区按类抽样，再分给客户端，不是每客户端各取 K 张。
+默认 100 张在 10 个 IID 客户端间分配为每客户端每类 10 张；CIFAR100 和
+Food101 的训练总数分别为 10,000 和 10,100 张。2026-09-10 之前的默认值为 16 张，
+复现旧配置可显式设置 `--set fpl_shots=16`。
 IID 划分要求每类训练样本数至少等于客户端数；更小的 K 需相应减少客户端数。
 两种数据规模都保留完整独立 evaluation/test 分区；防御若预留验证集，仍按其协议
 划分。新 Adapter/LoRA 任务不再使用旧 CIFAR100/Food101 的 50 张/类测试子集，
@@ -75,7 +78,7 @@ few-shot 也不再先经过旧 200 张/类训练子集。历史结果保持原�
 可以直接修改模型 YAML，也可在统一入口覆盖：
 
 ```bash
-# 两个模型默认均为 16-shot
+# 两个模型默认均在客户端划分前每类抽取 100 张
 python scripts/run_privacy_experiments.py --models clip_adapter,clip_lora
 
 # 两个模型都使用完整训练分区
@@ -325,8 +328,8 @@ Accuracy/TPR 使用百分比，MCC/AUC 使用四位小数；无法报告的值�
 [`docs/fedsgd_performance.md`](docs/fedsgd_performance.md)。
 
 ResNet18 基线保持完整 CIFAR100、随机等量 IID、10 客户端全参与、300 轮
-FedAvg 和每轮 `0.99` 学习率衰减。三个 CLIP 模型默认为 16-shot one-batch 等权
-FedSGD，Adapter/LoRA 可配置全量训练；BERT Adapter/LoRA 与 GPT2 Adapter 使用文本
+FedAvg 和每轮 `0.99` 学习率衰减。三个 CLIP 模型默认使用 one-batch 等权 FedSGD；
+MLP 每类 16 张，Adapter/LoRA 每类 100 张且可配置全量训练；BERT Adapter/LoRA 与 GPT2 Adapter 使用文本
 one-batch 等权 FedSGD。
 
 独立严格 ProjRes 诊断仍可直接调用分析工具：
@@ -414,11 +417,12 @@ python scripts/run_privacy_experiments.py --models clip_mlp --defenses www \
 `defense_summary.json` 记录 `risk_controlled_loss`、`clipping_enabled=false`、
 `formal_dp_enabled=false`、零噪声及空的 epsilon/delta。混跑 `record_dp,www` 时，
 共享的预算和裁剪阈值只影响普通 DP；WWW 会清空旧预算、裁剪阈值和 Beta 参数。
-默认生成 `www_diagnostics/sample_gradients.csv`，保存每次训练访问的风险、标签、
+默认关闭逐样本梯度诊断；可用 `--set defense.www_record_diagnostics=true` 开启。
+开启后生成 `www_diagnostics/sample_gradients.csv`，保存每次训练访问的风险、标签、
 本地索引、预测差异、正则权重及交叉熵/正则项/总损失梯度范数；`batch_summary.csv`
 保存分位数和按 batch、风险分组的 Pearson／Spearman 相关系数，`summary.json` 保存
-字段定义和状态。范数诊断需要额外逐样本求导；可用
-`--set defense.www_record_diagnostics=false` 关闭，训练本身只需整批损失的一次反向传播。
+字段定义和状态。范数诊断需要额外逐样本求导；关闭诊断不改变风险计算和训练，
+训练本身只需整批损失的一次反向传播。
 历史结果保持原样，需区分协议版本。
 防御与威胁模型说明见 [`docs/defenses.md`](docs/defenses.md)。
 
