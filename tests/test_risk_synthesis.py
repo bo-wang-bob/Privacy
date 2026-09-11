@@ -4,6 +4,7 @@ import json
 import io
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from torch.nn import functional as F
@@ -12,6 +13,8 @@ from aggregator.aggregator_builder import build_aggregator
 from privacy_defenses.risk_synthesis import DEFAULTS, LocalGeometry, RiskSynthesis, low_rank_factor, select_requests
 from scripts.run_privacy_experiments import build_tasks, load_yaml, parse_args
 from scripts.analyze_risk_synthesis import class_diagnostics, read_synthesis_mechanism, recompute_auc
+from scripts.paired_synthesis_uncertainty import paired_resampling, score_metrics, select_pair
+from scripts.prepare_synthesis_confirmation import reserve_indices
 from servers.serverbase import ServerBase
 from trainmodel.clip_lora import CLIPLoRA
 from trainmodel.clip_transformer_adapter import CLIPTransformerAdapter
@@ -93,6 +96,62 @@ def test_conditional_auc_removes_cross_class_score_comparisons():
     assert result["class_conditional_auc"] == result["macro_class_auc"] == 1.
     assert result["conditional_pair_count"] == 2
     assert all(row["tpr_at_global_1pct_fpr"] is None for row in result["classes"])
+
+
+def test_resampling_metrics_treat_ties_as_indivisible_threshold_groups():
+    membership = np.array([1, 1, 0, 0])
+    scores = np.array([[1., 2., 1., 1.], [1., 1., 1., 1.]])
+    auc, tpr = score_metrics(scores, membership)
+    np.testing.assert_array_equal(auc, [.75, .5])
+    np.testing.assert_array_equal(tpr, [.5, 0.])
+
+
+def test_paired_resampling_preserves_null_difference_and_class_membership_strata():
+    # Identical model predictions must have zero paired differences for every
+    # draw, including two attacks and tied scores. Class-only predictions must
+    # retain their AUC when resampling within class/membership strata.
+    membership = np.array([1, 1, 1, 0, 0, 0])
+    classes = np.array([0, 0, 1, 0, 1, 1])
+    attacks = np.array([[.9, .1, .6, .7, .2, .2], classes])
+    scores = np.stack([attacks, attacks])
+    auc, tpr = paired_resampling(scores, membership, classes, replicates=50, seed=17)
+    np.testing.assert_array_equal(auc[:, 1]-auc[:, 0], 0.)
+    np.testing.assert_array_equal(tpr[:, 1]-tpr[:, 0], 0.)
+    expected, _ = score_metrics(attacks, membership)
+    np.testing.assert_array_equal(auc[:, :, 1], expected[1])
+
+
+def test_explicit_resampling_control_requires_matched_candidate_identities():
+    left = dict(run="control", complete=True, comparison_key="same_protocol",
+                candidate_metadata={"source":"independent_evaluation"},
+                candidate_selection_digests={"fixed":"same_candidates"})
+    right = {**copy.deepcopy(left), "run":"treatment"}
+    report = dict(runs=[left, right], matched_comparisons=[])
+    assert select_pair(report, "treatment", "control") == (left, right)
+    right["candidate_selection_digests"]["fixed"] = "other_candidates"
+    with pytest.raises(ValueError, match="mismatched"):
+        select_pair(report, "treatment", "control")
+
+
+def test_confirmation_reservation_excludes_exploration_from_both_new_partitions():
+    labels = np.repeat([0, 1], 8)
+    first = reserve_indices(labels, [0, 8], holdout_per_class=2, train_shots=4, seed=17)
+    second = reserve_indices(labels, [0, 8], holdout_per_class=2, train_shots=4, seed=17)
+    assert first == second
+    training, holdout, old = (set(first[k]) for k in (
+        "train_pool_indices", "evaluation_indices", "excluded_exploration_indices"))
+    assert not training & holdout and not training & old and not holdout & old
+    assert training | holdout | old == set(range(16))
+    np.testing.assert_array_equal(np.bincount(labels[sorted(holdout)]), [2, 2])
+    np.testing.assert_array_equal(np.bincount(labels[sorted(training)]), [5, 5])
+
+
+def test_confirmation_reservation_rejects_reusing_or_overallocating_records():
+    labels = np.repeat([0, 1], 8)
+    with pytest.raises(ValueError, match="unique"):
+        reserve_indices(labels, [0, 0], holdout_per_class=2, train_shots=4)
+    with pytest.raises(ValueError, match="too few"):
+        reserve_indices(labels, [0, 8], holdout_per_class=4, train_shots=4)
 
 
 def test_generation_center_excludes_source_and_covariance_is_local_within_class():
