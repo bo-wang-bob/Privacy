@@ -208,6 +208,7 @@ defense_overrides:
           attempts: 2
           margin_tolerance: 0.02
           norm_ratio_min: 0.5
+          center_weighting: uniform
           norm_ratio_max: 2.0
           mode: risk
           semantic_filter: true

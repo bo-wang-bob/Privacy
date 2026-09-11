@@ -10,7 +10,7 @@ import torch
 from torch.nn import functional as F
 
 from aggregator.aggregator_builder import build_aggregator
-from privacy_defenses.risk_synthesis import DEFAULTS, LocalGeometry, RiskSynthesis, low_rank_factor, select_requests
+from privacy_defenses.risk_synthesis import DEFAULTS, LocalGeometry, PreviousRiskWeights, RiskSynthesis, low_rank_factor, select_requests
 from scripts.run_privacy_experiments import build_tasks, load_yaml, parse_args
 from scripts.analyze_risk_synthesis import class_diagnostics, read_synthesis_mechanism, recompute_auc
 from scripts.paired_synthesis_uncertainty import paired_resampling, score_metrics, select_pair
@@ -168,6 +168,73 @@ def test_generation_center_excludes_source_and_covariance_is_local_within_class(
     assert float((geometry.pooled @ geometry.pooled.T).trace()) < 100
 
 
+def test_weighted_center_excludes_source_and_uniform_weights_preserve_arithmetic():
+    codes, labels = torch.randn(5, 12), torch.zeros(5, dtype=torch.long)
+    geometry = LocalGeometry(codes, labels, DEFAULTS, "cpu")
+    weights = torch.tensor([100., 0., .2, .3, .5])
+    actual = geometry.leave_source_out_center(0, weights)
+    torch.testing.assert_close(actual, .2 * codes[2] + .3 * codes[3] + .5 * codes[4])
+    weights[0] = 0.
+    torch.testing.assert_close(actual, geometry.leave_source_out_center(0, weights), rtol=0, atol=0)
+    for weights in (torch.ones(5), torch.zeros(5), torch.full((5,), .3)):
+        first, second = torch.Generator().manual_seed(4), torch.Generator().manual_seed(4)
+        torch.testing.assert_close(geometry.sample(codes[0], 0, .8, DEFAULTS, first),
+                                   geometry.sample(codes[0], 0, .8, DEFAULTS, second, weights), rtol=0, atol=0)
+    with pytest.raises(ValueError, match="source-aligned"):
+        geometry.leave_source_out_center(0, torch.ones(4))
+
+
+def test_risk_weighted_centers_reduce_high_risk_reentry_in_fixed_risk_expectation():
+    # Basis-vector records make each original record's center coefficient
+    # directly observable. This is the fixed-risk/no-filter/no-cap expectation,
+    # not a guarantee about nonlinear training or lagged empirical risks.
+    codes = torch.eye(6)
+    labels = torch.zeros(6, dtype=torch.long)
+    risk = torch.tensor([0., .2, .4, .6, .8, .95])
+    geometry = LocalGeometry(codes, labels, DEFAULTS, "cpu")
+    options = {**DEFAULTS, "noise_scale": 0}
+    totals = []
+    for weights in (None, 1 - risk):
+        expected = torch.zeros(6)
+        for index in range(6):
+            probability = .25 * risk[index]
+            fake = geometry.sample(codes[index], index, risk[index], options,
+                                   torch.Generator().manual_seed(4), weights)
+            expected += (1 - probability) * codes[index] + probability * fake
+        totals.append(expected)
+        assert expected.sum() == pytest.approx(6.)
+    q, anchor = .25 * risk.square(), 1 - risk
+    formula = torch.stack([1 - q[j] + anchor[j] * sum(q[i] / (anchor.sum() - anchor[i])
+                                                    for i in range(6) if i != j) for j in range(6)])
+    torch.testing.assert_close(totals[1], formula)
+    assert totals[1][-1] < totals[0][-1] < 1
+    assert totals[1][0] > totals[0][0] > 1
+
+
+def test_anchor_risk_history_is_frozen_per_round_averages_visits_and_ignores_missing_scores():
+    history = PreviousRiskWeights()
+    first = history.begin(0, 0, 4)
+    history.observe(0, torch.tensor([0, 1]), torch.tensor([.9, .9]), available=False)
+    second = history.begin(0, 1, 4)
+    assert second["reference_round"] is None and torch.all(second["weights"] == 1)
+    history.observe(0, torch.tensor([0, 1, 1]), torch.tensor([.2, .4, .8]), available=True)
+    assert torch.all(first["weights"] == 1)
+    assert torch.all(history.begin(0, 1, 4)["weights"] == 1)
+    # These are assigned risks, so shuffling their original-record positions
+    # must also change the following round's anchor weights.
+    history.begin(1, 1, 4)
+    history.observe(1, torch.tensor([1, 0, 0]), torch.tensor([.2, .4, .8]), available=True)
+    third = history.begin(0, 3, 4)  # a skipped participation round is explicit
+    torch.testing.assert_close(third["weights"], torch.tensor([.8, .4, 1., 1.]))
+    assert third["reference_round"] == 2
+    assert third["available"].tolist() == [True, True, False, False]
+    torch.testing.assert_close(history.begin(1, 3, 4)["weights"], torch.tensor([.4, .8, 1., 1.]))
+    history.observe(0, torch.tensor([0]), torch.tensor([1.]), available=True)
+    torch.testing.assert_close(third["weights"], torch.tensor([.8, .4, 1., 1.]))
+    with pytest.raises(ValueError, match="increasing"):
+        history.begin(0, 2, 4)
+
+
 def test_catalog_validates_method_and_keeps_original_membership():
     catalog = load_yaml("configs/experiment_catalog.yaml")
     args = ["--models","clip_adapter,clip_lora","--datasets","cifar100","--defenses","risk_synthesis"]
@@ -184,6 +251,9 @@ def test_catalog_validates_method_and_keeps_original_membership():
         assert task.config["defense"]["formal_dp_enabled"] is False
     with pytest.raises(ValueError,match="replacement_fraction"):
         build_tasks(catalog,parse_args(args+["--methods","fedavg","--set","defense.synthesis.replacement_fraction=2"]))
+    with pytest.raises(ValueError, match="single MixUp donor"):
+        build_tasks(catalog, parse_args(args + ["--methods", "fedavg", "--set", "defense.synthesis.mode=mixup",
+                                                "--set", "defense.synthesis.center_weighting=previous_risk"]))
 
 
 def test_semantic_rejection_preserves_inputs_and_caps_requests():
@@ -232,13 +302,15 @@ def test_request_budget_matches_shuffled_risk_controls_across_batches():
 
 @pytest.mark.parametrize("kind", ["clip_adapter", "clip_lora"])
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
-def test_zero_replacement_matches_ordinary_fedavg_across_rounds(kind, optimizer, tmp_path):
+@pytest.mark.parametrize("center_weighting", ["uniform", "previous_risk"])
+def test_zero_replacement_matches_ordinary_fedavg_across_rounds(kind, optimizer, center_weighting, tmp_path):
     """The null intervention must preserve batches, optimizer state and uploads.
 
     Round two executes own/other risk scoring and restoration even when no
     record is replaced; repeated epochs and a short batch exercise that path.
     """
     final_states = []
+    rounds = 3 if center_weighting == "previous_risk" else 2
     for defense in ("none", "risk_synthesis"):
         torch.manual_seed(23)
         model = make_model(kind)
@@ -247,12 +319,13 @@ def test_zero_replacement_matches_ordinary_fedavg_across_rounds(kind, optimizer,
             train_sets=[dataset(3, 20), dataset(4, 21)],
             test_sets=[dataset(3, 30), dataset(4, 31)], class_names=["a", "b", "c"],
             batch_size=4, eval_batch_size=4, learning_rate=.01,
-            num_glob_iters=2, local_epochs=2, total_users=2, user_per_round=2,
+            num_glob_iters=rounds, local_epochs=2, total_users=2, user_per_round=2,
             results_dir=str(tmp_path / defense), eval_interval=1,
             aggregator=build_aggregator("fedavg", aggregation_weighting="sample_count"),
             audit_config={"enabled": False, "attacks": []},
             projres_config={"enabled": False},
-            defense_config={"name": defense, "synthesis": {"replacement_fraction": 0.}},
+            defense_config={"name": defense, "synthesis": {"replacement_fraction": 0.,
+                                                           "center_weighting": center_weighting}},
             method_config={"client_optimizer": optimizer, "seed": 42,
                            "momentum": .7 if optimizer == "sgd" else 0.,
                            "weight_decay": .01, "max_grad_norm": 0.},
@@ -262,14 +335,20 @@ def test_zero_replacement_matches_ordinary_fedavg_across_rounds(kind, optimizer,
                              for name, parameter in model.named_parameters()})
         if defense == "risk_synthesis":
             assert server.defense.synthesis.counts["accepted"] == 0
-            assert server.defense.synthesis.counts["visits"] == 84
+            assert server.defense.synthesis.counts["visits"] == rounds * 42
+            if center_weighting == "previous_risk":
+                mechanism = read_synthesis_mechanism(tmp_path / defense / "risk_synthesis",
+                                                     server.defense.synthesis.summary(), complete=True)
+                assert mechanism["anchor_history_rows_verified"] == rounds * 42
     assert set(final_states[0]) == set(final_states[1])
     for name in final_states[0]:
         torch.testing.assert_close(final_states[0][name], final_states[1][name], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("kind", ["clip_adapter", "clip_lora"])
-def test_full_fedavg_all_attacks_original_membership_and_streamed_exposure(kind,tmp_path):
+@pytest.mark.parametrize("center_weighting", ["uniform", "previous_risk"])
+def test_full_fedavg_all_attacks_original_membership_and_streamed_exposure(kind,center_weighting,tmp_path):
+    rounds = 3 if center_weighting == "previous_risk" else 2
     model = make_model(kind)
     frozen = {n:p.clone() for n,p in model.named_parameters() if not p.requires_grad}
     audit = _audit_config()
@@ -278,10 +357,11 @@ def test_full_fedavg_all_attacks_original_membership_and_streamed_exposure(kind,
         device=torch.device("cpu"),dataset_name="toy",model=model,
         train_sets=[dataset(3,20),dataset(4,21)],test_sets=[dataset(12,30),dataset(13,31)],
         class_names=["a","b","c"],batch_size=4,eval_batch_size=8,learning_rate=.05,
-        num_glob_iters=2,local_epochs=1,total_users=2,results_dir=str(tmp_path),
+        num_glob_iters=rounds,local_epochs=1,total_users=2,results_dir=str(tmp_path),
         user_per_round=2,eval_interval=1,aggregator=build_aggregator("fedavg",aggregation_weighting="sample_count"),
         audit_config=audit,projres_config={"enabled":True,"evaluation_interval":1},
-        defense_config={"name":"risk_synthesis","synthesis":{"replacement_fraction":1.,"semantic_filter":False}},
+        defense_config={"name":"risk_synthesis","synthesis":{"replacement_fraction":1.,"semantic_filter":False,
+                                                            "center_weighting": center_weighting}},
         method_config={"client_optimizer":"sgd","seed":42},
     )
     teacher = {n:p.clone() for n,p in server.defense.synthesis.teacher.named_parameters()}
@@ -295,17 +375,17 @@ def test_full_fedavg_all_attacks_original_membership_and_streamed_exposure(kind,
     assert server.ctx.aggregation_weights == {0:9/21,1:12/21}
     directory = tmp_path/"risk_synthesis"
     rows = list(csv.DictReader((directory/"synthetic_exposure.csv").open()))
-    assert len(rows)==42
+    assert len(rows)==rounds * 21
     assert sum(int(r["accepted"]) for r in rows if r["round"]=="1")==0
     assert sum(int(r["accepted"]) for r in rows if r["round"]=="2")>0
     assert all(int(r["sample_id"]) < [9,12][int(r["client"])] for r in rows)
     summary = json.loads((directory/"synthesis_summary.json").read_text())
     assert summary["status"]=="completed" and not summary["formal_dp_enabled"]
     mechanism = read_synthesis_mechanism(directory, summary, complete=True)
-    assert mechanism["counts"]["visits"] == 42
+    assert mechanism["counts"]["visits"] == rounds * 21
     assert mechanism["counts"]["accepted"] == sum(int(r["accepted"]) for r in rows)
     assert mechanism["completed_counters_verified"]
-    wrong_summary = {**summary, "counts": {**summary["counts"], "visits": 43}}
+    wrong_summary = {**summary, "counts": {**summary["counts"], "visits": rounds * 21 + 1}}
     with pytest.raises(ValueError, match="disagree"):
         read_synthesis_mechanism(directory, wrong_summary, complete=True)
     state = torch.load(directory/"client_0_distribution.pt",weights_only=False)
@@ -313,8 +393,31 @@ def test_full_fedavg_all_attacks_original_membership_and_streamed_exposure(kind,
     assert all(len(g["indices"])==3 for g in state["classes"].values())
     exposure = torch.load(directory/"source_exposure.pt",weights_only=False)
     for v in exposure.values():
-        assert torch.all(v["real_steps"]+v["synthetic_steps"]==2)
-        assert torch.all(v["risk_reads"]==1)
+        assert torch.all(v["real_steps"]+v["synthetic_steps"]==rounds)
+        assert torch.all(v["risk_reads"]==rounds - 1)
+    if center_weighting == "previous_risk":
+        assert mechanism["anchor_history_rows_verified"] == rounds * 21
+        assigned = {(int(r["client"]), int(r["sample_id"])): float(r["used_risk"])
+                    for r in rows if r["round"] == "2"}
+        for row in rows:
+            if row["round"] in {"1", "2"}:
+                assert row["anchor_reference_round"] == ""
+                assert float(row["anchor_source_weight"]) == 1
+            else:
+                assert row["anchor_reference_round"] == "2"
+                client, sid = int(row["client"]), int(row["sample_id"])
+                assert float(row["anchor_source_weight"]) == pytest.approx(1 - assigned[client, sid])
+                assert int(row["anchor_available_donors"]) == [2, 3][client]
+        # Keep the private source artifacts intact and corrupt only this test's
+        # temporary streamed diagnostic to verify the independent checker.
+        wrong = [dict(row) for row in rows]
+        wrong[-1]["anchor_source_weight"] = "123"
+        with (directory / "synthetic_exposure.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(wrong[0]))
+            writer.writeheader()
+            writer.writerows(wrong)
+        with pytest.raises(ValueError, match="prior-round"):
+            read_synthesis_mechanism(directory, summary, complete=True)
     for n,p in model.named_parameters():
         if n in frozen:
             torch.testing.assert_close(p,frozen[n],rtol=0,atol=0)

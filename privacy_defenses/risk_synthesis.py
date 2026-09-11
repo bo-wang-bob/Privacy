@@ -21,6 +21,7 @@ DEFAULTS = dict(
     class_rank=5, pooled_rank=16, min_class_samples=3, attempts=2,
     margin_tolerance=0.02, norm_ratio_min=0.5, norm_ratio_max=2.0,
     mode="risk", semantic_filter=True, warmup_rounds=1,
+    center_weighting="uniform",
 )
 
 
@@ -57,6 +58,10 @@ def validate_risk_synthesis(config):
         raise ValueError("synthesis.min_class_samples must be at least 3.")
     if options["mode"] not in {"risk", "shuffled_risk", "mixup"}:
         raise ValueError("synthesis.mode must be risk, shuffled_risk or mixup.")
+    if options["center_weighting"] not in {"uniform", "previous_risk"}:
+        raise ValueError("synthesis.center_weighting must be uniform or previous_risk.")
+    if options["center_weighting"] != "uniform" and options["mode"] == "mixup":
+        raise ValueError("Risk-weighted class centers do not apply to a single MixUp donor.")
     if type(options["semantic_filter"]) is not bool:
         raise ValueError("synthesis.semantic_filter must be boolean.")
     defense["synthesis"] = options
@@ -100,7 +105,24 @@ class LocalGeometry:
                     pooled_metadata=self.pooled_meta, source_sha256=hashlib.sha256(
                         self.codes.numpy().tobytes() + self.labels.numpy().tobytes()).hexdigest())
 
-    def sample(self, original, index, risk, options, generator):
+    def leave_source_out_center(self, index, weights=None):
+        group = self.classes[int(self.labels[index])]
+        donors = group["indices"][group["indices"] != index]
+        if not len(donors):
+            raise ValueError("A leave-source-out center needs another class record.")
+        if weights is not None:
+            if (weights.ndim != 1 or len(weights) != len(self.codes) or not torch.isfinite(weights).all()
+                    or (weights < 0).any()):
+                raise ValueError("Center weights must be finite, nonnegative and source-aligned.")
+            selected = weights[donors]
+            # Preserve the original arithmetic exactly for uniform anchors,
+            # including the bootstrap rounds and an all-zero donor fallback.
+            if float(selected.sum()) > 0 and not torch.equal(selected, selected[:1].expand_as(selected)):
+                return (self.codes[donors] * selected[:, None]).sum(0) / selected.sum()
+        count = len(group["indices"])
+        return (count * group["mean"] - self.codes[index]) / (count - 1)
+
+    def sample(self, original, index, risk, options, generator, center_weights=None):
         c = int(self.labels[index])
         group = self.classes[c]
         count = len(group["indices"])
@@ -111,13 +133,55 @@ class LocalGeometry:
             donor = int(donors[torch.randint(len(donors), (), generator=generator)])
             anchor = self.codes[donor]
         else:
-            anchor = (count * group["mean"] - self.codes[index]) / (count - 1)
+            anchor = self.leave_source_out_center(index, center_weights)
         noise = torch.zeros_like(anchor)
         for factor, weight in ((group["factor"], 1-options["shrinkage"]),
                                (self.pooled, options["shrinkage"])):
             noise.add_(factor @ torch.randn(factor.shape[1], generator=generator), alpha=math.sqrt(weight))
         scale = 0.0 if options["mode"] == "mixup" else options["noise_scale"]
         return (1-risk) * original.cpu() + risk * anchor + scale * noise
+
+
+class PreviousRiskWeights:
+    """Freeze 1 - mean(assigned risk) from the previous participating round.
+
+    Missing reference scores retain weight one. Accumulation never changes the
+    anchors used by other batches in the current round. Shuffled controls must
+    supply their assigned ``used_risk``, not the unshuffled original score.
+    """
+    def __init__(self):
+        self.clients = {}
+
+    def begin(self, client, round_index, size):
+        state = self.clients.get(client)
+        if state is None:
+            state = dict(round=round_index, reference_round=None,
+                         weights=torch.ones(size), available=torch.zeros(size, dtype=torch.bool),
+                         total=torch.zeros(size, dtype=torch.float64), count=torch.zeros(size, dtype=torch.long))
+            self.clients[client] = state
+        if len(state["weights"]) != size or round_index < state["round"]:
+            raise ValueError("Anchor risk history must retain original identities and increasing rounds.")
+        if round_index > state["round"]:
+            available = state["count"] > 0
+            weights = torch.ones(size)
+            weights[available] = (1 - state["total"][available] / state["count"][available]).float()
+            state.update(weights=weights, available=available,
+                         reference_round=state["round"] + 1 if available.any() else None,
+                         round=round_index)
+            state["total"].zero_()
+            state["count"].zero_()
+        return state
+
+    def observe(self, client, indices, assigned_risk, *, available):
+        if not available:
+            return
+        state = self.clients[client]
+        indices, risk = indices.cpu().long(), assigned_risk.cpu().double()
+        if (indices.ndim != 1 or risk.shape != indices.shape or not torch.isfinite(risk).all()
+                or (risk < 0).any() or (risk > 1).any()):
+            raise ValueError("Expected finite source-aligned assigned risks in [0,1].")
+        state["total"].scatter_add_(0, indices, risk)
+        state["count"].scatter_add_(0, indices, torch.ones_like(indices))
 
 
 def select_requests(risk, options, request_generator, control_generator):
@@ -151,6 +215,7 @@ class RiskSynthesis:
         self.handle = None
         self.directory = None
         self.exposure = {}
+        self.previous_risk_weights = PreviousRiskWeights()
 
     @torch.no_grad()
     def initialize(self, users, shared_model, directory):
@@ -173,6 +238,9 @@ class RiskSynthesis:
         fields = ["round", "client", "step", "sample_id", "label", "risk", "used_risk",
                   "requested", "accepted", "attempts", "reason", "nearest_distance", "source_round",
                   "norm_ratio", "teacher_margin_delta"]
+        if self.options["center_weighting"] == "previous_risk":
+            fields += ["anchor_reference_round", "anchor_available_donors", "anchor_source_weight",
+                       "anchor_donor_weight_sum", "anchor_uniform_fallback"]
         self.handle = (self.directory / "synthetic_exposure.csv").open("x", newline="")
         self.writer = csv.DictWriter(self.handle, fieldnames=fields)
         self.writer.writeheader()
@@ -244,11 +312,16 @@ class RiskSynthesis:
             len(requests) and self.options["semantic_filter"]) else None
         reference_margins = {} if margins is None else dict(zip(pending, margins.tolist()))
         geometry = self.geometry[user.id]
+        anchor_state = None
+        if self.options["center_weighting"] == "previous_risk":
+            anchor_state = self.previous_risk_weights.begin(user.id, round_index, len(geometry.labels))
+            self.previous_risk_weights.observe(user.id, indices, used, available=source_round >= 0)
         for _ in range(self.options["attempts"]):
             batch, positions = [], []
             for j in pending:
                 tries[j] += 1
-                candidate = geometry.sample(original[j], int(indices[j]), float(used[j]), self.options, generator)
+                candidate = geometry.sample(original[j], int(indices[j]), float(used[j]), self.options, generator,
+                                            None if anchor_state is None else anchor_state["weights"])
                 if candidate is None:
                     reasons[j] = "insufficient_class_samples"
                     continue
@@ -293,6 +366,16 @@ class RiskSynthesis:
                           requested=int(requested), accepted=int(accepted[j]), attempts=int(tries[j]),
                           reason=reasons[j], nearest_distance=distances[j], source_round=source_round,
                           norm_ratio=norm_ratios[j], teacher_margin_delta=margin_deltas[j])
+            if anchor_state is not None:
+                sid = int(indices[j])
+                group = geometry.classes[int(labels[j])]["indices"]
+                donors = group[group != sid]
+                weight_sum = float(anchor_state["weights"][donors].sum())
+                record.update(anchor_reference_round=anchor_state["reference_round"],
+                              anchor_available_donors=int(anchor_state["available"][donors].sum()),
+                              anchor_source_weight=float(anchor_state["weights"][sid]),
+                              anchor_donor_weight_sum=weight_sum,
+                              anchor_uniform_fallback=int(weight_sum <= 0))
             self.writer.writerow(record)
             count = dict(visits=1, requested=int(requested), accepted=int(accepted[j]),
                          fallback=int(requested and not accepted[j]))
@@ -305,7 +388,11 @@ class RiskSynthesis:
         return tokens.detach()
 
     def summary(self):
-        return dict(implementation="local_token_geometry_v2", options=self.options, seed=self.seed,
+        return dict(implementation=("local_token_geometry_v3_weighted_center" if
+                                    self.options["center_weighting"] == "previous_risk" else "local_token_geometry_v2"),
+                    options=self.options, seed=self.seed,
+                    center_risk_reference=("previous_participating_round_mean_assigned_rank" if
+                                           self.options["center_weighting"] == "previous_risk" else None),
                     request_sampling="rank_coupled_independent_rng",
                     counts=dict(self.counts), risk_bins={k:dict(v) for k,v in self.risk_bins.items()},
                     formal_dp_enabled=False, client_upload_is_private=False,

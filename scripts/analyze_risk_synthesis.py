@@ -26,6 +26,38 @@ def digest(path):
     return hasher.hexdigest()
 
 
+def verify_anchor_history_row(row, labels, history):
+    """Independent NumPy replay of lagged anchors from recorded assigned risks."""
+    client, sid, current_round = (int(row[key]) for key in ("client", "sample_id", "round"))
+    labels = np.asarray(labels)
+    if client not in history:
+        history[client] = dict(round=current_round, total=np.zeros(len(labels)), count=np.zeros(len(labels), dtype=int),
+                               weights=np.ones(len(labels), dtype=np.float32), known=np.zeros(len(labels), dtype=bool),
+                               reference="")
+    state = history[client]
+    if current_round < state["round"]:
+        raise ValueError("Anchor history rounds must be increasing.")
+    if current_round > state["round"]:
+        known = state["count"] > 0
+        weights = np.ones(len(labels), dtype=np.float32)
+        weights[known] = 1 - state["total"][known] / state["count"][known]
+        state.update(weights=weights, known=known,
+                     reference=str(state["round"]) if known.any() else "", round=current_round)
+        state["total"].fill(0)
+        state["count"].fill(0)
+    donors = (labels == labels[sid]) & (np.arange(len(labels)) != sid)
+    denominator = float(state["weights"][donors].sum())
+    if (row.get("anchor_reference_round") != state["reference"]
+            or int(row["anchor_available_donors"]) != int(state["known"][donors].sum())
+            or int(row["anchor_uniform_fallback"]) != int(denominator <= 0)
+            or not np.isclose(float(row["anchor_source_weight"]), state["weights"][sid], rtol=1e-6, atol=2e-6)
+            or not np.isclose(float(row["anchor_donor_weight_sum"]), denominator, rtol=1e-6, atol=2e-6)):
+        raise ValueError("Recorded anchor weights disagree with prior-round assigned-risk history.")
+    if int(row["source_round"]) >= 0:
+        state["total"][sid] += float(row["used_risk"])
+        state["count"][sid] += 1
+
+
 def read_synthesis_mechanism(directory, summary, *, complete):
     """Independently reconcile streamed visits with original IDs and counters.
 
@@ -52,6 +84,8 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     groups = defaultdict(Counter)
     bins = {str(i): Counter() for i in range(5)}
     measurements = defaultdict(lambda: dict(count=0, sum=0., min=float("inf"), max=-float("inf")))
+    weighted_centers = summary["options"].get("center_weighting", "uniform") == "previous_risk"
+    anchor_history = {}
     path = directory / "synthetic_exposure.csv"
     with path.open() as handle:
         for row in csv.DictReader(handle):
@@ -68,6 +102,8 @@ def read_synthesis_mechanism(directory, summary, *, complete):
                     or (requested and not attempts) or (not requested and attempts)
                     or (row["reason"] == "accepted") != bool(accepted)):
                 raise ValueError("Inconsistent synthetic exposure decision.")
+            if weighted_centers:
+                verify_anchor_history_row(row, states[client], anchor_history)
             counts = dict(visits=1, requested=requested, accepted=accepted,
                           fallback=requested-accepted)
             totals.update(counts)
@@ -109,7 +145,8 @@ def read_synthesis_mechanism(directory, summary, *, complete):
                 last_attempt_measurements=[dict(field=field, outcome=outcome, count=values["count"],
                     mean=values["sum"] / values["count"], min=values["min"], max=values["max"])
                     for (field, outcome), values in sorted(measurements.items())],
-                completed_counters_verified=bool(complete))
+                completed_counters_verified=bool(complete),
+                anchor_history_rows_verified=totals["visits"] if weighted_centers else None)
 
 
 def recompute_auc(labels, scores):
