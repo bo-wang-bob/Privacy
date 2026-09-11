@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import cast
 
 import torch
+from trainmodel.clip_tokens import CLIPTokenInputMixin, ClientCLIPTokenInputMixin
 from torch import nn
 from torch.nn import functional as F
 from transformers import CLIPModel, CLIPProcessor
@@ -111,7 +112,7 @@ def _layer_indices(selection: str | Iterable[int], count: int) -> list[int]:
     return indices
 
 
-class CLIPLoRA(nn.Module):
+class CLIPLoRA(CLIPTokenInputMixin, nn.Module):
     """One globally shared CLIP backbone with switchable LoRA parameters."""
 
     model_type = "clip_lora"
@@ -493,7 +494,7 @@ class CLIPLoRA(nn.Module):
         }
 
 
-class ClientCLIPLoRA(nn.Module):
+class ClientCLIPLoRA(ClientCLIPTokenInputMixin, nn.Module):
     """Per-client LoRA factors executed through one shared frozen CLIP.
 
     The wrapper registers only this client's A/B factors.  A client session

@@ -933,6 +933,8 @@ def validate_config(config: dict) -> None:
     defense_name = str(defense.get("name", "none")).lower()
     validate_cofedmid(defense, int(config["total_users"]), int(config["sample_users"]))
     validate_www(defense)
+    from privacy_defenses.risk_synthesis import validate_risk_synthesis
+    validate_risk_synthesis(config)
     if defense_name not in SUPPORTED_DEFENSES:
         raise ValueError(f"Unknown privacy defense: {defense_name}")
     if www_candidate_scoring and defense_name != "none":
@@ -948,10 +950,11 @@ def validate_config(config: dict) -> None:
         "none",
         "www",
         "cofedmid",
+        "risk_synthesis",
     }:
         raise ValueError(
             f"{model_type} attack experiments currently require defense.name "
-            "to be none, www, or cofedmid."
+            "to be none, www, cofedmid, or risk_synthesis."
         )
     if defense_name == "www":
         if model_type not in {"clip_mlp", "clip_adapter", "clip_lora"}:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import torch
+from trainmodel.clip_tokens import CLIPTokenInputMixin, ClientCLIPTokenInputMixin
 from torch import nn
 from torch.nn import functional as F
 from transformers import CLIPModel
@@ -14,7 +15,7 @@ from trainmodel.transformer_adapter import (
 )
 
 
-class CLIPTransformerAdapter(TransformerAdapterClassifier):
+class CLIPTransformerAdapter(CLIPTokenInputMixin, TransformerAdapterClassifier):
     """Reuse Transformer Adapter client ownership with an image/text forward.
 
     Only the visual block adapters are trainable. Class prompts are stored as
@@ -207,7 +208,7 @@ class CLIPTransformerAdapter(TransformerAdapterClassifier):
         return representations, int(hidden.shape[0] * hidden.shape[1])
 
 
-class ClientCLIPTransformerAdapter(ClientTransformerAdapterClassifier):
+class ClientCLIPTransformerAdapter(ClientCLIPTokenInputMixin, ClientTransformerAdapterClassifier):
     trainable_state_filename = CLIPTransformerAdapter.trainable_state_filename
     adapter_variant = CLIPTransformerAdapter.adapter_variant
     text_adapter_enabled = False

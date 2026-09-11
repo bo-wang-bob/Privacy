@@ -34,6 +34,7 @@ from privacy_attacks.code_poison import (
     compromised_prompt_loss,
     generate_membership_encoding_samples,
 )
+from privacy_defenses.risk_synthesis import RiskSynthesis
 from privacy_defenses.cofedmid import CoFedMID
 from privacy_defenses.www_dp import WWWPrivacy, risk_regularization_weights
 from privacy_defenses.www_diagnostics import WWWGradientRecorder
@@ -53,6 +54,7 @@ from privacy_defenses.www_validation import (
 
 
 SUPPORTED_DEFENSES = {
+    "risk_synthesis",
     "none",
     "perturb",
     "sparse",
@@ -352,6 +354,7 @@ class DefenseController:
             WWWPrivacy(self.config, self.total_rounds, self.device, self.seed)
             if self.name == "www" else None
         )
+        self.synthesis = RiskSynthesis(self.config, self.seed) if self.name == "risk_synthesis" else None
         self.www_gradient_recorder = None
         self.cofedmid = (
             CoFedMID(
@@ -607,12 +610,12 @@ class DefenseController:
         code_poison: bool = False,
         privacy_probe: bool = False,
     ) -> None:
-        if privacy_probe and self.name in {"cofedmid", "www"}:
+        if privacy_probe and self.name in {"cofedmid", "www", "risk_synthesis"}:
             raise ValueError(f"{self.name} does not support isolated active client probes.")
         model.to(self.device)
         model.train()
         parameters = _trainable_parameters(model)
-        if self.name in {"none", "cofedmid", "record_dp", "local_client_dp", "www"}:
+        if self.name in {"none", "cofedmid", "record_dp", "local_client_dp", "www", "risk_synthesis"}:
             optimizer_name = str(
                 self.method_config.get("client_optimizer", "sgd")
             ).lower()
@@ -648,7 +651,9 @@ class DefenseController:
                     user.capture_protocol_gradients(model)
                 )
             )
-        if self.name == "www" and not privacy_probe:
+        if self.synthesis is not None:
+            self._synthesis_training(user, model, optimizer, round_index, code_poison)
+        elif self.name == "www" and not privacy_probe:
             self._www_training(
                 user, model, optimizer, round_index, code_poison
             )
@@ -678,6 +683,36 @@ class DefenseController:
             self._standard_training(
                 user, model, optimizer, round_index, code_poison=code_poison
             )
+
+    def _synthesis_training(self, user, model, optimizer, round_index, code_poison):
+        if code_poison:
+            raise ValueError("risk_synthesis does not support active code-poison probes.")
+        references = self._www_pending_states.pop(user.id, None)
+        for images, labels, indices in user.iter_www_local_batches():
+            source_round = int(user.www_source_round) if references is not None else -1
+            risk = torch.zeros(len(labels))
+            if references is not None:
+                with measure_stage(self, "train.synthesis_ranking"):
+                    ranking = rank_loss_differences(
+                        model, [(images, labels)], references[0], references[1],
+                        user.get_parameters(), self.device, indices,
+                    )
+                self._record_www_ranking(user, ranking, round_index, source_round,
+                                         float(user.www_aggregation_weight))
+                risk, _, _ = risk_regularization_weights(
+                    ranking.scores, 0.8, expected_batch_size=len(labels), tail_basis="actual_batch")
+            with measure_stage(self, "train.synthesis_generate"):
+                tokens = self.synthesis.transform(model, user, images, labels.to(self.device),
+                                                   indices, risk, round_index, self.steps[user.id], source_round)
+            optimizer.zero_grad(set_to_none=True)
+            with measure_stage(self, "train.synthesis_optimizer"):
+                loss = F.cross_entropy(model.forward_tokens(tokens), labels.to(self.device))
+                if not torch.isfinite(loss):
+                    raise ValueError("Non-finite risk synthesis loss.")
+                loss.backward()
+                optimizer.step()
+            self.steps[user.id] += 1
+            self._record("synthesis_ce_loss", float(loss.detach()))
 
     def _www_training(
         self,
@@ -762,6 +797,8 @@ class DefenseController:
             self.www_gradient_recorder = WWWGradientRecorder(results_dir)
 
     def finish_www_gradient_diagnostics(self, status):
+        if self.synthesis is not None:
+            self.synthesis.close(status)
         if self.www_gradient_recorder is not None:
             with measure_stage(self, "outputs.write"):
                 self.www_gradient_recorder.close(status)
@@ -1100,7 +1137,7 @@ class DefenseController:
         own_state: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Build the two WWW references immediately before global overwrite."""
-        if self.name != "www":
+        if self.name not in {"www", "risk_synthesis"}:
             return
         own_state = user.get_parameters() if own_state is None else own_state
         weight = float(own_weight)
@@ -1887,6 +1924,12 @@ class DefenseController:
         if self.cofedmid is not None:
             summary["cofedmid"] = self.cofedmid.summary()
             summary["cofedmid"]["implementation"] = f"paper_modules_{self.federated_method}_v1"
+        if self.synthesis is not None:
+            summary["risk_synthesis"] = self.synthesis.summary()
+            summary["privacy_accounting"] = {
+                "formal_dp_enabled": False, "client_upload_is_private": False,
+                "epsilon": None, "delta": None, "note": "Empirical local synthesis; no formal DP guarantee.",
+            }
         if self.name == "www":
             periodic_post_round = self.www_analysis_timing == "post_round"
             completed_rounds = (
@@ -2082,6 +2125,8 @@ class DefenseController:
 
     def save_summary(self, results_dir: str) -> dict:
         summary = self.summary()
+        if self.synthesis is not None:
+            self.synthesis.write_summary("running")
         if self.cofedmid is not None:
             self.cofedmid.save(results_dir)
         if self.name == "www" and self._www_round_metrics:

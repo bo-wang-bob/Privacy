@@ -21,6 +21,7 @@ tests/*
 !tests/test_result_formatting.py
 !tests/test_main_logging.py
 !tests/test_runtime_optimization.py
+!tests/test_risk_synthesis.py
 paper/
 
 # Local model weights and experiment artifacts

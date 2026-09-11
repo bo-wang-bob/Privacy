@@ -47,6 +47,13 @@
 - WWW 始终记录 `formal_dp_enabled=false`、`client_upload_is_private=false` 和空的 epsilon/delta，不输出 DP 攻击理论上界。旧 `reproducible_dp_noise` 在 WWW 中不再生效。新记录只影响新启动任务，不能补录旧进程未保存的范数。
 - WWW 下 ProjRes 与普通训练一样按 batch size 推导候选上限，完整 batch=32 时为 `32/320/320`，短 batch 仍按真实 n/10n 候选计算；当前真实类概率正则的逐样本梯度与 CE 共线，保留 batch 秩上限，`attacked_parameter_perturbed=false`，因修改训练损失仍标记 `paper_fedsgd_exact=false`。不要声称该损失必然防住 ProjRes。LoRA 初始化等导致被攻击层上传为零时，仅跳过 ProjRes 并记录 `zero_observed_update`，其余攻击继续执行。入口与完整公式见 `docs/defenses.md`。
 
+## 风险指导的本地生成研究
+
+- `risk_synthesis` 是 2026-09-12 新增的实验防御，当前只支持 CLIP transformer Adapter/LoRA + FedAvg。通过统一入口 `--methods fedavg --defenses risk_synthesis` 运行，默认参数集中在 catalog；FedSGD 组合跳过，直接配置会拒绝。
+- 每客户端从原始完整本地训练集拟合每类输入 patch+position token 的低秩几何，向该客户端类内合并协方差收缩；固定原始 CLIP 教师检查语义，统计与虚拟编码不共享。
+- 第一轮原图训练；后续复用 WWW 的上一轮 own/other 损失差和尾部秩风险。以 `0.25*r` 概率请求替换、每 batch 上限 `floor(0.25*B)`，生成 `(1-r)*h+r*mu_without_self+0.1*L*epsilon`，最多两次语义检查，失败回退原图。混合 token 上普通 CE 经当前 Adapter/LoRA 求导，不追加 WWW 正则；原始 batch 大小、本地 epoch 和聚合权重不变。
+- FedAvg 的攻击成员仍是原始完整客户端训练集，虚拟样本不能充当独立非成员。任务内 `risk_synthesis/` 保存本地分布、流式暴露记录和摘要，无 DP 保证。当前只完成小模型端到端与梯度/身份检查，真实数据效果待验证；见 `docs/risk_synthesis_research_log.md`，不得将两轮检查或代理风险下降描述为防御有效。
+
 ## 当前 CoFedMID 防御
 
 - `--defenses cofedmid` 已支持三个 CLIP 模型、BERT Adapter/LoRA 和 GPT2 Adapter。默认 `cofedmid_clients: all`，所有客户端协作，且每轮要求全员参与；显式列表可设置至少两个联盟成员。

@@ -68,7 +68,7 @@ class UserBase:
         )
         self._www_enabled = (
             str(getattr(self.defense_controller, "name", "none")).lower()
-            == "www"
+            in {"www", "risk_synthesis"}
         )
         self._record_dp_enabled = (
             str(getattr(self.defense_controller, "name", "none")).lower()

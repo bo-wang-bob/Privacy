@@ -484,6 +484,9 @@ def build_tasks(
                 local_epochs=getattr(args, "local_epochs", None),
                 aggregation_weighting=getattr(args, "aggregation_weighting", None),
             )
+            if defense == "risk_synthesis" and config["aggregator"] != "fedavg":
+                skipped.append(f"{model}/{config['aggregator']}: risk_synthesis 目前仅支持 FedAvg")
+                continue
             run_id = _task_id(config, model, dataset, defense, started)
             run_dir = results_root / run_id
             config["results_dir"] = str(run_dir)

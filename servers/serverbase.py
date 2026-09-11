@@ -303,6 +303,14 @@ class ServerBase:
         self.projres_evaluation_round = self.projres_evaluation_rounds[-1]
         self._projres_series_entries: list[dict] = []
         self.defense_config = defense_config or {"name": "none"}
+        if self.defense_config.get("name") == "risk_synthesis":
+            from privacy_defenses.risk_synthesis import validate_risk_synthesis
+            validate_risk_synthesis({
+                "defense": self.defense_config, "model_type": getattr(model, "model_type", ""),
+                "clip_adapter": {"variant": getattr(model, "adapter_variant", "")},
+                "aggregator": self.federated_method, "sample_users": user_per_round,
+                "code_poison": {"enabled": "codepoison" in self.audit_config.get("attacks", [])},
+            })
         validate_cofedmid(self.defense_config, total_users, user_per_round)
         if self.federated_method == "fedsgd" and str(
             self.defense_config.get("name", "none")
@@ -434,6 +442,10 @@ class ServerBase:
                 user.set_parameters(state)
 
         self.defense.initialize_www_feature_statistics(self.ctx.users)
+        if self.defense.synthesis is not None:
+            self.defense.synthesis.timings = self.timings
+            with self.timings.measure("setup.synthesis_geometry"):
+                self.defense.synthesis.initialize(self.ctx.users, self.model, self.results_dir)
 
         self.auditor = MembershipAuditor(
             model=model,
