@@ -19,7 +19,7 @@ def single_thread():
 
 
 def make_server(tmp_path, monkeypatch, model_type, *, method="fedsgd", lr=.1,
-                device="cpu", audit=None, dataset="cola", defense="none"):
+                device="cpu", audit=None, dataset="cola", defense="none", www_diagnostics=False):
     model = tiny_model(model_type, monkeypatch).to(device)
     model.device = torch.device(device)
     with torch.no_grad():
@@ -36,7 +36,7 @@ def make_server(tmp_path, monkeypatch, model_type, *, method="fedsgd", lr=.1,
         aggregator=build_aggregator(method, aggregation_weighting="uniform"),
         audit_config=audit or {"enabled": False}, projres_config={"enabled": False},
         defense_config={"name": defense, "target_epsilon": 16., "max_grad_norm": 8.,
-                        "reproducible_noise": True},
+                        "reproducible_noise": True, "www_record_diagnostics": www_diagnostics},
         method_config={"client_optimizer": "sgd", "momentum": 0., "weight_decay": 0.},
     )
 
@@ -208,16 +208,19 @@ def test_shared_evaluation_restores_global_state_on_forward_error(tmp_path, monk
     assert server.model.training
 
 
-@pytest.mark.parametrize("defense", ["www", "record_dp"])
-def test_step_timings_distinguish_www_loss_from_record_dp_noise(defense, tmp_path, monkeypatch):
-    server = make_server(tmp_path, monkeypatch, "bert_adapter", defense=defense)
+@pytest.mark.parametrize("defense,diagnostics", [("www", False), ("www", True), ("record_dp", False)])
+def test_step_timings_distinguish_www_loss_from_record_dp_noise(defense, diagnostics, tmp_path, monkeypatch):
+    server = make_server(tmp_path, monkeypatch, "bert_adapter", defense=defense, www_diagnostics=diagnostics)
     server.train()
     stages = json.loads((tmp_path / "performance_summary.json").read_text())["stages"]
     assert stages["evaluation"]["calls"] == 2
     if defense == "www":
         assert stages["train.www_ranking"]["calls"] == 2
         assert stages["train.www_backward_step"]["calls"] == 2
-        assert stages["train.www_gradient_diagnostics"]["calls"] == 2
+        if diagnostics:
+            assert stages["train.www_gradient_diagnostics"]["calls"] == 2
+        else:
+            assert "train.www_gradient_diagnostics" not in stages
         assert "train.clipping_step" not in stages and "train.record_gradients" not in stages
         assert "train.noise_and_step" not in stages
     else:

@@ -139,12 +139,16 @@ def _dataset_split_arguments(config: dict) -> dict:
     # The loader flag selects the source splits before fpl_shots is applied.
     # Bypass its historical CIFAR100/Food101 subsampling for both data regimes.
     complete_source = model_type in {"clip_adapter", "visual_adapter", "clip_lora"}
-    return {
+    arguments = {
         "root_dir": config.get("data_root", "./data"),
         "fpl": True,
         "fpl_shots": config.get("fpl_shots"),
         "use_full_dataset": complete_source or bool(config.get("use_full_dataset", False)),
     }
+    if config.get("confirmation_split_manifest") is not None:
+        arguments["confirmation_split_manifest"] = config["confirmation_split_manifest"]
+        arguments["confirmation_split_sha256"] = config["confirmation_split_sha256"]
+    return arguments
 
 
 def validate_config(config: dict) -> None:
@@ -1076,6 +1080,10 @@ def validate_config(config: dict) -> None:
         raise ValueError(
             "Cross-client membership attacks require at least two clients per round."
         )
+    from utils.confirmation_split import validate_confirmation_config
+    validate_confirmation_config(config)
+
+
 def run(config: dict) -> list[dict]:
     from trainmodel.custom_clip import CustomCLIP, get_default_prompt_template
     from trainmodel.clip_mlp import CLIPImageMLP
@@ -1172,6 +1180,11 @@ def run(config: dict) -> list[dict]:
             config["dirichlet_alpha"],
             **split_arguments,
         )
+
+    if config.get("confirmation_split_manifest") is not None:
+        from utils.confirmation_split import write_confirmation_provenance
+        write_confirmation_provenance(train_sets, test_sets, config, result_dir)
+        logger.info("Verified confirmation source roles; provenance=data_partition.json")
 
     processor = None
     clip_model = None

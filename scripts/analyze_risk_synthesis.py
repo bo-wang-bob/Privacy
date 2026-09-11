@@ -310,7 +310,46 @@ def read_run(directory):
         if path.exists():
             result["candidate_selection_digests"][name]=selection_digest(path)
             sources[str(path)]=digest(path)
+    if config.get("confirmation_split_manifest") is not None and summary:
+        result["confirmation_source"] = verify_confirmation_sources(directory, config, signals, sources)
+        # Local candidate positions alone are insufficient when source pools differ.
+        result["candidate_selection_digests"]["confirmation_original_source_identities"] = hashlib.sha256(
+            json.dumps(result["confirmation_source"], sort_keys=True).encode()).hexdigest()
     return result
+
+
+def verify_confirmation_sources(directory, config, signals, sources):
+    import sys
+    import torch
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from utils.confirmation_split import map_confirmation_candidates, read_manifest
+    manifest_path, mapping_path = directory / "confirmation_split.json", directory / "data_partition.json"
+    manifest, fingerprint = read_manifest(manifest_path, config["confirmation_split_sha256"])
+    mapping = json.loads(mapping_path.read_text())
+    if (mapping["manifest_sha256"] != fingerprint or mapping["seed"] != config["seed"]
+            or any(mapping[key] != manifest[key] for key in ("source_images_sha256", "source_labels_sha256"))):
+        raise ValueError("Confirmation source provenance disagrees with the saved configuration/manifest.")
+    for path in (manifest_path, mapping_path):
+        sources[str(path)] = digest(path)
+    client = int(config["audit"]["audit_client_ids"][0])
+    selection = torch.load(directory / "privacy_audit/candidate_selection.pt", map_location="cpu", weights_only=True)
+    update_path = directory / "privacy_audit/client_train_update_candidate_selection.pt"
+    updates = torch.load(update_path, map_location="cpu", weights_only=True) if update_path.exists() else {"rounds": []}
+    resolved = map_confirmation_candidates(mapping, manifest, client, selection)
+    for entry in updates["rounds"]:
+        current = map_confirmation_candidates(mapping, manifest, client, entry)
+        if any(not np.array_equal(current[key], resolved[key]) for key in resolved):
+            raise ValueError("Confirmation update candidates changed their original record identities.")
+    for observation in [signals, *signals.get("client_train_update_observations", [])]:
+        membership = np.asarray(observation["membership"])
+        labels = np.asarray(observation["candidate_labels"])
+        if (set(membership.tolist()) != {0, 1} or labels.shape != membership.shape
+                or not np.array_equal(labels[membership == 1], resolved["member_labels"])
+                or not np.array_equal(labels[membership == 0], resolved["nonmember_labels"])):
+            raise ValueError("Confirmation audit labels do not match the original source record mapping.")
+    return dict(manifest_sha256=fingerprint, source_partition="original_train",
+                **{key: values.tolist() for key, values in resolved.items()},
+                roles_disjoint=True, exploration_records_excluded=True)
 
 
 def analyze(directories,output):

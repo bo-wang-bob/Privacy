@@ -214,6 +214,9 @@ def load_config(args: argparse.Namespace) -> dict:
 
 
 def validate_config(config: dict) -> None:
+    if (config.get("confirmation_split_manifest") is not None
+            or config.get("confirmation_split_sha256") is not None):
+        raise ValueError("confirmation_split_manifest is only supported by the CLIP vision entry.")
     resolve_federated_protocol(config)
     method = config.get("aggregator", "fedsgd")
     validate_performance_config(config)

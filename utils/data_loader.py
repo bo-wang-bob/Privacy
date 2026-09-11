@@ -375,6 +375,8 @@ def generate_iid_split(
     fpl: bool = True,
     fpl_shots: Optional[int] = None,
     use_full_dataset: bool = False,
+    confirmation_split_manifest: Optional[str] = None,
+    confirmation_split_sha256: Optional[str] = None,
 ) -> Tuple[List[Subset], List[Subset], List[str]]:
     """
     Generate an IID split: for each class, distribute samples as evenly as possible
@@ -398,15 +400,28 @@ def generate_iid_split(
         f"(num_users: {num_users})"
     )
 
-    # Load raw datasets
+    # The confirmation reservation is applied before the per-class cap.
+    # The normal path retains its source splits and random-number sequence.
     trainset, testset, class_names = _load_dataset(
         dataset_name,
         root_dir,
         fpl=fpl,
-        fpl_shots=fpl_shots,
-        use_full_dataset=use_full_dataset,
+        fpl_shots=None if confirmation_split_manifest is not None else fpl_shots,
+        use_full_dataset=True if confirmation_split_manifest is not None else use_full_dataset,
     )
     num_classes = len(class_names)
+
+    if confirmation_split_manifest is not None:
+        if dataset_name.lower() != "cifar100" or num_users != 10 or fpl_shots != 100:
+            raise ValueError("Confirmation IID loading requires CIFAR100, ten clients and 100 shots.")
+        if confirmation_split_sha256 is None:
+            raise ValueError("Resolve the confirmation manifest fingerprint before loading data.")
+        from utils.confirmation_split import load_confirmation_pools
+        trainset, testset = load_confirmation_pools(
+            trainset, confirmation_split_manifest, confirmation_split_sha256)
+        trainset = limit_dataset_per_class(trainset, num_classes, fpl_shots)
+        logger.info("Confirmation reservation: capped_train=%d, independent_evaluation=%d",
+                    len(trainset), len(testset))
 
     # Group indices by class
     train_idx_by_class = group_idx_by_class(trainset, num_classes)

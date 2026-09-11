@@ -575,6 +575,9 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             f"batch:{config.get('batch_size')} lr:{config.get('learning_rate')} "
             f"partition:{partition} data:{data_view}"
         )
+        if config.get("confirmation_split_manifest") is not None:
+            print("      confirmation=original_train reserved roles; train:10000 evaluation:10000 "
+                  f"manifest_sha256:{config['confirmation_split_sha256']}")
         defense_config = config.get("defense", {})
         if task.model == "clip_adapter":
             adapter = config.get("clip_adapter", {})

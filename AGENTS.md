@@ -52,7 +52,8 @@
 - `risk_synthesis` 是 2026-09-12 新增的实验防御，当前只支持 CLIP transformer Adapter/LoRA + FedAvg。通过统一入口 `--methods fedavg --defenses risk_synthesis` 运行，默认参数集中在 catalog；FedSGD 组合跳过，直接配置会拒绝。
 - 每客户端从原始完整本地训练集拟合每类输入 patch+position token 的低秩几何，向该客户端类内合并协方差收缩；固定原始 CLIP 教师检查语义，统计与虚拟编码不共享。
 - 第一轮原图训练；后续复用 WWW 的上一轮 own/other 损失差和尾部秩风险。以 `0.25*r` 概率请求替换、每 batch 上限 `floor(0.25*B)`，生成 `(1-r)*h+r*mu_without_self+0.1*L*epsilon`，最多两次语义检查，失败回退原图。混合 token 上普通 CE 经当前 Adapter/LoRA 求导，不追加 WWW 正则；原始 batch 大小、本地 epoch 和聚合权重不变。
-- FedAvg 的攻击成员仍是原始完整客户端训练集，虚拟样本不能充当独立非成员。任务内 `risk_synthesis/` 保存本地分布、流式暴露记录和摘要，无 DP 保证。当前只完成小模型端到端与梯度/身份检查，真实数据效果待验证；见 `docs/risk_synthesis_research_log.md`，不得将两轮检查或代理风险下降描述为防御有效。
+- FedAvg 的攻击成员仍是原始完整客户端训练集，虚拟样本不能充当独立非成员。任务内 `risk_synthesis/` 保存本地分布、流式暴露记录和摘要，无 DP 保证。真实 CIFAR100/Adapter 的 10 轮探索出现 ProjRes 局部改善，但余弦类攻击可能增强，风险排序的独立收益和确认性效果尚未成立；见 `docs/risk_synthesis_research_log.md`，不得将两轮检查、代理风险下降或单种子选参结果描述为已证明防御有效。
+- 独立确认可显式设置 `confirmation_split_manifest`；当前仅支持 CLIP transformer Adapter/LoRA、CIFAR100、FedAvg、10 个 IID 客户端、全局每类 100 张及 none/www/risk_synthesis。清单预留原始训练源中的 30,000 张训练抽样池和 10,000 张独立 evaluation，并排除探索用过的 10,000 张；先按清单隔离，再截取每类 100 张训练。默认数据路径不变，文本入口拒绝该参数。配置解析保存清单 SHA256，加载时核对图像/标签指纹，任务内保存 `confirmation_split.json` 与 `data_partition.json`，审计分析将候选位置恢复为原始图片身份；不能复用旧分区基线作为确认对照。
 
 ## 当前 CoFedMID 防御
 
