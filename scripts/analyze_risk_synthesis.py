@@ -307,7 +307,7 @@ def read_run(directory):
         if not np.isclose(auc,attack["auc"],atol=1e-6,rtol=0):
             raise ValueError(f"Independent AUC verification failed: {directory.name}/{name}")
         reportable = attack.get("reportable_metrics",{})
-        for target in (.01,.001):
+        for target in (.1,.01,.001):
             reported=reportable.get(f"tpr_at_fpr_{target:g}")
             if reported is not None and not np.isclose(recompute_tpr(labels,scores,target),reported,atol=1e-6,rtol=0):
                 raise ValueError(f"Independent TPR verification failed: {directory.name}/{name}")
@@ -328,6 +328,7 @@ def read_run(directory):
             attack=name,auc=auc,members=sum(labels),nonmembers=len(rows)-sum(labels),
             direction_symmetric_auc=max(auc,1-auc),
             fpr_resolution=1/(len(rows)-sum(labels)),
+            tpr_at_10pct=reportable.get("tpr_at_fpr_0.1"),
             tpr_at_1pct=reportable.get("tpr_at_fpr_0.01"),
             tpr_at_01pct=reportable.get("tpr_at_fpr_0.001"),
             independent_auc_verified=True,

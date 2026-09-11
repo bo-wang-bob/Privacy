@@ -439,6 +439,29 @@ GPU 1 已启动第一组为 `2026-09-12_04-32-45-784977_clip_adapter_cifar100_fe
 
 确认候选的额外回归为 **13 passed**：使用真实审计器构造共享原始数据根的嵌套 Subset 候选，固定池与第 50/100 轮 FedAvg 上传候选均正确恢复为互不重叠的原始身份；该测试禁止模型前向，没有对真实确认数据评分。相关证据位于 `tests/test_confirmation_split.py`。此前全套 491 项和加权中心相关 95 项通过记录继续有效；本次没有修改共享攻击或训练实现。
 
+## 确认结果的统一验收入口已准备
+
+新增只读分析脚本 `scripts/summarize_synthesis_confirmation.py`，要求冻结计划的所有四组、所有种子完整结束，逐项核对执行状态的计划哈希、任务命令、实际完整配置和原始候选身份，再调用独立分数核验器。它重新计算每个模型/种子在全部 11 种攻击上的最大 AUC 和最大 TPR，不固定使用无防御时的最强攻击，也不将三个种子的候选拼接成更大的“独立”样本池。
+
+输出包括全部运行指标、逐种子配对效应、逐攻击配对效应、种子均值/范围，以及冻结标准的每一项布尔判断；风险/打乱、风险/WWW 和各方案/无防御分别保留。正式攻击标准与分数翻转诊断分开显示：如果翻转后最大 AUC 上升，报告会明确指出这一冲突，不能将正式方向分数下降当作所有可用攻击变弱。候选或配置不匹配、缺少某组或不可报告的主要低 FPR 指标均拒绝产生验收判断。
+
+通用核验器同时补全了 `TPR@10%FPR` 的独立复算和 CSV/JSON 输出；原 1%/0.1% FPR 与可报告性逻辑不变。已对既有两组 100 轮探索模型的全部 22 个 10% FPR 值核验，ProjRes 对应 45.6%→38.8%，证据为 `analysis_scripts/risk_synthesis_100round_10pct_fpr_verified_20260912.json`。这没有使用新确认数据，也不改写旧产物。
+
+相关回归 **49 passed**（确认汇总 7、来源划分 13、生成机制 29）；测试覆盖最强攻击切换、均值掩盖某种子隐私/准确率退步、风险组件不优于打乱但整体仍改善、分数翻转、候选变化、未结束任务、缺失攻击，以及已知 AUC/TPR 排序与不可报告指标不回填。对真实运行中的队列也验证了“未完整结束时拒绝判断”，未创建确认效果报告；71 个冻结文件仍逐项匹配，训练与参数未变。
+
+待两条队列全部完成后运行：
+
+```bash
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+/root/.local/share/mamba/envs/pfedba/bin/python scripts/summarize_synthesis_confirmation.py \
+  --plan analysis_scripts/risk_synthesis_confirmation_plan_20260912.json \
+  --states analysis_scripts/risk_synthesis_confirmation_lane0_20260912.json \
+           analysis_scripts/risk_synthesis_confirmation_lane1_20260912.json \
+  --output analysis_scripts/risk_synthesis_confirmation_report_20260912
+```
+
+输出目录必须不存在。该入口不会启动训练、发布报告或推送代码。固定模型的候选重采样继续使用现有 `scripts/paired_synthesis_uncertainty.py`，不能将其区间改称训练种子总体区间。
+
 ## 运行方式
 
 完整原始参数对照（生成范数下限仍为 0.5）：
