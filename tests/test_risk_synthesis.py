@@ -11,7 +11,7 @@ from torch.nn import functional as F
 from aggregator.aggregator_builder import build_aggregator
 from privacy_defenses.risk_synthesis import DEFAULTS, LocalGeometry, RiskSynthesis, low_rank_factor, select_requests
 from scripts.run_privacy_experiments import build_tasks, load_yaml, parse_args
-from scripts.analyze_risk_synthesis import read_synthesis_mechanism, recompute_auc
+from scripts.analyze_risk_synthesis import class_diagnostics, read_synthesis_mechanism, recompute_auc
 from servers.serverbase import ServerBase
 from trainmodel.clip_lora import CLIPLoRA
 from trainmodel.clip_transformer_adapter import CLIPTransformerAdapter
@@ -82,6 +82,17 @@ def test_independent_auc_counts_tied_member_nonmember_pairs_as_half():
     assert recompute_auc([1,0],[1,1]) == .5
     with pytest.raises(ValueError,match="finite"):
         recompute_auc([1,0],[float("nan"),1])
+
+
+def test_conditional_auc_removes_cross_class_score_comparisons():
+    # Both within-class pairs are correctly ordered. Cross-class pairs include
+    # one score-baseline inversion, so the ordinary AUC is only .75.
+    membership, scores, classes = [1, 1, 0, 0], [11., 1., 10., 0.], [0, 1, 0, 1]
+    assert recompute_auc(membership, scores) == .75
+    result = class_diagnostics(membership, scores, classes)
+    assert result["class_conditional_auc"] == result["macro_class_auc"] == 1.
+    assert result["conditional_pair_count"] == 2
+    assert all(row["tpr_at_global_1pct_fpr"] is None for row in result["classes"])
 
 
 def test_generation_center_excludes_source_and_covariance_is_local_within_class():
@@ -158,6 +169,44 @@ def test_request_budget_matches_shuffled_risk_controls_across_batches():
         torch.testing.assert_close(left[a].sort().values,right[b].sort().values)
         differs=differs or not torch.equal(left,right)
     assert differs
+
+
+@pytest.mark.parametrize("kind", ["clip_adapter", "clip_lora"])
+@pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
+def test_zero_replacement_matches_ordinary_fedavg_across_rounds(kind, optimizer, tmp_path):
+    """The null intervention must preserve batches, optimizer state and uploads.
+
+    Round two executes own/other risk scoring and restoration even when no
+    record is replaced; repeated epochs and a short batch exercise that path.
+    """
+    final_states = []
+    for defense in ("none", "risk_synthesis"):
+        torch.manual_seed(23)
+        model = make_model(kind)
+        server = ServerBase(
+            device=torch.device("cpu"), dataset_name="toy", model=model,
+            train_sets=[dataset(3, 20), dataset(4, 21)],
+            test_sets=[dataset(3, 30), dataset(4, 31)], class_names=["a", "b", "c"],
+            batch_size=4, eval_batch_size=4, learning_rate=.01,
+            num_glob_iters=2, local_epochs=2, total_users=2, user_per_round=2,
+            results_dir=str(tmp_path / defense), eval_interval=1,
+            aggregator=build_aggregator("fedavg", aggregation_weighting="sample_count"),
+            audit_config={"enabled": False, "attacks": []},
+            projres_config={"enabled": False},
+            defense_config={"name": defense, "synthesis": {"replacement_fraction": 0.}},
+            method_config={"client_optimizer": optimizer, "seed": 42,
+                           "momentum": .7 if optimizer == "sgd" else 0.,
+                           "weight_decay": .01, "max_grad_norm": 0.},
+        )
+        server.train()
+        final_states.append({name: parameter.detach().clone()
+                             for name, parameter in model.named_parameters()})
+        if defense == "risk_synthesis":
+            assert server.defense.synthesis.counts["accepted"] == 0
+            assert server.defense.synthesis.counts["visits"] == 84
+    assert set(final_states[0]) == set(final_states[1])
+    for name in final_states[0]:
+        torch.testing.assert_close(final_states[0][name], final_states[1][name], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("kind", ["clip_adapter", "clip_lora"])

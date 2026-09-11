@@ -133,6 +133,40 @@ def recompute_tpr(labels, scores, fpr):
     return float(valid.max()) if len(valid) else 0.
 
 
+def class_diagnostics(membership, scores, classes, *, report_low_fpr=False):
+    """Compare same-class pairs without fitting a class-specific score rule.
+
+    Class TPR/FPR use one global threshold and are descriptive breakdowns.
+    """
+    membership = np.asarray(membership, dtype=int)
+    scores, classes = np.asarray(scores, dtype=float), np.asarray(classes)
+    if not (len(membership) == len(scores) == len(classes)):
+        raise ValueError("Class diagnostics require aligned candidates.")
+    threshold = None
+    if report_low_fpr:
+        negative = np.sort(scores[membership == 0])[::-1]
+        threshold = np.nextafter(negative[int(np.floor(.01 * len(negative)))], np.inf)
+    rows, weighted_auc, pairs = [], 0., 0
+    for label in np.unique(classes):
+        mask = classes == label
+        local_membership, local_scores = membership[mask], scores[mask]
+        members, nonmembers = int(local_membership.sum()), int((1-local_membership).sum())
+        local_pairs = members * nonmembers
+        auc = recompute_auc(local_membership, local_scores) if local_pairs else None
+        if local_pairs:
+            weighted_auc += auc * local_pairs
+            pairs += local_pairs
+        rows.append(dict(label=int(label), members=members, nonmembers=nonmembers, auc=auc,
+                         tpr_at_global_1pct_fpr=(float((local_scores[local_membership == 1] >= threshold).mean())
+                                                if threshold is not None and members else None),
+                         fpr_at_global_1pct_fpr=(float((local_scores[local_membership == 0] >= threshold).mean())
+                                                if threshold is not None and nonmembers else None)))
+    aucs = [row["auc"] for row in rows if row["auc"] is not None]
+    return dict(class_conditional_auc=weighted_auc / pairs if pairs else None,
+                macro_class_auc=float(np.mean(aucs)) if aucs else None,
+                conditional_pair_count=pairs, classes=rows)
+
+
 def selection_digest(path):
     import torch
     def canonical(value):
@@ -145,6 +179,22 @@ def selection_digest(path):
         return value
     value=torch.load(path,map_location="cpu",weights_only=True)
     return hashlib.sha256(json.dumps(canonical(value),sort_keys=True).encode()).hexdigest()
+
+
+def comparison_protocol(config):
+    """Fail closed for unknown protocol fields; ignore only run/output metadata.
+
+    In particular, compare complete audit/ProjRes options and learning-rate
+    schedules. A small whitelist could silently pair different attack surfaces.
+    """
+    ignored = {"defense", "results_dir", "results_dir_is_run_dir", "gpu", "require_cuda",
+               "save_models", "performance"}
+    protocol = {key: value for key, value in config.items() if key not in ignored}
+    # A defense reservation changes evaluation/nonmember identities even when
+    # the intervention's own options are intentionally excluded from matching.
+    protocol["validation_fraction"] = float(
+        config.get("defense", {}).get("cofedmid_validation_fraction", 0) or 0)
+    return protocol
 
 
 def read_run(directory):
@@ -172,17 +222,7 @@ def read_run(directory):
     performance=json.loads(performance_path.read_text()) if performance_path.exists() else {}
     if performance_path.exists():
         sources[str(performance_path)]=digest(performance_path)
-    protocol = {k:config.get(k) for k in (
-        "model_type", "dataset_name", "seed", "fpl_shots", "use_full_dataset", "partition_mode",
-        "dirichlet_alpha", "total_users", "sample_users", "aggregator", "aggregation_weighting",
-        "num_global_iters", "local_epochs", "batch_size", "learning_rate", "learning_rate_decay",
-        "clip_adapter", "clip_lora", "fedavg",
-    )}
-    protocol["audit"] = {k:config.get("audit",{}).get(k) for k in (
-        "audit_client_ids", "target_client_id", "attacks", "attack_audit_intervals",
-        "candidate_sampling", "nonmember_to_member_ratio",
-    )}
-    protocol["validation_fraction"] = config.get("defense",{}).get("cofedmid_validation_fraction",0)
+    protocol = comparison_protocol(config)
     key = hashlib.sha256(json.dumps(protocol,sort_keys=True).encode()).hexdigest()
     completed = (actual_round == int(config["num_global_iters"]) and bool(summary)
                  and not summary.get("errors") and performance.get("status")=="completed"
@@ -209,6 +249,13 @@ def read_run(directory):
         for row in csv.DictReader(predictions_path.open()):
             predictions[row["attack"]].append(row)
         sources[str(predictions_path)] = digest(predictions_path)
+    signals = {}
+    signals_path = directory / "privacy_audit" / "signals.pt"
+    if config.get("aggregator") == "fedavg" and signals_path.exists():
+        import torch
+        signals = torch.load(signals_path, map_location="cpu", weights_only=True, mmap=True)
+        sources[str(signals_path)] = digest(signals_path)
+    result["class_metrics"] = []
     for attack in summary.get("attacks",[]):
         name = attack["attack"]
         rows = predictions[name]
@@ -227,6 +274,19 @@ def read_run(directory):
             reported=reportable.get(f"tpr_at_fpr_{target:g}")
             if reported is not None and not np.isclose(recompute_tpr(labels,scores,target),reported,atol=1e-6,rtol=0):
                 raise ValueError(f"Independent TPR verification failed: {directory.name}/{name}")
+        class_metrics = dict(class_conditional_auc=None, macro_class_auc=None, conditional_pair_count=None)
+        label_source = next((ob for ob in reversed(signals.get("client_train_update_observations", []))
+                             if name in ob.get("attacks", [])), signals)
+        if "candidate_labels" in label_source and "membership" in label_source:
+            indices = np.array([int(row["sample_index"]) for row in rows])
+            recorded_membership = np.asarray(label_source["membership"])
+            if (indices.min() < 0 or indices.max() >= len(recorded_membership)
+                    or not np.array_equal(recorded_membership[indices], labels)):
+                raise ValueError(f"Saved label/prediction alignment failed: {directory.name}/{name}")
+            classes = np.asarray(label_source["candidate_labels"])[indices]
+            class_metrics = class_diagnostics(labels, scores, classes,
+                report_low_fpr=reportable.get("tpr_at_fpr_0.01") is not None)
+            result["class_metrics"].extend(dict(attack=name, **row) for row in class_metrics.pop("classes"))
         result["attacks"].append(dict(
             attack=name,auc=auc,members=sum(labels),nonmembers=len(rows)-sum(labels),
             direction_symmetric_auc=max(auc,1-auc),
@@ -234,10 +294,13 @@ def read_run(directory):
             tpr_at_1pct=reportable.get("tpr_at_fpr_0.01"),
             tpr_at_01pct=reportable.get("tpr_at_fpr_0.001"),
             independent_auc_verified=True,
+            **class_metrics,
         ))
     result["strongest_auc"] = max((a["auc"] for a in result["attacks"]),default=None)
     result["strongest_direction_symmetric_auc"] = max(
         (a["direction_symmetric_auc"] for a in result["attacks"]), default=None)
+    result["strongest_class_conditional_auc"] = max(
+        (a["class_conditional_auc"] for a in result["attacks"] if a["class_conditional_auc"] is not None), default=None)
     # Candidate identities are checked independently of scores, with source/index metadata.
     selection = summary.get("candidate_sampling",{}).get("per_client",{})
     result["candidate_metadata"] = selection
@@ -262,6 +325,11 @@ def analyze(directories,output):
     if rows:
         with (output/"attack_metrics.csv").open("w",newline="") as handle:
             writer=csv.DictWriter(handle,fieldnames=list(rows[0]));writer.writeheader();writer.writerows(rows)
+    class_rows = [dict(run=run["run"], **row) for run in runs for row in run["class_metrics"]]
+    if class_rows:
+        with (output / "class_metrics.csv").open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(class_rows[0]))
+            writer.writeheader(); writer.writerows(class_rows)
     mechanism_rows = [dict(run=run["run"], implementation=run["synthesis"]["implementation"], **group)
                       for run in runs for group in run.get("synthesis_mechanism", {}).get("groups", [])]
     if mechanism_rows:
@@ -285,6 +353,9 @@ def analyze(directories,output):
             strongest_auc_delta=run["strongest_auc"]-base["strongest_auc"],
             strongest_direction_symmetric_auc_delta=(run["strongest_direction_symmetric_auc"]
                                                     -base["strongest_direction_symmetric_auc"]),
+            strongest_class_conditional_auc_delta=(run["strongest_class_conditional_auc"]
+                -base["strongest_class_conditional_auc"] if run["strongest_class_conditional_auc"] is not None
+                and base["strongest_class_conditional_auc"] is not None else None),
             attack_auc_deltas={a["attack"]:a["auc"]-lookup[a["attack"]]["auc"] for a in run["attacks"]}))
     payload=dict(runs=runs,matched_comparisons=comparisons,
                  interpretation="Exploratory unless protocol and independent confirmation are separately established.")
@@ -298,6 +369,7 @@ def analyze(directories,output):
         lines.append(f'| {r["run"]} | {r["actual_round"]}/{r["expected_rounds"]} | {"完成" if r["complete"] else "未完成/失败"} | {accuracy} | {auc} |')
     lines += ["",f"符合配置、候选元数据与完成状态要求的基线配对：{len(comparisons)} 组。",
               "", "所有已输出 AUC 均从 predictions.csv 用平均秩公式独立复算；低 FPR 指标仅采用可报告值。",
+              "class_metrics.csv 额外报告同类别内的 AUC 和统一全局阈值下的分类别 TPR/FPR；这些诊断不替代正式攻击结果。",
               "结论仍需逐攻击比较、效用容差、风险消融和未用于选参的确认实验支持。"]
     for run in runs:
         mechanism = run.get("synthesis_mechanism")
