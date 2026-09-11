@@ -163,3 +163,52 @@ def test_text_entry_rejects_confirmation_flag_instead_of_silently_ignoring_it():
     from scripts.run_fedllm_adapter import validate_config
     with pytest.raises(ValueError, match="CLIP vision"):
         validate_config({"confirmation_split_manifest": "unused.json"})
+
+
+def test_actual_auditor_preserves_disjoint_shared_source_identities(reservation, monkeypatch, tmp_path):
+    """Exercise both candidate paths through actual nested subsets, without scoring."""
+    from types import SimpleNamespace
+    import torch
+    import utils.data_loader as loader
+    from main import _dataset_split_arguments
+    from privacy_attacks.auditor import MembershipAuditor
+
+    *_, manifest, config = reservation
+    monkeypatch.setattr(loader.datasets, "CIFAR100", Source)
+    validate_confirmation_config(config)
+    random.seed(43)
+    train, evaluation, _ = loader.generate_iid_split(
+        "cifar100", 10, **_dataset_split_arguments(config))
+    mapping = write_confirmation_provenance(train, evaluation, config, tmp_path)
+    users = [SimpleNamespace(id=i, train_data=a, test_data=b)
+             for i, (a, b) in enumerate(zip(train, evaluation))]
+    model = torch.nn.Linear(1, 100)
+    model.model_type = "clip_adapter"
+    # Candidate construction must not infer membership from root identity or
+    # call a model on any confirmation record.
+    model.forward = lambda *args, **kwargs: pytest.fail("Unexpected model scoring")
+    auditor = MembershipAuditor(
+        model=model, users=users, target_client_id=0, device=torch.device("cpu"),
+        results_dir=str(tmp_path), num_classes=100, federated_method="fedavg",
+        config=dict(enabled=True, attacks=["blackbox_loss", "loss_series"],
+                    candidate_sampling="balanced_global_holdout",
+                    require_full_target_train_members=True,
+                    low_fpr_max_members=0, low_fpr_max_nonmembers=0,
+                    low_fpr_min_nonmembers=1000, nonmember_to_member_ratio=1,
+                    client_train_membership_attacks=["blackbox_loss"],
+                    paper_balanced_evaluation_size=100, seed=43))
+    selection = auditor.low_fpr_candidate_selection
+    mapped = map_confirmation_candidates(mapping, manifest, 0, selection)
+    expected_inputs = np.concatenate([mapped["member_source_indices"], mapped["nonmember_source_indices"]])
+    np.testing.assert_array_equal(auditor.images.numpy().reshape(-1), expected_inputs)
+    np.testing.assert_array_equal(auditor.labels.numpy(), np.concatenate(
+        [mapped["member_labels"], mapped["nonmember_labels"]]))
+    assert not set(mapped["member_source_indices"]) & set(mapped["nonmember_source_indices"])
+    for round_index in (49, 99):
+        update = auditor._build_exact_batch_candidates(round_index)
+        assert update["selection"]["membership_definition"] == "target_client_original_training_set"
+        assert update["selection"]["member_count"] == update["selection"]["nonmember_count"] == 1000
+        torch.testing.assert_close(update["inputs"], auditor.images, rtol=0, atol=0)
+        actual = map_confirmation_candidates(mapping, manifest, 0, update["selection"])
+        for key in mapped:
+            np.testing.assert_array_equal(actual[key], mapped[key])
