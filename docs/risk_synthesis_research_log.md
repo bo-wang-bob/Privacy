@@ -498,6 +498,19 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 
 下一阶段保持全部生成参数不变，分别检查 LoRA/CIFAR100 和 Adapter/Food101，先运行各自 seed 43 下无防御、风险生成、打乱风险三个同预算任务。该阶段用于刻画适用范围，不凭单种子迁移结果宣称跨模型/数据集的普适保证，也不重新调整已完成的确认结论。
 
+## 固定参数的适用范围验证已启动
+
+计划为 `analysis_scripts/risk_synthesis_transfer_plan_20260912.json`，SHA256 `68ffe0b5d7fb13369d4fbd77e5c1995cbbc6ff9d930ae340aa1c2b7659e16d25`，记录 74 个源码/配置/调度/来源清单指纹。六个任务在各自比较范围内逐项匹配非防御配置，均为 seed 43、目标客户端 0、100 轮、一个完整本地 epoch、sample-count FedAvg 与默认全部 11 种攻击。生成参数不变，仍显式使用均匀中心和范数下限 0.1。
+
+- GPU 1：LoRA/CIFAR100 的 none、risk、shuffled_risk。保留 rank=32、alpha=1、sqrt-rank scaling、dropout=0、图像与文本所有 Q/K/V。使用已记录的预留源记录分区，不将其描述为从未经过 Adapter 研究的数据。
+- GPU 0：Adapter/Food101 的 none、risk、shuffled_risk。先从完整 75,750 张训练源截取每类 100 张，得到训练 10,100 张；evaluation 保留完整 25,250 张。每客户端每类分别为训练 10、evaluation 25，训练/evaluation 的原始路径不交叉。
+
+Food101 的实际确定性划分和全部 35,350 个 JPEG 文件指纹保存为 `risk_synthesis_transfer_food_sources_20260912.json`，SHA256 `ea55669055cdbf10a434f85f2f8da576544f844ab8c929d373576a582b74f035`。队列在各 Food101 任务前后复核所有源文件；其中没有跨训练/evaluation、字节完全相同的 JPEG，这与解码后的像素/近重复检查是不同的判定，不据此声称排除了所有内容重复。未使用本次迁移结果调参，也不声称 Food101 在仓库历史或预训练中从未出现。
+
+两个设置的正式干运行均通过。首个实际任务分别为 `2026-09-12_16-33-38-005666_clip_lora_cifar100_fedavg_none_seed43_target0_39f6ef75fe` 和 `2026-09-12_16-33-44-603808_clip_adapter_food101_fedavg_none_seed43_target0_4b357816a1`；LoRA 原始来源映射与先前 Adapter seed 43 完全相同，Food101 审计候选为 1,010/1,010、TV=0。实际配置和冻结文件核验见 `risk_synthesis_transfer_actual_precheck_20260912.json`。
+
+队列状态为 `risk_synthesis_transfer_lane{0,1}_20260912.json`。只读分析进程 `analysis_scripts/verify_synthesis_transfer_20260912.py` 等待各组三个任务全部成功结束，再独立复算原始分数、核对候选配对、报告固定范围效应及候选区间；状态为 `risk_synthesis_transfer_analysis_20260912.json`。这组单种子检查不能调用要求三种子/四组的确认汇总来冒充新的多种子确认。目前尚无迁移效果结论。
+
 ## 运行方式
 
 完整原始参数对照（生成范数下限仍为 0.5）：
