@@ -525,7 +525,7 @@ Food101 的实际确定性划分和全部 35,350 个 JPEG 文件指纹保存为 
 
 每次干运行核对最终协议后再运行。新实验保存在新的 `results/` 一级任务目录中，历史结果不修改。
 
-当前已选中、尚待进一步验证的范数下限 0.1 方案：
+已在上述 Adapter/CIFAR100 确认范围内通过验收的范数下限 0.1 方案（其他设置仍待验证）：
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
@@ -535,4 +535,4 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
   --set defense.synthesis.norm_ratio_min=0.1
 ```
 
-此命令使用默认 100 轮与默认 FedAvg 审计频次。10 轮探索的每两轮全攻击覆盖见对应队列中保存的实际命令；不能直接将不同轮数/频次的结果配对。
+此命令使用常规默认数据分区、默认 100 轮与默认 FedAvg 审计频次，不复现预留源记录确认分区。确认分区的命令补充与简明结果见[结果说明](risk_synthesis_results.md)。10 轮探索的每两轮全攻击覆盖见对应队列中保存的实际命令；不能直接将不同轮数/频次的结果配对。
