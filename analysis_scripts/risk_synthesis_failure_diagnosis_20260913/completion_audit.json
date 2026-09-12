@@ -1,0 +1,20 @@
+{
+  "objective": "Analyze current shortcomings, assess an added risk factor and multiple substitutes.",
+  "previous_goal_turn_classification": "progress",
+  "requirements": {
+    "failure_scope": "Existing full-budget metrics distinguish overall gain from unresolved sorting and residual attacks.",
+    "record_evidence": "Two 1m-row streams reconciled; target1000 each100 visits; identity-linked hit counts reproduce all11 reportable1%FPR values in none/risk/shuffle.",
+    "new_factor": "Temporal and within-class analyses support an exploratory history-retention factor; weak input novelty associations retained as counterevidence.",
+    "multiple_substitutes": "Existing100 redraws clarified; independent fixed-teacher2/4 candidate probe completed; selection/joint-training/variance and weighting distinctions documented.",
+    "constraints": "All replacement, best-generated semantic fallback, local-only statistics, original membership and noDP claims retained.",
+    "source_review": "Both local papers read and primary publication sources checked; active-paper/FedAvg attack scope distinguished.",
+    "limits": "No causal mechanism or new-defense attack benefit claimed. Proposed controls and cost/accounting described; no production defense implementation requested or claimed."
+  },
+  "paper_sha256": {
+    "/root/Privacy/paper/Nguyen \u7b49 - Theoretically Unmasking Inference Attacks Against LDP-Protected Clients in Federated Vision Models.pdf": "cbd45c08fd46eda81b2273e13401f9668a9583e0d4e04fca4feb99da0f6aa70b",
+    "/root/Privacy/paper/Ma \u7b49 - Geometric Knowledge-Guided Localized Global Distribution Alignment for Federated Learning.pdf": "928b1cc245b093636871bfe7737f6e251ece28c0f112e4b46fca2e4c14e2b0f3"
+  },
+  "report": "/root/Privacy/docs/risk_synthesis_failure_analysis.md",
+  "report_sha256": "e9672c48a7aca8ba70db03d19f5d540bcc8c1c68d4c9e5c50454bd9fb656ade9",
+  "validation": "Source fingerprints, full probe row aggregation, member-hit joins, report links, script compilation, class0 QR-vs-SVD and noise orthogonality checks passed."
+}
