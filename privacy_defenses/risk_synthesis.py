@@ -16,13 +16,22 @@ from trainmodel.clip_tokens import token_features
 from utils.performance import measure_stage
 
 
-DEFAULTS = dict(
+LEGACY_DEFAULTS = dict(
     replacement_fraction=0.25, noise_scale=0.1, shrinkage=0.5,
     class_rank=5, pooled_rank=16, min_class_samples=3, attempts=2,
     margin_tolerance=0.02, norm_ratio_min=0.5, norm_ratio_max=2.0,
     mode="risk", semantic_filter=True, warmup_rounds=1,
-    center_weighting="uniform",
+    center_weighting="uniform", replacement_policy="risk_probability",
 )
+DEFAULTS = {**LEGACY_DEFAULTS, "replacement_policy": "all", "replacement_fraction": 1.0,
+            "warmup_rounds": 0, "norm_ratio_min": 0.1}
+
+
+def synthesis_options(options):
+    """Preserve saved partial-replacement configurations lacking a policy field."""
+    options = options or {}
+    legacy = bool(options) and options.get("replacement_policy", "risk_probability") == "risk_probability"
+    return {**(LEGACY_DEFAULTS if legacy else DEFAULTS), **options}
 
 
 def validate_risk_synthesis(config):
@@ -39,7 +48,7 @@ def validate_risk_synthesis(config):
         raise ValueError("risk_synthesis requires at least two participating clients.")
     if config.get("code_poison", {}).get("enabled", False):
         raise ValueError("risk_synthesis does not support active code-poison probes.")
-    options = {**DEFAULTS, **defense.get("synthesis", {})}
+    options = synthesis_options(defense.get("synthesis", {}))
     unknown = set(options) - set(DEFAULTS)
     if unknown:
         raise ValueError(f"Unknown synthesis options: {sorted(unknown)}")
@@ -51,7 +60,7 @@ def validate_risk_synthesis(config):
             raise ValueError(f"synthesis.{key} must be finite and nonnegative.")
     if options["norm_ratio_min"] > options["norm_ratio_max"]:
         raise ValueError("Invalid synthesis norm ratio interval.")
-    for key in ("class_rank", "pooled_rank", "min_class_samples", "attempts", "warmup_rounds"):
+    for key in ("class_rank", "pooled_rank", "min_class_samples", "attempts"):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f"synthesis.{key} must be a positive integer.")
     if options["min_class_samples"] < 3:
@@ -64,6 +73,17 @@ def validate_risk_synthesis(config):
         raise ValueError("Risk-weighted class centers do not apply to a single MixUp donor.")
     if type(options["semantic_filter"]) is not bool:
         raise ValueError("synthesis.semantic_filter must be boolean.")
+    if type(options["warmup_rounds"]) is not int or options["warmup_rounds"] < 0:
+        raise ValueError("synthesis.warmup_rounds must be a nonnegative integer.")
+    if options["replacement_policy"] not in {"all", "risk_probability"}:
+        raise ValueError("synthesis.replacement_policy must be all or risk_probability.")
+    if options["replacement_policy"] == "all":
+        if options["replacement_fraction"] != 1 or options["warmup_rounds"] != 0:
+            raise ValueError("All replacement requires replacement_fraction=1 and warmup_rounds=0.")
+        if options["noise_scale"] <= 0 or options["mode"] == "mixup":
+            raise ValueError("All replacement requires positive noise_scale and risk/shuffled_risk mode, including zero-risk records.")
+        if options["center_weighting"] != "uniform":
+            raise ValueError("All replacement uses uniform centers; risk controls source retention only.")
     defense["synthesis"] = options
     defense.update(target_epsilon=None, delta=None, noise_multiplier=0.0,
                    formal_dp_enabled=False, client_upload_is_private=False)
@@ -193,6 +213,8 @@ def select_requests(risk, options, request_generator, control_generator):
     used = risk.cpu().float().clone()
     if options["mode"] in {"shuffled_risk", "mixup"}:
         used = used[torch.randperm(len(used), generator=control_generator)]
+    if options.get("replacement_policy", "risk_probability") == "all":
+        return used, torch.arange(len(used))
     order = torch.argsort(used, stable=True)
     requests = order[torch.rand(len(used), generator=request_generator) < options["replacement_fraction"] * used[order]]
     cap = math.floor(options["replacement_fraction"] * len(used))
@@ -203,7 +225,7 @@ def select_requests(risk, options, request_generator, control_generator):
 
 class RiskSynthesis:
     def __init__(self, config, seed):
-        self.options = {**DEFAULTS, **config.get("synthesis", {})}
+        self.options = synthesis_options(config.get("synthesis", {}))
         self.seed = seed
         self.geometry = {}
         self.counts = Counter()
@@ -238,6 +260,8 @@ class RiskSynthesis:
         fields = ["round", "client", "step", "sample_id", "label", "risk", "used_risk",
                   "requested", "accepted", "attempts", "reason", "nearest_distance", "source_round",
                   "norm_ratio", "teacher_margin_delta"]
+        if self.options["replacement_policy"] == "all":
+            fields += ["quality_passed", "selected_attempt", "retained_original_fraction", "original_distance"]
         if self.options["center_weighting"] == "previous_risk":
             fields += ["anchor_reference_round", "anchor_available_donors", "anchor_source_weight",
                        "anchor_donor_weight_sum", "anchor_uniform_fallback"]
@@ -257,6 +281,9 @@ class RiskSynthesis:
             if not torch.equal(indices, torch.arange(user.train_samples)):
                 raise ValueError("Synthesis geometry must cover each original local ID exactly once.")
             geometry = LocalGeometry(torch.cat(codes), torch.cat(labels), self.options, device)
+            if self.options["replacement_policy"] == "all" and any(
+                    len(group["indices"]) < self.options["min_class_samples"] for group in geometry.classes.values()):
+                raise ValueError("All replacement requires min_class_samples in every local class; original-image fallback is disabled.")
             self.geometry[user.id] = geometry
             self.exposure[user.id] = dict(risk_reads=torch.zeros(user.train_samples, dtype=torch.long),
                                           real_steps=torch.zeros(user.train_samples, dtype=torch.long),
@@ -290,6 +317,8 @@ class RiskSynthesis:
 
     @torch.no_grad()
     def transform(self, model, user, images, labels, indices, risk, round_index, step, source_round):
+        if self.options["replacement_policy"] == "all":
+            return self._transform_all(model, user, images, labels, indices, risk, round_index, step, source_round)
         tokens = model.encode_input_tokens(images)
         original = tokens[:, 1:].flatten(1).cpu()
         risk = risk.cpu().float()
@@ -387,13 +416,114 @@ class RiskSynthesis:
         self.handle.flush()
         return tokens.detach()
 
+    @torch.no_grad()
+    def _transform_all(self, model, user, images, labels, indices, risk, round_index, step, source_round):
+        """Replace every position, retaining the best generated semantic candidate.
+
+        Semantic failure never restores the original. An absent finite, changed,
+        norm-valid candidate aborts the batch before optimization instead.
+        """
+        tokens = model.encode_input_tokens(images)
+        original = tokens[:, 1:].flatten(1).cpu()
+        risk = risk.cpu().float()
+        if risk.shape != (len(tokens),) or not torch.isfinite(risk).all() or (risk < 0).any() or (risk > 1).any():
+            raise ValueError("All replacement requires one finite risk in [0,1] per original record.")
+        if source_round < 0:
+            risk = torch.zeros_like(risk)
+        if user.id not in self.control_generators:
+            self.control_generators[user.id] = torch.Generator().manual_seed(self.seed + 1000003*user.id + 31415)
+        used, requests = select_requests(risk, self.options, None, self.control_generators[user.id])
+        geometry, generator = self.geometry[user.id], self.generators[user.id]
+        semantic = self.options["semantic_filter"]
+        reference = self.margins(tokens, labels).cpu() if semantic else None
+        if reference is not None and not torch.isfinite(reference).all():
+            raise ValueError("Nonfinite reference semantics in all-replacement synthesis.")
+        pending = requests.tolist()
+        tries = [0] * len(tokens)
+        best = {}
+        invalid = {}
+        for attempt in range(1, self.options["attempts"] + 1):
+            batch, positions, ratios = [], [], []
+            for j in pending:
+                tries[j] += 1
+                candidate = geometry.sample(original[j], int(indices[j]), float(used[j]), self.options, generator)
+                if candidate is None:
+                    invalid[j] = "insufficient_class_samples"
+                    continue
+                candidate = candidate.to(dtype=tokens.dtype)
+                if not torch.isfinite(candidate).all():
+                    invalid[j] = "nonfinite_geometry"
+                    continue
+                ratio = float(candidate.float().norm() / original[j].float().norm().clamp_min(1e-12))
+                if not self.options["norm_ratio_min"] <= ratio <= self.options["norm_ratio_max"]:
+                    invalid[j] = "invalid_norm_ratio"
+                    continue
+                if torch.equal(candidate, original[j]):
+                    invalid[j] = "unchanged_candidate"
+                    continue
+                batch.append(candidate.reshape(tokens.shape[1]-1, tokens.shape[2]))
+                positions.append(j)
+                ratios.append(ratio)
+            if not positions:
+                continue
+            candidates = tokens[positions].clone()
+            candidates[:, 1:] = torch.stack(batch).to(tokens)
+            if semantic:
+                with measure_stage(self, "train.synthesis_filter"):
+                    margins = self.margins(candidates, labels[positions]).cpu()
+            else:
+                margins = torch.zeros(len(positions))
+            for pos, j in enumerate(positions):
+                delta = float(margins[pos] - reference[j]) if semantic else 0.0
+                if not math.isfinite(delta):
+                    invalid[j] = "nonfinite_semantics"
+                    continue
+                if j not in best or delta > best[j]["delta"]:
+                    best[j] = dict(token=batch[pos], delta=delta, norm_ratio=ratios[pos], attempt=attempt,
+                                   quality_passed=not semantic or delta >= -self.options["margin_tolerance"])
+            pending = [j for j in pending if j not in best or not best[j]["quality_passed"]]
+            if not pending:
+                break
+        missing = [int(indices[j]) for j in requests.tolist() if j not in best]
+        if missing:
+            raise RuntimeError(f"All replacement could not produce valid changed tokens for client {user.id}, "
+                               f"original IDs {missing}; reasons={invalid}. No original-image fallback.")
+        for j in requests.tolist():
+            chosen = best[j]
+            candidate = chosen["token"].flatten().float()
+            distance = float((candidate - original[j].float()).norm())
+            if not math.isfinite(distance) or distance <= 0:
+                raise RuntimeError("All replacement produced an unchanged or nonfinite input.")
+            tokens[j, 1:] = chosen["token"].to(tokens)
+            group = geometry.classes[int(labels[j])]
+            nearest = float((geometry.codes[group["indices"]] - candidate).norm(dim=1).min())
+            quality = chosen["quality_passed"]
+            self.writer.writerow(dict(round=round_index+1, client=user.id, step=step, sample_id=int(indices[j]),
+                label=int(labels[j]), risk=float(risk[j]), used_risk=float(used[j]), requested=1, accepted=1,
+                attempts=tries[j], reason="accepted" if quality else "best_semantic_candidate", nearest_distance=nearest,
+                source_round=source_round, norm_ratio=chosen["norm_ratio"],
+                teacher_margin_delta=chosen["delta"] if semantic else None, quality_passed=int(quality),
+                selected_attempt=chosen["attempt"], retained_original_fraction=1-float(used[j]), original_distance=distance))
+            count = dict(visits=1, requested=1, accepted=1, fallback=0, quality_failed=int(not quality))
+            self.counts.update(count)
+            self.risk_bins[str(min(4, int(float(risk[j])*5)))].update(count)
+            sid = int(indices[j])
+            self.exposure[user.id]["risk_reads"][sid] += int(source_round >= 0)
+            self.exposure[user.id]["synthetic_steps"][sid] += 1
+        self.handle.flush()
+        return tokens.detach()
+
     def summary(self):
-        return dict(implementation=("local_token_geometry_v3_weighted_center" if
+        return dict(implementation=("local_token_geometry_v4_all_replacement" if self.options["replacement_policy"] == "all" else
+                                    "local_token_geometry_v3_weighted_center" if
                                     self.options["center_weighting"] == "previous_risk" else "local_token_geometry_v2"),
                     options=self.options, seed=self.seed,
                     center_risk_reference=("previous_participating_round_mean_assigned_rank" if
                                            self.options["center_weighting"] == "previous_risk" else None),
-                    request_sampling="rank_coupled_independent_rng",
+                    request_sampling=("every_original_training_position" if self.options["replacement_policy"] == "all"
+                                      else "rank_coupled_independent_rng"),
+                    semantic_failure_policy=("best_generated_candidate" if self.options["replacement_policy"] == "all"
+                                             else "original_input"),
                     counts=dict(self.counts), risk_bins={k:dict(v) for k,v in self.risk_bins.items()},
                     formal_dp_enabled=False, client_upload_is_private=False,
                     epsilon=None, delta=None, membership="original_client_train",

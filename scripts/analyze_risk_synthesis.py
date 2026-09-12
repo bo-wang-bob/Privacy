@@ -61,8 +61,9 @@ def verify_anchor_history_row(row, labels, history):
 def read_synthesis_mechanism(directory, summary, *, complete):
     """Independently reconcile streamed visits with original IDs and counters.
 
-    Norm and margin statistics describe the last attempted candidate per visit,
-    rather than all attempts. No distance is interpreted as a privacy guarantee.
+    Norm and margin statistics describe the selected candidate for all replacement,
+    or the last attempted candidate for legacy sampling, not every attempt.
+    No distance is interpreted as a privacy guarantee.
     """
     import torch
     directory = Path(directory)
@@ -85,6 +86,7 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     bins = {str(i): Counter() for i in range(5)}
     measurements = defaultdict(lambda: dict(count=0, sum=0., min=float("inf"), max=-float("inf")))
     weighted_centers = summary["options"].get("center_weighting", "uniform") == "previous_risk"
+    replace_all = summary["options"].get("replacement_policy", "risk_probability") == "all"
     anchor_history = {}
     path = directory / "synthetic_exposure.csv"
     with path.open() as handle:
@@ -100,12 +102,33 @@ def read_synthesis_mechanism(directory, summary, *, complete):
                     or accepted not in (0, 1) or accepted > requested
                     or not 0 <= attempts <= summary["options"]["attempts"]
                     or (requested and not attempts) or (not requested and attempts)
-                    or (row["reason"] == "accepted") != bool(accepted)):
+                    or (row["reason"] in ({"accepted", "best_semantic_candidate"} if replace_all else {"accepted"})) != bool(accepted)):
                 raise ValueError("Inconsistent synthetic exposure decision.")
+            if replace_all:
+                quality = int(row["quality_passed"])
+                distance = float(row["original_distance"])
+                if (requested != 1 or accepted != 1 or quality not in (0, 1)
+                        or (row["reason"] == "accepted") != bool(quality)
+                        or not 1 <= int(row["selected_attempt"]) <= attempts
+                        or not np.isfinite(distance) or distance <= 0
+                        or not np.isclose(float(row["retained_original_fraction"]), 1-used, rtol=0, atol=1e-7)
+                        or (int(row["source_round"]) < 0 and (risk != 0 or used != 0))):
+                    raise ValueError("All-replacement exposure must record changed virtual inputs and risk-only retention.")
+                if summary["options"]["semantic_filter"]:
+                    delta = float(row["teacher_margin_delta"])
+                    if not np.isfinite(delta) or bool(quality) != (delta >= -summary["options"]["margin_tolerance"]):
+                        raise ValueError("All-replacement semantic quality disagrees with the selected candidate margin.")
+                elif not quality:
+                    raise ValueError("Disabled semantic filtering cannot record a semantic quality failure.")
+                ratio = float(row["norm_ratio"])
+                if not summary["options"]["norm_ratio_min"] <= ratio <= summary["options"]["norm_ratio_max"]:
+                    raise ValueError("All-replacement selected candidate violates its norm constraint.")
             if weighted_centers:
                 verify_anchor_history_row(row, states[client], anchor_history)
             counts = dict(visits=1, requested=requested, accepted=accepted,
                           fallback=requested-accepted)
+            if replace_all:
+                counts["quality_failed"] = 1-quality
             totals.update(counts)
             risk_bin = min(4, int(risk * 5))
             bins[str(risk_bin)].update(counts)
@@ -142,6 +165,7 @@ def read_synthesis_mechanism(directory, summary, *, complete):
                          acceptance_given_request=(counts["accepted"] / counts["requested"]
                                                    if counts["requested"] else None)))
     return dict(counts=dict(totals), reasons=dict(reasons), geometry=geometry, groups=rows,
+                measurement_scope="selected_candidate" if replace_all else "last_attempt",
                 last_attempt_measurements=[dict(field=field, outcome=outcome, count=values["count"],
                     mean=values["sum"] / values["count"], min=values["min"], max=values["max"])
                     for (field, outcome), values in sorted(measurements.items())],

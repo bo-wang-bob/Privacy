@@ -382,6 +382,17 @@ MIST、SOFT、HAMP 和 WWW 等实现。当前 CLIP 三模型正式支持 `none`�
 `www` 与 `cofedmid`；BERT Adapter/LoRA 和 GPT2 Adapter 也支持 CoFedMID。
 具体兼容性由 `configs/experiment_catalog.yaml` 维护。
 
+CLIP transformer Adapter/LoRA 另支持 FedAvg 下的实验防御 `risk_synthesis`：
+每个训练位置都使用本地几何生成的 token，风险只控制原始编码保留系数；从首轮开始替换，
+语义重试失败时保留最佳虚拟候选并记录未达标。默认仍为每类 100 张、100 轮 FedAvg。
+该全部替换版本须单独评价效果，不能继承旧部分替换方案的确认结论，也不提供 DP 保证。
+参数、暴露记录与历史兼容性见[全部替换方案](docs/risk_synthesis_all_replacement.md)。
+
+```bash
+python scripts/run_privacy_experiments.py --models clip_adapter --datasets cifar100 \
+  --methods fedavg --defenses risk_synthesis --attacks all
+```
+
 CoFedMID 默认**所有客户端协作防御**，开启动态类别分配、EXP3 样本回收与正则、
 聚合中性上传扰动。模型原有的 one-batch 等权 FedSGD、学习率及轮数保留。
 默认第 11 轮开始回收，参数空间噪声标准差为 0.01，扰动可训练参数向量尾部 20%。

@@ -199,7 +199,8 @@ defense_overrides:
         noise_multiplier: 0.0
         release_private_diagnostics: false
         synthesis:
-          replacement_fraction: 0.25
+          replacement_policy: all
+          replacement_fraction: 1.0
           noise_scale: 0.1
           shrinkage: 0.5
           class_rank: 5
@@ -207,12 +208,12 @@ defense_overrides:
           min_class_samples: 3
           attempts: 2
           margin_tolerance: 0.02
-          norm_ratio_min: 0.5
+          norm_ratio_min: 0.1
           center_weighting: uniform
           norm_ratio_max: 2.0
           mode: risk
           semantic_filter: true
-          warmup_rounds: 1
+          warmup_rounds: 0
 
   www:
     common:

@@ -51,10 +51,11 @@
 
 - `risk_synthesis` 是 2026-09-12 新增的实验防御，当前只支持 CLIP transformer Adapter/LoRA + FedAvg。通过统一入口 `--methods fedavg --defenses risk_synthesis` 运行，默认参数集中在 catalog；FedSGD 组合跳过，直接配置会拒绝。
 - 每客户端从原始完整本地训练集拟合每类输入 patch+position token 的低秩几何，向该客户端类内合并协方差收缩；固定原始 CLIP 教师检查语义，统计与虚拟编码不共享。
-- 第一轮原图训练；后续复用 WWW 的上一轮 own/other 损失差和尾部秩风险。以 `0.25*r` 概率请求替换、每 batch 上限 `floor(0.25*B)`，生成 `(1-r)*h+r*mu_without_self+0.1*L*epsilon`，最多两次语义检查，失败回退原图。混合 token 上普通 CE 经当前 Adapter/LoRA 求导，不追加 WWW 正则；原始 batch 大小、本地 epoch 和聚合权重不变。
-- FedAvg 的攻击成员仍是原始完整客户端训练集，虚拟样本不能充当独立非成员。任务内 `risk_synthesis/` 保存本地分布、流式暴露记录和摘要，无 DP 保证。真实 CIFAR100/Adapter 的 10 轮探索出现 ProjRes 局部改善，但余弦类攻击可能增强，风险排序的独立收益和确认性效果尚未成立；见 `docs/risk_synthesis_research_log.md`，不得将两轮检查、代理风险下降或单种子选参结果描述为已证明防御有效。
+- 用户随后要求全部替换：catalog 默认 `replacement_policy: all`、`replacement_fraction: 1`、`warmup_rounds: 0`、范数下限 0.1。首轮缺少参考时 r=0 但仍加几何噪声；后续复用 WWW 上一轮 own/other 损失差和尾部秩风险，所有位置生成 `(1-r)*h+r*mu_without_self+0.1*L*epsilon`，风险只控制原始编码系数，类别中心均匀。不存在概率请求或 batch 替换上限。
+- 按用户确认，最多两次语义检查后仍不达标则保留语义最好的有效虚拟候选，记录 `quality_passed=0`，不能回退原图。无法产生有限、范数合格且实际改变的编码则在该 batch 优化前报错。新版本 `local_token_geometry_v4_all_replacement` 记录 `selected_attempt`、`retained_original_fraction`、`original_distance`，全部访问均计入 synthetic_steps。普通 CE、batch 大小、本地 epoch、聚合权重及原始完整客户端训练集的成员身份不变，无 DP 保证。见 `docs/risk_synthesis_all_replacement.md`。
+- 旧非空 synthesis 配置缺少 replacement_policy 时保持历史 risk_probability 协议；新实验用该策略复现时还需显式恢复 replacement_fraction=0.25、warmup_rounds=1。旧部分替换的 Adapter/CIFAR100 三种子确认通过事前标准，但风险排序的额外低 FPR 收益不稳定；这些收益不能继承给新的全部替换版本。历史结果不改写，真实数据新版本效果须另行验证。
 - 独立确认可显式设置 `confirmation_split_manifest`；当前仅支持 CLIP transformer Adapter/LoRA、CIFAR100、FedAvg、10 个 IID 客户端、全局每类 100 张及 none/www/risk_synthesis。清单预留原始训练源中的 30,000 张训练抽样池和 10,000 张独立 evaluation，并排除探索用过的 10,000 张；先按清单隔离，再截取每类 100 张训练。默认数据路径不变，文本入口拒绝该参数。配置解析保存清单 SHA256，加载时核对图像/标签指纹，任务内保存 `confirmation_split.json` 与 `data_partition.json`，审计分析将候选位置恢复为原始图片身份；不能复用旧分区基线作为确认对照。
-- `defense.synthesis.center_weighting` 默认 `uniform` 保留原始类别均值；显式 `previous_risk` 使用上一参与轮各原始记录的平均 assigned/used-risk，按 `a=1-r` 加权排除自身的类别中心。本轮权重冻结，缺少历史的记录权重为 1；正常全参与下第三轮首次使用风险加权中心。重复本地 epoch 对同一原始记录求平均，不增加成员数。打乱风险对照必须同时用打乱后的 used-risk 建立中心，不能保留真实风险作为隐藏信号；MixUp 不支持该中心选项。协方差、请求规则和语义筛选不变，属于尚待真实数据验证的实验扩展。加权运行记录 `anchor_*` 来源和权重字段，分析器从历史 CSV 独立重放核验。
+- 历史 risk_probability 模式仍支持 `center_weighting: previous_risk`：使用上一参与轮各原始记录平均 assigned/used-risk，按 a=1-r 加权排除自身的类别中心，本轮冻结；打乱风险必须同时打乱建中心的风险，重复 epoch 对原始记录求平均。全部替换模式只支持 uniform，避免风险同时改变锚点。历史加权运行保留 anchor_* 字段和分析器重放核验。
 
 ## 当前 CoFedMID 防御
 

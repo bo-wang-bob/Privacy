@@ -1,10 +1,10 @@
 # 风险指导本地生成：实现与实验记录
 
-2026-09-12。原均匀中心、范数下限 0.1 方案已在 Adapter/CIFAR100、目标客户端 0、三个预留源记录种子上通过事前验收：最大攻击 AUC 平均下降 0.0265，最大 TPR@1%FPR 平均下降 6.4 个百分点，准确率平均提高 0.99 个百分点。少量跨角色像素重复的补充敏感性分析保留相同改善方向。该证据限于当前范围；风险排序的低 FPR 额外收益仍不稳定，LoRA/Food101 的适用范围尚待验证，不提供形式 DP 保证。
+2026-09-12。当前依据用户要求改为[全部替换、风险控制保留量](risk_synthesis_all_replacement.md)，语义重试失败时保留最佳虚拟候选。以下原均匀中心、范数下限 0.1 **部分替换**方案曾在 Adapter/CIFAR100、目标客户端 0、三个预留源记录种子上通过事前验收：最大攻击 AUC 平均下降 0.0265，最大 TPR@1%FPR 平均下降 6.4 个百分点，准确率平均提高 0.99 个百分点。这些结果不能作为新版本的有效性证据。少量跨角色像素重复的补充敏感性分析保留旧方案的改善方向，风险排序的额外低 FPR 收益仍不稳定，不提供形式 DP 保证。
 
 当前实现位于 main。原批次重建分支已提交为 `5794138`；用户在目的地确认中选择“暂不推送”，因此没有推送远端。
 
-## 实现协议
+## 初始部分替换协议（历史）
 
 - 正式入口 `scripts/run_privacy_experiments.py --defenses risk_synthesis`，目前限 CLIP transformer Adapter/LoRA + FedAvg。
 - 原始客户端完整训练集先建立每类 Patch+Position 低秩协方差，按 1/n 归一化；向本客户端合并类内协方差收缩，所有统计保留在本地。
@@ -511,9 +511,25 @@ Food101 的实际确定性划分和全部 35,350 个 JPEG 文件指纹保存为 
 
 队列状态为 `risk_synthesis_transfer_lane{0,1}_20260912.json`。只读分析进程 `analysis_scripts/verify_synthesis_transfer_20260912.py` 等待各组三个任务全部成功结束，再独立复算原始分数、核对候选配对、报告固定范围效应及候选区间；状态为 `risk_synthesis_transfer_analysis_20260912.json`。这组单种子检查不能调用要求三种子/四组的确认汇总来冒充新的多种子确认。目前尚无迁移效果结论。
 
-## 运行方式
+## 全部替换版本：用户指定的协议变更
 
-完整原始参数对照（生成范数下限仍为 0.5）：
+用户明确要求“都得替换，风险控制保留多少信息”，并选择重试后仍不达标时保留语义最好的虚拟候选。该修改来自用户要求，不根据旧迁移分数调参。新默认 `replacement_policy=all`、`replacement_fraction=1`、`warmup_rounds=0`、`norm_ratio_min=0.1`，从首轮起替换每个原始训练位置；缺少风险参考时 r=0，仍加入 0.1 倍本地几何噪声。后续风险只决定生成中心的原始编码系数 1-r，均匀同类中心、协方差、普通 CE 和原始成员定义保持不变。
+
+最多两次尝试，合格候选优先；若均不满足语义 margin，则选取有效候选中 margin 最高者并记录未达标。没有原图回退。有限性、范数与实际改变是数值约束，无法生成满足这些条件的候选则在 batch 优化前失败。新增日志区分 `accepted`（确实替换）和 `quality_passed`（语义达标），记录实际 `selected_attempt`、原始编码系数与距离；独立分析器验证逐访问约束。
+
+旧迁移 LoRA 无防御任务已于 17:08 完成，准确率 80.40%；生成任务 `2026-09-12_17-08-14-353592_clip_lora_cifar100_fedavg_risk_synthesis_seed43_target0_9b573ad7e6` 因本次用户改动中断，不计为完整实验。旧迁移只读等待进程已停止。Food101 无防御基线继续完成，旧队列后续生成任务受源码指纹检查阻止启动。旧计划未改写，过渡快照为 `analysis_scripts/risk_synthesis_full_replacement_transition_20260912.json`，既有结果全部保留。
+
+核心与新增全部替换测试 43 项、入口/确认来源/结果汇总/重复敏感性回归 86 项通过，共 129 项；两个模型的正式干运行显示 `policy:all warmup_rounds:0 semantic_failure:best_generated_candidate`。真实 CIFAR100 上的 Adapter/LoRA 各两轮执行检查已启动，计划与源码指纹为 `analysis_scripts/risk_synthesis_all_pilot_plan_20260912.json`，执行状态为 `risk_synthesis_all_pilot_execution_20260912.json`。这些短程检查只验证实现与审计可执行，不证明新防御有效。
+
+随后两个真实任务均成功结束：Adapter 为 `2026-09-12_17-22-45-230143_clip_adapter_cifar100_fedavg_risk_synthesis_seed42_target0_bea0dd09a9`，LoRA 为 `2026-09-12_17-22-45-230143_clip_lora_cifar100_fedavg_risk_synthesis_seed42_target0_0ff18f07c4`，分别耗时约 4 分 20 秒和 5 分 12 秒。两组各 20,000 次访问全部替换，原图回退为 0；Adapter/LoRA 的语义未达标数为 1,163/1,017。第一轮每组均为 10,000 次替换，其中 2 次语义未达标；第二轮未达标数分别为 1,161/1,015。所有这些位置仍使用生成候选。
+
+逐记录暴露张量、CSV、摘要相互核对，每个原始记录的 synthetic_steps=2、real_steps=0、risk_reads=1；两个模型十个客户端的源编码 hash 一致，运行期间冻结源码未改变。全部 22 个正式攻击结果与 1,000/1,000 原始成员/非成员身份均已独立核验。产物为 `analysis_scripts/risk_synthesis_all_{adapter,lora}_pilot_verified_20260912/`，汇总检查为 `risk_synthesis_all_pilot_validation_20260912.json`。
+
+两轮后 Adapter Accuracy 为 75.44%、最大 AUC 为 0.574564（ProjRes）；LoRA Accuracy 为 66.41%、最大 AUC 为 0.627403（FedMIA-Cosine），不能以 LoRA 的 ProjRes 接近 0.5 代表所有攻击失效。当前没有同两轮预算的匹配无防御比较，也不能与旧 100 轮结果直接比较；这些数据只确立了全部替换机制在真实模型中的可执行性。新防御效果仍需完整预算对照。
+
+## 当前运行方式
+
+新默认全部替换方案与 none/WWW 对照：
 
 ```bash
 /root/.local/share/mamba/envs/pfedba/bin/python scripts/run_privacy_experiments.py \
@@ -521,17 +537,20 @@ Food101 的实际确定性划分和全部 35,350 个 JPEG 文件指纹保存为 
   --defenses none,www,risk_synthesis --attacks all
 ```
 
-同一生成器的风险消融使用 `--set defense.synthesis.mode=shuffled_risk`；同类随机混合使用 `mode=mixup`；去除几何扰动使用 `--set defense.synthesis.noise_scale=0`。这些覆盖应仅用于 `--defenses risk_synthesis` 的独立任务，避免给对照附加未使用配置。
+同一生成器的风险消融使用 `--set defense.synthesis.mode=shuffled_risk`，所有位置仍替换。历史同类 MixUp、零噪声和风险加权中心仅在显式 `replacement_policy=risk_probability` 模式中支持，不能直接套用到新全部替换默认值。
 
 每次干运行核对最终协议后再运行。新实验保存在新的 `results/` 一级任务目录中，历史结果不修改。
 
-已在上述 Adapter/CIFAR100 确认范围内通过验收的范数下限 0.1 方案（其他设置仍待验证）：
+复现已在上述 Adapter/CIFAR100 确认范围内通过验收的历史部分替换、范数下限 0.1 方案：
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 /root/.local/share/mamba/envs/pfedba/bin/python scripts/run_privacy_experiments.py \
   --models clip_adapter --datasets cifar100 --methods fedavg \
   --defenses risk_synthesis --attacks all --seeds 42 \
+  --set defense.synthesis.replacement_policy=risk_probability \
+  --set defense.synthesis.replacement_fraction=0.25 \
+  --set defense.synthesis.warmup_rounds=1 \
   --set defense.synthesis.norm_ratio_min=0.1
 ```
 

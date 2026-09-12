@@ -1,6 +1,6 @@
-# 本地分布与风险指导生成：当前结果
+# 本地分布与风险指导生成：部分替换方案结果
 
-2026-09-12。**已经实现，并在 CLIP transformer Adapter / CIFAR100 的三个确认种子上观察到稳定的整体防御收益。** 结论限于下述训练与攻击范围；风险排序相对打乱风险的额外低 FPR 收益不稳定，LoRA/CIFAR100 和 Adapter/Food101 的固定参数验证仍在运行。
+2026-09-12。**本文结果属于旧的部分替换方案。** 用户随后要求全部训练位置替换、风险只控制原始编码保留量，并选择语义重试失败时保留最佳虚拟候选。当前默认及运行命令见[全部替换方案](risk_synthesis_all_replacement.md)；以下确认收益与耗时不能归属于新版本。旧方案在 CLIP transformer Adapter / CIFAR100 的三个确认种子上观察到整体防御收益，风险排序相对打乱风险的额外低 FPR 收益不稳定；尚未完成的旧迁移生成任务已停止或取消后续启动。
 
 完整设计见[方案](local_risk_guided_synthesis_plan.md)，包含失败实验、消融和后续修订的记录见[研究日志](risk_synthesis_research_log.md)。代码已保存在本地 main；按照用户最新决定，暂不推送远端。
 
@@ -57,7 +57,7 @@
 - 每种子 2,000 次配对候选重采样，风险生成减无防御的最大 AUC 区间均低于 0。该区间条件于已训练模型，不度量训练种子或总体不确定性。
 - 原始记录编号不重叠，但 CIFAR100 源数据存在少量完全重复像素。使用不依赖攻击分数的排除与类别配平规则后，最大 AUC 平均仍下降 0.026221。此补充分析不改变训练或主分析，不能据此宣称消除了近重复或预训练暴露。
 - 单目标的低 FPR 分辨率有限。补充筛选后种子 43/44 仅有 998/999 个非成员，TPR@0.1%FPR 留空；不能合并重复种子候选来扩充独立非成员数。
-- LoRA/CIFAR100 与 Adapter/Food101 各三组、seed 43 的任务正在运行。它们用于检验适用范围，不能提前解释为跨模型、跨数据集的成功，也不能以一个迁移种子建立多种子确认结论。
+- 原 LoRA/CIFAR100 与 Adapter/Food101 各三组、seed 43 的方案未完成全部比较。用户改动后停止旧生成任务，保留已完成 LoRA 基线及正在运行的 Food101 基线，不能据此得出旧方案的迁移效果结论。
 
 可核查的本地产物：
 
@@ -71,15 +71,18 @@
 
 上述实验产物保留在本地，其中部分被 Git 忽略。正式核验工具为 [`analyze_risk_synthesis.py`](../scripts/analyze_risk_synthesis.py)、[`summarize_synthesis_confirmation.py`](../scripts/summarize_synthesis_confirmation.py)、[`paired_synthesis_uncertainty.py`](../scripts/paired_synthesis_uncertainty.py) 和 [`confirmation_duplicate_sensitivity.py`](../scripts/confirmation_duplicate_sensitivity.py)。
 
-## 运行当前选定方案
+## 复现旧部分替换方案
 
-当前 catalog 的原始默认范数下限仍是 **0.5**；通过确认的是显式设为 **0.1**、均匀类别中心的方案。运行以下命令会新建任务，使用常规默认数据分区：
+通过上述确认的是范数下限 **0.1**、均匀类别中心的部分替换方案。当前 catalog 已改为全部替换，因此复现旧方案须显式恢复请求策略与 warmup。以下命令新建任务，使用常规默认数据分区：
 
 ```bash
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 /root/.local/share/mamba/envs/pfedba/bin/python scripts/run_privacy_experiments.py \
   --models clip_adapter --datasets cifar100 --methods fedavg \
   --defenses risk_synthesis --attacks all --seeds 43 \
+  --set defense.synthesis.replacement_policy=risk_probability \
+  --set defense.synthesis.replacement_fraction=0.25 \
+  --set defense.synthesis.warmup_rounds=1 \
   --set defense.synthesis.norm_ratio_min=0.1
 ```
 
@@ -98,6 +101,6 @@ none/WWW 对照也必须使用同一分区与种子；生成参数覆盖只加�
 
 ## 从结果推导的下一步
 
-1. **先完成固定参数的适用范围验证。** 不依据迁移中间分数改参数；若改善只出现在 Adapter/CIFAR100，就按实际范围报告。
+1. **按用户改动验证全部替换版本。** 这是一次明确的协议修改，不依据旧迁移中间分数调参，也不把旧确认的收益继承给新版本。
 2. **优先研究风险与低 FPR 攻击的错位。** 真实风险与打乱风险低 FPR 效果不一致，说明 WWW 的批内秩不能直接当作通用泄漏概率。下一版应保留独立攻击评价、请求及接受预算对照，并在新的确认数据上检查风险改进，不能以代理风险下降作为成功标准。
 3. **保留几何机制的反例。** 现有均值与经验协方差采样仍来自原始输入的仿射空间；它们不会自动消除所有子空间线索。只有实际攻击暴露了明确瓶颈时，才检验同类多锚点或独立噪声先验等扩展，并继续约束语义和效用。这些是待检验方向，不是已验证功能。

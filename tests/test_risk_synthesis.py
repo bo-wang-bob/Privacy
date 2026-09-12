@@ -10,7 +10,8 @@ import torch
 from torch.nn import functional as F
 
 from aggregator.aggregator_builder import build_aggregator
-from privacy_defenses.risk_synthesis import DEFAULTS, LocalGeometry, PreviousRiskWeights, RiskSynthesis, low_rank_factor, select_requests
+from privacy_defenses.risk_synthesis import LEGACY_DEFAULTS as DEFAULTS
+from privacy_defenses.risk_synthesis import LocalGeometry, PreviousRiskWeights, RiskSynthesis, low_rank_factor, select_requests
 from scripts.run_privacy_experiments import build_tasks, load_yaml, parse_args
 from scripts.analyze_risk_synthesis import class_diagnostics, read_synthesis_mechanism, recompute_auc
 from scripts.paired_synthesis_uncertainty import paired_resampling, score_metrics, select_pair
@@ -249,6 +250,10 @@ def test_catalog_validates_method_and_keeps_original_membership():
         assert task.config["audit"]["membership_protocol"] == "client_train"
         assert task.config["projres"]["max_candidates"] == 0
         assert task.config["defense"]["formal_dp_enabled"] is False
+        options = task.config["defense"]["synthesis"]
+        assert options["replacement_policy"] == "all"
+        assert options["replacement_fraction"] == 1 and options["warmup_rounds"] == 0
+        assert options["norm_ratio_min"] == .1
     with pytest.raises(ValueError,match="replacement_fraction"):
         build_tasks(catalog,parse_args(args+["--methods","fedavg","--set","defense.synthesis.replacement_fraction=2"]))
     with pytest.raises(ValueError, match="single MixUp donor"):

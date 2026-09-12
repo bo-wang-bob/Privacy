@@ -566,6 +566,12 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             f"defense={task.defense} attacks={attacks} seed={task.seed} "
             f"target={task.target_client_id}"
         )
+        if task.defense == "risk_synthesis":
+            synthesis = config["defense"]["synthesis"]
+            all_positions = synthesis.get("replacement_policy", "risk_probability") == "all"
+            print(f"      synthesis=policy:{synthesis.get('replacement_policy', 'risk_probability')} "
+                  f"warmup_rounds:{synthesis['warmup_rounds']} "
+                  f"semantic_failure:{'best_generated_candidate' if all_positions else 'original_input'}")
         print(
             f"      protocol=method:{method} "
             f"weighting:{config.get('aggregation_weighting', 'uniform')} "
