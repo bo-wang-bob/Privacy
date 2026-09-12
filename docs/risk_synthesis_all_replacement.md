@@ -72,4 +72,14 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 
 两个模型第一轮各 10,000 次访问全部替换，均有 2 次语义未达标。每个原始记录均有两次 synthetic_steps、零 real_steps、一次风险读取；十个客户端的原始输入编码在两模型间一致。22 个正式攻击输出、原始成员身份和流式诊断通过独立分析器核验，证据为 `analysis_scripts/risk_synthesis_all_pilot_validation_20260912.json` 及 `risk_synthesis_all_{adapter,lora}_pilot_verified_20260912/`。
 
-这些是两轮执行检查，没有相同两轮预算的无防御对照，不能证明防御有效。后续须按完整训练预算重新评价。旧部分替换的 LoRA 任务已因本次用户改动停止；无防御 Food101 基线保留运行，旧队列后续生成任务会因源码指纹变化停止。旧 Adapter 三种子效果及实测耗时只属于旧方案，见[历史结果说明](risk_synthesis_results.md)。
+这些是两轮执行检查，没有相同两轮预算的无防御对照，不能证明防御有效。旧部分替换的 LoRA 任务已因本次用户改动停止；无防御 Food101 基线于 17:41 成功完成，旧队列随后因源码指纹变化停止，没有启动旧部分替换任务。旧 Adapter 三种子效果及实测耗时只属于旧方案，见[历史结果说明](risk_synthesis_results.md)。
+
+## 完整预算效果对照
+
+2026-09-12 17:45 启动 Adapter/CIFAR100 的真实风险与打乱风险各 100 轮，seed=43、目标客户端 0。计划为 `analysis_scripts/risk_synthesis_all_study_plan_20260912.json`，SHA256 `4eb407a68e8be2c82fa7a1ff867016267f11950a30c345c002fd8200efadb0b3`。两组仍经唯一统一训练入口运行，实际解析配置已逐项核对；每个新任务预期有 1,000,000 次原始训练位置访问。
+
+复用相同种子、原始来源分区、训练/审计预算的已完成无防御基线，并附旧部分替换组作为整体协议对照。共享模型、训练器、聚合器、数据与攻击源码均未变化；差异仅为新防御实现、默认值及干运行显示。所有非防御实际配置完全相同，已有结果文件指纹冻结，最终还需核对原始候选身份。
+
+这次继续使用此前评估过的预留来源分区，是探索性效果检查，不是全新的独立确认。判据固定为：相对无防御，11 种攻击中的最大 AUC 至少降低 0.02，最大 TPR@1%FPR 下降，准确率降低不超过 2 个百分点。真实风险与打乱风险另行比较；旧部分替换与新版属于同时改变多项行为的整体协议比较。
+
+状态为 `risk_synthesis_all_study_{risk,shuffled_risk}_execution_20260912.json`。`analysis_scripts/verify_synthesis_all_study_20260912.py` 等待这两个既有进程完成，再独立复算全部攻击、检查全替换计数、复算重复像素敏感性并进行固定模型下的候选配对重采样。正式效果报告保存到 `analysis_scripts/risk_synthesis_all_study_verified_20260912/`；任务未完成时不据中途准确率判定防御有效。

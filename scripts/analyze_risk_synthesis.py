@@ -479,7 +479,9 @@ def analyze(directories,output):
             lines += ["", f'生成机制 `{run["run"]}`：访问 {counts.get("visits", 0)} 次，'
                       f'请求 {counts.get("requested", 0)} 次，接受 {counts.get("accepted", 0)} 次。',
                       f'请求的最终结果：{json.dumps(mechanism["reasons"], ensure_ascii=False)}。',
-                      "范数和 margin 统计仅对应每次访问的最后一次尝试；接受率本身不表示隐私改善。"]
+                      ("范数和 margin 统计对应实际选用的候选；替换率本身不表示隐私改善。"
+                       if mechanism.get("measurement_scope") == "selected_candidate" else
+                       "范数和 margin 统计仅对应每次访问的最后一次尝试；接受率本身不表示隐私改善。")]
     (output/"readout.md").write_text("\n".join(lines)+"\n")
     return payload
 
