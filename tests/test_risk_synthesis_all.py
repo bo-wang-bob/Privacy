@@ -123,6 +123,32 @@ def test_saved_partial_options_remain_legacy_and_empty_new_options_replace_all()
     assert synthesis_options({}) == DEFAULTS
 
 
+@pytest.mark.parametrize("reverse", [False, True])
+def test_analysis_exports_mixed_versions_without_inventing_legacy_quality_counts(tmp_path, monkeypatch, reverse):
+    from scripts import analyze_risk_synthesis as analysis
+    records = []
+    for name, scope, extra in (("legacy", "last_attempt", {}),
+                               ("all", "selected_candidate", {"quality_failed": 0})):
+        counts = dict(visits=1, requested=1, accepted=1, fallback=0, **extra)
+        records.append(dict(run=name, defense="risk_synthesis", complete=False, comparison_key="same",
+            accuracy=None, strongest_auc=None, actual_round=1, expected_rounds=2, attacks=[], class_metrics=[],
+            synthesis={"implementation": name}, synthesis_mechanism=dict(counts=counts, reasons={"accepted": 1},
+                measurement_scope=scope, groups=[dict(round=1, client=0, risk_bin=0, **counts)])))
+    if reverse:
+        records.reverse()
+    iterator = iter(records)
+    monkeypatch.setattr(analysis, "read_run", lambda _: next(iterator))
+    output = tmp_path / "mixed"
+    analysis.analyze(["first", "second"], output)
+    with (output / "synthesis_mechanism.csv").open() as handle:
+        exported = {row["run"]: row for row in csv.DictReader(handle)}
+    assert exported["legacy"]["quality_failed"] == ""
+    assert exported["all"]["quality_failed"] == "0"
+    assert len(json.loads((output / "verified_results.json").read_text())["runs"]) == 2
+    readout = (output / "readout.md").read_text()
+    assert "实际选用的候选" in readout and "最后一次尝试" in readout
+
+
 @pytest.mark.parametrize("kind", ["clip_adapter", "clip_lora"])
 def test_all_replacement_fedavg_all_attacks_and_independent_exposure_reconciliation(kind, tmp_path):
     model = make_model(kind)

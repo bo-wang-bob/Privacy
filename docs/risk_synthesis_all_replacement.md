@@ -82,4 +82,6 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
 
 这次继续使用此前评估过的预留来源分区，是探索性效果检查，不是全新的独立确认。判据固定为：相对无防御，11 种攻击中的最大 AUC 至少降低 0.02，最大 TPR@1%FPR 下降，准确率降低不超过 2 个百分点。真实风险与打乱风险另行比较；旧部分替换与新版属于同时改变多项行为的整体协议比较。
 
-状态为 `risk_synthesis_all_study_{risk,shuffled_risk}_execution_20260912.json`。`analysis_scripts/verify_synthesis_all_study_20260912.py` 等待这两个既有进程完成，再独立复算全部攻击、检查全替换计数、复算重复像素敏感性并进行固定模型下的候选配对重采样。正式效果报告保存到 `analysis_scripts/risk_synthesis_all_study_verified_20260912/`；任务未完成时不据中途准确率判定防御有效。
+两组已于 9 月 12 日 19:19/19:27 完成。自动分析曾因合并新旧诊断字段失败，9 月 13 日修复 CSV 字段兼容后在新目录完成全部核验，原始结果与失败目录保留。新版真实风险 Accuracy=80.90%、最大 AUC=0.609326、最大 TPR@1%FPR=18.50%；匹配无防御为 81.58%/0.674120/37.10%，本次三个固定判据均通过。相对打乱风险的额外最大 AUC/TPR 收益区间仍跨零，不能声称风险排序的稳定独立收益。
+
+详细结果、限制与下一步见[最新效果说明](risk_synthesis_all_replacement_results.md)。已核验产物为 `analysis_scripts/risk_synthesis_all_study_verified_20260913/`，完成状态为 `risk_synthesis_all_study_analysis_20260913.json`。复算既有任务使用 `python analysis_scripts/verify_synthesis_all_study_20260912.py --analysis-tag <新的标识>`，每次新建分析目录，不重跑训练、不覆盖既有产物。

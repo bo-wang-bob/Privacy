@@ -1,0 +1,16 @@
+{
+  "original_analysis_state_sha256": "645cf5d1d14db1e3e434a9b91a29bde2b2a00223be00d7f5afa33e865534414a",
+  "original_status": "failed",
+  "original_error": "ValueError(\"dict contains fields not in fieldnames: 'quality_failed'\")",
+  "plan_sha256": "4eb407a68e8be2c82fa7a1ff867016267f11950a30c345c002fd8200efadb0b3",
+  "training_sources_unchanged": true,
+  "repair": "Union of diagnostic CSV field names across historical and all-replacement records. Missing historical quality_failed stays blank; recorded zero stays 0. No change to attack metrics, synthesis or training.",
+  "new_analysis_state": "analysis_scripts/risk_synthesis_all_study_analysis_20260913.json",
+  "sources": {
+    "scripts/analyze_risk_synthesis.py": "143697c54fbda4b6e86f0009c236f877ac4af58ee9c541553e8a34995ca2f46a",
+    "analysis_scripts/verify_synthesis_all_study_20260912.py": "7022714beb85a36b40685ad5d796ae3542c1cf2b00d755d11c5fe3c6867805d5",
+    "tests/test_risk_synthesis_all.py": "a43aa27ab47fd63d6c1d528e4c3379d499b82a6ad8b115091ae98c62d2083949"
+  },
+  "tests": "45 related regression tests passed; mixed-version export verified in both row orders.",
+  "original_results_policy": "Existing results and failed analysis artifacts retained without modification."
+}

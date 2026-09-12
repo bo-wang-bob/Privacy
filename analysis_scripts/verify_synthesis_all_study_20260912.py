@@ -1,5 +1,6 @@
 """Verify the two existing full-replacement jobs and compare their fixed controls."""
 from datetime import datetime, timezone
+import argparse
 import csv
 import json
 import os
@@ -15,8 +16,9 @@ from scripts.paired_synthesis_uncertainty import run as resample
 from scripts.run_privacy_experiments import load_yaml
 
 PLAN = ROOT / "analysis_scripts/risk_synthesis_all_study_plan_20260912.json"
-STATE = ROOT / "analysis_scripts/risk_synthesis_all_study_analysis_20260912.json"
-OUTPUT = ROOT / "analysis_scripts/risk_synthesis_all_study_verified_20260912"
+ANALYSIS_TAG = "20260912"
+STATE = ROOT / f"analysis_scripts/risk_synthesis_all_study_analysis_{ANALYSIS_TAG}.json"
+OUTPUT = ROOT / f"analysis_scripts/risk_synthesis_all_study_verified_{ANALYSIS_TAG}"
 ARMS = ("none", "legacy_partial_risk", "risk", "shuffled_risk")
 LABELS = {"none": "无防御", "legacy_partial_risk": "旧版部分替换", "risk": "新版全部替换：真实风险",
           "shuffled_risk": "新版全部替换：打乱风险"}
@@ -181,10 +183,10 @@ def main():
         print(json.dumps(outcome, indent=2), flush=True)
         duplicate_sensitivity(OUTPUT / "verified_results.json",
             ROOT / "analysis_scripts/risk_synthesis_confirmation_exact_image_identity_20260912.json",
-            ROOT / "analysis_scripts/risk_synthesis_all_study_duplicate_sensitivity_20260912")
+            ROOT / f"analysis_scripts/risk_synthesis_all_study_duplicate_sensitivity_{ANALYSIS_TAG}")
         for control in ("none", "shuffled_risk", "legacy_partial_risk"):
             resample(OUTPUT / "verified_results.json",
-                ROOT / f"analysis_scripts/risk_synthesis_all_study_vs_{control}_resampling_20260912",
+                ROOT / f"analysis_scripts/risk_synthesis_all_study_vs_{control}_resampling_{ANALYSIS_TAG}",
                 2000, 20260912, treatment=records["risk"]["run"], control_name=records[control]["run"])
         state.update(status="completed", finished_at_utc=now())
         save()
@@ -196,4 +198,14 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--analysis-tag", default="20260912",
+                        help="Fresh output suffix for reanalysis; existing artifacts are never overwritten.")
+    args = parser.parse_args()
+    if not args.analysis_tag or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+                                    for c in args.analysis_tag):
+        parser.error("analysis-tag must contain only letters, digits, underscores or hyphens")
+    ANALYSIS_TAG = args.analysis_tag
+    STATE = ROOT / f"analysis_scripts/risk_synthesis_all_study_analysis_{ANALYSIS_TAG}.json"
+    OUTPUT = ROOT / f"analysis_scripts/risk_synthesis_all_study_verified_{ANALYSIS_TAG}"
     main()

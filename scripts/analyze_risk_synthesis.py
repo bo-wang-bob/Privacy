@@ -435,7 +435,10 @@ def analyze(directories,output):
                       for run in runs for group in run.get("synthesis_mechanism", {}).get("groups", [])]
     if mechanism_rows:
         with (output / "synthesis_mechanism.csv").open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=list(mechanism_rows[0]))
+            # Version-specific diagnostics (e.g. v4 quality_failed) are absent,
+            # rather than zero, in historical records. Preserve their union.
+            fields = list(dict.fromkeys(key for row in mechanism_rows for key in row))
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(mechanism_rows)
     comparisons=[]
