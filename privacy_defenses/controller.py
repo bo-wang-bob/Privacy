@@ -702,15 +702,18 @@ class DefenseController:
                 risk, _, _ = risk_regularization_weights(
                     ranking.scores, 0.8, expected_batch_size=len(labels), tail_basis="actual_batch")
             with measure_stage(self, "train.synthesis_generate"):
-                tokens = self.synthesis.transform(model, user, images, labels.to(self.device),
+                views = self.synthesis.transform_views(model, user, images, labels.to(self.device),
                                                    indices, risk, round_index, self.steps[user.id], source_round,
                                                    raw_scores=ranking.scores if references is not None else None)
             optimizer.zero_grad(set_to_none=True)
             with measure_stage(self, "train.synthesis_optimizer"):
-                loss = F.cross_entropy(model.forward_tokens(tokens), labels.to(self.device))
-                if not torch.isfinite(loss):
-                    raise ValueError("Non-finite risk synthesis loss.")
-                loss.backward()
+                loss = torch.zeros((), device=self.device)
+                for tokens in views:
+                    view_loss = F.cross_entropy(model.forward_tokens(tokens), labels.to(self.device)) / len(views)
+                    if not torch.isfinite(view_loss):
+                        raise ValueError("Non-finite risk synthesis loss.")
+                    view_loss.backward()
+                    loss += view_loss.detach()
                 optimizer.step()
             self.synthesis.record_optimized_batch(user.id)
             self.steps[user.id] += 1

@@ -24,7 +24,8 @@ def summarize(record):
     options = record.get("synthesis_options") or {}
     if options.get("replacement_policy") != "all":
         return None
-    path = Path(record["path"]) / "risk_synthesis/synthetic_exposure.csv"
+    views = options.get("views_per_record", 1)
+    path = Path(record["path"]) / "risk_synthesis" / ("synthetic_views.csv" if views > 1 else "synthetic_exposure.csv")
     if digest(path) != record["sources"][str(path)]:
         raise ValueError("Exposure stream changed after formal verification.")
     observations = {}
@@ -59,13 +60,14 @@ def summarize(record):
                 value["neighbor_cosine_sum"] += float(row["nearest_teacher_cosine"])
                 value["source_nearest_count"] += int(int(row["nearest_teacher_source_id"]) == key[1])
     result = []
-    expected = record["protocol"]["num_global_iters"] * record["protocol"]["local_epochs"]
+    expected = record["protocol"]["num_global_iters"] * record["protocol"]["local_epochs"] * views
     for (client, sid), value in sorted(observations.items()):
         n = value["reference_visits"]
         if value["visits"] != expected or n == 0:
             raise ValueError("Expected complete full-local-epoch original-record exposures.")
         result.append(dict(run=record["run"], seed=record["protocol"]["seed"], client=client, sample_id=sid,
-            label=value["label"], visits=value["visits"], reference_visits=n, zero_risk_count=value["zeros"],
+            label=value["label"], visits=value["visits"]//views, reference_visits=n//views,
+            trained_views=value["visits"], zero_risk_count=value["zeros"]/views,
             zero_risk_fraction=value["zeros"]/n, mean_retained_fraction=value["retained_sum"]/n,
             mean_retained_fourth=value["retained_fourth_sum"]/n,
             semantic_failure_fraction=value["quality_failures"]/value["visits"],

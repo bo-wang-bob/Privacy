@@ -67,6 +67,13 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     """
     import torch
     directory = Path(directory)
+    multiview = summary["options"].get("views_per_record", 1) > 1
+    view_evidence = None
+    if multiview and complete:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from scripts.verify_synthesis_multiview import verify as verify_views
+        view_evidence = verify_views(directory)
     states = {}
     exposure = {}
     geometry = []
@@ -165,7 +172,9 @@ def read_synthesis_mechanism(directory, summary, *, complete):
                          acceptance_given_request=(counts["accepted"] / counts["requested"]
                                                    if counts["requested"] else None)))
     return dict(counts=dict(totals), reasons=dict(reasons), geometry=geometry, groups=rows,
-                measurement_scope="selected_candidate" if replace_all else "last_attempt",
+                measurement_scope="worst_semantic_view_per_original_visit" if multiview else
+                                  "selected_candidate" if replace_all else "last_attempt",
+                **({"multiview_evidence": view_evidence, "view_counts": summary["view_counts"]} if multiview else {}),
                 last_attempt_measurements=[dict(field=field, outcome=outcome, count=values["count"],
                     mean=values["sum"] / values["count"], min=values["min"], max=values["max"])
                     for (field, outcome), values in sorted(measurements.items())],
@@ -300,7 +309,7 @@ def read_run(directory):
     if synthesis is not None and (directory / "risk_synthesis" / "synthetic_exposure.csv").exists():
         result["synthesis_mechanism"] = read_synthesis_mechanism(
             directory / "risk_synthesis", synthesis, complete=completed)
-        for name in ("synthetic_exposure.csv", "source_exposure.pt"):
+        for name in ("synthetic_exposure.csv", "source_exposure.pt", "synthetic_views.csv", "candidate_choices.csv"):
             source = directory / "risk_synthesis" / name
             if source.exists():
                 sources[str(source)] = digest(source)

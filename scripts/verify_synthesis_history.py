@@ -34,9 +34,16 @@ def verify(directory):
     summary_path = directory / "synthesis_summary.json"
     summary = json.loads(summary_path.read_text())
     options = summary["options"]
+    multiview = options.get("views_per_record", 1) > 1
+    multiview_evidence = None
+    if multiview:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from scripts.verify_synthesis_multiview import verify as verify_views
+        multiview_evidence = verify_views(directory)
     history_enabled = options.get("risk_history", "none") == "zero_risk_frequency"
-    choices_enabled = options.get("candidate_selection", "first_semantic") == "least_local_similarity"
-    require(history_enabled or choices_enabled, "No v5 history or selection to verify.")
+    choices_enabled = not multiview and options.get("candidate_selection", "first_semantic") == "least_local_similarity"
+    require(history_enabled or choices_enabled or multiview, "No v5 history or selection to verify.")
     require(summary["status"] == "completed", "Cannot verify incomplete synthesis.")
     sources = [summary_path, directory / "synthetic_exposure.csv"]
     sizes = {}
@@ -173,7 +180,11 @@ def verify(directory):
         require(counters["history_visits_verified"] == summary["counts"]["visits"], "History visit total differs.")
     if choices_enabled:
         require(counters["selected_visits_verified"] == summary["counts"]["visits"], "Selection visit total differs.")
-    return dict(status="verified", **counters, source_hashes={str(p): fingerprint(p) for p in sources},
+    hashes = {str(p): fingerprint(p) for p in sources}
+    if multiview_evidence:
+        hashes.update(multiview_evidence["source_hashes"])
+    return dict(status="verified", **counters, source_hashes=hashes,
+                **({"multiview": {k:v for k,v in multiview_evidence.items() if k!='source_hashes'}} if multiview else {}),
                 scope="Exact stream replay; candidate distances are logged teacher proxies, not MIA guarantees.")
 
 

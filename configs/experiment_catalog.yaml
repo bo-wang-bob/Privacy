@@ -214,6 +214,7 @@ defense_overrides:
           mode: risk
           risk_history: none
           candidate_selection: first_semantic
+          views_per_record: 1
           semantic_filter: true
           warmup_rounds: 0
 

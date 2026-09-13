@@ -23,7 +23,7 @@ LEGACY_DEFAULTS = dict(
     margin_tolerance=0.02, norm_ratio_min=0.5, norm_ratio_max=2.0,
     mode="risk", semantic_filter=True, warmup_rounds=1,
     center_weighting="uniform", replacement_policy="risk_probability",
-    risk_history="none", candidate_selection="first_semantic",
+    risk_history="none", candidate_selection="first_semantic", views_per_record=1,
 )
 DEFAULTS = {**LEGACY_DEFAULTS, "replacement_policy": "all", "replacement_fraction": 1.0,
             "warmup_rounds": 0, "norm_ratio_min": 0.1}
@@ -62,7 +62,7 @@ def validate_risk_synthesis(config):
             raise ValueError(f"synthesis.{key} must be finite and nonnegative.")
     if options["norm_ratio_min"] > options["norm_ratio_max"]:
         raise ValueError("Invalid synthesis norm ratio interval.")
-    for key in ("class_rank", "pooled_rank", "min_class_samples", "attempts"):
+    for key in ("class_rank", "pooled_rank", "min_class_samples", "attempts", "views_per_record"):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f"synthesis.{key} must be a positive integer.")
     if options["min_class_samples"] < 3:
@@ -86,6 +86,8 @@ def validate_risk_synthesis(config):
     advanced = options["risk_history"] != "none" or options["candidate_selection"] != "first_semantic"
     if advanced and options["replacement_policy"] != "all":
         raise ValueError("History and local-neighbor selection require all replacement.")
+    if options["views_per_record"] > 1 and options["replacement_policy"] != "all":
+        raise ValueError("Multiple training views require all replacement.")
     if options["candidate_selection"] != "first_semantic" and not options["semantic_filter"]:
         raise ValueError("Local-neighbor selection requires the semantic filter.")
     if options["replacement_policy"] == "all":
@@ -253,6 +255,9 @@ class RiskSynthesis:
         self.pending_history = {}
         self.semantic_sources = {}
         self.candidate_handle = None
+        self.view_handle = None
+        self.view_counts = Counter()
+        self.pending_views = {}
 
     @torch.no_grad()
     def initialize(self, users, shared_model, directory):
@@ -282,13 +287,21 @@ class RiskSynthesis:
         if self.options["candidate_selection"] != "first_semantic":
             fields += ["nearest_teacher_cosine", "nearest_teacher_source_id"]
             self.candidate_handle = (self.directory / "candidate_choices.csv").open("x", newline="")
-            self.candidate_writer = csv.DictWriter(self.candidate_handle, fieldnames=[
+            candidate_fields = [
                 "round", "client", "step", "sample_id", "attempt", "norm_ratio", "teacher_margin_delta",
-                "quality_passed", "nearest_teacher_cosine", "nearest_teacher_source_id"])
+                "quality_passed", "nearest_teacher_cosine", "nearest_teacher_source_id"]
+            if self.options["views_per_record"] > 1:
+                candidate_fields += ["view_index"]
+            self.candidate_writer = csv.DictWriter(self.candidate_handle, fieldnames=candidate_fields)
             self.candidate_writer.writeheader()
         if self.options["center_weighting"] == "previous_risk":
             fields += ["anchor_reference_round", "anchor_available_donors", "anchor_source_weight",
                        "anchor_donor_weight_sum", "anchor_uniform_fallback"]
+        if self.options["views_per_record"] > 1:
+            self.view_handle = (self.directory / "synthetic_views.csv").open("x", newline="")
+            self.view_writer = csv.DictWriter(self.view_handle, fieldnames=fields + ["view_index", "loss_weight"])
+            self.view_writer.writeheader()
+            fields += ["views_per_record", "quality_passed_views", "representative_view_index", "total_attempts"]
         self.handle = (self.directory / "synthetic_exposure.csv").open("x", newline="")
         self.writer = csv.DictWriter(self.handle, fieldnames=fields)
         self.writer.writeheader()
@@ -312,6 +325,8 @@ class RiskSynthesis:
             self.exposure[user.id] = dict(risk_reads=torch.zeros(user.train_samples, dtype=torch.long),
                                           real_steps=torch.zeros(user.train_samples, dtype=torch.long),
                                           synthetic_steps=torch.zeros(user.train_samples, dtype=torch.long))
+            if self.options["views_per_record"] > 1:
+                self.exposure[user.id]["synthetic_views"] = torch.zeros(user.train_samples, dtype=torch.long)
             state = geometry.state()
             z = torch.cat(semantic)
             if self.options["candidate_selection"] != "first_semantic":
@@ -355,13 +370,71 @@ class RiskSynthesis:
         return (own - similarities.max(1).values).cpu(), cosine.cpu(), nearest.cpu()
 
     def record_optimized_batch(self, client):
+        views = self.pending_views.pop(client, None)
+        if views is not None:
+            for records in zip(*views):
+                # One original visit, with the worst semantic view as the
+                # explicitly declared representative. Every view is saved below.
+                worst = min(records, key=lambda r: (r["teacher_margin_delta"] or 0., r["view_index"]))
+                record = {k: v for k, v in worst.items() if k not in {"view_index", "loss_weight"}}
+                record.update(views_per_record=len(records),
+                              quality_passed_views=sum(r["quality_passed"] for r in records),
+                              representative_view_index=worst["view_index"],
+                              total_attempts=sum(r["attempts"] for r in records))
+                self.writer.writerow(record)
+                count = dict(visits=1, requested=1, accepted=1, fallback=0,
+                             quality_failed=int(record["quality_passed_views"] < len(records)))
+                self.counts.update(count)
+                self.risk_bins[str(min(4, int(record["risk"]*5)))].update(count)
+                sid = record["sample_id"]
+                self.exposure[client]["risk_reads"][sid] += int(record["source_round"] >= 0)
+                self.exposure[client]["synthetic_steps"][sid] += 1
+                self.exposure[client]["synthetic_views"][sid] += len(records)
+            # View-major order preserves each view's batch boundaries for replay.
+            for records in views:
+                for record in records:
+                    self.view_writer.writerow(record)
+                    self.view_counts.update(visits=1, requested=1, accepted=1, fallback=0,
+                                            quality_failed=1-record["quality_passed"])
+            self.handle.flush()
+            self.view_handle.flush()
         pending = self.pending_history.pop(client, None)
         if pending is not None:
             round_index, indices, used = pending
             self.history.observe(client, round_index, indices, used)
 
     @torch.no_grad()
+    def transform_views(self, model, user, images, labels, indices, risk, round_index, step, source_round, *, raw_scores=None):
+        """Generate K independently drawn, jointly trained views per original.
+
+        Ranking and shuffled assignment happen once per original batch. All K
+        views must be valid before any backward/optimizer work. Source counters
+        and history commit once, after the shared optimizer step succeeds.
+        """
+        if self.options["views_per_record"] == 1:
+            return (self.transform(model, user, images, labels, indices, risk, round_index, step,
+                                   source_round, raw_scores=raw_scores),)
+        if self.options["replacement_policy"] != "all":
+            raise ValueError("Multiple training views require all replacement.")
+        if user.id in self.pending_views or user.id in self.pending_history:
+            raise RuntimeError("Previous synthesis batch was not committed after optimization.")
+        assignment = self._all_assignment(user, indices, risk, round_index, source_round, raw_scores)
+        outputs, records = [], []
+        for view in range(self.options["views_per_record"]):
+            tokens, logged = self._transform_all(model, user, images, labels, indices, risk,
+                round_index, step, source_round, raw_scores=raw_scores, assignment=assignment,
+                view_index=view, previous_views=outputs)
+            outputs.append(tokens)
+            records.append(logged)
+        self.pending_views[user.id] = records
+        if self.options["risk_history"] != "none":
+            self.pending_history[user.id] = (round_index, indices.detach().cpu().clone(), assignment[-2].clone())
+        return tuple(outputs)
+
+    @torch.no_grad()
     def transform(self, model, user, images, labels, indices, risk, round_index, step, source_round, *, raw_scores=None):
+        if self.options["views_per_record"] != 1:
+            raise ValueError("Multiple training views require transform_views; selecting only one is invalid.")
         if self.options["replacement_policy"] == "all":
             return self._transform_all(model, user, images, labels, indices, risk, round_index, step, source_round,
                                        raw_scores=raw_scores)
@@ -462,17 +535,9 @@ class RiskSynthesis:
         self.handle.flush()
         return tokens.detach()
 
-    @torch.no_grad()
-    def _transform_all(self, model, user, images, labels, indices, risk, round_index, step, source_round, *, raw_scores=None):
-        """Replace every position, retaining the best generated semantic candidate.
-
-        Semantic failure never restores the original. An absent finite, changed,
-        norm-valid candidate aborts the batch before optimization instead.
-        """
-        tokens = model.encode_input_tokens(images)
-        original = tokens[:, 1:].flatten(1).cpu()
+    def _all_assignment(self, user, indices, risk, round_index, source_round, raw_scores):
         risk = risk.cpu().float()
-        if risk.shape != (len(tokens),) or not torch.isfinite(risk).all() or (risk < 0).any() or (risk > 1).any():
+        if risk.shape != (len(indices),) or not torch.isfinite(risk).all() or (risk < 0).any() or (risk > 1).any():
             raise ValueError("All replacement requires one finite risk in [0,1] per original record.")
         if source_round < 0:
             risk = torch.zeros_like(risk)
@@ -490,6 +555,21 @@ class RiskSynthesis:
         if user.id not in self.control_generators:
             self.control_generators[user.id] = torch.Generator().manual_seed(self.seed + 1000003*user.id + 31415)
         used, requests = select_requests(assigned, self.options, None, self.control_generators[user.id])
+        return risk, assigned, history_values, history_rounds, joint, used, requests
+
+    @torch.no_grad()
+    def _transform_all(self, model, user, images, labels, indices, risk, round_index, step, source_round, *,
+                       raw_scores=None, assignment=None, view_index=None, previous_views=()):
+        """Replace every position, retaining the best generated semantic candidate.
+
+        Semantic failure never restores the original. An absent finite, changed,
+        norm-valid candidate aborts the batch before optimization instead.
+        """
+        tokens = model.encode_input_tokens(images)
+        original = tokens[:, 1:].flatten(1).cpu()
+        if assignment is None:
+            assignment = self._all_assignment(user, indices, risk, round_index, source_round, raw_scores)
+        risk, assigned, history_values, history_rounds, joint, used, requests = assignment
         geometry, generator = self.geometry[user.id], self.generators[user.id]
         semantic = self.options["semantic_filter"]
         choose_local = self.options["candidate_selection"] == "least_local_similarity"
@@ -518,6 +598,9 @@ class RiskSynthesis:
                     continue
                 if torch.equal(candidate, original[j]):
                     invalid[j] = "unchanged_candidate"
+                    continue
+                if any(torch.equal(candidate, previous[j, 1:].flatten().cpu()) for previous in previous_views):
+                    invalid[j] = "duplicate_training_view"
                     continue
                 batch.append(candidate.reshape(tokens.shape[1]-1, tokens.shape[2]))
                 positions.append(j)
@@ -548,10 +631,13 @@ class RiskSynthesis:
                         invalid[j] = "nonfinite_neighbor_similarity"
                         continue
                     candidate.update(nearest_teacher_cosine=cosine, nearest_teacher_source_id=int(neighbors[pos]))
-                    self.candidate_writer.writerow(dict(round=round_index+1, client=user.id, step=step,
+                    candidate_record = dict(round=round_index+1, client=user.id, step=step,
                         sample_id=int(indices[j]), attempt=attempt, norm_ratio=ratios[pos],
                         teacher_margin_delta=delta, quality_passed=int(quality),
-                        nearest_teacher_cosine=cosine, nearest_teacher_source_id=int(neighbors[pos])))
+                        nearest_teacher_cosine=cosine, nearest_teacher_source_id=int(neighbors[pos]))
+                    if view_index is not None:
+                        candidate_record["view_index"] = view_index
+                    self.candidate_writer.writerow(candidate_record)
                     # Semantic feasibility dominates; if all fail, use maximum
                     # margin as requested. Exact ties retain the earlier draw.
                     key = (int(quality), -cosine if quality else delta, delta)
@@ -569,6 +655,7 @@ class RiskSynthesis:
         if missing:
             raise RuntimeError(f"All replacement could not produce valid changed tokens for client {user.id}, "
                                f"original IDs {missing}; reasons={invalid}. No original-image fallback.")
+        logged_records = []
         for j in requests.tolist():
             chosen = best[j]
             candidate = chosen["token"].flatten().float()
@@ -593,6 +680,10 @@ class RiskSynthesis:
             if choose_local:
                 record.update(nearest_teacher_cosine=chosen["nearest_teacher_cosine"],
                               nearest_teacher_source_id=chosen["nearest_teacher_source_id"])
+            if view_index is not None:
+                record.update(view_index=view_index, loss_weight=1/self.options["views_per_record"])
+                logged_records.append(record)
+                continue
             self.writer.writerow(record)
             count = dict(visits=1, requested=1, accepted=1, fallback=0, quality_failed=int(not quality))
             self.counts.update(count)
@@ -603,12 +694,15 @@ class RiskSynthesis:
         self.handle.flush()
         if self.candidate_handle is not None:
             self.candidate_handle.flush()
+        if view_index is not None:
+            return tokens.detach(), logged_records
         if history_values is not None:
             self.pending_history[user.id] = (round_index, indices.detach().cpu().clone(), used.clone())
         return tokens.detach()
 
     def summary(self):
-        return dict(implementation=("local_token_geometry_v5_history_selection" if
+        return dict(implementation=("local_token_geometry_v6_multiview" if self.options["views_per_record"] > 1 else
+                                    "local_token_geometry_v5_history_selection" if
                                     self.options["risk_history"] != "none" or self.options["candidate_selection"] != "first_semantic" else
                                     "local_token_geometry_v4_all_replacement" if self.options["replacement_policy"] == "all" else
                                     "local_token_geometry_v3_weighted_center" if
@@ -625,6 +719,11 @@ class RiskSynthesis:
                     semantic_failure_policy=("best_generated_candidate" if self.options["replacement_policy"] == "all"
                                              else "original_input"),
                     counts=dict(self.counts), risk_bins={k:dict(v) for k,v in self.risk_bins.items()},
+                    **(dict(view_counts=dict(self.view_counts),
+                            observation_unit="original_visit", view_observation_unit="trained_virtual_view",
+                            original_row_measurement="worst_semantic_view",
+                            loss_normalization="mean_over_views_then_mean_over_original_records",
+                            optimizer_steps_per_original_batch=1) if self.options["views_per_record"] > 1 else {}),
                     formal_dp_enabled=False, client_upload_is_private=False,
                     epsilon=None, delta=None, membership="original_client_train",
                     reference_is_exact_leave_one_out=False, shared_geometry=False)
@@ -643,3 +742,5 @@ class RiskSynthesis:
             self.handle.close()
         if self.candidate_handle is not None:
             self.candidate_handle.close()
+        if self.view_handle is not None:
+            self.view_handle.close()

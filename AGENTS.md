@@ -60,6 +60,8 @@
 - 2026-09-13 的后续原因诊断见 `docs/risk_synthesis_failure_analysis.md`：当前每次访问重新生成，每原始记录100轮有100次替身访问，不能称为固定一个替身。目标客户端风险相邻轮秩相关约-0.206；零风险访问频率与剩余ProjRes分数类别内相关约0.495，支持研究累积近原样暴露因子E。固定教师的2/4候选探针只评价语义/身份接近代理，不能当成新防御攻击效果。该诊断完成时 E、4候选新选择、K视图共同训练均未接入正式实现；后续简化实现见下一条。多视图须按原始记录归一化，不能扩大成员或非成员数，所有统计仍本地。
 - 用户随后要求验证并尽量减少超参数，新增可选 v5：`risk_history: zero_risk_frequency` 记录各原始记录截至上一参与轮的轮内零风险访问比例均值，整轮冻结、optimizer 成功后累计；与原始损失差做固定等权中秩合并，同分按损失差和 batch 顺序，保持原风险权重集合。去掉候选方案的 beta/p/lambda；`candidate_selection: least_local_similarity` 复用 attempts=2，评价两个候选，在语义合格者中最小化与全部本地原始记录的最大教师余弦，全部语义失败仍选语义最佳有效虚拟候选。默认仍为 v4 的 `none/first_semantic`，旧结果不改写；v5数值参数不新增，不代表原几何与语义参数消失。正式验证入口 `scripts/run_synthesis_history_study.py`，方法和冻结判据见 `docs/risk_synthesis_compact_validation.md`。已有127项执行/协议测试通过，百轮效果尚待正式结果；不能将新实现描述为已经有效。v5不包含共同训练K视图。
 
+- 用户于2026-09-13澄清要增加多个替身共同训练。v6新增 `defense.synthesis.views_per_record`，兼容默认1，专用入口 `scripts/run_synthesis_multiview.py` 默认2；每条原始记录的K个独立且不同视图都训练，逐视图CE除以K累积梯度，每原始batch只更新一次。K与attempts重试预算独立，要求全替换；风险只分配一次、历史和原始曝光只在成功优化后按原始记录提交一次。`synthetic_views.csv`记录每视图1/K权重；原始行的语义/范数等字段明确代表语义最差视图，不能误作均值。正式攻击仍评价原始成员，不扩大低FPR分辨率。实现、独立核验及冻结三种子方案见 `docs/risk_synthesis_multiview.md`；真实数据效果待验证，旧结果不改写。
+
 ## 当前 CoFedMID 防御
 
 - `--defenses cofedmid` 已支持三个 CLIP 模型、BERT Adapter/LoRA 和 GPT2 Adapter。默认 `cofedmid_clients: all`，所有客户端协作，且每轮要求全员参与；显式列表可设置至少两个联盟成员。
