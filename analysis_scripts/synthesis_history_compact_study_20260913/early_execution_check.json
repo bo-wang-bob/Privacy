@@ -1,0 +1,19 @@
+{
+  "scope": "First three complete real-data rounds only; not attack efficacy",
+  "source": "/root/Privacy/results/2026-09-13_11-58-28-069991_clip_adapter_cifar100_fedavg_risk_synthesis_seed43_target0_f285c7f541/risk_synthesis/synthetic_exposure.csv",
+  "canonical_batch_prefix_sha256": "d02f847868c5259cc23875b7b529a5afa4da3d8087b845d0894bfbfbae2072ce",
+  "visits_by_round": {
+    "1": 10000,
+    "2": 10000,
+    "3": 10000
+  },
+  "changed_assignments_by_round": {
+    "1": 0,
+    "2": 0,
+    "3": 7696
+  },
+  "batches_verified": 960,
+  "history_replay": true,
+  "risk_multiset_preserved": true,
+  "all_positions_changed": true
+}
