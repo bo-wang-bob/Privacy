@@ -62,3 +62,15 @@ $PY scripts/run_synthesis_history_study.py run --gpu 1 --wait-for-gpu
 计划已于 2026-09-13 冻结，SHA256 为 `6e79f95f5f5fd167c8a28f0be637e0c28b9fa40b2b1e00e3fa05f01b005e3a8d`，训练实现提交为 `0235f8b`。首个 history/seed43 任务于北京时间11:58在 GPU0 启动；另一个工作进程等待 GPU1 空闲。前三个完整真实数据轮次的30,000次访问已独立重放：全部替换，风险权重集合未改变，第一、二轮排序保持原方案，第三轮有7,696次风险分配改变；该证据仅验证机制执行，不代表防御效果。见研究目录 `early_execution_check.json`。
 
 完成后的分析入口为 `scripts/analyze_synthesis_history_study.py`，额外3项判据/身份一致性/拒绝未完成结果测试通过。可用 `--watch` 观察已验证存活的研究进程，全部10任务完成后自动复算15组结果、三种子组合比较、配对候选区间与重复像素敏感性；进程丢失或任务失败会记录错误，不自动重启训练。分析只写新的研究分析目录。
+
+候选选择在真实数据上的数值抽查也已通过：`scripts/check_synthesis_candidate_replay.py` 重建 selection/seed43 首批前两条原始记录的四个候选，绕开生产生成/评分函数及显式 token forward，改用原始 CLIP 的 CPU 像素前向和嵌入输出 hook。范数比误差为0，语义 margin 差最大误差约2.68e-7、最近原始记录余弦最大误差约5.36e-7，最近邻身份与最终选择一致。该检查仅覆盖这两条原始记录，不是完整候选评分复算或攻击效果。结果保存为研究目录 `candidate_numerical_spot_check.json`。
+
+正式结果生成后，还需运行按原始记录的暴露分布汇总，供最终解释历史因子的机制作用：
+
+```bash
+/root/.local/share/mamba/envs/pfedba/bin/python scripts/summarize_synthesis_exposure_distribution.py \
+  analysis_scripts/synthesis_history_compact_study_20260913/analysis/metrics/verified_results.json \
+  --output analysis_scripts/synthesis_history_compact_study_20260913/exposure_distributions
+```
+
+保留量、零风险频率和教师邻近度排除参考不可用的启动访问；语义失败率与尝试次数包含全部访问；旧版不存在的历史/教师字段保持缺失，不填0。汇总脚本已在两组旧百轮全替换的200万次访问、20,000个原始记录上验证，复现目标客户端零风险次数均值18.513及真实风险0～64、打乱风险7～32的范围；参考检查保存于研究目录 `exposure_pipeline_reference_check/`。新方法的暴露分布必须等待对应完整实验，不能用这些旧值代替。

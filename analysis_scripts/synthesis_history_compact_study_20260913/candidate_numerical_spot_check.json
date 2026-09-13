@@ -1,0 +1,76 @@
+{
+  "status": "passed_cpu_numerical_spot_check",
+  "scope": "First two originals, two candidates each, first batch only; no optimizer or MIA measurement.",
+  "run": "/root/Privacy/results/2026-09-13_12-07-35-739653_clip_adapter_cifar100_fedavg_risk_synthesis_seed43_target0_03b935a1ae",
+  "client": 0,
+  "results": [
+    {
+      "sample_id": 895,
+      "attempt": 1,
+      "recomputed_margin_delta": 0.0006367862224578857,
+      "recomputed_nearest_cosine": 0.995090126991272,
+      "nearest_source_id": 895,
+      "absolute_errors": {
+        "norm_ratio": 0.0,
+        "margin_delta": 2.682209014892578e-07,
+        "nearest_cosine": 5.960464477539063e-08
+      }
+    },
+    {
+      "sample_id": 995,
+      "attempt": 1,
+      "recomputed_margin_delta": 0.00011536478996276855,
+      "recomputed_nearest_cosine": 0.9938573837280273,
+      "nearest_source_id": 995,
+      "absolute_errors": {
+        "norm_ratio": 0.0,
+        "margin_delta": 0.0,
+        "nearest_cosine": 5.960464477539063e-08
+      }
+    },
+    {
+      "sample_id": 895,
+      "attempt": 2,
+      "recomputed_margin_delta": 0.0019834041595458984,
+      "recomputed_nearest_cosine": 0.997360348701477,
+      "nearest_source_id": 895,
+      "absolute_errors": {
+        "norm_ratio": 0.0,
+        "margin_delta": 5.960464477539063e-08,
+        "nearest_cosine": 5.364418029785156e-07
+      }
+    },
+    {
+      "sample_id": 995,
+      "attempt": 2,
+      "recomputed_margin_delta": 0.0029459893703460693,
+      "recomputed_nearest_cosine": 0.9912341833114624,
+      "nearest_source_id": 995,
+      "absolute_errors": {
+        "norm_ratio": 0.0,
+        "margin_delta": 2.086162567138672e-07,
+        "nearest_cosine": 1.1920928955078125e-07
+      }
+    }
+  ],
+  "decisions": [
+    {
+      "sample_id": 895,
+      "selected_attempt": 1
+    },
+    {
+      "sample_id": 995,
+      "selected_attempt": 2
+    }
+  ],
+  "sources": {
+    "/root/Privacy/results/2026-09-13_12-07-35-739653_clip_adapter_cifar100_fedavg_risk_synthesis_seed43_target0_03b935a1ae/run_config.yaml": "1996f0e54cb2d57e8d2bd1fae97c4a4d2177259c4764b22cff611ceb63f411dd",
+    "/root/Privacy/results/2026-09-13_12-07-35-739653_clip_adapter_cifar100_fedavg_risk_synthesis_seed43_target0_03b935a1ae/risk_synthesis/client_0_distribution.pt": "ce966cd8dab4c79d7dde6f64fead5ad588e83afbc8704d188fbbd28406e9c9e5",
+    "/root/Privacy/results/2026-09-13_12-07-35-739653_clip_adapter_cifar100_fedavg_risk_synthesis_seed43_target0_03b935a1ae/risk_synthesis/client_0_source_codes.pt": "7d58d47cf899f7a2d8654226bb4064f83900080ae31416621d2ead271ad493bb",
+    "/root/Privacy/data/CIFAR100/data/cifar-100-python/meta": "a5d4786345c961390f865e93b434dbd5c6904ce880667e0cb888c97d449f28b9",
+    "/root/Privacy/checkpoints/clip-vit-base-patch32/models--openai--clip-vit-base-patch32/snapshots/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/config.json": "b575ef3c36f2a057fa19e221650105052d61cc9c1a972ec15019c6261ec98770",
+    "/root/Privacy/checkpoints/clip-vit-base-patch32/models--openai--clip-vit-base-patch32/snapshots/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/pytorch_model.bin": "a63082132ba4f97a80bea76823f544493bffa8082296d62d71581a4feff1576f",
+    "/root/Privacy/scripts/check_synthesis_candidate_replay.py": "8421a11c690e3395156a987b6f09bcbdb0dcf43a8fe2e5486c3260c4f6cf7f7d"
+  },
+  "logged_prefix_sha256": "3fe3774fdcee251781f47650b64ac6226f7a4d0261548b9c095b70fd2fd059ac"
+}
