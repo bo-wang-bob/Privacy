@@ -89,6 +89,38 @@ def test_global_generation_requires_broadcast_and_valid_mode():
             defense=dict(name='risk_synthesis',synthesis={**DEFAULTS,'global_distribution':'bad'})))
 
 
+def test_global_center_equals_all_other_same_class_records_and_needs_no_new_exchange(tmp_path):
+    a = geometry([[1.,2.],[4.,1.],[7.,3.]],[0,0,0])
+    b = geometry([[20.,5.],[22.,6.],[24.,7.],[26.,8.],[1000.,9000.]],[0,0,0,0,1])
+    options = {**DEFAULTS,'global_distribution':'generate','center_source':'global_class'}
+    info = exchange({0:a,1:b},tmp_path,options,'cpu')
+    expected_center = torch.cat([a.codes[1:],b.codes[:4]]).mean(0)
+    center = a.global_leave_source_out_center(0)
+    torch.testing.assert_close(center,expected_center)
+    assert not torch.allclose(center,a.codes[1:].mean(0))
+    f = a.global_distribution['classes'][0]['factor']
+    for r in (0.,.4,1.):
+        candidate = a.sample(a.codes[0],0,r,options,torch.Generator().manual_seed(9))
+        noise = .1*(f@torch.randn(f.shape[1],generator=torch.Generator().manual_seed(9)))
+        torch.testing.assert_close(candidate,(1-r)*a.codes[0]+r*expected_center+noise)
+    assert info['aggregation_count']==1
+    # Even changing just the source in the original dataset does not change
+    # the center of all *other* records when moments are recomputed.
+    a2=geometry([[999.,-123.],[4.,1.],[7.,3.]],[0,0,0])
+    a2.global_distribution=aggregate_moments({0:local_moments(a2,'cpu'),1:local_moments(b,'cpu')},5,'cpu')
+    torch.testing.assert_close(a2.global_leave_source_out_center(0),expected_center)
+
+
+@pytest.mark.parametrize('overrides', [
+    {'global_distribution':'disabled'}, {'global_distribution':'share_only'},
+    {'center_weighting':'previous_risk'}])
+def test_global_center_rejects_missing_exchange_or_unavailable_risk_weighting(overrides):
+    options={**DEFAULTS,'global_distribution':'generate','center_source':'global_class',**overrides}
+    with pytest.raises(ValueError,match='Global class centers'):
+        validate_risk_synthesis(dict(model_type='clip_lora',aggregator='fedavg',sample_users=2,
+            defense=dict(name='risk_synthesis',synthesis=options)))
+
+
 def test_default_single_view_training_and_broadcast_tamper_detection(tmp_path):
     from aggregator.aggregator_builder import build_aggregator
     from servers.serverbase import ServerBase

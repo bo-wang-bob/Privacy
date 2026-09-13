@@ -571,6 +571,7 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             all_positions = synthesis.get("replacement_policy", "risk_probability") == "all"
             print(f"      synthesis=policy:{synthesis.get('replacement_policy', 'risk_probability')} "
                   f"global_distribution:{synthesis.get('global_distribution', 'disabled')} "
+                  f"center_source:{synthesis.get('center_source', 'local_class')} "
                   f"views_per_record:{synthesis.get('views_per_record', 1)} "
                   f"warmup_rounds:{synthesis['warmup_rounds']} "
                   f"semantic_failure:{'best_generated_candidate' if all_positions else 'original_input'}")

@@ -28,6 +28,13 @@ def verify(directory):
     directory = Path(directory)
     summary_path = directory/'synthesis_summary.json'
     summary = json.loads(summary_path.read_text())
+    center_source = summary['options'].get('center_source', 'local_class')
+    require(center_source in {'local_class', 'global_class'}, 'Unknown center source.')
+    require(summary['generation_center'] == f'{center_source.split("_")[0]}_same_class_leave_source_out',
+            'Generation center metadata mismatch.')
+    if center_source == 'global_class':
+        require(summary['options']['global_distribution'] == 'generate' and
+                summary['options']['center_weighting'] == 'uniform', 'Invalid global center protocol.')
     evidence = summary['global_distribution']
     require(summary['shared_geometry'] and evidence is not None, 'No global geometry exchange recorded.')
     require(evidence['artifact'] == 'global_distribution.pt', 'Unexpected global artifact.')
@@ -93,6 +100,7 @@ def verify(directory):
         require(error < 2e-5, 'Global covariance projection mismatch.')
         max_relative_error = max(max_relative_error, error)
     return dict(status='verified', recipients=clients, classes=len(state['classes']),
+        generation_center=summary['generation_center'],
         covariance_check='eight_fixed_probe_directions_per_class_from_uploaded_moments',
         max_covariance_relative_error=max_relative_error, source_hashes=sources,
         statistics_in_existing_attack_view=False)

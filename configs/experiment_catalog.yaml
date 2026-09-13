@@ -204,6 +204,7 @@ defense_overrides:
           noise_scale: 0.1
           class_rank: 5
           global_distribution: generate
+          center_source: global_class
           min_class_samples: 3
           attempts: 2
           margin_tolerance: 0.02

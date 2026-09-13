@@ -1,6 +1,6 @@
 # 首轮全局类别分布
 
-2026-09-13。用户要求加入 Ma 等《Geometric Knowledge-Guided Localized Global Distribution Alignment for Federated Learning》的首轮统计共享，并确认：**噪声用全局同类别几何，风险中心仍用本地同类样本**。实现版本为 `local_token_geometry_v8_global_class`。
+2026-09-13。用户要求加入 Ma 等《Geometric Knowledge-Guided Localized Global Distribution Alignment for Federated Learning》的首轮统计共享，随后进一步要求中心也使用全局同类统计。当前默认是**全局同类别几何＋全局同类排除自身的中心**，实现版本为 `local_token_geometry_v9_global_center`。此前 v8 的全局噪声＋本地中心保留为对照。
 
 ## 聚合协议
 
@@ -28,12 +28,12 @@ N_c=\sum_k n_{k,c},\qquad
 局部上传包含完整数值秩因子，**不会先按 class_rank 截断本地统计**。服务器拼接加权因子和均值偏移列后做特征分解，保存完整数值秩的全局协方差因子及特征值；全局分布不是仅五维的统计。生成阶段才按已有 `class_rank=5` 取前几个方向，没有新增秩或混合权重超参数。资源开销随类内样本数和数值秩增加，完整数据集设置可能明显增加初始化成本。
 
 \[
-\tilde h_{i,v}=(1-r_i)h_i+r_i\mu^{\mathrm{local}}_{-i}
+\tilde h_{i,v}=(1-r_i)h_i+r_i\mu^{\mathrm{global}}_{-i}
 +0.1L_c^{\mathrm{global}}\epsilon_{i,v},\qquad
 L_c^{\mathrm{global}}=U_{c,1:q}\sqrt{\Lambda_{c,1:q}}.
 \]
 
-全局均值下发供客户端获得完整分布，但不替换生成中心；中心仍在本地同类中排除原样本自身。全局协方差包含原始训练集中的该样本，不能称为全局 leave-one-out 统计。两个替身独立加噪并共同训练，仍对每条原始记录的K个视图平均CE，每个原始batch只做一次optimizer step。风险、语义重试、全部替换以及原始成员候选池不变。
+生成中心使用已下发的全局类别均值和样本数，在客户端扣除当前原始记录一次：`mu_global_without_i = (N_c * mu_global_c - h_i) / (N_c - 1)`。它等于所有客户端中其余同类原始记录的平均编码，按样本数加权，不是客户端均值的简单平均；不扣除整个目标客户端。计算不需要额外通信，不重复统计，两个视图仍使用同一个排除自身中心。全局协方差包含原始训练集中的该样本，不能称为全局 leave-one-out 统计。两个替身独立加噪并共同训练，仍对每条原始记录的K个视图平均CE，每个原始batch只做一次optimizer step。风险、语义重试、全部替换以及原始成员候选池不变。
 
 本次只接入论文的统计聚合/下发步骤。论文在最终CLIP embedding上生成，式(5)的噪声使用特征值λ；这里仍保留输入token、低秩及sqrt(λ)噪声。因此是现有方法的扩展，不是整篇论文逐项复现。
 
@@ -60,10 +60,16 @@ $PY scripts/run_synthesis_multiview.py --dry-run
 $PY scripts/run_synthesis_multiview.py --gpus 0
 ```
 
-catalog 默认 `defense.synthesis.global_distribution=generate`。`--set defense.synthesis.global_distribution=disabled` 关闭统计交换作本地几何对照；`share_only` 仅共享、不改用全局噪声。直接加载缺少新字段的旧配置按disabled处理，避免悄悄修改历史训练协议。
+catalog 默认 `defense.synthesis.global_distribution=generate` 和 `defense.synthesis.center_source=global_class`。
 
-验证覆盖：不等样本数权重、缺失类别、零类内方差时的客户端均值差异项、完整局部数值秩上传、全局采样与本地中心的组合、全部客户端接收全部类别，以及Adapter/LoRA的多轮多视图与11种攻击集成。独立核验脚本 `scripts/verify_synthesis_global_geometry.py` 校验文件哈希、接收回执、权重/均值，并用每类8个固定探针方向检查聚合协方差；探针检查不等于对真实高维矩阵的逐元素完整重算，中央协方差的完整逐元素对照由小规模数值测试完成。
+- `--set defense.synthesis.center_source=local_class`：保留全局噪声，恢复 v8 本地中心对照。
+- 同时加 `--set defense.synthesis.global_distribution=disabled --set defense.synthesis.center_source=local_class`：关闭统计交换，作 v7 本地中心＋本地噪声对照。
+- `share_only` 要求 `center_source=local_class`，仅共享、不使用全局统计生成。
 
-当前没有 v8 全局几何的真实数据隐私或准确率效果结论。
+直接加载缺少新字段的旧配置，global_distribution缺省disabled、center_source缺省local_class，避免悄悄修改历史训练协议。全局中心要求global_distribution=generate及uniform中心权重；不会把本地历史风险权重冒充全局加权中心。center_source是协议对照选项，没有新增连续混合系数。
 
-最终验证：156项相关测试通过（12.43秒）；统一入口干运行明确显示 `global_distribution:generate`、`views_per_record:2`、FedAvg100轮、每类100张，未启动真实训练或创建结果目录。`git diff --check` 通过。
+验证覆盖：不等样本数权重、缺失类别、零类内方差时的客户端均值差异项、完整局部数值秩上传、全局采样与本地/全局中心的组合、排除自身中心的中央计算对照、全部客户端接收全部类别，以及Adapter/LoRA的多轮多视图与11种攻击集成。独立核验脚本 `scripts/verify_synthesis_global_geometry.py` 校验文件哈希、接收回执、权重/均值，并用每类8个固定探针方向检查聚合协方差；探针检查不等于对真实高维矩阵的逐元素完整重算，中央协方差的完整逐元素对照由小规模数值测试完成。
+
+当前没有 v8/v9 全局几何或全局中心的真实数据隐私或准确率效果结论。
+
+最终验证：162项相关测试通过（17.20秒）；统一入口干运行明确显示 `global_distribution:generate`、`center_source:global_class`、`views_per_record:2`、FedAvg100轮、每类100张，未启动真实训练或创建结果目录。`git diff --check` 通过。
