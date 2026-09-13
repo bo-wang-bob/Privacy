@@ -18,8 +18,8 @@ from utils.performance import measure_stage
 
 
 LEGACY_DEFAULTS = dict(
-    replacement_fraction=0.25, noise_scale=0.1, shrinkage=0.5,
-    class_rank=5, pooled_rank=16, min_class_samples=3, attempts=2,
+    replacement_fraction=0.25, noise_scale=0.1,
+    class_rank=5, min_class_samples=3, attempts=2,
     margin_tolerance=0.02, norm_ratio_min=0.5, norm_ratio_max=2.0,
     mode="risk", semantic_filter=True, warmup_rounds=1,
     center_weighting="uniform", replacement_policy="risk_probability",
@@ -32,6 +32,9 @@ DEFAULTS = {**LEGACY_DEFAULTS, "replacement_policy": "all", "replacement_fractio
 def synthesis_options(options):
     """Preserve saved partial-replacement configurations lacking a policy field."""
     options = options or {}
+    removed = set(options) & {"shrinkage", "pooled_rank"}
+    if removed:
+        raise ValueError(f"Class-only synthesis removed options {sorted(removed)}; old pooled runs require their original code version.")
     legacy = bool(options) and options.get("replacement_policy", "risk_probability") == "risk_probability"
     return {**(LEGACY_DEFAULTS if legacy else DEFAULTS), **options}
 
@@ -54,7 +57,7 @@ def validate_risk_synthesis(config):
     unknown = set(options) - set(DEFAULTS)
     if unknown:
         raise ValueError(f"Unknown synthesis options: {sorted(unknown)}")
-    for key in ("replacement_fraction", "shrinkage"):
+    for key in ("replacement_fraction",):
         if not math.isfinite(float(options[key])) or not 0 <= options[key] <= 1:
             raise ValueError(f"synthesis.{key} must be in [0,1].")
     for key in ("noise_scale", "margin_tolerance", "norm_ratio_min", "norm_ratio_max"):
@@ -62,7 +65,7 @@ def validate_risk_synthesis(config):
             raise ValueError(f"synthesis.{key} must be finite and nonnegative.")
     if options["norm_ratio_min"] > options["norm_ratio_max"]:
         raise ValueError("Invalid synthesis norm ratio interval.")
-    for key in ("class_rank", "pooled_rank", "min_class_samples", "attempts", "views_per_record"):
+    for key in ("class_rank", "min_class_samples", "attempts", "views_per_record"):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f"synthesis.{key} must be a positive integer.")
     if options["min_class_samples"] < 3:
@@ -122,7 +125,6 @@ class LocalGeometry:
         self.codes = codes.detach().cpu().float()
         self.labels = labels.detach().cpu().long()
         self.classes = {}
-        residual = torch.empty_like(self.codes)
         for c in self.labels.unique().tolist():
             indices = torch.where(self.labels == c)[0]
             rows = self.codes[indices]
@@ -130,12 +132,10 @@ class LocalGeometry:
             centered = rows - mean
             factor, meta = low_rank_factor(centered.to(device), min(options["class_rank"], len(rows)-1))
             self.classes[c] = dict(indices=indices, mean=mean, factor=factor, **meta)
-            residual[indices] = centered
-        self.pooled, self.pooled_meta = low_rank_factor(residual.to(device), options["pooled_rank"])
 
     def state(self):
-        return dict(labels=self.labels, classes=self.classes, pooled_factor=self.pooled,
-                    pooled_metadata=self.pooled_meta, source_sha256=hashlib.sha256(
+        return dict(labels=self.labels, classes=self.classes, geometry_source="local_class_only",
+                    source_sha256=hashlib.sha256(
                         self.codes.numpy().tobytes() + self.labels.numpy().tobytes()).hexdigest())
 
     def leave_source_out_center(self, index, weights=None):
@@ -167,10 +167,8 @@ class LocalGeometry:
             anchor = self.codes[donor]
         else:
             anchor = self.leave_source_out_center(index, center_weights)
-        noise = torch.zeros_like(anchor)
-        for factor, weight in ((group["factor"], 1-options["shrinkage"]),
-                               (self.pooled, options["shrinkage"])):
-            noise.add_(factor @ torch.randn(factor.shape[1], generator=generator), alpha=math.sqrt(weight))
+        factor = group["factor"]
+        noise = factor @ torch.randn(factor.shape[1], generator=generator)
         scale = 0.0 if options["mode"] == "mixup" else options["noise_scale"]
         return (1-risk) * original.cpu() + risk * anchor + scale * noise
 
@@ -345,7 +343,6 @@ class RiskSynthesis:
             # pages on machines with much less host RAM than GPU RAM.
             mapped = torch.load(distribution_path, map_location="cpu", weights_only=True, mmap=True)
             geometry.classes = mapped["classes"]
-            geometry.pooled = mapped["pooled_factor"]
             geometry.codes = torch.load(code_path, map_location="cpu", weights_only=True, mmap=True)
             self.generators[user.id] = torch.Generator().manual_seed(self.seed + 1000003 * user.id + 9173)
         self.write_summary("initialized")
@@ -701,12 +698,8 @@ class RiskSynthesis:
         return tokens.detach()
 
     def summary(self):
-        return dict(implementation=("local_token_geometry_v6_multiview" if self.options["views_per_record"] > 1 else
-                                    "local_token_geometry_v5_history_selection" if
-                                    self.options["risk_history"] != "none" or self.options["candidate_selection"] != "first_semantic" else
-                                    "local_token_geometry_v4_all_replacement" if self.options["replacement_policy"] == "all" else
-                                    "local_token_geometry_v3_weighted_center" if
-                                    self.options["center_weighting"] == "previous_risk" else "local_token_geometry_v2"),
+        return dict(implementation="local_token_geometry_v7_class_only",
+                    geometry_source="local_class_only",
                     options=self.options, seed=self.seed,
                     history_definition=("mean_per_round_zero_assigned_risk_frequency" if
                                         self.options["risk_history"] != "none" else None),

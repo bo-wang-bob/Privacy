@@ -62,6 +62,8 @@
 
 - 用户于2026-09-13澄清要增加多个替身共同训练。v6新增 `defense.synthesis.views_per_record`，兼容默认1，专用入口 `scripts/run_synthesis_multiview.py` 默认2；每条原始记录的K个独立且不同视图都训练，逐视图CE除以K累积梯度，每原始batch只更新一次。K与attempts重试预算独立，要求全替换；风险只分配一次、历史和原始曝光只在成功优化后按原始记录提交一次。`synthetic_views.csv`记录每视图1/K权重；原始行的语义/范数等字段明确代表语义最差视图，不能误作均值。正式攻击仍评价原始成员，不扩大低FPR分辨率。实现、独立核验及冻结三种子方案见 `docs/risk_synthesis_multiview.md`；真实数据效果待验证，旧结果不改写。
 
+- 用户随后明确删除本地合并类内几何。最新v7仅用当前客户端当前类别的协方差因子，噪声为 `0.1*L_class*epsilon`；删除 `pooled_rank`、`shrinkage`，不构造/保存/使用合并协方差。新状态标记 `geometry_source: local_class_only`，旧结果分析保留历史字段；带旧参数的训练配置拒绝执行，旧混合协议须用旧代码复现。K=2共同训练与原始记录归一化保持。此前未运行的混合几何多视图计划已取消；新版为三种子类别几何K=1/K=2六任务，使用独立新计划目录，不把旧混合K=1当作多视图独立收益对照。见 `docs/risk_synthesis_multiview.md`。
+
 ## 当前 CoFedMID 防御
 
 - `--defenses cofedmid` 已支持三个 CLIP 模型、BERT Adapter/LoRA 和 GPT2 Adapter。默认 `cofedmid_clients: all`，所有客户端协作，且每轮要求全员参与；显式列表可设置至少两个联盟成员。

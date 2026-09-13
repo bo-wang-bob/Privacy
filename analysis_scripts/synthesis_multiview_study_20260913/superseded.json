@@ -1,0 +1,14 @@
+{
+  "status": "superseded_before_training",
+  "reason": "User requested removal of pooled within-class geometry; replace pending study with class-only K=1/K=2 comparisons.",
+  "training_jobs_launched": 0,
+  "previous_plan_sha256": "1b07282357a4adf9b28251033bf9cce9402fa3bc40d0a91fbc147c357d56ee80",
+  "previous_plan_commit": "b12e1e5",
+  "replacement_study": "analysis_scripts/synthesis_class_only_multiview_study_20260913",
+  "cancelled_waiter_pids": [
+    124981,
+    125005
+  ],
+  "dependency_status_note": "KeyboardInterrupt stopped waiting processes; their failed status does not represent failed training.",
+  "recorded_at_utc": "2026-09-13T08:44:31.590341+00:00"
+}

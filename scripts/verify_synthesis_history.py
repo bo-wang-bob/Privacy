@@ -34,6 +34,9 @@ def verify(directory):
     summary_path = directory / "synthesis_summary.json"
     summary = json.loads(summary_path.read_text())
     options = summary["options"]
+    class_only = summary.get("geometry_source") == "local_class_only"
+    if class_only:
+        require(not ({"pooled_rank", "shrinkage"} & set(options)), "Class-only options retain removed pooled parameters.")
     multiview = options.get("views_per_record", 1) > 1
     multiview_evidence = None
     if multiview:
@@ -43,13 +46,16 @@ def verify(directory):
         multiview_evidence = verify_views(directory)
     history_enabled = options.get("risk_history", "none") == "zero_risk_frequency"
     choices_enabled = not multiview and options.get("candidate_selection", "first_semantic") == "least_local_similarity"
-    require(history_enabled or choices_enabled or multiview, "No v5 history or selection to verify.")
+    require(history_enabled or choices_enabled or multiview or class_only, "No v5 history or selection to verify.")
     require(summary["status"] == "completed", "Cannot verify incomplete synthesis.")
     sources = [summary_path, directory / "synthetic_exposure.csv"]
     sizes = {}
     for path in directory.glob("client_*_distribution.pt"):
         client = int(path.stem.split("_")[1])
         state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        if class_only:
+            require(state.get("geometry_source") == "local_class_only"
+                    and not ({"pooled_factor", "pooled_metadata"} & set(state)), "Unexpected pooled geometry in class-only run.")
         sizes[client] = len(state["labels"])
         if choices_enabled:
             z = state["semantic_source_features"]

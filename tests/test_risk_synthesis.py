@@ -159,14 +159,17 @@ def test_generation_center_excludes_source_and_covariance_is_local_within_class(
     codes = torch.randn(8, 12)
     codes[4:] += 100
     labels = torch.tensor([0]*4+[1]*4)
-    options = {**DEFAULTS,"noise_scale":0,"class_rank":3,"pooled_rank":8}
+    options = {**DEFAULTS,"noise_scale":0,"class_rank":3}
     geometry = LocalGeometry(codes,labels,options,"cpu")
     gen = torch.Generator().manual_seed(4)
     torch.testing.assert_close(geometry.sample(codes[0],0,1.,options,gen),codes[1:4].mean(0))
     torch.testing.assert_close(geometry.sample(codes[0],0,0.,options,gen),codes[0])
-    residual = torch.cat([codes[:4]-codes[:4].mean(0),codes[4:]-codes[4:].mean(0)])
-    torch.testing.assert_close(geometry.pooled @ geometry.pooled.T,residual.T @ residual/8,atol=1e-5,rtol=1e-4)
-    assert float((geometry.pooled @ geometry.pooled.T).trace()) < 100
+    for c in (0,1):
+        local = codes[labels==c]
+        residual = local-local.mean(0)
+        factor = geometry.classes[c]['factor']
+        torch.testing.assert_close(factor @ factor.T,residual.T @ residual/len(local),atol=1e-5,rtol=1e-4)
+    assert not hasattr(geometry,'pooled') and 'pooled_factor' not in geometry.state()
 
 
 def test_weighted_center_excludes_source_and_uniform_weights_preserve_arithmetic():

@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 from aggregator.aggregator_builder import build_aggregator
 from privacy_defenses.controller import DefenseController
-from privacy_defenses.risk_synthesis import DEFAULTS, validate_risk_synthesis
+from privacy_defenses.risk_synthesis import DEFAULTS, LocalGeometry, validate_risk_synthesis
 from servers.serverbase import ServerBase
 from test_clip_peft_fedsgd import ATTACKS, _audit_config
 from test_risk_synthesis import make_model, dataset, deterministic_cpu
@@ -32,6 +32,43 @@ def multiview_mechanism(k=2, history=False):
     synth.writer.writeheader()
     synth.exposure[0]['synthetic_views'] = torch.zeros(8, dtype=torch.long)
     return synth, *rest
+
+
+def test_class_noise_ignores_other_class_geometry_and_has_no_pooled_directions():
+    # Class0 varies only along x; class1 varies strongly along y.
+    codes = torch.tensor([[1.,2.],[2.,2.],[3.,2.],[4.,2.],
+                          [100.,0.],[100.,100.],[100.,200.],[100.,300.]])
+    labels = torch.tensor([0]*4+[1]*4)
+    first = LocalGeometry(codes, labels, DEFAULTS, 'cpu')
+    changed = codes.clone()
+    changed[4:] = torch.randn(4,2)*10000
+    second = LocalGeometry(changed, labels, DEFAULTS, 'cpu')
+    a, b = torch.Generator().manual_seed(8), torch.Generator().manual_seed(8)
+    for _ in range(20):
+        x = first.sample(codes[0],0,.6,DEFAULTS,a)
+        y = second.sample(codes[0],0,.6,DEFAULTS,b)
+        torch.testing.assert_close(x,y,rtol=0,atol=0)
+        assert x[1].item()==2., 'Other-class y variation must not enter class0 noise.'
+    assert 'pooled_factor' not in first.state() and 'pooled_metadata' not in first.state()
+    assert first.state()['geometry_source']=='local_class_only'
+
+
+@pytest.mark.parametrize('removed', [{'pooled_rank':16},{'shrinkage':0.5}])
+def test_removed_pooled_options_fail_instead_of_silently_changing_old_protocol(removed):
+    config = dict(model_type='clip_lora',aggregator='fedavg',sample_users=2,
+                  defense=dict(name='risk_synthesis',synthesis={**DEFAULTS,**removed}))
+    with pytest.raises(ValueError,match='removed options'):
+        validate_risk_synthesis(config)
+
+
+def test_zero_variance_class_does_not_borrow_noise_from_other_classes():
+    synth, model, images, labels, ids, original = multiview_mechanism()
+    synth.options['semantic_filter'] = False
+    factor = synth.geometry[0].classes[0]['factor']
+    synth.geometry[0].classes[0]['factor'] = factor[:, :0]
+    with pytest.raises(RuntimeError,match='unchanged_candidate'):
+        synth.transform_views(model,SimpleNamespace(id=0),images,labels,ids,torch.zeros(8),0,0,-1)
+    assert not synth.pending_views and not synth.counts
 
 
 @pytest.mark.parametrize('k', [2, 3])
@@ -167,7 +204,7 @@ def test_multiview_full_training_keeps_original_membership(kind, history, select
     assert len(list(csv.DictReader((tmp_path/'risk_synthesis/synthetic_exposure.csv').open()))) == 126
     assert len(list(csv.DictReader((tmp_path/'risk_synthesis/synthetic_views.csv').open()))) == 252
     summary = json.loads((tmp_path/'risk_synthesis/synthesis_summary.json').read_text())
-    assert summary['implementation']=='local_token_geometry_v6_multiview'
+    assert summary['implementation']=='local_token_geometry_v7_class_only'
     from scripts.analyze_risk_synthesis import read_synthesis_mechanism
     verified = read_synthesis_mechanism(tmp_path/'risk_synthesis', summary, complete=True)
     assert verified['counts']['visits'] == 126

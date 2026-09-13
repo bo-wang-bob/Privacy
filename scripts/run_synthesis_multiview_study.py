@@ -1,4 +1,4 @@
-"""Frozen K=2 training study, queued after the existing single-view experiments."""
+"""Frozen local-class-only geometry comparison with one or two trained views."""
 import argparse
 import json
 import os
@@ -14,19 +14,19 @@ from scripts.run_synthesis_history_study import normalized, comparison_protocol,
 COMMON = Path(subprocess.check_output(['git','rev-parse','--git-common-dir'],cwd=ROOT,text=True).strip())
 MAIN_ROOT = (ROOT/COMMON).resolve().parent
 PRIOR = MAIN_ROOT/'analysis_scripts/synthesis_history_compact_study_20260913'
-STUDY = ROOT/'analysis_scripts/synthesis_multiview_study_20260913'
+STUDY = ROOT/'analysis_scripts/synthesis_class_only_multiview_study_20260913'
 
 
 def prepare():
     old = json.loads((PRIOR/'plan.json').read_text())
     controls = {k:v for k,v in old['controls'].items() if k in ('none_43','none_44','none_45','baseline_43')}
     jobs = []
-    for seed in (43,44,45):
+    for arm,seed,k in [(a,s,k) for s in (43,44,45) for a,k in [('singleview',1),('multiview',2)]]:
         arguments = ['--models','clip_adapter','--datasets','cifar100','--methods','fedavg',
             '--defenses','risk_synthesis','--attacks','all','--seeds',str(seed),'--rounds','100',
             '--set',f"confirmation_split_manifest={old['confirmation_manifest']}",
             '--set',f"confirmation_split_sha256={old['confirmation_manifest_sha256']}",
-            '--set','defense.synthesis.views_per_record=2',
+            '--set',f'defense.synthesis.views_per_record={k}',
             '--set','defense.synthesis.risk_history=none',
             '--set','defense.synthesis.candidate_selection=first_semantic',
             '--set','defense.synthesis.mode=risk']
@@ -34,7 +34,7 @@ def prepare():
         protocol = comparison_protocol(config)
         if protocol != controls[f'none_{seed}']['protocol']:
             raise ValueError('Multiview protocol does not match the original-record control.')
-        jobs.append(dict(id=f'multiview_{seed}',arm='multiview',seed=seed,arguments=arguments,
+        jobs.append(dict(id=f'{arm}_{seed}',arm=arm,seed=seed,arguments=arguments,
                          protocol=protocol,defense=config['defense']))
     sources = set(old['source_hashes']) | {'scripts/run_synthesis_multiview_study.py',
         'scripts/run_synthesis_multiview.py','scripts/verify_synthesis_multiview.py',
@@ -48,22 +48,23 @@ def prepare():
         pending_baseline_controls={f'baseline_{s}':str(PRIOR/f'baseline_{s}.json') for s in (44,45)},
         confirmation_manifest=old['confirmation_manifest'],confirmation_manifest_sha256=old['confirmation_manifest_sha256'],
         environment=old['environment'],
-        hypothesis='Two independently generated virtual views both contribute to each original-record update.',
-        scope='CLIP transformer Adapter/CIFAR100; K=2; seeds43/44/45; 100 FedAvg rounds; 100 originals/class; '
+        hypothesis='Use only local class covariance; compare K=1 and K=2 without pooled geometry or shrinkage.',
+        scope='CLIP transformer Adapter/CIFAR100; local-class-only geometry; K=1 and K=2; seeds43/44/45; 100 FedAvg rounds; 100 originals/class; '
               '10 IID clients; target0; 1000 original members and 1000 independent evaluation nonmembers. '
               'Existing studied source/seed identities; not untouched-data or cross-model confirmation.',
         training='Mean CE across K views and B originals; one optimizer step per original batch; '
                  'same risk per original across views; semantic retry budget is separate from trained views.',
-        hyperparameters=dict(views_per_record=2,search_performed=False,risk_history='none',candidate_selection='first_semantic',
+        hyperparameters=dict(views_per_record=[1,2],removed_parameters=['pooled_rank','shrinkage'],search_performed=False,risk_history='none',candidate_selection='first_semantic',
                              unchanged_generation_parameters=config['defense']['synthesis'],
                              caveat='K is an explicit view-count choice. No new loss coefficient, threshold or risk-history parameter.'),
         criteria=dict(overall_vs_none='Each seed: max11 AUC drop >=0.02, max11 TPR@1% drop >0, accuracy loss <=0.02.',
-                      added_value_vs_single_view='Each seed: max11 AUC and TPR both lower; accuracy loss <=0.02.',
+                      added_value_vs_single_view='Compare class-only K=2 against class-only K=1: each seed max11 AUC and TPR lower; accuracy loss <=0.02.',
+                      geometry_removal='Separately compare class-only K=1 with the historical pooled K=1 per seed; do not attribute both changes to K.',
                       reporting='All scheduled seeds and 100-round checkpoints; all11 attacks; paired candidate intervals, '
                                 'class-conditional metrics, original/view counts, semantic failures and runtime. No post-hoc K tuning.'))
     STUDY.mkdir(exist_ok=False)
     save(STUDY/'plan.json',plan,exclusive=True)
-    print(json.dumps(dict(plan=str(STUDY/'plan.json'),sha256=digest(STUDY/'plan.json'),new_jobs=3),indent=2))
+    print(json.dumps(dict(plan=str(STUDY/'plan.json'),sha256=digest(STUDY/'plan.json'),new_jobs=len(jobs)),indent=2))
 
 
 def prior_workers_alive():
@@ -143,7 +144,8 @@ def analyze():
     records = {k:by_path[p.resolve()] for k,p in paths.items()}
     if any(not r['complete'] or len(r['attacks'])!=11 for r in records.values()):
         raise ValueError('Incomplete formal attack results.')
-    comparisons = [compare(f'multiview_{s}',f'{arm}_{s}',records) for s in (43,44,45) for arm in ('none','baseline')]
+    comparisons = [compare(f'{a}_{s}',f'{b}_{s}',records) for s in (43,44,45)
+                   for a,b in [('singleview','none'),('multiview','none'),('multiview','singleview'),('singleview','baseline')]]
     for row in comparisons:
         resample(output/'metrics/verified_results.json',output/f"{row['treatment']}_vs_{row['control']}",2000,20260913,
                  treatment=records[row['treatment']]['run'],control_name=records[row['control']]['run'])

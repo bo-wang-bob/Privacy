@@ -80,6 +80,9 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     for path in sorted(directory.glob("client_*_distribution.pt")):
         client = int(path.stem.split("_")[1])
         state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
+        if summary.get("geometry_source") == "local_class_only" and (
+                state.get("geometry_source") != "local_class_only" or "pooled_factor" in state or "pooled_metadata" in state):
+            raise ValueError("Class-only geometry must not contain pooled class statistics.")
         states[client] = state["labels"]
         exposure[client] = {key: torch.zeros(len(state["labels"]), dtype=torch.long)
                             for key in ("risk_reads", "real_steps", "synthetic_steps")}
@@ -87,7 +90,8 @@ def read_synthesis_mechanism(directory, summary, *, complete):
         geometry.append(dict(client=client, samples=len(state["labels"]),
                              class_count=len(sizes), min_class_samples=min(sizes),
                              max_class_samples=max(sizes), source_sha256=state["source_sha256"],
-                             pooled_metadata=state["pooled_metadata"]))
+                             geometry_source=state.get("geometry_source", "legacy_class_plus_pooled"),
+                             pooled_metadata=state.get("pooled_metadata")))
     totals, reasons = Counter(), Counter()
     groups = defaultdict(Counter)
     bins = {str(i): Counter() for i in range(5)}
