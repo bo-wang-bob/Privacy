@@ -13,6 +13,7 @@ import torch
 from torch.nn import functional as F
 
 from trainmodel.clip_tokens import token_features
+from privacy_defenses.synthesis_history import ZeroRiskHistory, history_assignment
 from utils.performance import measure_stage
 
 
@@ -22,6 +23,7 @@ LEGACY_DEFAULTS = dict(
     margin_tolerance=0.02, norm_ratio_min=0.5, norm_ratio_max=2.0,
     mode="risk", semantic_filter=True, warmup_rounds=1,
     center_weighting="uniform", replacement_policy="risk_probability",
+    risk_history="none", candidate_selection="first_semantic",
 )
 DEFAULTS = {**LEGACY_DEFAULTS, "replacement_policy": "all", "replacement_fraction": 1.0,
             "warmup_rounds": 0, "norm_ratio_min": 0.1}
@@ -77,6 +79,15 @@ def validate_risk_synthesis(config):
         raise ValueError("synthesis.warmup_rounds must be a nonnegative integer.")
     if options["replacement_policy"] not in {"all", "risk_probability"}:
         raise ValueError("synthesis.replacement_policy must be all or risk_probability.")
+    if options["risk_history"] not in {"none", "zero_risk_frequency"}:
+        raise ValueError("synthesis.risk_history must be none or zero_risk_frequency.")
+    if options["candidate_selection"] not in {"first_semantic", "least_local_similarity"}:
+        raise ValueError("Unknown synthesis.candidate_selection.")
+    advanced = options["risk_history"] != "none" or options["candidate_selection"] != "first_semantic"
+    if advanced and options["replacement_policy"] != "all":
+        raise ValueError("History and local-neighbor selection require all replacement.")
+    if options["candidate_selection"] != "first_semantic" and not options["semantic_filter"]:
+        raise ValueError("Local-neighbor selection requires the semantic filter.")
     if options["replacement_policy"] == "all":
         if options["replacement_fraction"] != 1 or options["warmup_rounds"] != 0:
             raise ValueError("All replacement requires replacement_fraction=1 and warmup_rounds=0.")
@@ -238,6 +249,10 @@ class RiskSynthesis:
         self.directory = None
         self.exposure = {}
         self.previous_risk_weights = PreviousRiskWeights()
+        self.history = ZeroRiskHistory()
+        self.pending_history = {}
+        self.semantic_sources = {}
+        self.candidate_handle = None
 
     @torch.no_grad()
     def initialize(self, users, shared_model, directory):
@@ -262,6 +277,15 @@ class RiskSynthesis:
                   "norm_ratio", "teacher_margin_delta"]
         if self.options["replacement_policy"] == "all":
             fields += ["quality_passed", "selected_attempt", "retained_original_fraction", "original_distance"]
+        if self.options["risk_history"] != "none":
+            fields += ["loss_gap", "history_exposure", "history_rounds", "joint_rank_score", "assigned_risk"]
+        if self.options["candidate_selection"] != "first_semantic":
+            fields += ["nearest_teacher_cosine", "nearest_teacher_source_id"]
+            self.candidate_handle = (self.directory / "candidate_choices.csv").open("x", newline="")
+            self.candidate_writer = csv.DictWriter(self.candidate_handle, fieldnames=[
+                "round", "client", "step", "sample_id", "attempt", "norm_ratio", "teacher_margin_delta",
+                "quality_passed", "nearest_teacher_cosine", "nearest_teacher_source_id"])
+            self.candidate_writer.writeheader()
         if self.options["center_weighting"] == "previous_risk":
             fields += ["anchor_reference_round", "anchor_available_donors", "anchor_source_weight",
                        "anchor_donor_weight_sum", "anchor_uniform_fallback"]
@@ -290,6 +314,9 @@ class RiskSynthesis:
                                           synthetic_steps=torch.zeros(user.train_samples, dtype=torch.long))
             state = geometry.state()
             z = torch.cat(semantic)
+            if self.options["candidate_selection"] != "first_semantic":
+                self.semantic_sources[user.id] = z
+                state["semantic_source_features"] = z
             state["semantic_class_means"] = {c: z[g["indices"]].mean(0) for c,g in geometry.classes.items()}
             state["representation"] = "frozen_patch_plus_position_without_cls"
             state["covariance_divisor"] = "n"
@@ -316,9 +343,28 @@ class RiskSynthesis:
         return own - similarities.max(1).values
 
     @torch.no_grad()
-    def transform(self, model, user, images, labels, indices, risk, round_index, step, source_round):
+    def candidate_metrics(self, tokens, labels, client):
+        features = F.normalize(token_features(self.teacher, tokens).float(), dim=-1)
+        similarities = features @ self.text.T
+        own = similarities.gather(1, labels[:, None]).squeeze(1)
+        similarities.scatter_(1, labels[:, None], -torch.inf)
+        # Include every local original, including the source and other classes.
+        # This avoids explicitly rewarding transfer toward a different donor.
+        local = features @ self.semantic_sources[client].to(features).T
+        cosine, nearest = local.max(1)
+        return (own - similarities.max(1).values).cpu(), cosine.cpu(), nearest.cpu()
+
+    def record_optimized_batch(self, client):
+        pending = self.pending_history.pop(client, None)
+        if pending is not None:
+            round_index, indices, used = pending
+            self.history.observe(client, round_index, indices, used)
+
+    @torch.no_grad()
+    def transform(self, model, user, images, labels, indices, risk, round_index, step, source_round, *, raw_scores=None):
         if self.options["replacement_policy"] == "all":
-            return self._transform_all(model, user, images, labels, indices, risk, round_index, step, source_round)
+            return self._transform_all(model, user, images, labels, indices, risk, round_index, step, source_round,
+                                       raw_scores=raw_scores)
         tokens = model.encode_input_tokens(images)
         original = tokens[:, 1:].flatten(1).cpu()
         risk = risk.cpu().float()
@@ -417,7 +463,7 @@ class RiskSynthesis:
         return tokens.detach()
 
     @torch.no_grad()
-    def _transform_all(self, model, user, images, labels, indices, risk, round_index, step, source_round):
+    def _transform_all(self, model, user, images, labels, indices, risk, round_index, step, source_round, *, raw_scores=None):
         """Replace every position, retaining the best generated semantic candidate.
 
         Semantic failure never restores the original. An absent finite, changed,
@@ -430,11 +476,23 @@ class RiskSynthesis:
             raise ValueError("All replacement requires one finite risk in [0,1] per original record.")
         if source_round < 0:
             risk = torch.zeros_like(risk)
+        assigned = risk
+        history_values = history_rounds = joint = None
+        if self.options["risk_history"] != "none":
+            if user.id in self.pending_history:
+                raise RuntimeError("Previous synthesis batch was not committed after optimization.")
+            history_values, history_rounds = self.history.values(
+                user.id, round_index, len(self.geometry[user.id].labels), indices)
+            if source_round >= 0:
+                if raw_scores is None:
+                    raise ValueError("Exposure history needs original loss gaps, before tail truncation.")
+                assigned, joint = history_assignment(raw_scores, history_values, risk)
         if user.id not in self.control_generators:
             self.control_generators[user.id] = torch.Generator().manual_seed(self.seed + 1000003*user.id + 31415)
-        used, requests = select_requests(risk, self.options, None, self.control_generators[user.id])
+        used, requests = select_requests(assigned, self.options, None, self.control_generators[user.id])
         geometry, generator = self.geometry[user.id], self.generators[user.id]
         semantic = self.options["semantic_filter"]
+        choose_local = self.options["candidate_selection"] == "least_local_similarity"
         reference = self.margins(tokens, labels).cpu() if semantic else None
         if reference is not None and not torch.isfinite(reference).all():
             raise ValueError("Nonfinite reference semantics in all-replacement synthesis.")
@@ -468,7 +526,10 @@ class RiskSynthesis:
                 continue
             candidates = tokens[positions].clone()
             candidates[:, 1:] = torch.stack(batch).to(tokens)
-            if semantic:
+            if choose_local:
+                with measure_stage(self, "train.synthesis_filter"):
+                    margins, cosines, neighbors = self.candidate_metrics(candidates, labels[positions], user.id)
+            elif semantic:
                 with measure_stage(self, "train.synthesis_filter"):
                     margins = self.margins(candidates, labels[positions]).cpu()
             else:
@@ -478,10 +539,30 @@ class RiskSynthesis:
                 if not math.isfinite(delta):
                     invalid[j] = "nonfinite_semantics"
                     continue
-                if j not in best or delta > best[j]["delta"]:
-                    best[j] = dict(token=batch[pos], delta=delta, norm_ratio=ratios[pos], attempt=attempt,
-                                   quality_passed=not semantic or delta >= -self.options["margin_tolerance"])
-            pending = [j for j in pending if j not in best or not best[j]["quality_passed"]]
+                quality = not semantic or delta >= -self.options["margin_tolerance"]
+                candidate = dict(token=batch[pos], delta=delta, norm_ratio=ratios[pos], attempt=attempt,
+                                 quality_passed=quality)
+                if choose_local:
+                    cosine = float(cosines[pos])
+                    if not math.isfinite(cosine):
+                        invalid[j] = "nonfinite_neighbor_similarity"
+                        continue
+                    candidate.update(nearest_teacher_cosine=cosine, nearest_teacher_source_id=int(neighbors[pos]))
+                    self.candidate_writer.writerow(dict(round=round_index+1, client=user.id, step=step,
+                        sample_id=int(indices[j]), attempt=attempt, norm_ratio=ratios[pos],
+                        teacher_margin_delta=delta, quality_passed=int(quality),
+                        nearest_teacher_cosine=cosine, nearest_teacher_source_id=int(neighbors[pos])))
+                    # Semantic feasibility dominates; if all fail, use maximum
+                    # margin as requested. Exact ties retain the earlier draw.
+                    key = (int(quality), -cosine if quality else delta, delta)
+                    candidate["selection_key"] = key
+                    improved = j not in best or key > best[j]["selection_key"]
+                else:
+                    improved = j not in best or delta > best[j]["delta"]
+                if improved:
+                    best[j] = candidate
+            if not choose_local:
+                pending = [j for j in pending if j not in best or not best[j]["quality_passed"]]
             if not pending:
                 break
         missing = [int(indices[j]) for j in requests.tolist() if j not in best]
@@ -498,12 +579,21 @@ class RiskSynthesis:
             group = geometry.classes[int(labels[j])]
             nearest = float((geometry.codes[group["indices"]] - candidate).norm(dim=1).min())
             quality = chosen["quality_passed"]
-            self.writer.writerow(dict(round=round_index+1, client=user.id, step=step, sample_id=int(indices[j]),
+            record = dict(round=round_index+1, client=user.id, step=step, sample_id=int(indices[j]),
                 label=int(labels[j]), risk=float(risk[j]), used_risk=float(used[j]), requested=1, accepted=1,
                 attempts=tries[j], reason="accepted" if quality else "best_semantic_candidate", nearest_distance=nearest,
                 source_round=source_round, norm_ratio=chosen["norm_ratio"],
                 teacher_margin_delta=chosen["delta"] if semantic else None, quality_passed=int(quality),
-                selected_attempt=chosen["attempt"], retained_original_fraction=1-float(used[j]), original_distance=distance))
+                selected_attempt=chosen["attempt"], retained_original_fraction=1-float(used[j]), original_distance=distance)
+            if history_values is not None:
+                record.update(loss_gap=None if source_round < 0 else float(raw_scores[j]),
+                              history_exposure=float(history_values[j]), history_rounds=int(history_rounds[j]),
+                              joint_rank_score=None if joint is None else float(joint[j]),
+                              assigned_risk=float(assigned[j]))
+            if choose_local:
+                record.update(nearest_teacher_cosine=chosen["nearest_teacher_cosine"],
+                              nearest_teacher_source_id=chosen["nearest_teacher_source_id"])
+            self.writer.writerow(record)
             count = dict(visits=1, requested=1, accepted=1, fallback=0, quality_failed=int(not quality))
             self.counts.update(count)
             self.risk_bins[str(min(4, int(float(risk[j])*5)))].update(count)
@@ -511,13 +601,23 @@ class RiskSynthesis:
             self.exposure[user.id]["risk_reads"][sid] += int(source_round >= 0)
             self.exposure[user.id]["synthetic_steps"][sid] += 1
         self.handle.flush()
+        if self.candidate_handle is not None:
+            self.candidate_handle.flush()
+        if history_values is not None:
+            self.pending_history[user.id] = (round_index, indices.detach().cpu().clone(), used.clone())
         return tokens.detach()
 
     def summary(self):
-        return dict(implementation=("local_token_geometry_v4_all_replacement" if self.options["replacement_policy"] == "all" else
+        return dict(implementation=("local_token_geometry_v5_history_selection" if
+                                    self.options["risk_history"] != "none" or self.options["candidate_selection"] != "first_semantic" else
+                                    "local_token_geometry_v4_all_replacement" if self.options["replacement_policy"] == "all" else
                                     "local_token_geometry_v3_weighted_center" if
                                     self.options["center_weighting"] == "previous_risk" else "local_token_geometry_v2"),
                     options=self.options, seed=self.seed,
+                    history_definition=("mean_per_round_zero_assigned_risk_frequency" if
+                                        self.options["risk_history"] != "none" else None),
+                    history_combination=("equal_midrank_sum_then_loss_gap_then_batch_order" if
+                                         self.options["risk_history"] != "none" else None),
                     center_risk_reference=("previous_participating_round_mean_assigned_rank" if
                                            self.options["center_weighting"] == "previous_risk" else None),
                     request_sampling=("every_original_training_position" if self.options["replacement_policy"] == "all"
@@ -534,8 +634,12 @@ class RiskSynthesis:
             (self.directory / "synthesis_summary.json").write_text(json.dumps(
                 dict(status=status, **self.summary()), indent=2, allow_nan=False))
             torch.save(self.exposure, self.directory / "source_exposure.pt")
+            if self.options["risk_history"] != "none":
+                torch.save(self.history.clients, self.directory / "history_state.pt")
 
     def close(self, status):
         self.write_summary(status)
         if self.handle is not None:
             self.handle.close()
+        if self.candidate_handle is not None:
+            self.candidate_handle.close()

@@ -212,6 +212,8 @@ defense_overrides:
           center_weighting: uniform
           norm_ratio_max: 2.0
           mode: risk
+          risk_history: none
+          candidate_selection: first_semantic
           semantic_filter: true
           warmup_rounds: 0
 
