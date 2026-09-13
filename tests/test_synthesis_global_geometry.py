@@ -89,14 +89,17 @@ def test_global_generation_requires_broadcast_and_valid_mode():
             defense=dict(name='risk_synthesis',synthesis={**DEFAULTS,'global_distribution':'bad'})))
 
 
-def test_global_center_equals_all_other_same_class_records_and_needs_no_new_exchange(tmp_path):
+def test_global_center_equals_all_same_class_records_including_source_without_new_exchange(tmp_path):
     a = geometry([[1.,2.],[4.,1.],[7.,3.]],[0,0,0])
     b = geometry([[20.,5.],[22.,6.],[24.,7.],[26.,8.],[1000.,9000.]],[0,0,0,0,1])
     options = {**DEFAULTS,'global_distribution':'generate','center_source':'global_class'}
     info = exchange({0:a,1:b},tmp_path,options,'cpu')
-    expected_center = torch.cat([a.codes[1:],b.codes[:4]]).mean(0)
-    center = a.global_leave_source_out_center(0)
+    expected_center = torch.cat([a.codes,b.codes[:4]]).mean(0)
+    center = a.global_class_center(0)
     torch.testing.assert_close(center,expected_center)
+    for g in (a,b):
+        for index in torch.where(g.labels==0)[0].tolist():
+            torch.testing.assert_close(g.global_class_center(index),center,atol=0,rtol=0)
     assert not torch.allclose(center,a.codes[1:].mean(0))
     f = a.global_distribution['classes'][0]['factor']
     for r in (0.,.4,1.):
@@ -104,11 +107,10 @@ def test_global_center_equals_all_other_same_class_records_and_needs_no_new_exch
         noise = .1*(f@torch.randn(f.shape[1],generator=torch.Generator().manual_seed(9)))
         torch.testing.assert_close(candidate,(1-r)*a.codes[0]+r*expected_center+noise)
     assert info['aggregation_count']==1
-    # Even changing just the source in the original dataset does not change
-    # the center of all *other* records when moments are recomputed.
+    # The source contributes exactly 1/N of the global same-class mean.
     a2=geometry([[999.,-123.],[4.,1.],[7.,3.]],[0,0,0])
     a2.global_distribution=aggregate_moments({0:local_moments(a2,'cpu'),1:local_moments(b,'cpu')},5,'cpu')
-    torch.testing.assert_close(a2.global_leave_source_out_center(0),expected_center)
+    torch.testing.assert_close(a2.global_class_center(0),expected_center+(a2.codes[0]-a.codes[0])/7)
 
 
 @pytest.mark.parametrize('overrides', [

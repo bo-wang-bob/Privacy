@@ -167,16 +167,13 @@ class LocalGeometry:
         count = len(group["indices"])
         return (count * group["mean"] - self.codes[index]) / (count - 1)
 
-    def global_leave_source_out_center(self, index):
+    def global_class_center(self, index):
         if self.global_distribution is None:
             raise RuntimeError("Global distribution must be received before computing a global center.")
         group = self.global_distribution["classes"][int(self.labels[index])]
-        count = group["count"]
-        if count <= 1:
-            raise ValueError("A global leave-source-out center needs another class record.")
-        # The original occurs exactly once in the uploaded training moments.
-        # Use the frozen local source code, not a previously generated view.
-        return ((count * group["mean"].double() - self.codes[index].double()) / (count - 1)).float()
+        # All clients and records of this class use the same broadcast mean.
+        # It includes every original training record, including this source.
+        return group["mean"].float()
 
     def sample(self, original, index, risk, options, generator, center_weights=None):
         c = int(self.labels[index])
@@ -189,7 +186,7 @@ class LocalGeometry:
             donor = int(donors[torch.randint(len(donors), (), generator=generator)])
             anchor = self.codes[donor]
         elif options.get("center_source", "local_class") == "global_class":
-            anchor = self.global_leave_source_out_center(index)
+            anchor = self.global_class_center(index)
         else:
             anchor = self.leave_source_out_center(index, center_weights)
         factor = group["factor"]
@@ -736,14 +733,15 @@ class RiskSynthesis:
     def summary(self):
         shared = self.options["global_distribution"] != "disabled"
         global_center = self.options["center_source"] == "global_class"
-        return dict(implementation=("local_token_geometry_v9_global_center" if global_center else
+        return dict(implementation=("local_token_geometry_v10_global_mean" if global_center else
                                     "local_token_geometry_v8_global_class" if shared else
                                     "local_token_geometry_v7_class_only"),
                     geometry_source=("global_same_class" if self.options["global_distribution"] == "generate"
                                      else "local_class_only"),
                     local_statistics_geometry_source="local_class_only",
-                    generation_center=("global_same_class_leave_source_out" if global_center else
+                    generation_center=("global_same_class_mean" if global_center else
                                        "local_same_class_leave_source_out"),
+                    center_includes_source=global_center,
                     global_distribution=self.global_exchange,
                     options=self.options, seed=self.seed,
                     history_definition=("mean_per_round_zero_assigned_risk_frequency" if

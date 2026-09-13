@@ -30,8 +30,14 @@ def verify(directory):
     summary = json.loads(summary_path.read_text())
     center_source = summary['options'].get('center_source', 'local_class')
     require(center_source in {'local_class', 'global_class'}, 'Unknown center source.')
-    require(summary['generation_center'] == f'{center_source.split("_")[0]}_same_class_leave_source_out',
+    # Preserve verification of historical v9 artifacts without reinterpreting
+    # their leave-source-out protocol as the new shared mean.
+    inclusive = center_source == 'global_class' and summary['implementation'] == 'local_token_geometry_v10_global_mean'
+    expected_center = ('global_same_class_mean' if inclusive else
+                       f'{center_source.split("_")[0]}_same_class_leave_source_out')
+    require(summary['generation_center'] == expected_center,
             'Generation center metadata mismatch.')
+    require(summary.get('center_includes_source', False) == inclusive, 'Center inclusion metadata mismatch.')
     if center_source == 'global_class':
         require(summary['options']['global_distribution'] == 'generate' and
                 summary['options']['center_weighting'] == 'uniform', 'Invalid global center protocol.')

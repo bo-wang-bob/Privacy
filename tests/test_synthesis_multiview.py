@@ -215,12 +215,14 @@ def test_multiview_full_training_keeps_original_membership(kind, history, select
     assert len(list(csv.DictReader((tmp_path/'risk_synthesis/synthetic_exposure.csv').open()))) == 126
     assert len(list(csv.DictReader((tmp_path/'risk_synthesis/synthetic_views.csv').open()))) == 252
     summary = json.loads((tmp_path/'risk_synthesis/synthesis_summary.json').read_text())
-    assert summary['implementation']==('local_token_geometry_v9_global_center' if center_source=='global_class' else
+    assert summary['implementation']==('local_token_geometry_v10_global_mean' if center_source=='global_class' else
                                        'local_token_geometry_v7_class_only' if exchange_mode=='disabled'
                                        else 'local_token_geometry_v8_global_class')
     if exchange_mode != 'disabled':
         assert synth.global_exchange['sha256']==before
-        assert summary['shared_geometry'] and summary['generation_center']==f'{center_source.split("_")[0]}_same_class_leave_source_out'
+        expected_center = 'global_same_class_mean' if center_source=='global_class' else 'local_same_class_leave_source_out'
+        assert summary['shared_geometry'] and summary['generation_center']==expected_center
+        assert summary['center_includes_source']==(center_source=='global_class')
         from scripts.verify_synthesis_global_geometry import verify as verify_global
         evidence = verify_global(tmp_path/'risk_synthesis')
         assert evidence['recipients']==[0,1] and evidence['classes']==3
