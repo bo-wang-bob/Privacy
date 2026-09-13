@@ -34,7 +34,11 @@ def verify(directory):
     summary_path = directory / "synthesis_summary.json"
     summary = json.loads(summary_path.read_text())
     options = summary["options"]
-    class_only = summary.get("geometry_source") == "local_class_only"
+    class_only = summary.get("local_statistics_geometry_source", summary.get("geometry_source")) == "local_class_only"
+    global_evidence = None
+    if summary.get("shared_geometry"):
+        from scripts.verify_synthesis_global_geometry import verify as verify_global
+        global_evidence = verify_global(directory)
     if class_only:
         require(not ({"pooled_rank", "shrinkage"} & set(options)), "Class-only options retain removed pooled parameters.")
     multiview = options.get("views_per_record", 1) > 1
@@ -189,7 +193,10 @@ def verify(directory):
     hashes = {str(p): fingerprint(p) for p in sources}
     if multiview_evidence:
         hashes.update(multiview_evidence["source_hashes"])
+    if global_evidence:
+        hashes.update(global_evidence["source_hashes"])
     return dict(status="verified", **counters, source_hashes=hashes,
+                global_geometry=global_evidence,
                 **({"multiview": {k:v for k,v in multiview_evidence.items() if k!='source_hashes'}} if multiview else {}),
                 scope="Exact stream replay; candidate distances are logged teacher proxies, not MIA guarantees.")
 

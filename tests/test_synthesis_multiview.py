@@ -181,7 +181,8 @@ def test_controller_matches_joint_mean_loss_and_one_momentum_step_per_original_b
     ('clip_adapter', 'none', 'first_semantic'),
     ('clip_lora', 'zero_risk_frequency', 'least_local_similarity'),
 ])
-def test_multiview_full_training_keeps_original_membership(kind, history, selection, tmp_path):
+@pytest.mark.parametrize('exchange_mode', ['disabled', 'generate', 'share_only'])
+def test_multiview_full_training_keeps_original_membership(kind, history, selection, exchange_mode, tmp_path):
     audit = _audit_config()
     audit.update(audit_batch_size=4, grad_sample_chunk_size=2)
     server = ServerBase(device=torch.device('cpu'), dataset_name='toy', model=make_model(kind),
@@ -191,8 +192,16 @@ def test_multiview_full_training_keeps_original_membership(kind, history, select
         results_dir=str(tmp_path), aggregator=build_aggregator('fedavg', aggregation_weighting='sample_count'),
         audit_config=audit, projres_config={'enabled':True,'evaluation_interval':1},
         defense_config={'name':'risk_synthesis','synthesis':{**DEFAULTS,'views_per_record':2,
-            'risk_history':history,'candidate_selection':selection,'mode':'shuffled_risk'}},
+            'risk_history':history,'candidate_selection':selection,'mode':'shuffled_risk',
+            'global_distribution':exchange_mode}},
         method_config={'client_optimizer':'sgd','seed':42})
+    synth = server.defense.synthesis
+    if exchange_mode != 'disabled':
+        assert synth.global_exchange['aggregation_count']==1
+        before = synth.global_exchange['sha256']
+        assert all(g.global_distribution is not None for g in synth.geometry.values())
+        with pytest.raises(RuntimeError,match='exactly once'):
+            synth.initialize(server.ctx.users,server.model,tmp_path)
     result = server.train()
     assert server.auditor.errors == {} and {r['attack'] for r in result} == ATTACKS
     assert all(r['member_count']==r['nonmember_count']==9 for r in result)
@@ -204,7 +213,14 @@ def test_multiview_full_training_keeps_original_membership(kind, history, select
     assert len(list(csv.DictReader((tmp_path/'risk_synthesis/synthetic_exposure.csv').open()))) == 126
     assert len(list(csv.DictReader((tmp_path/'risk_synthesis/synthetic_views.csv').open()))) == 252
     summary = json.loads((tmp_path/'risk_synthesis/synthesis_summary.json').read_text())
-    assert summary['implementation']=='local_token_geometry_v7_class_only'
+    assert summary['implementation']==('local_token_geometry_v7_class_only' if exchange_mode=='disabled'
+                                       else 'local_token_geometry_v8_global_class')
+    if exchange_mode != 'disabled':
+        assert synth.global_exchange['sha256']==before
+        assert summary['shared_geometry'] and summary['generation_center']=='local_same_class_leave_source_out'
+        from scripts.verify_synthesis_global_geometry import verify as verify_global
+        evidence = verify_global(tmp_path/'risk_synthesis')
+        assert evidence['recipients']==[0,1] and evidence['classes']==3
     from scripts.analyze_risk_synthesis import read_synthesis_mechanism
     verified = read_synthesis_mechanism(tmp_path/'risk_synthesis', summary, complete=True)
     assert verified['counts']['visits'] == 126

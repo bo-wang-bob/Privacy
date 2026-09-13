@@ -1,4 +1,4 @@
-"""Client-local low-rank token synthesis; empirical defense, no DP claim."""
+"""Risk-guided token synthesis with optional one-time global class geometry."""
 from __future__ import annotations
 
 import copy
@@ -24,6 +24,7 @@ LEGACY_DEFAULTS = dict(
     mode="risk", semantic_filter=True, warmup_rounds=1,
     center_weighting="uniform", replacement_policy="risk_probability",
     risk_history="none", candidate_selection="first_semantic", views_per_record=1,
+    global_distribution="disabled",
 )
 DEFAULTS = {**LEGACY_DEFAULTS, "replacement_policy": "all", "replacement_fraction": 1.0,
             "warmup_rounds": 0, "norm_ratio_min": 0.1}
@@ -34,7 +35,7 @@ def synthesis_options(options):
     options = options or {}
     removed = set(options) & {"shrinkage", "pooled_rank"}
     if removed:
-        raise ValueError(f"Class-only synthesis removed options {sorted(removed)}; old pooled runs require their original code version.")
+        raise ValueError(f"Per-class synthesis removed options {sorted(removed)}; old pooled runs require their original code version.")
     legacy = bool(options) and options.get("replacement_policy", "risk_probability") == "risk_probability"
     return {**(LEGACY_DEFAULTS if legacy else DEFAULTS), **options}
 
@@ -86,6 +87,10 @@ def validate_risk_synthesis(config):
         raise ValueError("synthesis.risk_history must be none or zero_risk_frequency.")
     if options["candidate_selection"] not in {"first_semantic", "least_local_similarity"}:
         raise ValueError("Unknown synthesis.candidate_selection.")
+    if options["global_distribution"] not in {"disabled", "share_only", "generate"}:
+        raise ValueError("synthesis.global_distribution must be disabled, share_only or generate.")
+    if options["global_distribution"] == "generate" and options["mode"] == "mixup":
+        raise ValueError("Global geometry generation requires a geometric noise mode, not mixup.")
     advanced = options["risk_history"] != "none" or options["candidate_selection"] != "first_semantic"
     if advanced and options["replacement_policy"] != "all":
         raise ValueError("History and local-neighbor selection require all replacement.")
@@ -125,6 +130,7 @@ class LocalGeometry:
         self.codes = codes.detach().cpu().float()
         self.labels = labels.detach().cpu().long()
         self.classes = {}
+        self.global_distribution = None
         for c in self.labels.unique().tolist():
             indices = torch.where(self.labels == c)[0]
             rows = self.codes[indices]
@@ -168,6 +174,10 @@ class LocalGeometry:
         else:
             anchor = self.leave_source_out_center(index, center_weights)
         factor = group["factor"]
+        if options.get("global_distribution", "disabled") == "generate":
+            if self.global_distribution is None:
+                raise RuntimeError("Global distribution must be received before synthesis training.")
+            factor = self.global_distribution["classes"][c]["factor"]
         noise = factor @ torch.randn(factor.shape[1], generator=generator)
         scale = 0.0 if options["mode"] == "mixup" else options["noise_scale"]
         return (1-risk) * original.cpu() + risk * anchor + scale * noise
@@ -256,9 +266,12 @@ class RiskSynthesis:
         self.view_handle = None
         self.view_counts = Counter()
         self.pending_views = {}
+        self.global_exchange = None
 
     @torch.no_grad()
     def initialize(self, users, shared_model, directory):
+        if self.directory is not None:
+            raise RuntimeError("Synthesis distributions are initialized exactly once before training.")
         self.directory = Path(directory) / "risk_synthesis"
         self.directory.mkdir(exist_ok=False)
         device = shared_model.device
@@ -345,6 +358,10 @@ class RiskSynthesis:
             geometry.classes = mapped["classes"]
             geometry.codes = torch.load(code_path, map_location="cpu", weights_only=True, mmap=True)
             self.generators[user.id] = torch.Generator().manual_seed(self.seed + 1000003 * user.id + 9173)
+        if self.options["global_distribution"] != "disabled":
+            from privacy_defenses.global_geometry import exchange
+            with measure_stage(self, "setup.synthesis_global_distribution"):
+                self.global_exchange = exchange(self.geometry, self.directory, self.options, device)
         self.write_summary("initialized")
 
     @torch.no_grad()
@@ -698,8 +715,14 @@ class RiskSynthesis:
         return tokens.detach()
 
     def summary(self):
-        return dict(implementation="local_token_geometry_v7_class_only",
-                    geometry_source="local_class_only",
+        shared = self.options["global_distribution"] != "disabled"
+        return dict(implementation=("local_token_geometry_v8_global_class" if shared else
+                                    "local_token_geometry_v7_class_only"),
+                    geometry_source=("global_same_class" if self.options["global_distribution"] == "generate"
+                                     else "local_class_only"),
+                    local_statistics_geometry_source="local_class_only",
+                    generation_center="local_same_class_leave_source_out",
+                    global_distribution=self.global_exchange,
                     options=self.options, seed=self.seed,
                     history_definition=("mean_per_round_zero_assigned_risk_frequency" if
                                         self.options["risk_history"] != "none" else None),
@@ -719,7 +742,7 @@ class RiskSynthesis:
                             optimizer_steps_per_original_batch=1) if self.options["views_per_record"] > 1 else {}),
                     formal_dp_enabled=False, client_upload_is_private=False,
                     epsilon=None, delta=None, membership="original_client_train",
-                    reference_is_exact_leave_one_out=False, shared_geometry=False)
+                    reference_is_exact_leave_one_out=False, shared_geometry=shared)
 
     def write_summary(self, status):
         if self.directory is not None:

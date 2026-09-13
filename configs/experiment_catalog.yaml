@@ -203,6 +203,7 @@ defense_overrides:
           replacement_fraction: 1.0
           noise_scale: 0.1
           class_rank: 5
+          global_distribution: generate
           min_class_samples: 3
           attempts: 2
           margin_tolerance: 0.02

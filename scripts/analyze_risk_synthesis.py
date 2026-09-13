@@ -69,6 +69,12 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     directory = Path(directory)
     multiview = summary["options"].get("views_per_record", 1) > 1
     view_evidence = None
+    global_evidence = None
+    if summary.get("shared_geometry") and complete:
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from scripts.verify_synthesis_global_geometry import verify as verify_global
+        global_evidence = verify_global(directory)
     if multiview and complete:
         import sys
         sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -80,7 +86,7 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     for path in sorted(directory.glob("client_*_distribution.pt")):
         client = int(path.stem.split("_")[1])
         state = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
-        if summary.get("geometry_source") == "local_class_only" and (
+        if summary.get("local_statistics_geometry_source", summary.get("geometry_source")) == "local_class_only" and (
                 state.get("geometry_source") != "local_class_only" or "pooled_factor" in state or "pooled_metadata" in state):
             raise ValueError("Class-only geometry must not contain pooled class statistics.")
         states[client] = state["labels"]
@@ -176,6 +182,7 @@ def read_synthesis_mechanism(directory, summary, *, complete):
                          acceptance_given_request=(counts["accepted"] / counts["requested"]
                                                    if counts["requested"] else None)))
     return dict(counts=dict(totals), reasons=dict(reasons), geometry=geometry, groups=rows,
+                global_geometry_evidence=global_evidence,
                 measurement_scope="worst_semantic_view_per_original_visit" if multiview else
                                   "selected_candidate" if replace_all else "last_attempt",
                 **({"multiview_evidence": view_evidence, "view_counts": summary["view_counts"]} if multiview else {}),
@@ -313,6 +320,9 @@ def read_run(directory):
     if synthesis is not None and (directory / "risk_synthesis" / "synthetic_exposure.csv").exists():
         result["synthesis_mechanism"] = read_synthesis_mechanism(
             directory / "risk_synthesis", synthesis, complete=completed)
+        global_evidence = result["synthesis_mechanism"].get("global_geometry_evidence")
+        if global_evidence:
+            sources.update(global_evidence["source_hashes"])
         for name in ("synthetic_exposure.csv", "source_exposure.pt", "synthetic_views.csv", "candidate_choices.csv"):
             source = directory / "risk_synthesis" / name
             if source.exists():

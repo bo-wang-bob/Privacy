@@ -1,5 +1,13 @@
 # Repository guidance
 
+## 首轮全局类别分布（2026-09-13，v8）
+
+- 最新用户要求恢复 Ma 等论文的首轮类别统计聚合和下发，并确认噪声改用全局同类几何、风险中心仍用本地同类排除自身均值。catalog 默认 `defense.synthesis.global_distribution: generate`；`share_only` 只共享仍用本地噪声，`disabled` 复现 v7 类别本地模式。显式旧配置缺省此字段保持 disabled。多替身入口仍默认 K=2。
+- 所有已配置客户端在第1轮优化前，从原始本地训练集提交逐类 n、mean、完整数值秩 covariance factor。服务器按 n/N 合并类内协方差和客户端同类均值偏移外积，一次聚合后全类别下发所有客户端；不按模型上传的 uniform/sample_count 权重替代逐类样本权重，不使用 evaluation。后续不刷新。
+- 全局协方差通过完整数值秩因子表示以避免高维稠密矩阵；先聚合完整局部数值秩，再取现有 class_rank=5 用于生成。不能先截断局部到5维。不同类别不合并，没有 pooled_rank/shrinkage。中心、风险、K视图归一化、原始成员身份保持原定义。
+- 仓库为单进程模拟：`global_distribution.pt` 一份只读约定的共享对象，逐客户端 receipt 保存 SHA256 与完整可用类别。`client_*_moment_upload.pt` 不含逐样本编码/ID；本地 source_codes 仍属本地诊断，不能作为上传使用。统计没有 DP，现有11种攻击未纳入该统计传输视图，不能用这些攻击代表新协议整体隐私。
+- 新实现独立于 `/tmp/privacy-risk-multiview` 的冻结 v7 队列。旧队列和历史结果保持原版本，新功能说明见 `docs/risk_synthesis_global_geometry.md`。尚无 v8 真实数据有效性结论。
+
 ## 用户偏好与基本规则
 
 - 默认使用中文沟通。

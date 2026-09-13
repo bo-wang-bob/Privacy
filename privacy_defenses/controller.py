@@ -1933,7 +1933,12 @@ class DefenseController:
             summary["risk_synthesis"] = self.synthesis.summary()
             summary["privacy_accounting"] = {
                 "formal_dp_enabled": False, "client_upload_is_private": False,
-                "epsilon": None, "delta": None, "note": "Empirical local synthesis; no formal DP guarantee.",
+                "epsilon": None, "delta": None,
+                "note": ("Empirical synthesis; shared class moments have no DP protection and are outside existing attack views."
+                         if summary["risk_synthesis"]["shared_geometry"] else
+                         "Empirical local synthesis; no formal DP guarantee."),
+                "class_statistics_shared": summary["risk_synthesis"]["shared_geometry"],
+                "shared_statistics_in_existing_attack_view": False,
             }
         if self.name == "www":
             periodic_post_round = self.www_analysis_timing == "post_round"
