@@ -1,10 +1,10 @@
 # 简化方案的阶段性完整结果
 
-2026-09-13，第一项新任务完成后的阶段性分析。这里每个列出的任务均已完成100轮，但整项10任务研究尚未完成；当前新方法证据只包含 **history/seed43** 组件，不能代表候选选择或组合方案的效果。
+2026-09-13，两项新任务完成后的阶段性分析。这里每个列出的任务均已完成100轮，但整项10任务研究尚未完成；当前新方法证据包含 **history/seed43、selection/seed43** 两个独立组件，不能代表组合方案或其他种子的效果。
 
-## 仅历史因子：分配更均衡，额外隐私收益尚不明确
+## 已完成组件的正式效果
 
-CLIP transformer Adapter / CIFAR100，10个IID客户端、全局每类100张、FedAvg100轮、每轮完整本地epoch、目标客户端0。四组原始候选身份及非防御协议已核对一致；每组1000个原始成员、1000个独立evaluation非成员。44组正式攻击结果由原始预测独立复算，3组无防御配对通过。
+CLIP transformer Adapter / CIFAR100，10个IID客户端、全局每类100张、FedAvg100轮、每轮完整本地epoch、目标客户端0。五组原始候选身份及非防御协议已核对一致；每组1000个原始成员、1000个独立evaluation非成员。55组正式攻击结果由原始预测独立复算，4组无防御配对通过。
 
 | 方案 | Accuracy | 11攻击最大AUC | 最大TPR@1%FPR | 最大类别条件AUC | 服务器训练/审计分钟 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -12,8 +12,11 @@ CLIP transformer Adapter / CIFAR100，10个IID客户端、全局每类100张、F
 | 原全替换 | 80.90% | 0.609326 | 18.50% | 0.6231 | 102.19 |
 | 原全替换：打乱风险 | 81.53% | 0.612777 | 20.70% | 0.6335 | 93.85 |
 | 简化历史因子 | **81.83%** | **0.609546** | **17.20%** | **0.6275** | **93.52** |
+| 仅候选选择 | **81.73%** | **0.615747** | **23.00%** | **0.6322** | **113.64** |
 
-这四组最大正式AUC/最大TPR均由ProjRes取得。方向对称的最大AUC与表中最大AUC一致。计时含训练和审计、不含模型/数据初始化，受运行环境和资源竞争影响。
+这五组最大正式AUC/最大TPR均由ProjRes取得。方向对称的最大AUC与表中最大AUC一致。计时含训练和审计、不含模型/数据初始化，受运行环境和资源竞争影响。
+
+## 仅历史因子：分配更均衡，额外隐私收益尚不明确
 
 相对无防御，历史因子方案的最大AUC下降0.064574、最大TPR下降19.90个百分点，准确率提高0.25个百分点，满足既定整体标准。这个比较包含了原本的全替换生成作用。
 
@@ -48,13 +51,33 @@ CLIP transformer Adapter / CIFAR100，10个IID客户端、全局每类100张、F
 
 历史因子组中，目标客户端参考可用访问的78.8485%重新分配了风险。零风险访问明显更均匀，但各记录平均保留系数的离散程度下降较少；全局风险权重集合、平均保留量与四次矩保持匹配。**代理量的均衡化已经落实，其改善尚未转化为明确的最强攻击AUC收益。** 这些线性系数和历史频率不等于实际信息保留比例或DP预算。
 
+## 仅候选选择：本次没有新增隐私收益
+
+selection/seed43于北京时间14:02完成验证。相对无防御，其最大AUC下降0.058373、最大TPR下降14.10个百分点、准确率提高0.15个百分点，满足整体标准。但相对原全替换，最大AUC上升 **0.006421**、最大TPR上升 **4.50个百分点**，准确率提高0.83个百分点，未满足新增收益标准。5/11项登记方向的AUC上升、7/11项TPR@1%FPR上升；不能把其相对无防御的整体改善归因于候选选择。
+
+同样使用2,000次按类别×成员身份分层的配对候选重采样，候选选择减原全替换为：
+
+| 指标 | 点差值 | 候选重采样区间 |
+| --- | ---: | ---: |
+| 11攻击最大AUC | +0.006421 | [-0.007694, +0.021713] |
+| 11攻击最大TPR@1%FPR（百分点） | +4.50 | [+1.20, +7.30] |
+
+AUC区间跨零，低FPR识别率区间均为正，支持本次固定模型和候选分布下的不利变化；这仍不是跨种子结论，也不是组合方案的结果。
+
+完整机制重放核验32,000个batch、100万次选择及200万个候选。全部访问替换、原图回退为0；语义未达标128,929次（12.8929%），按约定保留语义最佳有效候选。两次候选都评价，服务器训练和审计计时113.64分钟，比原全替换实测多11.45分钟；资源竞争不同，不能将这一差值当作稳定性能比例。
+
+目标客户端后99轮的每记录零风险次数范围为0～65、标准差16.0781，均值仍为18.513；平均保留系数总体均值仍为0.593500。该组件没有引入历史排序，零风险暴露仍集中在部分记录。所选替身与全部本地原始记录的最近教师余弦均值为0.955463，源样本仍为最近邻的访问比例为65.52%。这两个值仅描述教师代理；旧组未记录相同邻近度字段，不能直接据此量化相对旧组的下降，也不能把邻近度当成实际泄漏概率。
+
 ## 剩余工作及来源
 
 简化规则没有增加新的可调数值超参数：历史频率代替beta/p，固定等权中秩合并代替可调lambda；两候选选择仍复用既有attempts=2。原有几何、噪声与语义参数保留，不能称整个方法无超参数。
 
-候选选择、组合及其整体打乱、seed44/45对照仍按[冻结方案](risk_synthesis_compact_validation.md)执行，不据本次阶段性结果改参、挑选中途checkpoint或替换预定组合。最终报告还需包含全部任务的正式攻击、候选区间、精确重复敏感性和原始记录暴露分布。来源清单和这些种子此前已研究，本次不是未接触数据确认，也没有跨模型或形式DP保证。
+其余8项任务（组合及其整体打乱、seed44/45对照）仍按[冻结方案](risk_synthesis_compact_validation.md)执行，不据本次阶段性结果改参、挑选中途checkpoint或替换预定组合。最终报告还需包含全部任务的正式攻击、候选区间、精确重复敏感性和原始记录暴露分布。来源清单和这些种子此前已研究，本次不是未接触数据确认，也没有跨模型或形式DP保证。
 
 - [完整阶段性核验](../analysis_scripts/synthesis_history_compact_study_20260913/interim_history43/verified_results.json)、[44组逐攻击指标](../analysis_scripts/synthesis_history_compact_study_20260913/interim_history43/attack_metrics.csv)。
 - [历史机制完整重放](../analysis_scripts/synthesis_history_compact_study_20260913/history_43_mechanism.json)。
 - [条件于固定模型的候选区间](../analysis_scripts/synthesis_history_compact_study_20260913/interim_history43_vs_baseline_resampling/resampling_report.json)。
 - [原始记录暴露分布](../analysis_scripts/synthesis_history_compact_study_20260913/interim_history43_exposures/exposure_summary.json)。其中总行数30,000表示三个方案各10,000条原始记录的统计行，不是30,000个独立成员。
+- [加入候选选择后的五组核验](../analysis_scripts/synthesis_history_compact_study_20260913/interim_components43/verified_results.json)、[55组逐攻击指标](../analysis_scripts/synthesis_history_compact_study_20260913/interim_components43/attack_metrics.csv)。
+- [候选选择完整重放](../analysis_scripts/synthesis_history_compact_study_20260913/selection_43_mechanism.json)、[候选选择配对区间](../analysis_scripts/synthesis_history_compact_study_20260913/interim_selection43_vs_baseline_resampling/resampling_report.json)。
+- [四个全替换组的原始记录暴露分布](../analysis_scripts/synthesis_history_compact_study_20260913/interim_components43_exposures/exposure_summary.json)。40,000行表示四个方案各10,000条原始记录的统计行，不能扩大独立成员数。
