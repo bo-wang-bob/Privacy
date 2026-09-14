@@ -1,6 +1,6 @@
 # 首轮全局类别分布
 
-2026-09-13。用户要求加入 Ma 等《Geometric Knowledge-Guided Localized Global Distribution Alignment for Federated Learning》的首轮统计共享，随后进一步要求中心也使用全局同类统计。用户随后明确要求不排除自身。当前默认是**全局同类别几何＋包含自身的全局类别均值**，实现版本为 `local_token_geometry_v10_global_mean`。此前 v8 的全局噪声＋本地中心保留为对照。
+2026-09-13。用户要求加入 Ma 等《Geometric Knowledge-Guided Localized Global Distribution Alignment for Federated Learning》的首轮统计共享，随后进一步要求中心也使用全局同类统计。用户随后明确要求不排除自身。当前默认是**全局同类别几何＋包含自身的全局类别均值**，实现版本为 `local_token_geometry_v11_no_norm_filter`。此前 v8 的全局噪声＋本地中心保留为对照。
 
 ## 聚合协议
 
@@ -74,6 +74,14 @@ catalog 默认 `defense.synthesis.global_distribution=generate` 和 `defense.syn
 
 v9验证：162项相关测试通过（17.20秒）；统一入口干运行明确显示 `global_distribution:generate`、`center_source:global_class`、`views_per_record:2`、FedAvg100轮、每类100张，未启动真实训练或创建结果目录。`git diff --check` 通过。
 
-最新v10验证：162项相关测试通过（13.23秒），覆盖全局均值包含自身、同类别跨客户端参考中心一致、源记录变化按1/N_c进入均值，以及Adapter/LoRA多视图与全部11种攻击的集成。`git diff --check`通过；未启动真实数据训练。
+历史v10验证：162项相关测试通过（13.23秒），覆盖全局均值包含自身、同类别跨客户端参考中心一致、源记录变化按1/N_c进入均值，以及Adapter/LoRA多视图与全部11种攻击的集成。`git diff --check`通过；未启动真实数据训练。
 
 正式验证命令见 [Adapter/LoRA单种子验证](risk_synthesis_validation_commands.md)。入口默认只运行seed43的无防御与当前方案对照，实际超参数以解析配置为准。
+
+## 2026-09-14 范数门槛修复（v11）
+
+全替换候选不再受 `norm_ratio_min/max` 限制；这两个配置项已删除，范数比仅记录诊断。全局均值的范数可明显小于个体编码，旧下限会拒绝有限且已改变的高风险候选，耗尽重试后触发全部替换中止。当前仍保留有限值、实际改变、视图不重复和固定教师语义检查；语义全失败仍选最佳有效候选，不恢复原始编码。没有调大噪声或重试次数，也没有强行把替身范数归一到原始样本。
+
+新摘要标记 `norm_ratio_filter_enabled=false`、`norm_ratio_role=diagnostic_only`。核验工具按记录版本解释，历史 v10 等仍核对旧范数边界。不能直接用旧失败任务中含上下限的 `run_config.yaml` 启动新版；应使用当前统一入口重新生成配置，旧配置复现用原代码版本。只补跑防御的命令见 [验证命令](risk_synthesis_validation_commands.md)。相关168项测试通过，包括上下界外候选直接采用、多视图及Adapter/LoRA全部攻击接口；该验证不代表100轮真实数据效果。
+
+实样本生成检查使用失败Adapter任务的client3/原始ID440保存编码（类别44），重新设定风险25.5/26、抽样seed20260914，调用当前生成流程及真实冻结CLIP教师。原始编码范数166.1693，全局同类均值范数16.8986；两个不同替身的范数比分别为0.088886和0.108100，教师语义间隔变化分别为+0.042902和+0.039170，均首个候选通过。前者会被旧0.1下限拒绝。未恢复原始编码，未执行optimizer；失败批次的实际风险及随机状态未保存，因此这不是精确重放，也不代表防御效果。诊断保存于 `analysis_scripts/synthesis_norm_fix_20260914/probe.json`，脚本为 `scripts/check_synthesis_norm_fix.py`。防御组的双模型干运行核对通过，未启动完整训练。

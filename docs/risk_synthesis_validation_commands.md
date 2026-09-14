@@ -75,3 +75,21 @@ cd /root/Privacy
 共享类别统计不受DP保护，现有11种攻击没有专门纳入这些统计的攻击视图。即便本批通过上述判据，也只能在已测威胁视图下报告经验效果。
 
 本文命令已做干运行和协议核对；创建脚本时没有启动本批真实训练。
+
+## 范数门槛修复后，只重跑失败的防御
+
+2026-09-14 的旧 v10 Adapter 和 LoRA 防御任务均因 `invalid_norm_ratio` 退出。v11 删除该门槛，范数仅用于诊断。已完成的无防御任务保留，无需重复训练。以下两个命令分别新建防御任务，默认仍是seed43、100轮、每次两个替身：
+
+```bash
+cd /root/Privacy
+/root/.local/share/mamba/envs/pfedba/bin/python scripts/run_global_synthesis_validation.py \
+  --models clip_adapter --gpus 0 --defenses risk_synthesis
+```
+
+```bash
+cd /root/Privacy
+/root/.local/share/mamba/envs/pfedba/bin/python scripts/run_global_synthesis_validation.py \
+  --models clip_lora --gpus 1 --defenses risk_synthesis
+```
+
+两张卡可分别执行；只用一张卡则传 `--gpus 0 --defenses risk_synthesis`，默认依次运行两个模型。可先追加 `--dry-run` 检查。新任务从头训练，不续写失败目录；比较时使用各模型此前同分区的完整无防御基线，不把失败防御任务的初始准确率当最终效果。

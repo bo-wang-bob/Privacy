@@ -12,6 +12,9 @@ import hashlib
 import json
 from collections import Counter, defaultdict
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.synthesis_norm_protocol import norm_filter_enabled, valid_norm_diagnostic
 
 import numpy as np
 from scipy.stats import rankdata
@@ -67,6 +70,7 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     """
     import torch
     directory = Path(directory)
+    norm_filter_enabled(summary)
     multiview = summary["options"].get("views_per_record", 1) > 1
     view_evidence = None
     global_evidence = None
@@ -138,7 +142,7 @@ def read_synthesis_mechanism(directory, summary, *, complete):
                 elif not quality:
                     raise ValueError("Disabled semantic filtering cannot record a semantic quality failure.")
                 ratio = float(row["norm_ratio"])
-                if not summary["options"]["norm_ratio_min"] <= ratio <= summary["options"]["norm_ratio_max"]:
+                if not valid_norm_diagnostic(ratio, summary):
                     raise ValueError("All-replacement selected candidate violates its norm constraint.")
             if weighted_centers:
                 verify_anchor_history_row(row, states[client], anchor_history)

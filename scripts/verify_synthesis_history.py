@@ -6,6 +6,9 @@ import itertools
 import json
 import math
 from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.synthesis_norm_protocol import norm_filter_enabled, valid_norm_diagnostic
 
 import numpy as np
 from scipy.stats import rankdata
@@ -34,6 +37,7 @@ def verify(directory):
     summary_path = directory / "synthesis_summary.json"
     summary = json.loads(summary_path.read_text())
     options = summary["options"]
+    norm_filter_enabled(summary)
     class_only = summary.get("local_statistics_geometry_source", summary.get("geometry_source")) == "local_class_only"
     global_evidence = None
     if summary.get("shared_geometry"):
@@ -149,7 +153,7 @@ def verify(directory):
                                 "Nonfinite candidate semantics or similarity.")
                         passed = margin >= -options["margin_tolerance"]
                         require(int(row["quality_passed"]) == passed and
-                                options["norm_ratio_min"] <= float(row["norm_ratio"]) <= options["norm_ratio_max"] and
+                                valid_norm_diagnostic(float(row["norm_ratio"]), summary) and
                                 0 <= int(row["nearest_teacher_source_id"]) < sizes[client], "Invalid candidate constraints.")
                         by_source[sid].append(row)
                     for record in records:

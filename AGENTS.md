@@ -1,6 +1,12 @@
 # Repository guidance
 
-## 首轮全局类别分布与全局中心（2026-09-13，v10）
+## 当前全替换范数门槛修复（2026-09-14，v11）
+
+- 当前全替换实现为 `local_token_geometry_v11_no_norm_filter`：删除 `norm_ratio_min/max` 配置及候选拒绝门槛，范数比只作诊断，不用于重缩放或裁剪。保留有限值、实际改变、视图去重、教师语义筛选及语义全失败时最佳有效候选，禁止原始编码回退。全局分布、含自身均值、风险及K视图归一化保持原定义。
+- 摘要记录 `norm_ratio_filter_enabled=false` 和 `norm_ratio_role=diagnostic_only`。旧版本核验继续执行其范数边界，旧结果不改写；含已删除参数的旧全替换配置须使用原代码版本，启动新版需通过当前入口生成配置。历史部分替换 `risk_probability` 的范数约束保留。
+- Adapter/LoRA旧v10 seed43防御均因 `invalid_norm_ratio` 失败；已完成的无防御基线保留。补跑使用 `scripts/run_global_synthesis_validation.py --models clip_adapter --gpus 0 --defenses risk_synthesis`，LoRA相应选择模型和GPU。168项相关测试通过，真实完整效果待验证。
+
+## 首轮全局类别分布与全局中心（2026-09-13，v10，几何协议沿用）
 
 - 最新用户要求恢复 Ma 等论文的首轮类别统计聚合和下发，随后要求中心也改用全局。catalog 默认 `defense.synthesis.global_distribution: generate`、`center_source: global_class`，用户最新要求不排除自身，中心直接使用首轮下发的 `mu_global_c`，同一类别跨客户端/原始记录共享同一参考均值，无新增通信。v10记录 `generation_center=global_same_class_mean`、`center_includes_source=true`。v9的排除自身协议只在历史版本保留，结果核验仍支持。`center_source: local_class` 恢复 v8 本地中心；share_only/disabled 还须显式配合 local_class。显式旧配置缺省 center_source 保持 local_class，缺省 global_distribution 保持 disabled。多替身入口仍默认 K=2。
 - 所有已配置客户端在第1轮优化前，从原始本地训练集提交逐类 n、mean、完整数值秩 covariance factor。服务器按 n/N 合并类内协方差和客户端同类均值偏移外积，一次聚合后全类别下发所有客户端；不按模型上传的 uniform/sample_count 权重替代逐类样本权重，不使用 evaluation。后续不刷新。

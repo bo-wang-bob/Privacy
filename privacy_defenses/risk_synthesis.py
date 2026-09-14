@@ -27,8 +27,8 @@ LEGACY_DEFAULTS = dict(
     global_distribution="disabled",
     center_source="local_class",
 )
-DEFAULTS = {**LEGACY_DEFAULTS, "replacement_policy": "all", "replacement_fraction": 1.0,
-            "warmup_rounds": 0, "norm_ratio_min": 0.1}
+DEFAULTS = {**{k:v for k,v in LEGACY_DEFAULTS.items() if k not in {"norm_ratio_min", "norm_ratio_max"}},
+            "replacement_policy": "all", "replacement_fraction": 1.0, "warmup_rounds": 0}
 
 
 def synthesis_options(options):
@@ -38,6 +38,8 @@ def synthesis_options(options):
     if removed:
         raise ValueError(f"Per-class synthesis removed options {sorted(removed)}; old pooled runs require their original code version.")
     legacy = bool(options) and options.get("replacement_policy", "risk_probability") == "risk_probability"
+    if not legacy and {"norm_ratio_min", "norm_ratio_max"} & set(options):
+        raise ValueError("All-replacement synthesis removed norm_ratio_min/norm_ratio_max; rebuild the run with the current entrypoint. Historical norm-filter runs require their original code version.")
     return {**(LEGACY_DEFAULTS if legacy else DEFAULTS), **options}
 
 
@@ -56,16 +58,16 @@ def validate_risk_synthesis(config):
     if config.get("code_poison", {}).get("enabled", False):
         raise ValueError("risk_synthesis does not support active code-poison probes.")
     options = synthesis_options(defense.get("synthesis", {}))
-    unknown = set(options) - set(DEFAULTS)
+    unknown = set(options) - set(LEGACY_DEFAULTS)
     if unknown:
         raise ValueError(f"Unknown synthesis options: {sorted(unknown)}")
     for key in ("replacement_fraction",):
         if not math.isfinite(float(options[key])) or not 0 <= options[key] <= 1:
             raise ValueError(f"synthesis.{key} must be in [0,1].")
-    for key in ("noise_scale", "margin_tolerance", "norm_ratio_min", "norm_ratio_max"):
+    for key in ("noise_scale", "margin_tolerance") + tuple(k for k in ("norm_ratio_min", "norm_ratio_max") if k in options):
         if not math.isfinite(float(options[key])) or options[key] < 0:
             raise ValueError(f"synthesis.{key} must be finite and nonnegative.")
-    if options["norm_ratio_min"] > options["norm_ratio_max"]:
+    if "norm_ratio_min" in options and options["norm_ratio_min"] > options["norm_ratio_max"]:
         raise ValueError("Invalid synthesis norm ratio interval.")
     for key in ("class_rank", "min_class_samples", "attempts", "views_per_record"):
         if type(options[key]) is not int or options[key] < 1:
@@ -593,7 +595,7 @@ class RiskSynthesis:
         """Replace every position, retaining the best generated semantic candidate.
 
         Semantic failure never restores the original. An absent finite, changed,
-        norm-valid candidate aborts the batch before optimization instead.
+        distinct candidate aborts the batch before optimization instead.
         """
         tokens = model.encode_input_tokens(images)
         original = tokens[:, 1:].flatten(1).cpu()
@@ -622,10 +624,10 @@ class RiskSynthesis:
                 if not torch.isfinite(candidate).all():
                     invalid[j] = "nonfinite_geometry"
                     continue
-                ratio = float(candidate.float().norm() / original[j].float().norm().clamp_min(1e-12))
-                if not self.options["norm_ratio_min"] <= ratio <= self.options["norm_ratio_max"]:
-                    invalid[j] = "invalid_norm_ratio"
-                    continue
+                # Descriptive only: global means can legitimately have much
+                # smaller norms than individual inputs. Do not gate, rescale
+                # or clip a generated candidate based on this ratio.
+                ratio = float(candidate.double().norm() / original[j].double().norm().clamp_min(1e-12))
                 if torch.equal(candidate, original[j]):
                     invalid[j] = "unchanged_candidate"
                     continue
@@ -733,9 +735,13 @@ class RiskSynthesis:
     def summary(self):
         shared = self.options["global_distribution"] != "disabled"
         global_center = self.options["center_source"] == "global_class"
-        return dict(implementation=("local_token_geometry_v10_global_mean" if global_center else
+        replace_all = self.options["replacement_policy"] == "all"
+        return dict(implementation=("local_token_geometry_v11_no_norm_filter" if replace_all else
+                                    "local_token_geometry_v10_global_mean" if global_center else
                                     "local_token_geometry_v8_global_class" if shared else
                                     "local_token_geometry_v7_class_only"),
+                    norm_ratio_filter_enabled=not replace_all,
+                    norm_ratio_role="diagnostic_only" if replace_all else "candidate_constraint",
                     geometry_source=("global_same_class" if self.options["global_distribution"] == "generate"
                                      else "local_class_only"),
                     local_statistics_geometry_source="local_class_only",

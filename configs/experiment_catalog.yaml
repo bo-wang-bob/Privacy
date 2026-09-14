@@ -208,9 +208,7 @@ defense_overrides:
           min_class_samples: 3
           attempts: 2
           margin_tolerance: 0.02
-          norm_ratio_min: 0.1
           center_weighting: uniform
-          norm_ratio_max: 2.0
           mode: risk
           risk_history: none
           candidate_selection: first_semantic

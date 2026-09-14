@@ -13,6 +13,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.verify_synthesis_history import batch_key, fingerprint, require
+from scripts.synthesis_norm_protocol import norm_filter_enabled, valid_norm_diagnostic
 
 
 def verify(directory):
@@ -20,6 +21,7 @@ def verify(directory):
     summary_path = directory / 'synthesis_summary.json'
     summary = json.loads(summary_path.read_text())
     options = summary['options']
+    norm_filter_enabled(summary)
     k = options.get('views_per_record', 1)
     require(type(k) is int and k > 1 and options['replacement_policy']=='all', 'Not an all-replacement multiview run.')
     require(summary['status']=='completed', 'Cannot verify uncompleted multiview training.')
@@ -78,7 +80,7 @@ def verify(directory):
                 require(math.isclose(float(row['retained_original_fraction']),1-used,rel_tol=0,abs_tol=1e-7), 'Incorrect retention.')
                 distance, ratio = float(row['original_distance']), float(row['norm_ratio'])
                 require(math.isfinite(distance) and distance > 0
-                        and options['norm_ratio_min'] <= ratio <= options['norm_ratio_max'], 'Invalid trained view geometry.')
+                        and valid_norm_diagnostic(ratio, summary), 'Invalid trained view geometry.')
                 attempts, selected = int(row['attempts']), int(row['selected_attempt'])
                 require(1 <= selected <= attempts <= options['attempts'], 'Invalid view attempt budget.')
                 quality = int(row['quality_passed'])
@@ -96,7 +98,7 @@ def verify(directory):
                         require(math.isfinite(delta) and math.isfinite(cosine) and -1.00001<=cosine<=1.00001
                                 and 0 <= int(c['nearest_teacher_source_id']) < len(labels[client])
                                 and int(c['quality_passed'])==int(delta >= -options['margin_tolerance'])
-                                and options['norm_ratio_min']<=float(c['norm_ratio'])<=options['norm_ratio_max'],
+                                and valid_norm_diagnostic(float(c['norm_ratio']), summary),
                                 'Invalid view candidate metrics.')
                     feasible = [c for c in candidates if c['quality_passed']=='1']
                     chosen = (min(feasible,key=lambda c:(float(c['nearest_teacher_cosine']),-float(c['teacher_margin_delta']),int(c['attempt'])))

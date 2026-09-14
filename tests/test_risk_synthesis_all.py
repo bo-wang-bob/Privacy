@@ -22,7 +22,7 @@ def mechanism(semantic=True):
     images = torch.randn(8, 3, 4, 4)
     labels, indices = torch.tensor([0]*4+[1]*4), torch.arange(8)
     tokens = model.encode_input_tokens(images)
-    options = {**DEFAULTS, "semantic_filter": semantic, "norm_ratio_min": 0.01, "norm_ratio_max": 10.0}
+    options = {**DEFAULTS, "semantic_filter": semantic}
     synth = RiskSynthesis({"synthesis": options}, 42)
     synth.geometry[0] = LocalGeometry(tokens[:, 1:].flatten(1), labels, options, "cpu")
     synth.generators[0] = torch.Generator().manual_seed(10)
@@ -95,7 +95,7 @@ def test_invalid_first_geometry_is_retried_and_unchanged_candidates_abort():
     def sample(source, *args, **kwargs):
         nonlocal calls
         calls += 1
-        return source * 100 if calls <= 8 else source + .01
+        return torch.full_like(source, float('nan')) if calls <= 8 else source + .01
     synth.geometry[0].sample = sample
     output = synth.transform(model, SimpleNamespace(id=0), images, labels, indices, torch.zeros(8), 0, 0, -1)
     assert calls == 16

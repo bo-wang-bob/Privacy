@@ -215,9 +215,7 @@ def test_multiview_full_training_keeps_original_membership(kind, history, select
     assert len(list(csv.DictReader((tmp_path/'risk_synthesis/synthetic_exposure.csv').open()))) == 126
     assert len(list(csv.DictReader((tmp_path/'risk_synthesis/synthetic_views.csv').open()))) == 252
     summary = json.loads((tmp_path/'risk_synthesis/synthesis_summary.json').read_text())
-    assert summary['implementation']==('local_token_geometry_v10_global_mean' if center_source=='global_class' else
-                                       'local_token_geometry_v7_class_only' if exchange_mode=='disabled'
-                                       else 'local_token_geometry_v8_global_class')
+    assert summary['implementation']=='local_token_geometry_v11_no_norm_filter'
     if exchange_mode != 'disabled':
         assert synth.global_exchange['sha256']==before
         expected_center = 'global_same_class_mean' if center_source=='global_class' else 'local_same_class_leave_source_out'

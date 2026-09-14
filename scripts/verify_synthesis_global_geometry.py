@@ -32,7 +32,8 @@ def verify(directory):
     require(center_source in {'local_class', 'global_class'}, 'Unknown center source.')
     # Preserve verification of historical v9 artifacts without reinterpreting
     # their leave-source-out protocol as the new shared mean.
-    inclusive = center_source == 'global_class' and summary['implementation'] == 'local_token_geometry_v10_global_mean'
+    inclusive = center_source == 'global_class' and summary['implementation'] in {
+        'local_token_geometry_v10_global_mean', 'local_token_geometry_v11_no_norm_filter'}
     expected_center = ('global_same_class_mean' if inclusive else
                        f'{center_source.split("_")[0]}_same_class_leave_source_out')
     require(summary['generation_center'] == expected_center,

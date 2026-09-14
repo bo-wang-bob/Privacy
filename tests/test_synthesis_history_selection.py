@@ -185,7 +185,7 @@ def test_history_and_selection_end_to_end_preserve_original_membership_and_steps
     assert len(choices) == 252
     assert {row["history_rounds"] for row in records if row["round"] == "3"} == {"2"}
     assert all(row["attempts"] == "2" for row in records)
-    assert json.loads((directory / "synthesis_summary.json").read_text())["implementation"] == "local_token_geometry_v7_class_only"
+    assert json.loads((directory / "synthesis_summary.json").read_text())["implementation"] == "local_token_geometry_v11_no_norm_filter"
     from scripts.verify_synthesis_history import verify
     result = verify(directory)
     assert result["history_visits_verified"] == result["selected_visits_verified"] == 126
