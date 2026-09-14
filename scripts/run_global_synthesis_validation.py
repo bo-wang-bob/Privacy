@@ -21,7 +21,7 @@ def build_arguments(overrides):
         '--methods', 'fedavg',
         '--defenses', 'none,risk_synthesis',
         '--attacks', 'all',
-        '--seeds', '43,44,45',
+        '--seeds', '43',
         '--target-clients', '0',
         '--rounds', '100',
         '--local-epochs', '1',
