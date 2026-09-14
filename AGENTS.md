@@ -6,7 +6,7 @@
 - 所有已配置客户端在第1轮优化前，从原始本地训练集提交逐类 n、mean、完整数值秩 covariance factor。服务器按 n/N 合并类内协方差和客户端同类均值偏移外积，一次聚合后全类别下发所有客户端；不按模型上传的 uniform/sample_count 权重替代逐类样本权重，不使用 evaluation。后续不刷新。
 - 全局协方差通过完整数值秩因子表示以避免高维稠密矩阵；先聚合完整局部数值秩，再取现有 class_rank=5 用于生成。不能先截断局部到5维。不同类别不合并，没有 pooled_rank/shrinkage。中心按上述最新用户要求变更；风险、K视图归一化、原始成员身份保持原定义。全局中心仅支持uniform，不使用未共享的逐样本历史风险。
 - 仓库为单进程模拟：`global_distribution.pt` 一份只读约定的共享对象，逐客户端 receipt 保存 SHA256 与完整可用类别。`client_*_moment_upload.pt` 不含逐样本编码/ID；本地 source_codes 仍属本地诊断，不能作为上传使用。统计没有 DP，现有11种攻击未纳入该统计传输视图，不能用这些攻击代表新协议整体隐私。
-- 新实现独立于 `/tmp/privacy-risk-multiview` 的冻结 v7 队列。旧队列和历史结果保持原版本，新功能说明见 `docs/risk_synthesis_global_geometry.md`。尚无 v8/v9/v10 真实数据有效性结论。
+- 2026-09-14 已按用户要求将新版整合到 `/root/Privacy` 的 `main`，统一从正式目录运行。旧主分支归档为 `archive/pre-global-integration-20260914`，研究分支和历史结果保留。`scripts/run_global_synthesis_validation.py` 默认seed43、Adapter/LoRA各none/risk_synthesis，共4项；每次调用单GPU串行，两种模型可分卡运行。新功能与命令见 `docs/risk_synthesis_global_geometry.md`、`docs/risk_synthesis_validation_commands.md`。尚无v8/v9/v10真实数据有效性结论。
 
 ## 用户偏好与基本规则
 

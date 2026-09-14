@@ -35,7 +35,7 @@ $PY scripts/run_synthesis_multiview.py --gpus 0
 
 默认CLIP transformer Adapter/CIFAR100、100张原始图像/类、10个IID客户端、FedAvg100轮、每轮一个完整本地epoch、全部11种攻击、seed43、K=2。LoRA可用 `--models clip_lora`；K可用 `--set defense.synthesis.views_per_record=3`，但冻结实验不做K搜索。去掉两个合并几何参数，保留类别秩5、噪声强度0.1及原语义检查参数，不增加新的混合权重。
 
-本次代码位于本地分支 `research/risk-synthesis-multiview` 的独立工作树 `/tmp/privacy-risk-multiview`，上述命令从该目录执行。原工作区仍用于先前冻结实验；不要在两个训练队列使用的GPU上另外手动启动重复任务。
+当前最新实现已整合到 `/root/Privacy` 的 `main`，上述命令统一从正式目录执行。本文的类别本地几何实验定义属于历史v7对照，复现须使用 `research/risk-synthesis-multiview` 对应提交及其原冻结计划；当前效果验证使用 `scripts/run_global_synthesis_validation.py`。
 
 ## 记录和审计
 

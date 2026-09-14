@@ -10,7 +10,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-MANIFEST = Path('/root/Privacy/analysis_scripts/risk_synthesis_confirmation_data_20260912/split.json')
+MANIFEST = ROOT / 'analysis_scripts/risk_synthesis_confirmation_data_20260912/split.json'
 MANIFEST_SHA256 = '00941791be9727022bb09c4b9d55f8b06d05a1cc3489a99753cbdb393151c178'
 
 

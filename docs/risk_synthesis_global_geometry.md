@@ -50,10 +50,10 @@ L_c^{\mathrm{global}}=U_{c,1:q}\sqrt{\Lambda_{c,1:q}}.
 
 ## 运行与验证
 
-代码在本地分支 `research/risk-synthesis-global`，工作树 `/tmp/privacy-risk-global`。已冻结的 v7 本地几何研究继续使用原工作树，新旧结果不可混称。
+新版已从 `research/risk-synthesis-global` 快进整合到 `/root/Privacy` 的 `main`，当前运行统一使用正式目录。整合前主分支保存在 `archive/pre-global-integration-20260914`，研究分支和已有实验结果保留；历史结果仍按产生它们的版本解释。
 
 ```bash
-cd /tmp/privacy-risk-global
+cd /root/Privacy
 PY=/root/.local/share/mamba/envs/pfedba/bin/python
 $PY scripts/run_synthesis_multiview.py --dry-run
 # GPU空闲时运行；使用统一批量入口，默认K=2、FedAvg100轮、每类100张。
@@ -75,3 +75,5 @@ catalog 默认 `defense.synthesis.global_distribution=generate` 和 `defense.syn
 v9验证：162项相关测试通过（17.20秒）；统一入口干运行明确显示 `global_distribution:generate`、`center_source:global_class`、`views_per_record:2`、FedAvg100轮、每类100张，未启动真实训练或创建结果目录。`git diff --check` 通过。
 
 最新v10验证：162项相关测试通过（13.23秒），覆盖全局均值包含自身、同类别跨客户端参考中心一致、源记录变化按1/N_c进入均值，以及Adapter/LoRA多视图与全部11种攻击的集成。`git diff --check`通过；未启动真实数据训练。
+
+正式验证命令见 [Adapter/LoRA单种子验证](risk_synthesis_validation_commands.md)。入口默认只运行seed43的无防御与当前方案对照，实际超参数以解析配置为准。
