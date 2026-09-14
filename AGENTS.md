@@ -1,5 +1,12 @@
 # Repository guidance
 
+## 当前候选直接训练（v12）
+
+- 用户要求删除候选有效性与固定教师语义检查。当前默认 `candidate_selection: direct`、`semantic_filter: false`，实现 `local_token_geometry_v12_direct`。每原始记录的V个视图各抽样一次、全部训练，不检查候选有限性、范数、距离、实际改变或视图重复；不重试、择优或原图回退。通用views=1，当前验证入口保持views=2，可通过views_per_record增加共同训练候选。
+- 删除当前直接模式的attempts、margin_tolerance、min_class_samples参数；固定教师不初始化、不做语义统计。原始编码同批复用、按类别批量抽样。保留全局类别统计、包含自身的均值、风险混合位置、CE视图平均、原始成员身份及FedAvg。已有显式first_semantic/least_local_similarity配置保留历史机制，旧结果不改写。
+- 语义、范数、距离字段留空，摘要不虚构quality_failed=0；记录代表为first_generated_view，不宣称视图一定互异或每次编码确实改变。优化成功后才提交原始和视图计数。候选不筛选，但配置/身份/风险以及训练损失非有限保护仍保留；后者不重试生成。当前均不启用历史风险因子。
+- 新模式源代码为privacy_defenses/synthesis_direct.py，核验为scripts/verify_synthesis_direct.py；历史核验入口按版本路由。185项相关测试通过，覆盖1/2/3视图、Adapter/LoRA全部11攻击、无教师调用及旧协议兼容；双模型2视图和Adapter4视图干运行通过。新版改动只作用于新进程，不停止已有v11实验，尚未运行新版完整效果实验。
+
 ## 当前全替换范数门槛修复（2026-09-14，v11）
 
 - 当前全替换实现为 `local_token_geometry_v11_no_norm_filter`：删除 `norm_ratio_min/max` 配置及候选拒绝门槛，范数比只作诊断，不用于重缩放或裁剪。保留有限值、实际改变、视图去重、教师语义筛选及语义全失败时最佳有效候选，禁止原始编码回退。全局分布、含自身均值、风险及K视图归一化保持原定义。

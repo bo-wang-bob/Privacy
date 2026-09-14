@@ -574,7 +574,9 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
                   f"center_source:{synthesis.get('center_source', 'local_class')} "
                   f"views_per_record:{synthesis.get('views_per_record', 1)} "
                   f"warmup_rounds:{synthesis['warmup_rounds']} "
-                  f"semantic_failure:{'best_generated_candidate' if all_positions else 'original_input'}")
+                  f"candidate_selection:{synthesis.get('candidate_selection', 'first_semantic')} "
+                  f"semantic_filter:{synthesis['semantic_filter']} "
+                  f"semantic_failure:{'not_checked' if synthesis.get('candidate_selection') == 'direct' else 'best_generated_candidate' if all_positions else 'original_input'}")
         print(
             f"      protocol=method:{method} "
             f"weighting:{config.get('aggregation_weighting', 'uniform')} "

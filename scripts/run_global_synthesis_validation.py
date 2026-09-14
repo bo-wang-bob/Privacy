@@ -42,7 +42,7 @@ def build_arguments(overrides):
         '--set', 'defense.synthesis.warmup_rounds=0',
         '--set', 'defense.synthesis.views_per_record=2',
         '--set', 'defense.synthesis.risk_history=none',
-        '--set', 'defense.synthesis.candidate_selection=first_semantic',
+        '--set', 'defense.synthesis.candidate_selection=direct',
         '--set', 'defense.synthesis.center_weighting=uniform',
         '--set', 'defense.synthesis.mode=risk',
         *overrides,

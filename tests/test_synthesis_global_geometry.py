@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from privacy_defenses.global_geometry import local_moments, aggregate_moments, exchange
-from privacy_defenses.risk_synthesis import DEFAULTS, LocalGeometry, validate_risk_synthesis
+from privacy_defenses.risk_synthesis import FILTERED_DEFAULTS as DEFAULTS, LocalGeometry, validate_risk_synthesis
 
 
 def geometry(rows, labels):

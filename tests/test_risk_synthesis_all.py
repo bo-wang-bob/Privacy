@@ -9,7 +9,7 @@ import torch
 
 from aggregator.aggregator_builder import build_aggregator
 from privacy_defenses.risk_synthesis import (
-    DEFAULTS, LocalGeometry, RiskSynthesis, select_requests, synthesis_options, validate_risk_synthesis,
+    FILTERED_DEFAULTS as DEFAULTS, LocalGeometry, RiskSynthesis, select_requests, synthesis_options, validate_risk_synthesis,
 )
 from scripts.analyze_risk_synthesis import read_synthesis_mechanism
 from servers.serverbase import ServerBase
@@ -120,7 +120,8 @@ def test_all_replacement_rejects_options_that_reintroduce_original_positions(ove
 def test_saved_partial_options_remain_legacy_and_empty_new_options_replace_all():
     assert synthesis_options({"replacement_fraction": .25})["replacement_policy"] == "risk_probability"
     assert synthesis_options({"replacement_fraction": .25})["warmup_rounds"] == 1
-    assert synthesis_options({}) == DEFAULTS
+    assert synthesis_options({})["candidate_selection"] == "direct"
+    assert synthesis_options({**DEFAULTS}) == DEFAULTS
 
 
 @pytest.mark.parametrize("reverse", [False, True])

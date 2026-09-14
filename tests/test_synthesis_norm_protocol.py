@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from privacy_defenses.risk_synthesis import DEFAULTS, synthesis_options
+from privacy_defenses.risk_synthesis import FILTERED_DEFAULTS as DEFAULTS, synthesis_options
 from scripts.synthesis_norm_protocol import norm_filter_enabled, valid_norm_diagnostic
 from test_risk_synthesis_all import mechanism, rows
 from test_synthesis_multiview import multiview_mechanism

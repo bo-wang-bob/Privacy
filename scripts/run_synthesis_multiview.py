@@ -11,7 +11,7 @@ def main():
                 '--defenses','risk_synthesis','--attacks','all','--seeds','43','--rounds','100',
                 '--set','defense.synthesis.views_per_record=2',
                 '--set','defense.synthesis.risk_history=none',
-                '--set','defense.synthesis.candidate_selection=first_semantic']
+                '--set','defense.synthesis.candidate_selection=direct']
     return subprocess.call([sys.executable,str(ROOT/'scripts/run_privacy_experiments.py'),
                             *defaults,*sys.argv[1:]],cwd=ROOT)
 

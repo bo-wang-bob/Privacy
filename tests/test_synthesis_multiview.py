@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 from aggregator.aggregator_builder import build_aggregator
 from privacy_defenses.controller import DefenseController
-from privacy_defenses.risk_synthesis import DEFAULTS, LocalGeometry, validate_risk_synthesis
+from privacy_defenses.risk_synthesis import FILTERED_DEFAULTS as DEFAULTS, LocalGeometry, validate_risk_synthesis
 from servers.serverbase import ServerBase
 from test_clip_peft_fedsgd import ATTACKS, _audit_config
 from test_risk_synthesis import make_model, dataset, deterministic_cpu

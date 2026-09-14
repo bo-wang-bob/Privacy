@@ -27,8 +27,12 @@ LEGACY_DEFAULTS = dict(
     global_distribution="disabled",
     center_source="local_class",
 )
-DEFAULTS = {**{k:v for k,v in LEGACY_DEFAULTS.items() if k not in {"norm_ratio_min", "norm_ratio_max"}},
+FILTERED_DEFAULTS = {**{k:v for k,v in LEGACY_DEFAULTS.items() if k not in {"norm_ratio_min", "norm_ratio_max"}},
             "replacement_policy": "all", "replacement_fraction": 1.0, "warmup_rounds": 0}
+
+DIRECT_REMOVED_OPTIONS = {"attempts", "margin_tolerance", "min_class_samples"}
+DEFAULTS = {**{k: v for k, v in FILTERED_DEFAULTS.items() if k not in DIRECT_REMOVED_OPTIONS},
+            "candidate_selection": "direct", "semantic_filter": False}
 
 
 def synthesis_options(options):
@@ -37,10 +41,15 @@ def synthesis_options(options):
     removed = set(options) & {"shrinkage", "pooled_rank"}
     if removed:
         raise ValueError(f"Per-class synthesis removed options {sorted(removed)}; old pooled runs require their original code version.")
-    legacy = bool(options) and options.get("replacement_policy", "risk_probability") == "risk_probability"
+    legacy = bool(options) and options.get(
+        "replacement_policy", "all" if options.get("candidate_selection") == "direct" else "risk_probability"
+    ) == "risk_probability"
     if not legacy and {"norm_ratio_min", "norm_ratio_max"} & set(options):
         raise ValueError("All-replacement synthesis removed norm_ratio_min/norm_ratio_max; rebuild the run with the current entrypoint. Historical norm-filter runs require their original code version.")
-    return {**(LEGACY_DEFAULTS if legacy else DEFAULTS), **options}
+    direct = not legacy and options.get("candidate_selection", "first_semantic" if options else "direct") == "direct"
+    if direct and DIRECT_REMOVED_OPTIONS & set(options):
+        raise ValueError("Direct synthesis removed retry, semantic tolerance and minimum-class candidate options; use the current entrypoint.")
+    return {**(LEGACY_DEFAULTS if legacy else DEFAULTS if direct else FILTERED_DEFAULTS), **options}
 
 
 def validate_risk_synthesis(config):
@@ -64,15 +73,15 @@ def validate_risk_synthesis(config):
     for key in ("replacement_fraction",):
         if not math.isfinite(float(options[key])) or not 0 <= options[key] <= 1:
             raise ValueError(f"synthesis.{key} must be in [0,1].")
-    for key in ("noise_scale", "margin_tolerance") + tuple(k for k in ("norm_ratio_min", "norm_ratio_max") if k in options):
+    for key in tuple(k for k in ("noise_scale", "margin_tolerance", "norm_ratio_min", "norm_ratio_max") if k in options):
         if not math.isfinite(float(options[key])) or options[key] < 0:
             raise ValueError(f"synthesis.{key} must be finite and nonnegative.")
     if "norm_ratio_min" in options and options["norm_ratio_min"] > options["norm_ratio_max"]:
         raise ValueError("Invalid synthesis norm ratio interval.")
-    for key in ("class_rank", "min_class_samples", "attempts", "views_per_record"):
+    for key in (k for k in ("class_rank", "min_class_samples", "attempts", "views_per_record") if k in options):
         if type(options[key]) is not int or options[key] < 1:
             raise ValueError(f"synthesis.{key} must be a positive integer.")
-    if options["min_class_samples"] < 3:
+    if "min_class_samples" in options and options["min_class_samples"] < 3:
         raise ValueError("synthesis.min_class_samples must be at least 3.")
     if options["mode"] not in {"risk", "shuffled_risk", "mixup"}:
         raise ValueError("synthesis.mode must be risk, shuffled_risk or mixup.")
@@ -88,7 +97,7 @@ def validate_risk_synthesis(config):
         raise ValueError("synthesis.replacement_policy must be all or risk_probability.")
     if options["risk_history"] not in {"none", "zero_risk_frequency"}:
         raise ValueError("synthesis.risk_history must be none or zero_risk_frequency.")
-    if options["candidate_selection"] not in {"first_semantic", "least_local_similarity"}:
+    if options["candidate_selection"] not in {"direct", "first_semantic", "least_local_similarity"}:
         raise ValueError("Unknown synthesis.candidate_selection.")
     if options["global_distribution"] not in {"disabled", "share_only", "generate"}:
         raise ValueError("synthesis.global_distribution must be disabled, share_only or generate.")
@@ -104,8 +113,11 @@ def validate_risk_synthesis(config):
         raise ValueError("History and local-neighbor selection require all replacement.")
     if options["views_per_record"] > 1 and options["replacement_policy"] != "all":
         raise ValueError("Multiple training views require all replacement.")
-    if options["candidate_selection"] != "first_semantic" and not options["semantic_filter"]:
+    if options["candidate_selection"] == "least_local_similarity" and not options["semantic_filter"]:
         raise ValueError("Local-neighbor selection requires the semantic filter.")
+    if options["candidate_selection"] == "direct" and (
+            options["replacement_policy"] != "all" or options["semantic_filter"] or options["risk_history"] != "none"):
+        raise ValueError("Direct synthesis requires all replacement, no semantic filter and risk_history=none.")
     if options["replacement_policy"] == "all":
         if options["replacement_fraction"] != 1 or options["warmup_rounds"] != 0:
             raise ValueError("All replacement requires replacement_fraction=1 and warmup_rounds=0.")
@@ -178,6 +190,10 @@ class LocalGeometry:
         return group["mean"].float()
 
     def sample(self, original, index, risk, options, generator, center_weights=None):
+        if options.get("candidate_selection") == "direct":
+            from privacy_defenses.synthesis_direct import draw_batch
+            return draw_batch(self, original.cpu().float()[None], torch.tensor([index]),
+                              torch.tensor([risk], dtype=torch.float32), options, generator)[0]
         c = int(self.labels[index])
         group = self.classes[c]
         count = len(group["indices"])
@@ -293,19 +309,21 @@ class RiskSynthesis:
         self.directory = Path(directory) / "risk_synthesis"
         self.directory.mkdir(exist_ok=False)
         device = shared_model.device
-        self.teacher = copy.deepcopy(shared_model.clip_model).eval().requires_grad_(False)
-        # Remove PEFT residual effects, including nonzero loaded checkpoints.
-        for module in self.teacher.modules():
-            if hasattr(module, "lora_B"):
-                module.lora_B.zero_()
-            if module.__class__.__name__ == "BottleneckAdapter":
-                module.up.weight.zero_()
-                if module.up.bias is not None:
-                    module.up.bias.zero_()
-        text_args = {"input_ids": shared_model.text_input_ids}
-        if hasattr(shared_model, "text_attention_mask"):
-            text_args["attention_mask"] = shared_model.text_attention_mask
-        self.text = F.normalize(self.teacher.get_text_features(**text_args).float(), dim=-1)
+        direct = self.options["candidate_selection"] == "direct"
+        if not direct:
+            self.teacher = copy.deepcopy(shared_model.clip_model).eval().requires_grad_(False)
+            # Remove PEFT residual effects, including nonzero loaded checkpoints.
+            for module in self.teacher.modules():
+                if hasattr(module, "lora_B"):
+                    module.lora_B.zero_()
+                if module.__class__.__name__ == "BottleneckAdapter":
+                    module.up.weight.zero_()
+                    if module.up.bias is not None:
+                        module.up.bias.zero_()
+            text_args = {"input_ids": shared_model.text_input_ids}
+            if hasattr(shared_model, "text_attention_mask"):
+                text_args["attention_mask"] = shared_model.text_attention_mask
+            self.text = F.normalize(self.teacher.get_text_features(**text_args).float(), dim=-1)
         fields = ["round", "client", "step", "sample_id", "label", "risk", "used_risk",
                   "requested", "accepted", "attempts", "reason", "nearest_distance", "source_round",
                   "norm_ratio", "teacher_margin_delta"]
@@ -313,7 +331,7 @@ class RiskSynthesis:
             fields += ["quality_passed", "selected_attempt", "retained_original_fraction", "original_distance"]
         if self.options["risk_history"] != "none":
             fields += ["loss_gap", "history_exposure", "history_rounds", "joint_rank_score", "assigned_risk"]
-        if self.options["candidate_selection"] != "first_semantic":
+        if self.options["candidate_selection"] == "least_local_similarity":
             fields += ["nearest_teacher_cosine", "nearest_teacher_source_id"]
             self.candidate_handle = (self.directory / "candidate_choices.csv").open("x", newline="")
             candidate_fields = [
@@ -342,12 +360,13 @@ class RiskSynthesis:
                 codes.append(tokens[:, 1:].flatten(1).cpu())
                 labels.append(target.cpu())
                 ids.append(indices.cpu())
-                semantic.append(F.normalize(token_features(self.teacher, tokens), dim=-1).cpu())
+                if not direct:
+                    semantic.append(F.normalize(token_features(self.teacher, tokens), dim=-1).cpu())
             indices = torch.cat(ids)
             if not torch.equal(indices, torch.arange(user.train_samples)):
                 raise ValueError("Synthesis geometry must cover each original local ID exactly once.")
             geometry = LocalGeometry(torch.cat(codes), torch.cat(labels), self.options, device)
-            if self.options["replacement_policy"] == "all" and any(
+            if not direct and self.options["replacement_policy"] == "all" and any(
                     len(group["indices"]) < self.options["min_class_samples"] for group in geometry.classes.values()):
                 raise ValueError("All replacement requires min_class_samples in every local class; original-image fallback is disabled.")
             self.geometry[user.id] = geometry
@@ -357,11 +376,12 @@ class RiskSynthesis:
             if self.options["views_per_record"] > 1:
                 self.exposure[user.id]["synthetic_views"] = torch.zeros(user.train_samples, dtype=torch.long)
             state = geometry.state()
-            z = torch.cat(semantic)
-            if self.options["candidate_selection"] != "first_semantic":
-                self.semantic_sources[user.id] = z
-                state["semantic_source_features"] = z
-            state["semantic_class_means"] = {c: z[g["indices"]].mean(0) for c,g in geometry.classes.items()}
+            if not direct:
+                z = torch.cat(semantic)
+                if self.options["candidate_selection"] == "least_local_similarity":
+                    self.semantic_sources[user.id] = z
+                    state["semantic_source_features"] = z
+                state["semantic_class_means"] = {c: z[g["indices"]].mean(0) for c,g in geometry.classes.items()}
             state["representation"] = "frozen_patch_plus_position_without_cls"
             state["covariance_divisor"] = "n"
             state["options"] = self.options
@@ -402,6 +422,9 @@ class RiskSynthesis:
         return (own - similarities.max(1).values).cpu(), cosine.cpu(), nearest.cpu()
 
     def record_optimized_batch(self, client):
+        if self.options["candidate_selection"] == "direct":
+            from privacy_defenses.synthesis_direct import record_optimized
+            return record_optimized(self, client)
         views = self.pending_views.pop(client, None)
         if views is not None:
             for records in zip(*views):
@@ -440,9 +463,13 @@ class RiskSynthesis:
         """Generate K independently drawn, jointly trained views per original.
 
         Ranking and shuffled assignment happen once per original batch. All K
-        views must be valid before any backward/optimizer work. Source counters
-        and history commit once, after the shared optimizer step succeeds.
+        views are prepared before backward; direct mode does not filter them.
+        Source counters commit once, after the optimizer step succeeds.
         """
+        if self.options["candidate_selection"] == "direct":
+            from privacy_defenses.synthesis_direct import generate_views
+            return generate_views(self, model, user, images, labels, indices, risk,
+                                  round_index, step, source_round, raw_scores)
         if self.options["views_per_record"] == 1:
             return (self.transform(model, user, images, labels, indices, risk, round_index, step,
                                    source_round, raw_scores=raw_scores),)
@@ -467,6 +494,10 @@ class RiskSynthesis:
     def transform(self, model, user, images, labels, indices, risk, round_index, step, source_round, *, raw_scores=None):
         if self.options["views_per_record"] != 1:
             raise ValueError("Multiple training views require transform_views; selecting only one is invalid.")
+        if self.options["candidate_selection"] == "direct":
+            from privacy_defenses.synthesis_direct import generate_views
+            return generate_views(self, model, user, images, labels, indices, risk,
+                                  round_index, step, source_round, raw_scores)[0]
         if self.options["replacement_policy"] == "all":
             return self._transform_all(model, user, images, labels, indices, risk, round_index, step, source_round,
                                        raw_scores=raw_scores)
@@ -736,12 +767,18 @@ class RiskSynthesis:
         shared = self.options["global_distribution"] != "disabled"
         global_center = self.options["center_source"] == "global_class"
         replace_all = self.options["replacement_policy"] == "all"
-        return dict(implementation=("local_token_geometry_v11_no_norm_filter" if replace_all else
+        direct = self.options["candidate_selection"] == "direct"
+        return dict(implementation=("local_token_geometry_v12_direct" if direct else
+                                    "local_token_geometry_v11_no_norm_filter" if replace_all else
                                     "local_token_geometry_v10_global_mean" if global_center else
                                     "local_token_geometry_v8_global_class" if shared else
                                     "local_token_geometry_v7_class_only"),
                     norm_ratio_filter_enabled=not replace_all,
-                    norm_ratio_role="diagnostic_only" if replace_all else "candidate_constraint",
+                    norm_ratio_role="not_measured" if direct else "diagnostic_only" if replace_all else "candidate_constraint",
+                    **(dict(candidate_validity_filter_enabled=False, semantic_filter_enabled=False,
+                            teacher_initialized=False, candidate_generation="one_draw_per_training_view",
+                            candidate_failure_policy="no_rejection_or_retry",
+                            semantic_quality_measured=False) if direct else {}),
                     geometry_source=("global_same_class" if self.options["global_distribution"] == "generate"
                                      else "local_class_only"),
                     local_statistics_geometry_source="local_class_only",
@@ -758,12 +795,12 @@ class RiskSynthesis:
                                            self.options["center_weighting"] == "previous_risk" else None),
                     request_sampling=("every_original_training_position" if self.options["replacement_policy"] == "all"
                                       else "rank_coupled_independent_rng"),
-                    semantic_failure_policy=("best_generated_candidate" if self.options["replacement_policy"] == "all"
+                    semantic_failure_policy=("not_checked" if direct else "best_generated_candidate" if self.options["replacement_policy"] == "all"
                                              else "original_input"),
                     counts=dict(self.counts), risk_bins={k:dict(v) for k,v in self.risk_bins.items()},
                     **(dict(view_counts=dict(self.view_counts),
                             observation_unit="original_visit", view_observation_unit="trained_virtual_view",
-                            original_row_measurement="worst_semantic_view",
+                            original_row_measurement="first_generated_view" if direct else "worst_semantic_view",
                             loss_normalization="mean_over_views_then_mean_over_original_records",
                             optimizer_steps_per_original_batch=1) if self.options["views_per_record"] > 1 else {}),
                     formal_dp_enabled=False, client_upload_is_private=False,

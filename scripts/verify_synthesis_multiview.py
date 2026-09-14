@@ -20,6 +20,9 @@ def verify(directory):
     directory = Path(directory)
     summary_path = directory / 'synthesis_summary.json'
     summary = json.loads(summary_path.read_text())
+    if summary.get('implementation') == 'local_token_geometry_v12_direct':
+        from scripts.verify_synthesis_direct import verify as verify_direct
+        return verify_direct(directory)
     options = summary['options']
     norm_filter_enabled(summary)
     k = options.get('views_per_record', 1)

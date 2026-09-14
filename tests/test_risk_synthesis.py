@@ -257,6 +257,8 @@ def test_catalog_validates_method_and_keeps_original_membership():
         assert options["replacement_policy"] == "all"
         assert options["replacement_fraction"] == 1 and options["warmup_rounds"] == 0
         assert not {"norm_ratio_min", "norm_ratio_max"} & set(options)
+        assert options["candidate_selection"] == "direct" and options["semantic_filter"] is False
+        assert not {"attempts", "margin_tolerance", "min_class_samples"} & set(options)
     with pytest.raises(ValueError,match="replacement_fraction"):
         build_tasks(catalog,parse_args(args+["--methods","fedavg","--set","defense.synthesis.replacement_fraction=2"]))
     with pytest.raises(ValueError, match="single MixUp donor"):

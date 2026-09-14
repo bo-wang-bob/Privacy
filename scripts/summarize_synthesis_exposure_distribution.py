@@ -24,6 +24,7 @@ def summarize(record):
     options = record.get("synthesis_options") or {}
     if options.get("replacement_policy") != "all":
         return None
+    direct = options.get("candidate_selection") == "direct"
     views = options.get("views_per_record", 1)
     path = Path(record["path"]) / "risk_synthesis" / ("synthetic_views.csv" if views > 1 else "synthetic_exposure.csv")
     if digest(path) != record["sources"][str(path)]:
@@ -34,7 +35,7 @@ def summarize(record):
             key = int(row["client"]), int(row["sample_id"])
             label = int(row["label"])
             value = observations.setdefault(key, dict(label=label, visits=0, reference_visits=0, zeros=0,
-                retained_sum=0., retained_fourth_sum=0., quality_failures=0, attempts=0,
+                retained_sum=0., retained_fourth_sum=0., quality_failures=None if direct else 0, attempts=0,
                 history_changes=0 if "assigned_risk" in row else None,
                 neighbor_cosine_sum=0. if "nearest_teacher_cosine" in row else None,
                 source_nearest_count=0 if "nearest_teacher_source_id" in row else None))
@@ -45,7 +46,11 @@ def summarize(record):
                 raise ValueError("Invalid recorded risk.")
             value["visits"] += 1
             value["attempts"] += int(row["attempts"])
-            value["quality_failures"] += 1-int(row["quality_passed"])
+            if direct:
+                if row["quality_passed"] != "":
+                    raise ValueError("Unchecked direct views cannot claim semantic quality.")
+            else:
+                value["quality_failures"] += 1-int(row["quality_passed"])
             # Exclude unavailable-reference bootstrap visits for all retained
             # moments, zero-risk frequency and selection-history comparisons.
             if int(row["source_round"]) < 0:
@@ -70,7 +75,7 @@ def summarize(record):
             trained_views=value["visits"], zero_risk_count=value["zeros"]/views,
             zero_risk_fraction=value["zeros"]/n, mean_retained_fraction=value["retained_sum"]/n,
             mean_retained_fourth=value["retained_fourth_sum"]/n,
-            semantic_failure_fraction=value["quality_failures"]/value["visits"],
+            semantic_failure_fraction=None if direct else value["quality_failures"]/value["visits"],
             mean_attempts=value["attempts"]/value["visits"],
             history_reassignment_fraction=None if value["history_changes"] is None else value["history_changes"]/n,
             mean_nearest_teacher_cosine=None if value["neighbor_cosine_sum"] is None else value["neighbor_cosine_sum"]/n,

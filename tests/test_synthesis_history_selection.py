@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from aggregator.aggregator_builder import build_aggregator
-from privacy_defenses.risk_synthesis import DEFAULTS, select_requests, validate_risk_synthesis
+from privacy_defenses.risk_synthesis import FILTERED_DEFAULTS as DEFAULTS, select_requests, validate_risk_synthesis
 from privacy_defenses.synthesis_history import ZeroRiskHistory, history_assignment, midranks
 from privacy_defenses.www_dp import risk_regularization_weights
 from servers.serverbase import ServerBase

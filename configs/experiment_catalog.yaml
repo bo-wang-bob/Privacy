@@ -205,15 +205,12 @@ defense_overrides:
           class_rank: 5
           global_distribution: generate
           center_source: global_class
-          min_class_samples: 3
-          attempts: 2
-          margin_tolerance: 0.02
           center_weighting: uniform
           mode: risk
           risk_history: none
-          candidate_selection: first_semantic
+          candidate_selection: direct
           views_per_record: 1
-          semantic_filter: true
+          semantic_filter: false
           warmup_rounds: 0
 
   www:

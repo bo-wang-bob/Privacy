@@ -70,6 +70,9 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     """
     import torch
     directory = Path(directory)
+    if summary.get("implementation") == "local_token_geometry_v12_direct":
+        from scripts.verify_synthesis_direct import read_mechanism
+        return read_mechanism(directory, summary, complete=complete)
     norm_filter_enabled(summary)
     multiview = summary["options"].get("views_per_record", 1) > 1
     view_evidence = None
