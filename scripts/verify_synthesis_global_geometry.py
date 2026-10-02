@@ -52,6 +52,8 @@ def verify(directory):
     directory = Path(directory)
     summary_path = directory/'synthesis_summary.json'
     summary = json.loads(summary_path.read_text())
+    from privacy_defenses.synthesis_cleanup import require_geometry_available
+    require_geometry_available(directory, summary)
     verify_center_metadata(summary)
     from privacy_defenses.synthesis_storage import compact_global_evidence
     archived = compact_global_evidence(directory, summary)

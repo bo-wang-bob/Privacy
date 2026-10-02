@@ -25,6 +25,7 @@ tests/*
 !tests/test_synthesis_center_ablation.py
 !tests/test_synthesis_center_source_ablation.py
 !tests/test_synthesis_fedsgd.py
+!tests/test_synthesis_failure_cleanup.py
 paper/
 
 # Local model weights and experiment artifacts

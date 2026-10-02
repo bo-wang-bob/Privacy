@@ -1,7 +1,7 @@
 """Retain compact evidence before retiring this run's large synthesis caches.
 
-There is deliberately no directory-sweep or historical-cleanup CLI here.
-Only the owner of a newly completed direct training run invokes deletion.
+Verified successful-run cleanup. Unverified terminal cleanup lives separately
+in synthesis_cleanup and must never be interpreted as geometry verification.
 """
 import gc
 import hashlib
@@ -147,7 +147,7 @@ def _prepare(synth, summary):
 
 
 def cleanup_on_success(synth, *, audit_succeeded):
-    if (synth.directory is None or synth.options.get('statistics_retention', 'keep') != 'cleanup_on_success'
+    if (synth.directory is None or synth.options.get('statistics_retention', 'keep') not in {'cleanup_on_success', 'cleanup_on_exit'}
             or synth.options['candidate_selection'] != 'direct'):
         return
     directory = synth.directory
@@ -163,7 +163,7 @@ def cleanup_on_success(synth, *, audit_succeeded):
     try:
         receipt, paths = _prepare(synth, summary)
         atomic_json(directory/RECEIPT, receipt)
-        storage = dict(status='prepared', policy='cleanup_on_success', receipt=RECEIPT,
+        storage = dict(status='prepared', policy=synth.options['statistics_retention'], receipt=RECEIPT,
                        receipt_sha256=digest(directory/RECEIPT), removed_files=[], removed_bytes=0)
         atomic_json(summary_path, {**summary, 'statistics_storage':storage})
         prepared = True
@@ -187,7 +187,7 @@ def cleanup_on_success(synth, *, audit_succeeded):
     except Exception as error:
         # Never mask a valid completed training result with a housekeeping error.
         # If interrupted after preparation, the compact evidence remains usable.
-        storage = (storage if prepared else dict(policy='cleanup_on_success'))
+        storage = (storage if prepared else dict(policy=synth.options['statistics_retention']))
         storage.update(status='cleanup_incomplete' if prepared else 'retained_error',
                        error=f'{type(error).__name__}: {error}',
                        removed_files=[r['name'] for r in removed],

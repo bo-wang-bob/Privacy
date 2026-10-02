@@ -1,5 +1,11 @@
 # Repository guidance
 
+## 失败实验的统计清理（2026-10-02）
+
+- 用户要求失败时也清除大统计缓存。新direct/catalog默认 `statistics_retention: cleanup_on_exit`；显式旧 `cleanup_on_success` 和 `keep` 保留原语义。成功仍先核验再保存精简凭据，失败/核验异常另存 `statistics_cleanup_manifest.json` 和 `statistics_cleanup.json`，标记 `cleaned_unverified`，不把实验升级为核验通过。
+- 四类大文件为原始token缓存、本地分布、上传类别统计、全局分布；配置、模型、指标、日志、逐条CSV和原有摘要保留。初始化登记目录和客户端所有权；普通异常由训练finalizer清理，SIGBUS/SIGKILL等子进程退出由唯一批量入口wait后补清理。拒绝活动进程、符号链接和变化的文件；清理错误不覆盖原退出码。
+- `scripts/cleanup_synthesis_statistics.py --runs ... --plan FILE` 只为明确目录生成计划，`--apply FILE` 才执行历史清理，不自动扫描旧结果。原始结果删除仍须用户明确授权；历史清理不可伪造核验凭据。详见 `docs/risk_synthesis_statistics_retention.md`。
+
 ## 生成视图风险覆盖比例（2026-09-28）
 
 - 用户要求覆盖比例改为1。direct生成新增独立 `defense.synthesis.risk_tail_fraction`，catalog新实验默认1，范围 `(0,1]`；原生成分支的硬编码0.8已接通此参数。`defense.www_tail_fraction` 只控制独立WWW防御，之前对话将其说成生成参数不准确。

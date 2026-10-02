@@ -392,7 +392,7 @@ FedAvg 成员身份仍定义为目标客户端原始完整训练集中的记录�
 
 ## 12. 实现对应与文档依据
 
-当前新启动的direct任务默认在训练和审计成功后清理四类大统计缓存，先保留原始标签、类别计数/秩/特征值、哈希和清理前核验结论。模型、指标、攻击结果及逐样本CSV继续保留；清理后的分析不宣称重新计算了已删除的协方差。该文件生命周期选项不改变算法超参数。详见 [统计缓存清理](risk_synthesis_statistics_retention.md)。
+当前新启动的direct任务默认 `statistics_retention=cleanup_on_exit`，成功或失败后均清理四类大统计缓存。成功时先保留原始标签、类别计数/秩/特征值、哈希和清理前核验结论；失败或核验异常时保存独立的未核验清理凭据，不虚构核验结论。模型、指标、攻击结果及逐样本CSV继续保留；清理后的分析不宣称重新计算了已删除的协方差。该文件生命周期选项不改变算法超参数。详见 [统计缓存清理](risk_synthesis_statistics_retention.md)。
 
 本文默认公式对应v13：在v12直接生成基础上删除额外噪声系数，每个视图抽样一次并全部训练。摘要记录 `generation_noise=covariance_factor_times_standard_normal`、`noise_scale_parameter_enabled=false`，配置不含 `noise_scale`。后续v14按用户要求恢复显式幅度选项；含该字段的新direct任务记录为v14，不改标旧结果。历史筛选模式仍保留原噪声参数，旧结果按记录版本核验。旧 v11 范数门槛修复版本位于本地提交 `48137b8`。
 

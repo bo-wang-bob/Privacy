@@ -5,6 +5,7 @@ import copy
 import csv
 import hashlib
 import json
+import logging
 import math
 from collections import Counter
 from pathlib import Path
@@ -34,7 +35,7 @@ FILTERED_DEFAULTS = {**{k:v for k,v in LEGACY_DEFAULTS.items() if k not in {"nor
 DIRECT_REMOVED_OPTIONS = {"attempts", "margin_tolerance", "min_class_samples"}
 DEFAULTS = {**{k: v for k, v in FILTERED_DEFAULTS.items() if k not in DIRECT_REMOVED_OPTIONS | {"noise_scale"}},
             "candidate_selection": "direct", "semantic_filter": False, "class_rank": "all",
-            "statistics_retention": "cleanup_on_success"}
+            "statistics_retention": "cleanup_on_exit"}
 
 
 def synthesis_options(options):
@@ -122,9 +123,9 @@ def validate_risk_synthesis(config):
         raise ValueError("Unknown synthesis.candidate_selection.")
     if options["global_distribution"] not in {"disabled", "share_only", "generate"}:
         raise ValueError("synthesis.global_distribution must be disabled, share_only or generate.")
-    if options['statistics_retention'] not in {'keep', 'cleanup_on_success'}:
-        raise ValueError("synthesis.statistics_retention must be keep or cleanup_on_success.")
-    if options['statistics_retention'] == 'cleanup_on_success' and options['candidate_selection'] != 'direct':
+    if options['statistics_retention'] not in {'keep', 'cleanup_on_success', 'cleanup_on_exit'}:
+        raise ValueError("synthesis.statistics_retention must be keep, cleanup_on_success or cleanup_on_exit.")
+    if options['statistics_retention'] != 'keep' and options['candidate_selection'] != 'direct':
         raise ValueError("Statistics cleanup currently requires direct synthesis.")
     if options["global_distribution"] == "generate" and options["mode"] == "mixup":
         raise ValueError("Global geometry generation requires a geometric noise mode, not mixup.")
@@ -340,12 +341,29 @@ class RiskSynthesis:
     def initialize(self, users, shared_model, directory):
         if self.directory is not None:
             raise RuntimeError("Synthesis distributions are initialized exactly once before training.")
+        try:
+            self._initialize(users, shared_model, directory)
+        except BaseException as error:
+            try:
+                self.close('failed')
+            except Exception:
+                logging.getLogger(__name__).exception('Could not save failed synthesis initialization summary.')
+            self.cleanup_statistics(audit_succeeded=False, terminal_status='initialization_failed',
+                                    failure=f'{type(error).__name__}: {error}')
+            raise
+
+    def _initialize(self, users, shared_model, directory):
+        if self.directory is not None:
+            raise RuntimeError("Synthesis distributions are initialized exactly once before training.")
         methods = {user.federated_method for user in users}
         if len(methods) != 1:
             raise ValueError("Synthesis clients must share one federated method.")
         self.federated_method = next(iter(methods))
-        self.directory = Path(directory) / "risk_synthesis"
-        self.directory.mkdir(exist_ok=False)
+        owned_directory = Path(directory) / "risk_synthesis"
+        owned_directory.mkdir(exist_ok=False)
+        self.directory = owned_directory
+        from privacy_defenses.synthesis_cleanup import register_owner
+        register_owner(self.directory, [user.id for user in users], self.options['statistics_retention'])
         device = shared_model.device
         direct = self.options["candidate_selection"] == "direct"
         if not direct:
@@ -885,6 +903,34 @@ class RiskSynthesis:
         if self.view_handle is not None:
             self.view_handle.close()
 
-    def cleanup_statistics(self, *, audit_succeeded):
+    def cleanup_statistics(self, *, audit_succeeded, terminal_status='completed', failure=None):
         from privacy_defenses.synthesis_storage import cleanup_on_success
-        cleanup_on_success(self, audit_succeeded=audit_succeeded)
+        logger = logging.getLogger(__name__)
+        if terminal_status == 'completed':
+            try:
+                cleanup_on_success(self, audit_succeeded=audit_succeeded)
+            except Exception:
+                logger.exception('Verified statistics cleanup failed before preparation.')
+        if self.directory is None or self.options.get('statistics_retention') != 'cleanup_on_exit':
+            return
+        try:
+            # Drop CPU mmap and CUDA references even when a view or initialization
+            # was interrupted; the fallback reads files only as opaque bytes.
+            self.device_geometry_cache.clear()
+            self.pending_views.clear()
+            for geometry in self.geometry.values():
+                geometry.codes = None
+                geometry.classes = {}
+                geometry.global_distribution = None
+            self.geometry.clear()
+            from privacy_defenses.synthesis_cleanup import cleanup_owned
+            receipt = cleanup_owned(self.directory, in_process=True,
+                reason=dict(trigger='training_finalizer', training_status=terminal_status,
+                            audit_succeeded=audit_succeeded, failure=failure,
+                            prior_statistics_storage=self.statistics_storage))
+            if receipt:
+                logger.info('Synthesis terminal cleanup | status=%s | removed_bytes=%d',
+                            receipt['status'], receipt['removed_bytes'])
+        except Exception:
+            # Housekeeping must not replace the original training exception.
+            logger.exception('Terminal statistics cleanup failed; launcher can retry after process exit.')

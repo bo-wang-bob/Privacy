@@ -70,6 +70,8 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     """
     import torch
     directory = Path(directory)
+    from privacy_defenses.synthesis_cleanup import require_geometry_available
+    require_geometry_available(directory, summary)
     if summary.get("implementation") in {"local_token_geometry_v12_direct", "local_token_geometry_v13_direct_unit_noise", "local_token_geometry_v14_direct_scaled_noise", "local_token_geometry_v15_direct_mixing"}:
         from scripts.verify_synthesis_direct import read_mechanism
         return read_mechanism(directory, summary, complete=complete)
@@ -328,7 +330,15 @@ def read_run(directory):
                   accuracy=float(last["accuracy"]) if last else None,
                   complete=completed, errors=summary.get("errors"), synthesis=synthesis,
                   sources=sources, attacks=[])
-    if synthesis is not None and (directory / "risk_synthesis" / "synthetic_exposure.csv").exists():
+    from privacy_defenses.synthesis_cleanup import unverified_cleanup, MANIFEST, RECEIPT
+    cleanup = unverified_cleanup(directory / 'risk_synthesis', synthesis)
+    if cleanup is not None:
+        result.update(training_completed=completed, complete=False, statistics_cleanup=cleanup,
+                      synthesis_verification_status='unavailable_after_unverified_cleanup')
+        for name in (MANIFEST, RECEIPT):
+            path = directory / 'risk_synthesis' / name
+            sources[str(path)] = digest(path)
+    if cleanup is None and synthesis is not None and (directory / "risk_synthesis" / "synthetic_exposure.csv").exists():
         result["synthesis_mechanism"] = read_synthesis_mechanism(
             directory / "risk_synthesis", synthesis, complete=completed)
         global_evidence = result["synthesis_mechanism"].get("global_geometry_evidence")
@@ -529,7 +539,9 @@ def analyze(directories,output):
     for r in runs:
         accuracy="—" if r["accuracy"] is None else f'{r["accuracy"]*100:.2f}%'
         auc="—" if r["strongest_auc"] is None else f'{r["strongest_auc"]:.4f}'
-        lines.append(f'| {r["run"]} | {r["actual_round"]}/{r["expected_rounds"]} | {"完成" if r["complete"] else "未完成/失败"} | {accuracy} | {auc} |')
+        state = ('完成' if r['complete'] else '训练完成/生成统计未核验'
+                 if r.get('training_completed') else '未完成/失败')
+        lines.append(f'| {r["run"]} | {r["actual_round"]}/{r["expected_rounds"]} | {state} | {accuracy} | {auc} |')
     lines += ["",f"符合配置、候选元数据与完成状态要求的基线配对：{len(comparisons)} 组。",
               "", "所有已输出 AUC 均从 predictions.csv 用平均秩公式独立复算；低 FPR 指标仅采用可报告值。",
               "class_metrics.csv 额外报告同类别内的 AUC 和统一全局阈值下的分类别 TPR/FPR；这些诊断不替代正式攻击结果。",

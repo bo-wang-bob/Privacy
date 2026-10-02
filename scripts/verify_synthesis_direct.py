@@ -19,6 +19,8 @@ UNMEASURED = ('quality_passed', 'teacher_margin_delta', 'norm_ratio',
 
 def read_mechanism(directory, summary, *, complete):
     directory = Path(directory)
+    from privacy_defenses.synthesis_cleanup import require_geometry_available
+    require_geometry_available(directory, summary)
     options = summary['options']
     from scripts.verify_synthesis_global_geometry import verify_center_metadata
     # Historical partial snapshots may lack center metadata entirely.

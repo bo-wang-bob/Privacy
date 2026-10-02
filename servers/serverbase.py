@@ -780,21 +780,34 @@ class ServerBase:
 
     def train(self) -> list[dict]:
         status = "failed"
+        failure = None
         try:
             with self.timings.measure("run"):
                 self.defense.start_www_gradient_diagnostics(self.results_dir)
                 summaries = self._train()
             status = "completed"
             return summaries
+        except BaseException as error:
+            failure = f'{type(error).__name__}: {error}'
+            raise
         finally:
             try:
-                self.defense.finish_www_gradient_diagnostics(status)
+                try:
+                    self.defense.finish_www_gradient_diagnostics(status)
+                finally:
+                    self.timings.save(
+                        os.path.join(self.results_dir, "performance_summary.json"), status=status,
+                    )
+            except Exception as error:
+                if failure is None:
+                    status = 'failed'
+                    failure = f'{type(error).__name__}: {error}'
+                    raise
+                logger.exception('Final diagnostics failed; preserving original training exception.')
             finally:
-                self.timings.save(
-                    os.path.join(self.results_dir, "performance_summary.json"), status=status,
-                )
-            if status == "completed" and self.defense.synthesis is not None:
-                self.defense.synthesis.cleanup_statistics(audit_succeeded=not bool(self.auditor.errors))
+                if self.defense.synthesis is not None:
+                    self.defense.synthesis.cleanup_statistics(
+                        audit_succeeded=not bool(self.auditor.errors), terminal_status=status, failure=failure)
 
     def _train(self) -> list[dict]:
         self.ctx.set_base_model_state(

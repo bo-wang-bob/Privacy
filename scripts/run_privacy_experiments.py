@@ -671,6 +671,22 @@ def _forward_child_line(line: str) -> str:
     return line if line.endswith("\n") else line + "\n"
 
 
+def cleanup_finished_task(task: ExperimentTask, returncode: int) -> dict | None:
+    """Parent fallback after wait(), including SIGBUS/SIGKILL in the child."""
+    if (task.defense != 'risk_synthesis' or
+            task.config.get('defense', {}).get('synthesis', {}).get('statistics_retention') != 'cleanup_on_exit'):
+        return None
+    directory = task.run_dir / 'risk_synthesis'
+    if not directory.exists():
+        return None
+    try:
+        from privacy_defenses.synthesis_cleanup import cleanup_owned
+        return cleanup_owned(directory, reason=dict(trigger='launcher_after_wait', returncode=returncode))
+    except Exception as error:
+        # Preserve the original child return code and failure traceback.
+        return dict(status='cleanup_error', error=f'{type(error).__name__}: {error}')
+
+
 def run_task(task: ExperimentTask) -> TaskResult:
     started = dt.datetime.now(dt.timezone.utc)
     task.run_dir.mkdir(parents=True, exist_ok=False)
@@ -702,14 +718,39 @@ def run_task(task: ExperimentTask) -> TaskResult:
             bufsize=1,
         )
         assert process.stdout is not None
-        for raw_line in process.stdout:
-            formatted = _forward_child_line(raw_line)
-            log.write(formatted)
-            log.flush()
-            with _PRINT_LOCK:
-                sys.stdout.write(formatted)
-                sys.stdout.flush()
-        returncode = process.wait()
+        returncode = None
+        try:
+            for raw_line in process.stdout:
+                formatted = _forward_child_line(raw_line)
+                log.write(formatted)
+                log.flush()
+                with _PRINT_LOCK:
+                    sys.stdout.write(formatted)
+                    sys.stdout.flush()
+            returncode = process.wait()
+        except BaseException:
+            # Never remove mmap-backed caches under a still-running child.
+            if process.poll() is None:
+                process.terminate()
+            try:
+                returncode = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                returncode = process.wait()
+            raise
+        finally:
+            if returncode is not None:
+                cleanup = cleanup_finished_task(task, returncode)
+                if cleanup is not None:
+                    line = _timestamped_line('STATISTICS_CLEANUP | ' + json.dumps(cleanup, ensure_ascii=False))
+                    try:
+                        log.write(line)
+                        log.flush()
+                        with _PRINT_LOCK:
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                    except OSError:
+                        pass  # The per-run cleanup receipt is the durable evidence.
         footer = _timestamped_line(f"EXIT | returncode={returncode}")
         log.write(footer)
         with _PRINT_LOCK:

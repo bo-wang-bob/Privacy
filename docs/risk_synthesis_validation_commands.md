@@ -116,7 +116,7 @@ cd /root/Privacy
 
 CUDA训练现在默认启用设备端几何生成与有界类别因子缓存，原命令无需增加参数。只影响新启动任务；正在运行的进程继续使用已加载实现。说明与局部计时见 [GPU生成优化](risk_synthesis_gpu_generation.md)。
 
-新启动的direct任务还默认 `statistics_retention=cleanup_on_success`：训练与审计成功后保留精简核验凭据，自动删除本任务的四类大统计缓存；模型、指标、攻击结果和CSV保留。失败与历史任务不清理。需要保留完整统计时追加 `--set defense.synthesis.statistics_retention=keep`。见 [统计缓存清理](risk_synthesis_statistics_retention.md)。
+新启动的direct任务默认 `statistics_retention=cleanup_on_exit`：成功后保留精简核验凭据，失败或统计核验异常时保留独立的未核验清理凭据，再删除本任务的四类大统计缓存；模型、指标、攻击结果和CSV保留。批量入口可在子进程信号退出后补清理；历史目录需显式指定清理。需要保留完整统计时追加 `--set defense.synthesis.statistics_retention=keep`。见 [统计缓存清理](risk_synthesis_statistics_retention.md)。
 
 ## 每次原始访问分别生成2、4、8个替身
 

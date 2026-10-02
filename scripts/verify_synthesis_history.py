@@ -36,6 +36,8 @@ def verify(directory):
     directory = Path(directory)
     summary_path = directory / "synthesis_summary.json"
     summary = json.loads(summary_path.read_text())
+    from privacy_defenses.synthesis_cleanup import require_geometry_available
+    require_geometry_available(directory, summary)
     if summary.get("implementation") in {"local_token_geometry_v12_direct", "local_token_geometry_v13_direct_unit_noise", "local_token_geometry_v14_direct_scaled_noise", "local_token_geometry_v15_direct_mixing"}:
         from scripts.verify_synthesis_direct import verify as verify_direct
         result = verify_direct(directory)
