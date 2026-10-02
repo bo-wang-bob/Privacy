@@ -2189,6 +2189,8 @@ class MembershipAuditor:
 
     def _exact_batch_membership_definition(self) -> str:
         if getattr(self, "federated_method", "fedsgd") == "fedsgd":
+            if getattr(self, "defense_name", "none") == "risk_synthesis":
+                return "current_round_original_source_batch"
             return "current_round_exact_upload_batch"
         return "target_client_original_training_set"
 
@@ -2526,7 +2528,10 @@ class MembershipAuditor:
                     parameter_perturbed = offset + width > tail_start
                     break
                 offset += width
-        rank_bound = (None if parameter_perturbed or getattr(self, "federated_method", "fedsgd") == "fedavg"
+        synthesis = getattr(self, "defense_name", "none") == "risk_synthesis"
+        # Candidates are original records, whereas the upload uses generated
+        # views. Original candidate token counts cannot bound this gradient.
+        rank_bound = (None if parameter_perturbed or synthesis or getattr(self, "federated_method", "fedsgd") == "fedavg"
                       else int(hidden_vector_count))
         attack = strict_mlp_projres(
             observed_update,
@@ -2545,7 +2550,7 @@ class MembershipAuditor:
         )
         paper_fedsgd_exact = (
             getattr(self, "federated_method", "fedsgd") == "fedsgd"
-            and getattr(self, "defense_name", "none") != "www"
+            and getattr(self, "defense_name", "none") not in {"www", "risk_synthesis"}
             and projres_uses_frozen_features(self.model)
         )
         if cofedmid and (cofedmid["upload_perturbed"] or cofedmid["custom_training_loss"]):
@@ -2578,7 +2583,7 @@ class MembershipAuditor:
             "communication_round": int(round_index) + 1,
             "candidate_hidden_vector_count": int(hidden_vector_count),
             "observed_hidden_vector_count": (
-                None if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                None if synthesis or getattr(self, "federated_method", "fedsgd") == "fedavg"
                 else int(hidden_vector_count)
             ),
             "observed_update_norm": float(observed_update.norm()),
@@ -2589,6 +2594,8 @@ class MembershipAuditor:
             "paper_fedsgd_exact": paper_fedsgd_exact,
             "interpretation": ("empirical_multistep_model_delta_projection"
                                if getattr(self, "federated_method", "fedsgd") == "fedavg"
+                               else "empirical_original_candidate_synthetic_gradient_projection"
+                               if synthesis
                                else "empirical_post_update_representation_gradient_projection"
                                if not projres_uses_frozen_features(self.model)
                                else "observed_batch_gradient_projection"),
@@ -2598,6 +2605,11 @@ class MembershipAuditor:
             "cofedmid": cofedmid,
             "attacked_parameter_perturbed": parameter_perturbed,
             "batch_rank_bound": rank_bound,
+            **({"training_input": "generated_token_views",
+                "candidate_input": "original_images",
+                "views_per_record": self.defense_config["synthesis"]["views_per_record"],
+                "batch_rank_bound_reason": "original_candidate_count_does_not_bound_generated_views"}
+               if synthesis else {}),
             "reported_fpr_targets": list(
                 self._update_fpr_targets()
             ),

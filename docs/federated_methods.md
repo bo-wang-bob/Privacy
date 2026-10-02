@@ -2,6 +2,8 @@
 
 ## 统一切换 FedSGD / FedAvg
 
+生成视图防御 `risk_synthesis` 的 direct 模式也支持两种方法；FedSGD 使用原始 batch 成员和生成视图真实梯度，详见 [生成视图的 FedSGD 协议与命令](risk_synthesis_fedsgd.md)。
+
 六个 PEFT 模型（CLIP-MLP/Adapter/LoRA、BERT Adapter/LoRA、GPT2 Adapter）
 均支持两种方法。模型 YAML 保持默认 FedSGD；统一入口按
 模型 × 数据集 × 防御 × seed × 目标客户端 × 方法生成独立任务。
@@ -20,7 +22,7 @@ python scripts/run_privacy_experiments.py --models clip_mlp,clip_adapter,clip_lo
 
 | 项目 | FedSGD | FedAvg |
 | --- | --- | --- |
-| 默认通信轮数 | CLIP-MLP 150；CLIP-Adapter/LoRA 300；BERT/GPT2 500 | 全部 100 |
+| 默认通信轮数 | CLIP-MLP 150；CLIP-Adapter/LoRA 1000；BERT/GPT2 500 | 全部 100 |
 | 本地训练 | 每轮 1 个打乱后的 mini-batch | 每轮遍历 `local_epochs` 个完整本地 epoch，默认 1 |
 | 短批次 | 保留，按实际大小求均值 | 保留，作为本地 optimizer step |
 | 协议消息 | 可训练参数的真实梯度 | 本地训练后参数相对轮初全局参数的 delta |

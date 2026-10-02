@@ -242,8 +242,9 @@ def test_anchor_risk_history_is_frozen_per_round_averages_visits_and_ignores_mis
 def test_catalog_validates_method_and_keeps_original_membership():
     catalog = load_yaml("configs/experiment_catalog.yaml")
     args = ["--models","clip_adapter,clip_lora","--datasets","cifar100","--defenses","risk_synthesis"]
-    with pytest.raises(ValueError,match="没有生成任何兼容任务"):
-        build_tasks(catalog,parse_args(args))
+    sgd, skipped = build_tasks(catalog,parse_args(args))
+    assert not skipped and len(sgd) == 2
+    assert all(t.config['aggregator'] == 'fedsgd' for t in sgd)
     tasks,_ = build_tasks(catalog,parse_args(args+["--methods","fedavg"]))
     assert len(tasks)==2
     direct,_ = build_tasks(catalog,parse_args(args+["--set","aggregator=fedavg"]))

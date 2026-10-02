@@ -26,7 +26,7 @@ batch 当作整个上传的成员集合；CoFedMID 的选择/回收曝光另存�
 | `data_aug` | FedMIA Data Aug 基线 | 对已经预处理的 CLIP 张量做翻转、平移和颜色扰动 |
 | `data_aug_sampling` | FedMIA Data Aug + Sampling 基线 | 在同一本地训练分支中先抽样再增强 |
 | `www` | WWW（原 ICLR） | 打乱后分批、CE 加风险加权的真实类概率差异正则；记录风险、损失及梯度范数，不裁剪、不加噪、不提供 DP 保证 |
-| `risk_synthesis` | 本地类别几何与风险控制生成 | CLIP transformer Adapter/LoRA + FedAvg；从首轮起全部位置使用虚拟 token，风险只控制原始编码保留量；语义失败使用最佳虚拟候选，无形式 DP 保证。见[当前方案](risk_synthesis_all_replacement.md) |
+| `risk_synthesis` | 类别几何与风险控制生成 | CLIP transformer Adapter/LoRA，direct支持FedSGD/FedAvg；从首轮起生成虚拟token，多视图CE平均，无候选筛选和形式DP保证。见[当前方案](risk_synthesis_method.md)与[FedSGD协议](risk_synthesis_fedsgd.md) |
 
 历史通用防御主要针对“冻结 CLIP、只训练共享 CoOp prompt”的场景适配；正式模型的可用范围以 `configs/experiment_catalog.yaml` 为准。CoFedMID 已单独适配当前六个 PEFT 模型的 one-batch FedSGD。SOFT 原论文处理文本，因此本仓库使用保持图像语义的视觉混淆；HAMP 原论文测试阶段使用随机低置信度分数重排，本仓库使用可微温度映射。
 

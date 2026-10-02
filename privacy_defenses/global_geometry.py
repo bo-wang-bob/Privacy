@@ -55,7 +55,8 @@ def aggregate_moments(payloads, class_rank, device):
     """Server: weighted within-client covariance PLUS between-client means.
 
     Full numerical covariance is retained for distribution access. class_rank
-    truncates only the generation factor after the complete global aggregation.
+    'all' also uses every numerical direction for generation; an integer keeps
+    the historical truncation after the complete global aggregation.
     """
     if not payloads:
         raise ValueError('Global distribution requires client statistics.')
@@ -84,7 +85,7 @@ def aggregate_moments(payloads, class_rank, device):
             columns.append(weight * group['covariance_factor'].to(device=device, dtype=torch.float64))
             columns.append((weight * (group['mean'].double() - mean)).to(device)[:, None])
         factor, values = spectral_factor(torch.cat(columns, dim=1))
-        used = min(class_rank, len(values))
+        used = len(values) if class_rank == 'all' else min(class_rank, len(values))
         classes[label] = dict(count=count, mean=mean, covariance_factor=factor,
             eigenvalues=values, factor=factor[:, :used], used_rank=used,
             numerical_rank=len(values), retained_variance=(float(values[:used].sum()/values.sum()) if len(values) else 0.),

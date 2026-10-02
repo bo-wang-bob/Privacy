@@ -793,6 +793,8 @@ class ServerBase:
                 self.timings.save(
                     os.path.join(self.results_dir, "performance_summary.json"), status=status,
                 )
+            if status == "completed" and self.defense.synthesis is not None:
+                self.defense.synthesis.cleanup_statistics(audit_succeeded=not bool(self.auditor.errors))
 
     def _train(self) -> list[dict]:
         self.ctx.set_base_model_state(

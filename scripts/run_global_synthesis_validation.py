@@ -1,5 +1,6 @@
 """Matched CIFAR100 validation of inclusive-global-mean synthetic views.
 
+Current direct generation adds L @ epsilon with no noise-scale parameter.
 One serial queue on one GPU per invocation. Run separate invocations for
 Adapter and LoRA to use two GPUs. Execution stays in the unified runner.
 """
@@ -23,9 +24,7 @@ def build_arguments(overrides):
         '--attacks', 'all',
         '--seeds', '43',
         '--target-clients', '0',
-        '--rounds', '100',
         '--local-epochs', '1',
-        '--aggregation-weighting', 'sample_count',
         '--partition-mode', 'iid',
         '--gpus', '0', '--jobs', '1',
         '--set', 'use_full_dataset=false',
@@ -36,6 +35,7 @@ def build_arguments(overrides):
         '--set', f'confirmation_split_manifest={MANIFEST}',
         '--set', f'confirmation_split_sha256={MANIFEST_SHA256}',
         '--set', 'defense.synthesis.global_distribution=generate',
+        '--set', 'defense.synthesis.class_rank=all',
         '--set', 'defense.synthesis.center_source=global_class',
         '--set', 'defense.synthesis.replacement_policy=all',
         '--set', 'defense.synthesis.replacement_fraction=1.0',

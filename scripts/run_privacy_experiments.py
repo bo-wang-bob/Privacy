@@ -484,9 +484,6 @@ def build_tasks(
                 local_epochs=getattr(args, "local_epochs", None),
                 aggregation_weighting=getattr(args, "aggregation_weighting", None),
             )
-            if defense == "risk_synthesis" and config["aggregator"] != "fedavg":
-                skipped.append(f"{model}/{config['aggregator']}: risk_synthesis 目前仅支持 FedAvg")
-                continue
             run_id = _task_id(config, model, dataset, defense, started)
             run_dir = results_root / run_id
             config["results_dir"] = str(run_dir)
@@ -572,7 +569,13 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
             print(f"      synthesis=policy:{synthesis.get('replacement_policy', 'risk_probability')} "
                   f"global_distribution:{synthesis.get('global_distribution', 'disabled')} "
                   f"center_source:{synthesis.get('center_source', 'local_class')} "
+                  f"mixing_mode:{synthesis.get('mixing_mode', 'risk')} "
+                  f"risk_mode:{synthesis.get('mode', 'risk')} "
+                  f"risk_tail_fraction:{synthesis.get('risk_tail_fraction', 0.8)} "
                   f"views_per_record:{synthesis.get('views_per_record', 1)} "
+                  f"class_rank:{synthesis.get('class_rank', 5)} "
+                  f"noise:{'L_epsilon' if synthesis.get('candidate_selection') == 'direct' and 'noise_scale' not in synthesis else str(synthesis.get('noise_scale', 0.1)) + '*L_epsilon'} "
+                  f"statistics_retention:{synthesis.get('statistics_retention', 'keep')} "
                   f"warmup_rounds:{synthesis['warmup_rounds']} "
                   f"candidate_selection:{synthesis.get('candidate_selection', 'first_semantic')} "
                   f"semantic_filter:{synthesis['semantic_filter']} "
@@ -601,6 +604,9 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
         if method == "fedavg" and config.get("audit", {}).get("client_train_membership_attacks"):
             print("      audit=client_train vs independent_evaluation; "
                   "upload:model_delta; projres:empirical_no_batch_rank_bound")
+        if method == "fedsgd" and task.defense == "risk_synthesis":
+            print("      audit=original_source_batch vs independent_evaluation; "
+                  "upload:mean_view_loss_gradient; projres:empirical_no_batch_rank_bound")
         if "projres" in config.get("audit", {}).get("exact_batch_membership_attacks", []):
             bounds = config["projres"]
             print(

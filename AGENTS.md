@@ -1,6 +1,47 @@
 # Repository guidance
 
-## 当前候选直接训练（v12）
+## 生成视图风险覆盖比例（2026-09-28）
+
+- 用户要求覆盖比例改为1。direct生成新增独立 `defense.synthesis.risk_tail_fraction`，catalog新实验默认1，范围 `(0,1]`；原生成分支的硬编码0.8已接通此参数。`defense.www_tail_fraction` 只控制独立WWW防御，之前对话将其说成生成参数不准确。
+- 有参考时风险为全batch稳定排序后的 `(j-0.5)/b`，batch32为0.015625至0.984375；首轮/缺少参考仍为0。未含新参数的旧配置保留0.8，旧结果不改写。新摘要记录实际比例，核验器检查各batch风险集合；复现已完成的0.5噪声结果须显式设置比例0.8。新比例并无真实数据效果结论。
+
+## 生成视图 FedSGD 支持（2026-09-27）
+
+- 当前 `risk_synthesis` direct 支持 CLIP transformer Adapter/LoRA 的 FedSGD/FedAvg；历史筛选模式仍只支持 FedAvg。FedSGD 每轮一个原始 batch、跨轮顺序遍历打乱池，K视图CE平均后一次更新并捕获真实上传梯度。FedAvg行为保留。
+- 六种单轮审计在FedSGD下使用原始来源batch身份（`current_round_original_source_batch`），五种固定候选审计保留训练集身份；K不扩大成员数。ProjRes不按原图token数截断生成视图梯度，`batch_rank_bound=null`、`paper_fedsgd_exact=false`；仍使用真实上传梯度，对原图评分。完整训练集的首轮类别统计不变，现有攻击不评价统计上传泄漏。
+- 最新验证/位置/中心消融入口接受 `--methods fedsgd`，默认1000轮等权（用户于2026-09-27调整）；不传仍为FedAvg100轮sample_count。确认分区支持两种方法并核验原始batch来源；普通FedSGD新增本地ID记录但保留采样顺序。说明见 `docs/risk_synthesis_fedsgd.md`。尚未运行FedSGD真实数据完整效果实验。
+- 验证：完整本地套件769项通过、52项跳过，另新增FedSGD无防御/生成方案配对分析测试通过；双模型1/2/3视图、真实平均梯度、短batch与跨轮遍历、全部11攻击、统计清理及确认来源覆盖。FedSGD双模型0.5风险入口和两种方法混合8任务干运行通过；CUDA路径尚未实测。
+
+## 当前0.5噪声的生成位置消融（v15）
+
+- 2026-09-21新增中心来源消融：`scripts/run_synthesis_center_source_ablation.py` 默认只补本地的risk/class_center组，Adapter/LoRA各2项；固定0.5、全局完整秩协方差、100轮、K=2、seed43及11攻击。新增仅direct可用的 `center_source: local_class_mean`，读取包含自身的本地同类均值；旧local_class仍排除自身，global_class仍包含自身。两种中心均含自身，只改变均值范围，不能同时改为本地协方差。v15摘要本地组记录generation_center=local_same_class_mean、center_includes_source=true、geometry_source=global_same_class，清理凭据与历史核验兼容。`--centers local,global` 完整重跑，`--variants risk` 可先补风险方案；新种子须本地/全局成对运行。已按主入口默认值与调度GPU核对已有4项全局配置，仅中心来源/结果目录不同；291项CPU/协议测试和19项真实CUDA测试通过，未启动正式训练。公式、命令与判读见 `docs/risk_synthesis_center_source_ablation.md`。
+
+- 2026-09-16新增打乱风险补跑：`scripts/run_synthesis_center_ablation.py --variants shuffled_risk` 映射为 `mixing_mode=risk, mode=shuffled_risk`，复用已有batch内独立随机排列；保留风险权重集合，图片/标签/同类中心不变，K视图共用同次排列，几何噪声随机数流独立。默认仍为原三组；`--variants risk,shuffled_risk` 可在新种子匹配重跑。0.5、100轮、K=2、seed43、全部11攻击沿用，结果新存shuffled_risk子目录。实际入口补齐默认值后，与已完成同模型risk配置仅差mode和输出目录；核验器新增批内风险集合守恒检查。195项相关测试通过，13项CUDA测试因沙箱不可见而跳过（本次未改GPU生成代码）；覆盖双模型1/2/3视图全部11攻击、首轮一致、视图共享排列与独立噪声流，双模型单独补跑干运行通过；未启动正式训练。命令见 `docs/risk_synthesis_center_ablation.md`。
+
+- 用户要求比较纯目标图像、纯类中心和当前方案。新增可选 `defense.synthesis.mixing_mode: source | class_center | risk`，仅支持direct；显式配置标记 `local_token_geometry_v15_direct_mixing`。固定噪声0.5时分别生成 `h+0.5Lε`、`mu+0.5Lε`、`(1-r)h+r*mu+0.5Lε`。纯类中心从首轮起系数即为1；风险原值仍记录，三组保留原风险排序流程，仅risk组使用风险控制位置。CSV旧名used_risk在v15表示实际类中心混合系数，retained_original_fraction=1-used_risk。摘要单独标记位置模式，generation_center继续表示参考均值定义。
+- `scripts/run_synthesis_center_ablation.py` 固定0.5、全局完整秩几何、含自身均值；默认Adapter/LoRA各三组、seed43、CIFAR100、FedAvg100轮、K=2、全部11攻击。`--smoke` 预设5轮逐轮评估无攻击，`--variants` 选择补跑组。启动前核对除位置/输出目录外配置相同，唯一批量调度器仍为run_privacy_experiments；按新时间戳/source/class_center/risk保存，失败停止后续组。原始成员身份、视图平均与统计清理不变，缺省mixing_mode沿用旧v13/v14，不改历史结果。
+- 295项CPU/协议回归通过，沙箱跳过的13项CUDA测试在真实GPU全部通过；覆盖固定端点及首轮、双模型1/2/3视图与11攻击、配置匹配、统计凭据和历史协议。完整6项及短检查入口干运行通过；新增三组尚未启动真实数据完整实验。命令和比较口径见 `docs/risk_synthesis_center_ablation.md`。
+
+## 当前0.5噪声试验（v14显式幅度；默认仍为v13）
+
+- 用户在v13五轮检查后要求“样本噪声取0.5试试”。恢复可选 `defense.synthesis.noise_scale`：显式有限正数启用 `local_token_geometry_v14_direct_scaled_noise`，噪声为 `noise_scale * U sqrt(Lambda) epsilon`；缺省仍无该配置并沿用v13的单位幅度。v14摘要记录 `noise_scale_parameter_enabled=true` 和 `generation_noise=scaled_covariance_factor_times_standard_normal`。历史v12/v13结果继续按原版本核验。
+- `scripts/run_synthesis_noise_half.py` 固定0.5、Adapter/LoRA、seed43、CIFAR100、FedAvg5轮、K=2、eval_interval=1、attacks=none，默认GPU0串行；仍经全局验证入口调用唯一批量调度器。其他生成/风险/视图/GPU/统计清理协议不变，不覆盖历史实验。公式、命令与比较口径见 `docs/risk_synthesis_noise_half.md`。
+- 实现验证：242项CPU/协议回归通过，沙箱内跳过的5项CUDA测试已在真实GPU全部通过。覆盖0.1/0.5/1公式、无参数v13、显式参数v14、1/2/3视图双模型与11种攻击、精简统计核验及历史协议；双模型0.5五轮入口干运行通过。
+- 2026-09-16完成0.5双模型5轮无攻击对照：Adapter72.18%、LoRA67.22%，相对同配置单位幅度的63.98%/65.67%分别提高8.20/1.55个百分点，仍低于旧0.1第5轮77.45%/68.91%。实际数据身份一致，单位幅度与0.5完整配置仅差噪声选项和结果目录；每项5万次原始访问/10万视图核验通过。五轮无攻击不代表最终效用或隐私收益；详情 `analysis_scripts/synthesis_noise_half_20260915_235353/readout.md`。
+
+## 无额外噪声系数的直接训练记录（v13）
+
+- 验证：225项相关测试通过，当前环境CUDA不可用而跳过3项；覆盖无系数公式、旧配置拒绝、v12快照读取、Adapter/LoRA的1/2/3视图与11种攻击集成、统计清理及历史筛选协议。双模型默认4项配置干运行通过，未启动v13完整真实数据训练。
+- 2026-09-15 用户要求取消噪声系数。当前direct/catalog生成公式为 `(1-r)*h+r*mu+L*epsilon`，`L=U sqrt(Lambda)`，删除 `noise_scale` 配置；标准高斯、完整数值有效方向、全局均值包含自身、风险、多视图CE平均、GPU生成及成功后统计清理沿用既有协议。不对噪声重归一化。相对v12默认0.1系数，固定几何与抽样时噪声幅度扩大10倍，期望噪声能量扩大100倍，不能继承v12真实效果结论。
+- 新摘要版本为 `local_token_geometry_v13_direct_unit_noise`，记录 `generation_noise=covariance_factor_times_standard_normal`、`noise_scale_parameter_enabled=false`，options不含noise_scale。显式含noise_scale的direct配置拒绝执行（包括1/null），复现旧direct任务须使用原代码。历史筛选模式仍保留noise_scale，历史分析核验同时支持v12/v13，不改写结果。公式及迁移见 `docs/risk_synthesis_method.md`，命令见 `docs/risk_synthesis_validation_commands.md`。
+
+## 候选直接训练及优化记录（v12，噪声公式已由v13更新）
+
+- 2026-09-15 新增成功后统计清理：direct/catalog默认 `statistics_retention: cleanup_on_success`，显式keep保留完整统计，历史筛选默认keep。ServerBase在训练、审计无错误、诊断关闭和性能摘要写入成功后调用运行对象清理；只处理新任务持有的原始编码、本地分布、上传统计、全局分布四类精确路径，不扫描历史目录。先完成聚合探针/身份计数核验，原子保存statistics_receipt.json和prepared标记，再释放内存映射/GPU缓存并删除，最终summary记录cleaned、字节数、耗时；失败任务保留，核验/写入失败不删除，部分删除异常记录cleanup_incomplete。模型、配置、训练/攻击指标、CSV、source_exposure和接收回执保留。分析支持精简标签与凭据，明确verified_before_cleanup、covariance_recomputed_now=false，不声称能重放已删统计。见docs/risk_synthesis_statistics_retention.md；运行期间仍需足够磁盘。
+
+- 2026-09-15 GPU生成优化：direct训练的原始/虚拟高维token保留在输入设备，几何矩阵乘法在CUDA执行；全局类别因子与均值由RiskSynthesis运行级LRU缓存跨客户端/视图复用，上限min(2 GiB,首次使用时空闲CUDA显存/4)，超大条目不常驻，关闭任务释放缓存。CPU随机数流及视图/类别抽样顺序保留，只传低维高斯向量；CPU路径保持兼容。摘要新增generation_compute/generation_rng/generation_device_cache。每视图独立前向/反向和一次optimizer更新保持原定义。CUDA对照验证与局部微基准见docs/risk_synthesis_gpu_generation.md，不能将局部提速当成完整训练提速。
+
+- 2026-09-15 用户要求生成也使用全部方向：当前 direct/catalog/全局验证脚本默认 `class_rank: all`，本地与全局生成均保留完整数值秩，零特征值方向不产生噪声。噪声幅度不重归一化，仍为 `noise_scale * U sqrt(Lambda) epsilon`，相同幅度下总噪声能量随加入方向增加。摘要 options.class_rank 和全局产物 generation_rank 区分 all 与旧整数截断，旧配置显式整数继续按原秩生成；历史筛选默认仍为5。当前方向数由数据决定，不再是数值超参数。
 
 - 用户要求删除候选有效性与固定教师语义检查。当前默认 `candidate_selection: direct`、`semantic_filter: false`，实现 `local_token_geometry_v12_direct`。每原始记录的V个视图各抽样一次、全部训练，不检查候选有限性、范数、距离、实际改变或视图重复；不重试、择优或原图回退。通用views=1，当前验证入口保持views=2，可通过views_per_record增加共同训练候选。
 - 删除当前直接模式的attempts、margin_tolerance、min_class_samples参数；固定教师不初始化、不做语义统计。原始编码同批复用、按类别批量抽样。保留全局类别统计、包含自身的均值、风险混合位置、CE视图平均、原始成员身份及FedAvg。已有显式first_semantic/least_local_similarity配置保留历史机制，旧结果不改写。
@@ -17,7 +58,7 @@
 
 - 最新用户要求恢复 Ma 等论文的首轮类别统计聚合和下发，随后要求中心也改用全局。catalog 默认 `defense.synthesis.global_distribution: generate`、`center_source: global_class`，用户最新要求不排除自身，中心直接使用首轮下发的 `mu_global_c`，同一类别跨客户端/原始记录共享同一参考均值，无新增通信。v10记录 `generation_center=global_same_class_mean`、`center_includes_source=true`。v9的排除自身协议只在历史版本保留，结果核验仍支持。`center_source: local_class` 恢复 v8 本地中心；share_only/disabled 还须显式配合 local_class。显式旧配置缺省 center_source 保持 local_class，缺省 global_distribution 保持 disabled。多替身入口仍默认 K=2。
 - 所有已配置客户端在第1轮优化前，从原始本地训练集提交逐类 n、mean、完整数值秩 covariance factor。服务器按 n/N 合并类内协方差和客户端同类均值偏移外积，一次聚合后全类别下发所有客户端；不按模型上传的 uniform/sample_count 权重替代逐类样本权重，不使用 evaluation。后续不刷新。
-- 全局协方差通过完整数值秩因子表示以避免高维稠密矩阵；先聚合完整局部数值秩，再取现有 class_rank=5 用于生成。不能先截断局部到5维。不同类别不合并，没有 pooled_rank/shrinkage。中心按上述最新用户要求变更；风险、K视图归一化、原始成员身份保持原定义。全局中心仅支持uniform，不使用未共享的逐样本历史风险。
+- 全局协方差通过完整数值秩因子表示以避免高维稠密矩阵；聚合和生成均保留完整数值秩（当前 class_rank=all，旧版本生成截断为5）。不能提前截断局部统计。不同类别不合并，没有 pooled_rank/shrinkage。中心按上述最新用户要求变更；风险、K视图归一化、原始成员身份保持原定义。全局中心仅支持uniform，不使用未共享的逐样本历史风险。
 - 仓库为单进程模拟：`global_distribution.pt` 一份只读约定的共享对象，逐客户端 receipt 保存 SHA256 与完整可用类别。`client_*_moment_upload.pt` 不含逐样本编码/ID；本地 source_codes 仍属本地诊断，不能作为上传使用。统计没有 DP，现有11种攻击未纳入该统计传输视图，不能用这些攻击代表新协议整体隐私。
 - 2026-09-14 已按用户要求将新版整合到 `/root/Privacy` 的 `main`，统一从正式目录运行。旧主分支归档为 `archive/pre-global-integration-20260914`，研究分支和历史结果保留。`scripts/run_global_synthesis_validation.py` 默认seed43、Adapter/LoRA各none/risk_synthesis，共4项；每次调用单GPU串行，两种模型可分卡运行。新功能与命令见 `docs/risk_synthesis_global_geometry.md`、`docs/risk_synthesis_validation_commands.md`。尚无v8/v9/v10真实数据有效性结论。
 
@@ -53,7 +94,7 @@
 - 三个 CLIP 基线均显式使用 IID。不要在正常 IID 实验中传 `--dirichlet-alpha`；仅传该参数会自动切换为 `dirichlet`。如同时显式传 `--partition-mode iid --dirichlet-alpha 0.1`，显式 partition mode 优先，alpha 仅作为未使用的配置值保留。
 - 自 2026-09-10 起，CLIP-Adapter/LoRA 默认在客户端划分前每类抽取 100 张训练图像，10 个 IID 客户端时每客户端每类 10 张；MLP 仍固定每类 16 张。CLIP-Adapter/LoRA 均可配置 `use_full_dataset: false` 与正整数 `fpl_shots` 选择每类样本上限，或 `use_full_dataset: true` 与 `fpl_shots: null` 使用完整训练分区；旧 16 张/类对照使用 `--set fpl_shots=16`。Adapter/LoRA 始终从完整源分区加载，每类限额只截取训练集，再进行客户端划分；独立 evaluation/test 分区不随 shots 截断。新 Adapter/LoRA 的 CIFAR100/Food101 不再先经过历史 200 张/类训练及 50 张/类测试子集；旧结果不改写，比较时核对实际分区。直接 CLI 的 shots 覆盖也不再隐式把 Adapter/LoRA 切为 Dirichlet。IID 仍要求每类训练样本数至少等于客户端数。
 - 三个 CLIP 模型在 FedSGD/FedAvg 下默认只依次运行 CIFAR100、Food101。Caltech101、OxfordPets、Flowers102 仍支持通过 `--datasets` 显式选择，`--datasets all` 展开全部五个支持的数据集。单任务 CLIP 模型 YAML 的默认数据集为 CIFAR100。
-- 三个模型在全部默认数据集上统一使用 10 个客户端和 batch size 32；CLIP-MLP 使用 150 个通信轮次，CLIP-Adapter/CLIP-LoRA 使用 300 个通信轮次。三者均使用 FedSGD，每个客户端每轮只执行 1 个 mini-batch/1 次 optimizer step；`local_epochs: 1` 是协议校验值，不表示遍历完整本地数据集。
+- 三个模型在全部默认数据集上统一使用 10 个客户端和 batch size 32；CLIP-MLP 使用 150 个通信轮次，CLIP-Adapter/CLIP-LoRA 使用 1000 个通信轮次（2026-09-27调整，含无防御对照）。三者均使用 FedSGD，每个客户端每轮只执行 1 个 mini-batch/1 次 optimizer step；`local_epochs: 1` 是协议校验值，不表示遍历完整本地数据集。
 - 三种微调方式的服务器端聚合都使用 `aggregation_weighting: uniform`，即对本轮参与客户端上传的梯度直接等权平均，不按客户端本地样本数或实际 batch 大小加权。三者任务目录方法名均为 `fedsgd`。
 - 正常任务指标默认按 `eval_interval: 5` 在已完成的第 5、10、15、…轮评估；若总轮数不能被 5 整除，最后一轮仍会额外评估。`training_metrics.csv` 使用相同的一基轮次编号。
 
@@ -112,7 +153,7 @@
 ## 按需审计频次
 
 - 当前三个 CLIP 配置不设置共享的 `audit_interval`；逐轮攻击全部使用各自的显式间隔。
-- FedSGD 下 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 的全部 11 种攻击每 10 轮测量。MLP 测量到第 150 轮，Adapter/LoRA 测量到第 300 轮。
+- FedSGD 下 CLIP-MLP、CLIP-Adapter 和 CLIP-LoRA 的全部 11 种攻击每 10 轮测量。MLP 测量到第 150 轮，Adapter/LoRA 测量到第 1000 轮。
 - FedAvg 下三个 CLIP 模型与 BERT 一致：`blackbox_loss`、`grad_cosine`、`gradient_diff`、`score_diff`、`score_ratio`、`projres` 每 50 轮，`loss_series`、`avg_cosine`、`fedmia_loss`、`fedmia_cosine`、`fta` 每 10 轮；默认 100 轮分别测量 2 次和 10 次。覆盖保存在 catalog 的 `method_overrides.fedavg.models`，ProjRes 声明间隔同步为 50，不修改 FedSGD 模型基线。
 - 审计间隔按已完成的通信轮数计数；例如 `attack_audit_intervals: 10` 对应零基内部索引 9、19、…，而不是索引 0、10、…。三者每轮均只训练 1 个真实 batch。
 - 三种 CLIP 模型的 `blackbox_loss` 和 `grad_cosine` 都属于真实 Batch 协议，必须按配置轮次分别审计。

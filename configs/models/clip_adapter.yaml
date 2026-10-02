@@ -5,7 +5,7 @@ cache_dir: ./checkpoints/clip-vit-base-patch32
 
 total_users: 10
 sample_users: 10
-num_global_iters: 300
+num_global_iters: 1000
 batch_size: 32
 eval_batch_size: 32
 local_epochs: 1

@@ -201,12 +201,13 @@ defense_overrides:
         synthesis:
           replacement_policy: all
           replacement_fraction: 1.0
-          noise_scale: 0.1
-          class_rank: 5
+          class_rank: all
+          statistics_retention: cleanup_on_success
           global_distribution: generate
           center_source: global_class
           center_weighting: uniform
           mode: risk
+          risk_tail_fraction: 1.0
           risk_history: none
           candidate_selection: direct
           views_per_record: 1

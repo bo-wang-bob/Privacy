@@ -79,13 +79,13 @@ def validate_confirmation_config(config):
     if (model not in {"clip_adapter", "clip_lora"}
             or (model == "clip_adapter" and config.get("clip_adapter", {}).get("variant") != "transformer")
             or str(config.get("dataset_name", "")).lower() != "cifar100"
-            or config.get("partition_mode") != "iid" or config.get("aggregator") != "fedavg"
+            or config.get("partition_mode") != "iid" or config.get("aggregator") not in {"fedavg", "fedsgd"}
             or config.get("total_users") != 10 or config.get("fpl_shots") != 100
             or bool(config.get("use_full_dataset", False))
             or defense.get("name", "none") not in {"none", "www", "risk_synthesis"}
             or float(defense.get("cofedmid_validation_fraction", 0) or 0) != 0):
         raise ValueError("confirmation_split_manifest requires CLIP transformer Adapter/LoRA, "
-                         "CIFAR100, IID, FedAvg, 10 clients, 100-per-class training, "
+                         "CIFAR100, IID, FedAvg/FedSGD, 10 clients, 100-per-class training, "
                          "and none/www/risk_synthesis without an additional validation reservation.")
     path = Path(path).resolve()
     manifest, sha256 = read_manifest(path, config.get("confirmation_split_sha256"))
@@ -145,13 +145,13 @@ def validate_mapping(mapping, manifest):
     return output
 
 
-def map_confirmation_candidates(mapping, manifest, client_id, selection):
+def map_confirmation_candidates(mapping, manifest, client_id, selection, *, require_full=True):
     pools = validate_mapping(mapping, manifest)
     client = mapping["clients"][client_id]
     member = checked_indices(np.asarray(selection["member_pool_indices"]).tolist(), 1000, "member")
     nonmember = checked_indices(np.asarray(selection["nonmember_pool_indices"]).tolist(),
                                 len(pools["evaluation"][0]), "nonmember")
-    if len(member) != 1000:
+    if require_full and len(member) != 1000:
         raise ValueError("Confirmation audit must include the full original target training set.")
     return dict(member_source_indices=np.asarray(client["train_source_indices"])[member],
                 nonmember_source_indices=pools["evaluation"][0][nonmember],

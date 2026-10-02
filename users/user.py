@@ -100,6 +100,16 @@ class UserBase:
             drop_last=False,
             generator=train_generator,
         )
+        # Preserve original local IDs for exact-batch audit/confirmation even
+        # without a defense. Independent equal seeds keep ordinary and WWW /
+        # synthesis batches aligned without changing the public trainloader.
+        self._indexed_trainloader = (
+            DataLoader(_IndexedDataset(train_data), batch_size=batch_size, shuffle=True,
+                       collate_fn=self._collate_indexed_batch, drop_last=False,
+                       generator=torch.Generator().manual_seed(
+                           int(self.method_config.get("seed", 42)) + 1000003 * int(self.id)))
+            if self.federated_method == "fedsgd" and not self._www_enabled else None
+        )
         self.www_statistics_loader = (
             DataLoader(
                 _IndexedDataset(train_data),
@@ -214,19 +224,26 @@ class UserBase:
 
     def next_train_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the next shuffled local mini-batch, cycling across rounds."""
+        loader = getattr(self, "_indexed_trainloader", None)
+        if loader is None:
+            loader = self.trainloader
         if self._train_iterator is None:
-            self._train_iterator = iter(self.trainloader)
+            self._train_iterator = iter(loader)
         try:
             batch = next(self._train_iterator)
         except StopIteration:
-            self._train_iterator = iter(self.trainloader)
+            self._train_iterator = iter(loader)
             try:
                 batch = next(self._train_iterator)
             except StopIteration as error:
                 raise ValueError(
                     f"Client {self.id} has no local training batch."
                 ) from error
-        images, labels = batch
+        if getattr(self, "_indexed_trainloader", None) is not None:
+            images, labels, indices = batch
+            self.last_train_indices = indices.detach().cpu().long().clone()
+        else:
+            images, labels = batch
         self._record_train_batch(images, labels)
         return images, labels
 

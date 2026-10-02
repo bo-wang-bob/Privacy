@@ -70,7 +70,7 @@ def read_synthesis_mechanism(directory, summary, *, complete):
     """
     import torch
     directory = Path(directory)
-    if summary.get("implementation") == "local_token_geometry_v12_direct":
+    if summary.get("implementation") in {"local_token_geometry_v12_direct", "local_token_geometry_v13_direct_unit_noise", "local_token_geometry_v14_direct_scaled_noise", "local_token_geometry_v15_direct_mixing"}:
         from scripts.verify_synthesis_direct import read_mechanism
         return read_mechanism(directory, summary, complete=complete)
     norm_filter_enabled(summary)
@@ -261,7 +261,11 @@ def selection_digest(path):
         if isinstance(value,torch.Tensor):
             return dict(shape=list(value.shape),dtype=str(value.dtype),values=value.tolist())
         if isinstance(value,dict):
-            return {str(k):canonical(v) for k,v in value.items()}
+            return {str(k): ("current_round_original_source_batch"
+                            if path.name == "exact_batch_candidate_selection.pt"
+                            and k == "membership_definition"
+                            and v in ("current_round_exact_upload_batch", "current_round_original_source_batch")
+                            else canonical(v)) for k,v in value.items()}
         if isinstance(value,(tuple,list)):
             return [canonical(v) for v in value]
         return value
@@ -330,6 +334,8 @@ def read_run(directory):
         global_evidence = result["synthesis_mechanism"].get("global_geometry_evidence")
         if global_evidence:
             sources.update(global_evidence["source_hashes"])
+        direct_evidence = result["synthesis_mechanism"].get("direct_evidence", {})
+        sources.update(direct_evidence.get("source_hashes", {}))
         for name in ("synthetic_exposure.csv", "source_exposure.pt", "synthetic_views.csv", "candidate_choices.csv"):
             source = directory / "risk_synthesis" / name
             if source.exists():
@@ -342,7 +348,7 @@ def read_run(directory):
         sources[str(predictions_path)] = digest(predictions_path)
     signals = {}
     signals_path = directory / "privacy_audit" / "signals.pt"
-    if config.get("aggregator") == "fedavg" and signals_path.exists():
+    if config.get("aggregator") in {"fedavg", "fedsgd"} and signals_path.exists():
         import torch
         signals = torch.load(signals_path, map_location="cpu", weights_only=True, mmap=True)
         sources[str(signals_path)] = digest(signals_path)
@@ -366,7 +372,9 @@ def read_run(directory):
             if reported is not None and not np.isclose(recompute_tpr(labels,scores,target),reported,atol=1e-6,rtol=0):
                 raise ValueError(f"Independent TPR verification failed: {directory.name}/{name}")
         class_metrics = dict(class_conditional_auc=None, macro_class_auc=None, conditional_pair_count=None)
-        label_source = next((ob for ob in reversed(signals.get("client_train_update_observations", []))
+        observation_key = ("exact_batch_observations" if config.get("aggregator") == "fedsgd"
+                           else "client_train_update_observations")
+        label_source = next((ob for ob in reversed(signals.get(observation_key, []))
                              if name in ob.get("attacks", [])), signals)
         if "candidate_labels" in label_source and "membership" in label_source:
             indices = np.array([int(row["sample_index"]) for row in rows])
@@ -397,7 +405,8 @@ def read_run(directory):
     selection = summary.get("candidate_sampling",{}).get("per_client",{})
     result["candidate_metadata"] = selection
     result["candidate_selection_digests"]={}
-    for name in ("candidate_selection.pt","client_train_update_candidate_selection.pt"):
+    for name in ("candidate_selection.pt","client_train_update_candidate_selection.pt",
+                 "exact_batch_candidate_selection.pt"):
         path=directory/"privacy_audit"/name
         if path.exists():
             result["candidate_selection_digests"][name]=selection_digest(path)
@@ -425,23 +434,43 @@ def verify_confirmation_sources(directory, config, signals, sources):
         sources[str(path)] = digest(path)
     client = int(config["audit"]["audit_client_ids"][0])
     selection = torch.load(directory / "privacy_audit/candidate_selection.pt", map_location="cpu", weights_only=True)
-    update_path = directory / "privacy_audit/client_train_update_candidate_selection.pt"
+    fedsgd = config.get("aggregator") == "fedsgd"
+    update_path = directory / "privacy_audit" / ("exact_batch_candidate_selection.pt" if fedsgd
+                                                else "client_train_update_candidate_selection.pt")
     updates = torch.load(update_path, map_location="cpu", weights_only=True) if update_path.exists() else {"rounds": []}
     resolved = map_confirmation_candidates(mapping, manifest, client, selection)
+    batch_sources = {}
     for entry in updates["rounds"]:
-        current = map_confirmation_candidates(mapping, manifest, client, entry)
-        if any(not np.array_equal(current[key], resolved[key]) for key in resolved):
+        positions = ({**entry, "member_pool_indices": entry["member_local_indices"]} if fedsgd else entry)
+        current = map_confirmation_candidates(mapping, manifest, client, positions, require_full=not fedsgd)
+        if fedsgd:
+            round_number = int(entry["communication_round"])
+            if round_number in batch_sources:
+                raise ValueError("Duplicate confirmation batch round.")
+            batch_sources[round_number] = current
+        elif any(not np.array_equal(current[key], resolved[key]) for key in resolved):
             raise ValueError("Confirmation update candidates changed their original record identities.")
-    for observation in [signals, *signals.get("client_train_update_observations", [])]:
+    observation_key = "exact_batch_observations" if fedsgd else "client_train_update_observations"
+    for observation in [signals, *signals.get(observation_key, [])]:
+        expected = (batch_sources[int(observation["round"]) + 1]
+                    if fedsgd and observation is not signals else resolved)
+        if fedsgd and observation is not signals:
+            observed = map_confirmation_candidates(mapping, manifest, client,
+                dict(member_pool_indices=observation['member_local_indices'],
+                     nonmember_pool_indices=observation['nonmember_pool_indices']), require_full=False)
+            if any(not np.array_equal(observed[key], expected[key]) for key in expected):
+                raise ValueError("Confirmation batch signals disagree with saved original identities.")
         membership = np.asarray(observation["membership"])
         labels = np.asarray(observation["candidate_labels"])
         if (set(membership.tolist()) != {0, 1} or labels.shape != membership.shape
-                or not np.array_equal(labels[membership == 1], resolved["member_labels"])
-                or not np.array_equal(labels[membership == 0], resolved["nonmember_labels"])):
+                or not np.array_equal(labels[membership == 1], expected["member_labels"])
+                or not np.array_equal(labels[membership == 0], expected["nonmember_labels"])):
             raise ValueError("Confirmation audit labels do not match the original source record mapping.")
     return dict(manifest_sha256=fingerprint, source_partition="original_train",
                 **{key: values.tolist() for key, values in resolved.items()},
-                roles_disjoint=True, exploration_records_excluded=True)
+                roles_disjoint=True, exploration_records_excluded=True,
+                **({"original_source_batches": {str(r): {k: v.tolist() for k, v in values.items()}
+                                               for r, values in batch_sources.items()}} if fedsgd else {}))
 
 
 def analyze(directories,output):

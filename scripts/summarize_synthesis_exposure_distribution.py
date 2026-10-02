@@ -25,6 +25,7 @@ def summarize(record):
     if options.get("replacement_policy") != "all":
         return None
     direct = options.get("candidate_selection") == "direct"
+    mixing_ablation = direct and 'mixing_mode' in options
     views = options.get("views_per_record", 1)
     path = Path(record["path"]) / "risk_synthesis" / ("synthetic_views.csv" if views > 1 else "synthetic_exposure.csv")
     if digest(path) != record["sources"][str(path)]:
@@ -34,7 +35,7 @@ def summarize(record):
         for row in csv.DictReader(handle):
             key = int(row["client"]), int(row["sample_id"])
             label = int(row["label"])
-            value = observations.setdefault(key, dict(label=label, visits=0, reference_visits=0, zeros=0,
+            value = observations.setdefault(key, dict(label=label, visits=0, reference_visits=0, zeros=0, zero_mixing=0,
                 retained_sum=0., retained_fourth_sum=0., quality_failures=None if direct else 0, attempts=0,
                 history_changes=0 if "assigned_risk" in row else None,
                 neighbor_cosine_sum=0. if "nearest_teacher_cosine" in row else None,
@@ -56,7 +57,10 @@ def summarize(record):
             if int(row["source_round"]) < 0:
                 continue
             value["reference_visits"] += 1
-            value["zeros"] += int(used == 0)
+            # In v15 the fixed endpoints decouple risk from the mixing weight.
+            # Preserve historical assigned-risk summaries for older protocols.
+            value["zeros"] += int((raw if mixing_ablation else used) == 0)
+            value['zero_mixing'] += int(used == 0)
             value["retained_sum"] += 1-used
             value["retained_fourth_sum"] += (1-used)**4
             if value["history_changes"] is not None:
@@ -73,7 +77,11 @@ def summarize(record):
         result.append(dict(run=record["run"], seed=record["protocol"]["seed"], client=client, sample_id=sid,
             label=value["label"], visits=value["visits"]//views, reference_visits=n//views,
             trained_views=value["visits"], zero_risk_count=value["zeros"]/views,
-            zero_risk_fraction=value["zeros"]/n, mean_retained_fraction=value["retained_sum"]/n,
+            zero_risk_fraction=value["zeros"]/n,
+            zero_risk_basis='raw_risk' if mixing_ablation else 'used_risk',
+            mixing_mode=options.get('mixing_mode', 'risk'),
+            zero_mixing_count=value['zero_mixing']/views, zero_mixing_fraction=value['zero_mixing']/n,
+            mean_retained_fraction=value["retained_sum"]/n,
             mean_retained_fourth=value["retained_fourth_sum"]/n,
             semantic_failure_fraction=None if direct else value["quality_failures"]/value["visits"],
             mean_attempts=value["attempts"]/value["visits"],
@@ -85,7 +93,8 @@ def summarize(record):
     target = int(record["protocol"]["audit"]["audit_client_ids"][0])
     distributions = []
     for scope, rows in (("all_clients", result), (f"target_client_{target}", [r for r in result if r["client"] == target])):
-        for metric in ("zero_risk_count", "zero_risk_fraction", "mean_retained_fraction", "mean_retained_fourth",
+        for metric in ("zero_risk_count", "zero_risk_fraction", "zero_mixing_count", "zero_mixing_fraction",
+                       "mean_retained_fraction", "mean_retained_fourth",
                        "semantic_failure_fraction", "mean_attempts", "history_reassignment_fraction",
                        "mean_nearest_teacher_cosine", "source_is_nearest_teacher_fraction"):
             present = [row[metric] for row in rows if row[metric] is not None]
@@ -128,6 +137,7 @@ def run(verified_path, output):
         distributions=distributions, sources=sources,
         interpretation="Distributions across original records, not synthetic members. Retention/zero-risk/neighbor "
             "summaries exclude unavailable-reference visits; quality/attempt summaries include all visits. "
+            "zero_risk_basis identifies raw risk in v15 versus historical assigned risk; zero_mixing always uses the actual coefficient. "
             "Source coefficients and teacher similarities are proxies, not information fractions or privacy budgets.")
     (output / "exposure_summary.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(dict(status=result["status"], original_records=count, output=str(output)), indent=2))

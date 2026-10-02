@@ -122,6 +122,52 @@ def _args(*values: str):
 
 
 @pytest.mark.parametrize("model", ["clip_adapter", "clip_lora"])
+def test_global_validation_defaults_to_unit_noise_without_scale(model, tmp_path):
+    from scripts.run_global_synthesis_validation import build_arguments
+
+    tasks, skipped = build_tasks(CATALOG, _args(*build_arguments([
+        "--models", model, "--defenses", "risk_synthesis", "--results-root", str(tmp_path),
+    ])))
+    assert not skipped and len(tasks) == 1
+    config = tasks[0].config
+    validate_resolved_config(config, "vision")
+    options = config["defense"]["synthesis"]
+    assert options["candidate_selection"] == "direct"
+    assert options["class_rank"] == "all" and options["views_per_record"] == 2
+    assert "noise_scale" not in options
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("scale", ["0", "-0.5", ".nan", ".inf", "true", "null"])
+def test_global_validation_rejects_invalid_direct_noise_scale(scale, tmp_path):
+    from scripts.run_global_synthesis_validation import build_arguments
+
+    with pytest.raises(ValueError, match="noise_scale"):
+        build_tasks(CATALOG, _args(*build_arguments([
+            "--models", "clip_lora", "--defenses", "risk_synthesis",
+            "--results-root", str(tmp_path), "--set", f"defense.synthesis.noise_scale={scale}",
+        ])))
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("model", ["clip_adapter", "clip_lora"])
+def test_half_noise_trial_preserves_five_round_comparison(model, tmp_path):
+    from scripts.run_global_synthesis_validation import build_arguments
+    from scripts.run_synthesis_noise_half import build_overrides
+
+    tasks, skipped = build_tasks(CATALOG, _args(*build_arguments(build_overrides([
+        "--models", model, "--results-root", str(tmp_path),
+    ]))))
+    assert not skipped and len(tasks) == 1
+    config = tasks[0].config
+    assert config["num_global_iters"] == 5 and config["eval_interval"] == 1
+    assert config["audit"]["enabled"] is False
+    assert config["defense"]["synthesis"]["noise_scale"] == .5
+    assert config["defense"]["synthesis"]["views_per_record"] == 2
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("model", ["clip_adapter", "clip_lora"])
 @pytest.mark.parametrize("method", ["fedsgd", "fedavg"])
 @pytest.mark.parametrize("shots", [100, 16, 32, None])
 def test_clip_training_data_regimes_resolve_and_validate(model, method, shots, tmp_path):

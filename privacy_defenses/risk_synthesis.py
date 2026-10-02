@@ -26,13 +26,15 @@ LEGACY_DEFAULTS = dict(
     risk_history="none", candidate_selection="first_semantic", views_per_record=1,
     global_distribution="disabled",
     center_source="local_class",
+    statistics_retention="keep",
 )
 FILTERED_DEFAULTS = {**{k:v for k,v in LEGACY_DEFAULTS.items() if k not in {"norm_ratio_min", "norm_ratio_max"}},
             "replacement_policy": "all", "replacement_fraction": 1.0, "warmup_rounds": 0}
 
 DIRECT_REMOVED_OPTIONS = {"attempts", "margin_tolerance", "min_class_samples"}
-DEFAULTS = {**{k: v for k, v in FILTERED_DEFAULTS.items() if k not in DIRECT_REMOVED_OPTIONS},
-            "candidate_selection": "direct", "semantic_filter": False}
+DEFAULTS = {**{k: v for k, v in FILTERED_DEFAULTS.items() if k not in DIRECT_REMOVED_OPTIONS | {"noise_scale"}},
+            "candidate_selection": "direct", "semantic_filter": False, "class_rank": "all",
+            "statistics_retention": "cleanup_on_success"}
 
 
 def synthesis_options(options):
@@ -47,8 +49,22 @@ def synthesis_options(options):
     if not legacy and {"norm_ratio_min", "norm_ratio_max"} & set(options):
         raise ValueError("All-replacement synthesis removed norm_ratio_min/norm_ratio_max; rebuild the run with the current entrypoint. Historical norm-filter runs require their original code version.")
     direct = not legacy and options.get("candidate_selection", "first_semantic" if options else "direct") == "direct"
+    if "mixing_mode" in options:
+        if not direct or options["mixing_mode"] not in ("source", "class_center", "risk"):
+            raise ValueError("synthesis.mixing_mode requires direct generation and source, class_center or risk.")
+    if "risk_tail_fraction" in options:
+        fraction = options["risk_tail_fraction"]
+        if (not direct or type(fraction) not in (int, float)
+                or not math.isfinite(fraction) or not 0 < fraction <= 1):
+            raise ValueError("synthesis.risk_tail_fraction requires direct generation and a finite number in (0, 1].")
+    if options.get("center_source") == "local_class_mean" and not direct:
+        raise ValueError("synthesis.center_source=local_class_mean requires direct generation.")
     if direct and DIRECT_REMOVED_OPTIONS & set(options):
-        raise ValueError("Direct synthesis removed retry, semantic tolerance and minimum-class candidate options; use the current entrypoint.")
+        raise ValueError(f"Direct synthesis removed options {sorted(DIRECT_REMOVED_OPTIONS & set(options))}; "
+                         "use the current entrypoint.")
+    if direct:
+        from privacy_defenses.synthesis_direct import generation_noise_scale
+        generation_noise_scale(options)
     return {**(LEGACY_DEFAULTS if legacy else DEFAULTS if direct else FILTERED_DEFAULTS), **options}
 
 
@@ -60,14 +76,16 @@ def validate_risk_synthesis(config):
         raise ValueError("risk_synthesis supports CLIP Adapter/LoRA.")
     if config.get("model_type") == "clip_adapter" and config.get("clip_adapter", {}).get("variant") != "transformer":
         raise ValueError("risk_synthesis requires the transformer Adapter.")
-    if config.get("aggregator") != "fedavg":
-        raise ValueError("risk_synthesis requires FedAvg original-client membership auditing.")
+    if config.get("aggregator") not in {"fedavg", "fedsgd"}:
+        raise ValueError("risk_synthesis requires FedAvg or FedSGD.")
     if config.get("sample_users", 0) < 2:
         raise ValueError("risk_synthesis requires at least two participating clients.")
     if config.get("code_poison", {}).get("enabled", False):
         raise ValueError("risk_synthesis does not support active code-poison probes.")
     options = synthesis_options(defense.get("synthesis", {}))
-    unknown = set(options) - set(LEGACY_DEFAULTS)
+    if config.get("aggregator") == "fedsgd" and options["candidate_selection"] != "direct":
+        raise ValueError("FedSGD risk_synthesis requires candidate_selection=direct; historical filtered modes remain FedAvg-only.")
+    unknown = set(options) - set(LEGACY_DEFAULTS) - {"mixing_mode", "risk_tail_fraction"}
     if unknown:
         raise ValueError(f"Unknown synthesis options: {sorted(unknown)}")
     for key in ("replacement_fraction",):
@@ -79,8 +97,11 @@ def validate_risk_synthesis(config):
     if "norm_ratio_min" in options and options["norm_ratio_min"] > options["norm_ratio_max"]:
         raise ValueError("Invalid synthesis norm ratio interval.")
     for key in (k for k in ("class_rank", "min_class_samples", "attempts", "views_per_record") if k in options):
+        if key == "class_rank" and options[key] == "all":
+            continue
         if type(options[key]) is not int or options[key] < 1:
-            raise ValueError(f"synthesis.{key} must be a positive integer.")
+            suffix = " or 'all'" if key == "class_rank" else ""
+            raise ValueError(f"synthesis.{key} must be a positive integer{suffix}.")
     if "min_class_samples" in options and options["min_class_samples"] < 3:
         raise ValueError("synthesis.min_class_samples must be at least 3.")
     if options["mode"] not in {"risk", "shuffled_risk", "mixup"}:
@@ -101,10 +122,14 @@ def validate_risk_synthesis(config):
         raise ValueError("Unknown synthesis.candidate_selection.")
     if options["global_distribution"] not in {"disabled", "share_only", "generate"}:
         raise ValueError("synthesis.global_distribution must be disabled, share_only or generate.")
+    if options['statistics_retention'] not in {'keep', 'cleanup_on_success'}:
+        raise ValueError("synthesis.statistics_retention must be keep or cleanup_on_success.")
+    if options['statistics_retention'] == 'cleanup_on_success' and options['candidate_selection'] != 'direct':
+        raise ValueError("Statistics cleanup currently requires direct synthesis.")
     if options["global_distribution"] == "generate" and options["mode"] == "mixup":
         raise ValueError("Global geometry generation requires a geometric noise mode, not mixup.")
-    if options["center_source"] not in {"local_class", "global_class"}:
-        raise ValueError("synthesis.center_source must be local_class or global_class.")
+    if options["center_source"] not in {"local_class", "local_class_mean", "global_class"}:
+        raise ValueError("synthesis.center_source must be local_class, local_class_mean or global_class.")
     if options["center_source"] == "global_class" and (
             options["global_distribution"] != "generate" or options["center_weighting"] != "uniform"):
         raise ValueError("Global class centers require global_distribution=generate and uniform center_weighting.")
@@ -121,8 +146,10 @@ def validate_risk_synthesis(config):
     if options["replacement_policy"] == "all":
         if options["replacement_fraction"] != 1 or options["warmup_rounds"] != 0:
             raise ValueError("All replacement requires replacement_fraction=1 and warmup_rounds=0.")
-        if options["noise_scale"] <= 0 or options["mode"] == "mixup":
-            raise ValueError("All replacement requires positive noise_scale and risk/shuffled_risk mode, including zero-risk records.")
+        if options["mode"] == "mixup":
+            raise ValueError("All replacement requires risk/shuffled_risk mode, including zero-risk records.")
+        if options["candidate_selection"] != "direct" and options["noise_scale"] <= 0:
+            raise ValueError("Historical filtered all replacement requires positive noise_scale.")
         if options["center_weighting"] != "uniform":
             raise ValueError("All replacement uses uniform centers; risk controls source retention only.")
     defense["synthesis"] = options
@@ -131,14 +158,14 @@ def validate_risk_synthesis(config):
 
 
 def low_rank_factor(centered, rank):
-    """Factor of the truncated 1/N covariance using a sample Gram matrix."""
+    """Factor of the 1/N covariance; rank='all' keeps every numerical direction."""
     x = centered.double()
     gram = x @ x.T / len(x)
     values, vectors = torch.linalg.eigh(gram)
     values, vectors = values.flip(0).clamp_min(0), vectors.flip(1)
     total = float(values.sum())
     numerical_rank = int((values > max(float(values[0]) * 1e-10, 1e-16)).sum())
-    used = min(rank, numerical_rank)
+    used = numerical_rank if rank == "all" else min(rank, numerical_rank)
     # X.T @ eigenvectors / sqrt(N) = U sqrt(eigenvalues).
     factor = (x.T @ vectors[:, :used] / math.sqrt(len(x))).float().cpu()
     return factor, dict(numerical_rank=numerical_rank, used_rank=used,
@@ -156,7 +183,8 @@ class LocalGeometry:
             rows = self.codes[indices]
             mean = rows.mean(0)
             centered = rows - mean
-            factor, meta = low_rank_factor(centered.to(device), min(options["class_rank"], len(rows)-1))
+            rank = len(rows)-1 if options["class_rank"] == "all" else min(options["class_rank"], len(rows)-1)
+            factor, meta = low_rank_factor(centered.to(device), rank)
             self.classes[c] = dict(indices=indices, mean=mean, factor=factor, **meta)
 
     def state(self):
@@ -281,7 +309,10 @@ def select_requests(risk, options, request_generator, control_generator):
 class RiskSynthesis:
     def __init__(self, config, seed):
         self.options = synthesis_options(config.get("synthesis", {}))
+        # Saved configurations without this option retain the historical tail.
+        self.risk_tail_fraction = float(self.options.get("risk_tail_fraction", 0.8))
         self.seed = seed
+        self.federated_method = "fedavg"
         self.geometry = {}
         self.counts = Counter()
         self.risk_bins = {str(i): Counter() for i in range(5)}
@@ -301,11 +332,18 @@ class RiskSynthesis:
         self.view_counts = Counter()
         self.pending_views = {}
         self.global_exchange = None
+        from privacy_defenses.synthesis_direct import DeviceGeometryCache
+        self.device_geometry_cache = DeviceGeometryCache()
+        self.statistics_storage = None
 
     @torch.no_grad()
     def initialize(self, users, shared_model, directory):
         if self.directory is not None:
             raise RuntimeError("Synthesis distributions are initialized exactly once before training.")
+        methods = {user.federated_method for user in users}
+        if len(methods) != 1:
+            raise ValueError("Synthesis clients must share one federated method.")
+        self.federated_method = next(iter(methods))
         self.directory = Path(directory) / "risk_synthesis"
         self.directory.mkdir(exist_ok=False)
         device = shared_model.device
@@ -768,7 +806,11 @@ class RiskSynthesis:
         global_center = self.options["center_source"] == "global_class"
         replace_all = self.options["replacement_policy"] == "all"
         direct = self.options["candidate_selection"] == "direct"
-        return dict(implementation=("local_token_geometry_v12_direct" if direct else
+        scaled_direct = direct and "noise_scale" in self.options
+        location_ablation = direct and "mixing_mode" in self.options
+        return dict(implementation=("local_token_geometry_v15_direct_mixing" if location_ablation else
+                                    "local_token_geometry_v14_direct_scaled_noise" if scaled_direct else
+                                    "local_token_geometry_v13_direct_unit_noise" if direct else
                                     "local_token_geometry_v11_no_norm_filter" if replace_all else
                                     "local_token_geometry_v10_global_mean" if global_center else
                                     "local_token_geometry_v8_global_class" if shared else
@@ -778,15 +820,29 @@ class RiskSynthesis:
                     **(dict(candidate_validity_filter_enabled=False, semantic_filter_enabled=False,
                             teacher_initialized=False, candidate_generation="one_draw_per_training_view",
                             candidate_failure_policy="no_rejection_or_retry",
+                            generation_compute="input_token_device_float32",
+                            generation_rng="cpu_per_client_view_class_record_order",
+                            generation_noise=("scaled_covariance_factor_times_standard_normal" if scaled_direct
+                                              else "covariance_factor_times_standard_normal"),
+                            noise_scale_parameter_enabled=scaled_direct,
+                            generation_device_cache=self.device_geometry_cache.summary(),
                             semantic_quality_measured=False) if direct else {}),
+                    **(dict(generation_location_mode=self.options['mixing_mode'],
+                            mixing_coefficient_source={'risk':'risk', 'source':'constant_zero',
+                                                       'class_center':'constant_one'}[self.options['mixing_mode']],
+                            used_risk_role='class_center_mixing_coefficient',
+                            risk_ranking_policy='unchanged_when_references_available') if location_ablation else {}),
                     geometry_source=("global_same_class" if self.options["global_distribution"] == "generate"
                                      else "local_class_only"),
                     local_statistics_geometry_source="local_class_only",
                     generation_center=("global_same_class_mean" if global_center else
+                                       "local_same_class_mean" if self.options["center_source"] == "local_class_mean" else
                                        "local_same_class_leave_source_out"),
-                    center_includes_source=global_center,
+                    center_includes_source=global_center or self.options["center_source"] == "local_class_mean",
                     global_distribution=self.global_exchange,
+                    **(dict(statistics_storage=self.statistics_storage) if self.statistics_storage else {}),
                     options=self.options, seed=self.seed,
+                    risk_tail_fraction=self.risk_tail_fraction, risk_tail_basis="actual_batch",
                     history_definition=("mean_per_round_zero_assigned_risk_frequency" if
                                         self.options["risk_history"] != "none" else None),
                     history_combination=("equal_midrank_sum_then_loss_gap_then_batch_order" if
@@ -804,7 +860,11 @@ class RiskSynthesis:
                             loss_normalization="mean_over_views_then_mean_over_original_records",
                             optimizer_steps_per_original_batch=1) if self.options["views_per_record"] > 1 else {}),
                     formal_dp_enabled=False, client_upload_is_private=False,
-                    epsilon=None, delta=None, membership="original_client_train",
+                    epsilon=None, delta=None, federated_method=self.federated_method,
+                    membership=("original_source_batch" if self.federated_method == "fedsgd"
+                                else "original_client_train"),
+                    fixed_candidate_membership="original_client_train",
+                    statistics_source_membership="original_client_train",
                     reference_is_exact_leave_one_out=False, shared_geometry=shared)
 
     def write_summary(self, status):
@@ -817,9 +877,14 @@ class RiskSynthesis:
 
     def close(self, status):
         self.write_summary(status)
+        self.device_geometry_cache.clear()
         if self.handle is not None:
             self.handle.close()
         if self.candidate_handle is not None:
             self.candidate_handle.close()
         if self.view_handle is not None:
             self.view_handle.close()
+
+    def cleanup_statistics(self, *, audit_succeeded):
+        from privacy_defenses.synthesis_storage import cleanup_on_success
+        cleanup_on_success(self, audit_succeeded=audit_succeeded)

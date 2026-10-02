@@ -22,6 +22,9 @@ tests/*
 !tests/test_main_logging.py
 !tests/test_runtime_optimization.py
 !tests/test_risk_synthesis.py
+!tests/test_synthesis_center_ablation.py
+!tests/test_synthesis_center_source_ablation.py
+!tests/test_synthesis_fedsgd.py
 paper/
 
 # Local model weights and experiment artifacts

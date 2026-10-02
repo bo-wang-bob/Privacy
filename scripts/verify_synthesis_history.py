@@ -36,7 +36,7 @@ def verify(directory):
     directory = Path(directory)
     summary_path = directory / "synthesis_summary.json"
     summary = json.loads(summary_path.read_text())
-    if summary.get("implementation") == "local_token_geometry_v12_direct":
+    if summary.get("implementation") in {"local_token_geometry_v12_direct", "local_token_geometry_v13_direct_unit_noise", "local_token_geometry_v14_direct_scaled_noise", "local_token_geometry_v15_direct_mixing"}:
         from scripts.verify_synthesis_direct import verify as verify_direct
         result = verify_direct(directory)
         return dict(status="verified", multiview=result, history_visits_verified=0, direct=result)

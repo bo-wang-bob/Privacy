@@ -91,8 +91,8 @@ def risk_regularization_weights(scores, tail_fraction=0.8, *, expected_batch_siz
     scores = scores.detach().cpu().double().flatten()
     if not torch.isfinite(scores).all():
         raise ValueError("WWW requires finite sample scores.")
-    if not math.isfinite(tail_fraction) or not 0 < tail_fraction < 1:
-        raise ValueError("WWW tail_fraction must be in (0, 1).")
+    if not math.isfinite(tail_fraction) or not 0 < tail_fraction <= 1:
+        raise ValueError("Risk tail_fraction must be in (0, 1].")
     if isinstance(expected_batch_size, bool) or int(expected_batch_size) != expected_batch_size or expected_batch_size <= 0:
         raise ValueError("WWW expected_batch_size must be a positive integer.")
     if tail_basis not in {"actual_batch", "expected_batch"}:

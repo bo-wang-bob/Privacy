@@ -54,10 +54,12 @@ def reservation(tmp_path):
     return source, path, fingerprint, manifest, config
 
 
-def test_confirmation_loader_caps_after_reservation_and_saves_original_identities(reservation, monkeypatch, tmp_path):
+@pytest.mark.parametrize('method', ['fedavg', 'fedsgd'])
+def test_confirmation_loader_caps_after_reservation_and_saves_original_identities(reservation, monkeypatch, tmp_path, method):
     import utils.data_loader as loader
     from main import _dataset_split_arguments
     source, path, fingerprint, manifest, config = reservation
+    config['aggregator'] = method
     monkeypatch.setattr(loader.datasets, "CIFAR100", Source)
     validate_confirmation_config(config)
     assert config["confirmation_split_sha256"] == fingerprint
@@ -100,12 +102,34 @@ def test_confirmation_loader_caps_after_reservation_and_saves_original_identitie
     audit.mkdir()
     saved_positions = {key: torch.as_tensor(value) for key, value in candidate_positions.items()}
     torch.save(saved_positions, audit / "candidate_selection.pt")
-    torch.save({"rounds": [saved_positions]}, audit / "client_train_update_candidate_selection.pt")
+    if method == 'fedsgd':
+        batch = dict(communication_round=1, member_local_indices=torch.tensor([1, 3, 5]),
+                     nonmember_pool_indices=torch.tensor([2, 4, 6]))
+        torch.save({'rounds': [batch]}, audit / 'exact_batch_candidate_selection.pt')
+    else:
+        torch.save({"rounds": [saved_positions]}, audit / "client_train_update_candidate_selection.pt")
     signals = dict(membership=np.repeat([1, 0], 1000),
                    candidate_labels=np.concatenate([mapped["member_labels"], mapped["nonmember_labels"]]))
+    if method == 'fedsgd':
+        signals['exact_batch_observations'] = [dict(round=0, membership=np.repeat([1, 0], 3),
+            member_local_indices=batch['member_local_indices'],
+            nonmember_pool_indices=batch['nonmember_pool_indices'],
+            candidate_labels=np.concatenate([np.asarray(first['clients'][0]['train_labels'])[[1, 3, 5]],
+                                             pools['evaluation'][1][[2, 4, 6]]]))]
     config["audit"] = {"audit_client_ids": [0]}
     verified = verify_confirmation_sources(tmp_path, config, signals, {})
     assert verified["roles_disjoint"] and verified["exploration_records_excluded"]
+    if method == 'fedsgd':
+        assert verified['original_source_batches']['1']['member_source_indices'] == [
+            first['clients'][0]['train_source_indices'][i] for i in (1, 3, 5)]
+        bad = copy.deepcopy(signals)
+        bad['exact_batch_observations'][0]['candidate_labels'][0] += 1
+        with pytest.raises(ValueError, match='audit labels'):
+            verify_confirmation_sources(tmp_path, config, bad, {})
+        bad = copy.deepcopy(signals)
+        bad['exact_batch_observations'][0]['member_local_indices'][0] = 7
+        with pytest.raises(ValueError, match='original identities'):
+            verify_confirmation_sources(tmp_path, config, bad, {})
     signals["candidate_labels"][0] = (signals["candidate_labels"][0] + 1) % 100
     with pytest.raises(ValueError, match="audit labels"):
         verify_confirmation_sources(tmp_path, config, signals, {})

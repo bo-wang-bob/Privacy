@@ -52,6 +52,42 @@ def test_full_local_covariance_is_uploaded_before_generation_rank_truncation():
     torch.testing.assert_close(f@f.T,x.T@x/len(x),rtol=2e-6,atol=2e-6)
 
 
+def test_all_directions_generation_recovers_central_covariance_and_samples_beyond_five():
+    from privacy_defenses.risk_synthesis import DEFAULTS as DIRECT_DEFAULTS
+    from privacy_defenses.synthesis_direct import draw_batch
+    generator = torch.Generator().manual_seed(814)
+    codes = torch.randn(24, 8, generator=generator)
+    options = {**DIRECT_DEFAULTS, 'global_distribution': 'generate', 'center_source': 'global_class'}
+    a = LocalGeometry(codes[:10], torch.zeros(10, dtype=torch.long), options, 'cpu')
+    b = LocalGeometry(codes[10:], torch.zeros(14, dtype=torch.long), options, 'cpu')
+    assert a.classes[0]['used_rank'] == 8
+    uploads = {0: local_moments(a, 'cpu'), 1: local_moments(b, 'cpu')}
+    a.global_distribution = aggregate_moments(uploads, options['class_rank'], 'cpu')
+    group = a.global_distribution['classes'][0]
+    assert group['used_rank'] == group['numerical_rank'] == 8
+    assert group['retained_variance'] == 1.
+    f = group['factor'].double()
+    centered = codes.double() - codes.double().mean(0)
+    torch.testing.assert_close(f@f.T, centered.T@centered/len(codes), rtol=2e-6, atol=2e-6)
+    # Actual sampler must use the additional columns, not silently retain top five.
+    sample = draw_batch(a, a.codes[:1], torch.tensor([0]), torch.tensor([.5]), options,
+                        torch.Generator().manual_seed(19))
+    epsilon = torch.randn(1, 8, generator=torch.Generator().manual_seed(19))
+    center = .5*a.codes[:1] + .5*group['mean'].float()
+    expected = center + epsilon@group['factor'].T
+    torch.testing.assert_close(sample, expected)
+    truncated = center + epsilon[:, :5]@group['factor'][:, :5].T
+    assert not torch.allclose(sample, truncated)
+
+
+def test_all_directions_zero_rank_keeps_empty_factor():
+    from privacy_defenses.risk_synthesis import DEFAULTS as DIRECT_DEFAULTS
+    a = LocalGeometry(torch.ones(1, 8), torch.tensor([0]), DIRECT_DEFAULTS, 'cpu')
+    group = aggregate_moments({0: local_moments(a, 'cpu')}, 'all', 'cpu')['classes'][0]
+    assert group['factor'].shape == (8, 0)
+    assert group['used_rank'] == group['numerical_rank'] == 0
+
+
 def test_every_client_receives_all_classes_and_global_noise_keeps_local_center(tmp_path):
     # Local class0 varies only in x; remote class0 adds a y direction.
     a = geometry([[0.,0.],[1.,0.],[2.,0.]], [0,0,0])
