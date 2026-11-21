@@ -132,6 +132,11 @@ def generate_views(synth, model, user, images, labels, indices, risk,
     device_risk = used.to(original.device)
     ids = indices.detach().cpu().long()
     targets = labels.detach().cpu().long()
+    log_scores = 'risk_score' in synth.options
+    if log_scores and source_round >= 0:
+        if raw_scores is None or raw_scores.shape != risk.shape or not torch.isfinite(raw_scores).all():
+            raise ValueError('Configured risk score needs one finite signed loss gap per original record.')
+        ranking_scores = synth.ranking_scores(raw_scores)
     views, logs = [], []
     for view_index in range(synth.options['views_per_record']):
         generated = draw_batch(synth.geometry[user.id], original, ids, device_risk,
@@ -145,6 +150,9 @@ def generate_views(synth, model, user, images, labels, indices, risk,
             source_round=source_round, retained_original_fraction=1-float(used[j]),
             nearest_distance=None, norm_ratio=None, original_distance=None,
             teacher_margin_delta=None, quality_passed=None,
+            **(dict(signed_loss_gap=float(raw_scores[j]) if source_round >= 0 else None,
+                    risk_ranking_score=float(ranking_scores[j]) if source_round >= 0 else None)
+               if log_scores else {}),
             view_index=view_index, loss_weight=1/synth.options['views_per_record'])
             for j, sid in enumerate(ids)])
     synth.pending_views[user.id] = logs

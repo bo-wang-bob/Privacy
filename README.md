@@ -9,6 +9,38 @@ BERT-Base LoRA 和 GPT2-Large Adapter，并在统一训练任务中完成模型�
 SEISMOGRAPH 防御。仓库中可能保留早期研究攻击的实现文件，但公共审计器目前只
 注册本文档列出的 11 种攻击；未注册实现不能通过配置或命令行用于新实验。
 
+## 当前默认运行设置
+
+以下是直接运行 `python scripts/run_privacy_experiments.py`、不传选择或覆盖参数时的设置。
+默认展开 **3 个模型 × 2 个数据集，共 6 个独立训练任务**，每个任务共享所选攻击：
+
+| 项目 | 统一入口默认值 |
+| --- | --- |
+| 模型 | `clip_mlp`、`clip_adapter`、`clip_lora` |
+| 数据集 | `cifar100`、`food101` |
+| 联邦方法 | FedSGD；每客户端每轮 1 个 mini-batch、1 次更新 |
+| 客户端 / batch / 聚合 | 10 个客户端全部参与 / 32 / `uniform` 等权 |
+| 轮数 / 学习率 | MLP：150 / 0.1；Adapter、LoRA：1000 / 0.01；学习率不衰减 |
+| 训练数据 | IID；MLP 全局每类 16 张，Adapter、LoRA 全局每类 100 张 |
+| 防御 / seed / 攻击目标 | `none` / 42 / 客户端 0 |
+| 攻击 / 审计间隔 | 全部 11 种 / 每 10 个已完成通信轮，另包含最后一轮 |
+| 任务评估 | 每 5 个已完成通信轮，另包含最后一轮 |
+| 调度 / 输出 | GPU 0、`--jobs 1` 串行 / `results/` 下独立任务目录 |
+
+当前默认场景为**模型同构、IID 数据、同步联邦学习的单进程模拟**。一次任务的客户端
+使用相同模型结构；Adapter、LoRA、BERT 等是不同实验任务。配置中的
+`dirichlet_alpha: 0.1` 在 `partition_mode: iid` 时不参与划分。
+
+默认攻击者是能观察单客户端上传的诚实但好奇服务器，视图为
+`audit.audit_view: protocol_plus_released_prompts`。FedSGD 直接观察可训练参数的真实
+梯度，用 `轮初参数 - 学习率 × 上传梯度` 构造客户端更新后模型；允许使用公开参数
+检查点，默认不读取未上传的内部客户端状态。详见[攻击可见性](docs/federated_methods.md#攻击可见性)。
+
+最终配置按“模型基线 → 方法默认值 → 防御覆盖 → CLI → `--set`”解析，实际任务保存
+`run_config.yaml`。先查看计划可运行 `python scripts/run_privacy_experiments.py --dry-run`。
+专项研究入口有自己的固定参数；最近的 0.2 噪声风险分数对照使用 seed43、K=2，
+见[风险分数对照说明](docs/risk_synthesis_risk_score_ablation.md)，不要与上述通用默认值混用。
+
 ## 当前实验协议
 
 下表为默认协议。六种 CLIP/BERT/GPT2 PEFT 模型均可通过统一入口切换 FedSGD/FedAvg：
@@ -28,8 +60,8 @@ FedAvg 的 11 种攻击使用完整客户端训练集/独立 evaluation 固定�
 | --- | --- | --- | --- | ---: | ---: | --- |
 | ResNet18 / CIFAR100 | 完整 CIFAR ResNet18（GroupNorm） | FedAvg | 1 个完整 local epoch | 300 | 0.1，逐轮乘 0.99 | FedMIA-Loss |
 | CLIP-MLP | 冻结 CLIP 图像编码器后的两层 MLP | FedSGD | 1 个 mini-batch / 1 次 SGD step | 150 | 0.1 | 11 种攻击 |
-| CLIP-Adapter | 视觉 Transformer 各 block 后的残差 Adapter；文本编码器冻结 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.01 | 11 种攻击 |
-| CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 300 | 0.01 | 11 种攻击 |
+| CLIP-Adapter | 视觉 Transformer 各 block 后的残差 Adapter；文本编码器冻结 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 1000 | 0.01 | 11 种攻击 |
+| CLIP-LoRA | 图像、文本注意力 Q/K/V 的 LoRA 因子 | FedSGD | 1 个 mini-batch / 1 次 SGD step | 1000 | 0.01 | 11 种攻击 |
 | BERT-Base Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.005 | 11 种攻击 |
 | BERT-Base LoRA | 各层注意力 Query/Value 的 LoRA 因子和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.015 | 11 种攻击 |
 | GPT2-Large Adapter | 各 Transformer block 的 Adapter 和分类头 | FedSGD | 1 个 batch，batch size 16 | 500 | 0.001 | 11 种攻击 |
@@ -39,6 +71,8 @@ FedAvg 的 11 种攻击使用完整客户端训练集/独立 evaluation 固定�
 - CLIP 三种模型使用 10 个客户端、batch size 32、IID 划分和参与客户端等权 FedSGD。Adapter/LoRA 默认在客户端划分前每类抽取 100 张训练图像，MLP 保持每类 16 张；Adapter/LoRA 可通过配置切换全量或其他每类样本数量。
 - BERT/GPT2 使用 30 个客户端、IID 划分和 one-batch 等权 FedSGD。
 - BERT-LoRA 默认只展开 CoLA；SST-5 与 IMDb 仍可通过 `--datasets` 显式选择。
+- 六个 PEFT 模型的统一入口默认 seed 均为 42；BERT Adapter 默认防御为 `www`，其余为 `none`。
+  ResNet18 默认 seed 为 1、防御为 `none`。这些值以 catalog 为准，单模型 YAML 不是完整的批量配置。
 - FedSGD 客户端上传各自的可训练参数梯度；服务器先等权聚合梯度，再执行一次
   `global = base - learning_rate * mean_gradient` 并下发新的全局模型。
 - CLIP 普通任务每 5 个已完成通信轮评估一次；多轮攻击通常每 10 轮审计。
@@ -121,7 +155,7 @@ python scripts/run_privacy_experiments.py --models clip_adapter,clip_lora \
 | CLIP-Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
 | CLIP-LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种，均在同一训练任务内运行 |
 | BERT-Base Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种 |
-| BERT-Base LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种；ProjRes 攻击首个 Query `lora_A`，使用有效 token 均值表示 |
+| BERT-Base LoRA | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种；ProjRes 默认攻击最后一个已训练 Query 的 `lora_A`，使用该层输入 CLS |
 | GPT2-Large Adapter | 除 `projres` 外的 10 种 | 统一审计器，默认启用 | 共 11 种 |
 
 “代码已注册/可配置”和“正式 sweep 默认启用”是两个不同概念。当前 11 个注册名
@@ -131,14 +165,24 @@ ProjRes 入口用于单轮诊断，但统一 sweep 已将 ProjRes 作为第 11 �
 
 ## 各攻击的成员与非成员定义
 
-仓库存在两种成员问题：
+默认 FedSGD 存在两种成员问题：
 
 - **真实 Batch（exact-batch）**：判断样本是否出现在目标客户端产生当轮上传的
   真实 mini-batch 中。每个审计轮重新构造候选集，不跨轮拼接成员。
 - **固定候选（fixed-candidate）**：判断样本是否属于目标客户端历史训练集。训练
   开始前固定成员/非成员候选，所有审计轮复用同一集合。
 
-同一个攻击名在不同模型上可能使用不同成员问题。逐攻击的当前划分如下：
+切换到 FedAvg 后，全部 11 种攻击均使用目标客户端完整原始训练集的 `M` 个成员与
+默认等量 `M` 个独立 evaluation 非成员；六种单轮更新攻击自动改为
+`audit.client_train_membership_attacks`。上传为模型 delta，梯度类攻击只转换一次
+`-delta / round_learning_rate`，作为累计更新代理量；ProjRes 不设单 batch 秩上限，
+标记 `paper_fedsgd_exact=false`。下面的逐攻击分组和真实 batch 数量描述 **FedSGD**。
+
+生成视图 FedSGD 的成员仍是本轮**原始来源 batch**，攻击对原图评分，观察生成视图
+产生的真实上传梯度；K 个视图不把成员数扩大 K 倍。ProjRes 在此场景为经验性适配，
+`paper_fedsgd_exact=false`、`batch_rank_bound=null`，详见[生成视图 FedSGD 协议](docs/risk_synthesis_fedsgd.md)。
+
+逐攻击的 FedSGD 划分如下：
 
 | 攻击 | CLIP-MLP / CLIP-Adapter / CLIP-LoRA / BERT / GPT2 | 成员 | 非成员 |
 | --- | --- | --- | --- |
@@ -154,7 +198,7 @@ ProjRes 入口用于单轮诊断，但统一 sweep 已将 ProjRes 作为第 11 �
 | `fta` | 固定候选 | 目标客户端历史训练样本 | 从未训练的独立 evaluation 样本 |
 | `projres` | 真实 Batch | 产生被观察更新的当轮真实 batch | 从独立 evaluation 池按标签抽取、与该 batch 互斥的样本 |
 
-### 各模型的候选规模与抽样方式
+### 各模型默认方法的候选规模与抽样方式
 
 | 模型/视图 | 成员与非成员来源 | 默认规模 |
 | --- | --- | --- |
@@ -172,6 +216,10 @@ CLIP-MLP 的独立 ProjRes 诊断入口可使用更大的互斥非成员池；�
 
 ProjRes 只输出连续的负 L1 投影残差并按分数排序，通过 ROC/AUC 或指定 FPR 的
 TPR 评价；不再使用跨模型、跨轮次不可校准的固定残差阈值生成成员判断。
+
+攻击以 `TPR@1%FPR` 为主指标，并报告 AUC 和 `TPR@10%FPR`。FedSGD 六种真实 batch
+攻击不报告 `TPR@0.1%FPR`；五种固定候选攻击及 FedAvg 的低 FPR 可报告性取决于
+独立非成员数，重复审计轮次不增加 FPR 分辨率。
 
 CLIP-MLP、CLIP-Adapter、CLIP-LoRA、BERT 和 GPT2 固定候选攻击的经验 FPR 分辨率由目标
 客户端训练集大小决定。32/320 或 16/160 的真实 batch 视图只正式报告
@@ -221,13 +269,22 @@ cache_dir: ./checkpoints/clip-vit-base-patch32
 
 ### 数据集
 
-统一 CLIP sweep 默认运行：
+统一入口正式支持以下模型与数据集组合：
 
-- Caltech101
-- Oxford-IIIT Pets
-- Flowers102
-- Food101
-- CIFAR100
+| 模型 / CLI 标识 | 支持的数据集 | 默认展开的数据集 |
+| --- | --- | --- |
+| ResNet18 / `resnet18` | CIFAR100 | CIFAR100 |
+| CLIP-MLP / `clip_mlp` | CIFAR100、Food101、Caltech101、Oxford-IIIT Pets、Flowers102 | CIFAR100、Food101 |
+| CLIP-Adapter / `clip_adapter` | 同上五个图像集 | CIFAR100、Food101 |
+| CLIP-LoRA / `clip_lora` | 同上五个图像集 | CIFAR100、Food101 |
+| BERT-Base Adapter / `bert_adapter` | SST-5、CoLA、IMDB | 三个文本集 |
+| BERT-Base LoRA / `bert_lora` | SST-5、CoLA、IMDB | CoLA |
+| GPT2-Large Adapter / `gpt2_adapter` | SST-5、CoLA、IMDB | 三个文本集 |
+
+图像集 CLI 名为 `cifar100,food101,caltech101,oxfordpets,flowers`，文本集为
+`sst5,cola,imdb`。`--datasets all` 按所选模型展开兼容数据集，`--models all` 展开
+七种正式模型；不指定模型仍只选择三种 CLIP。CLIP 使用 ViT-B/32，BERT 使用
+`bert-base-uncased`，GPT2 使用 `gpt2-large`。目前没有正式 GPT2-LoRA 配置。
 
 图像数据使用本地 `data_root` 且 `download=False`。其他已接入图像数据集及目录
 约定见 [`utils/data_loader.py`](utils/data_loader.py)。
@@ -246,7 +303,7 @@ CoLA 和 IMDB 分别从 `data/huggingface/cola`、`data/huggingface/imdb` 等本
 ## 快速开始
 
 唯一批量入口是 [`scripts/run_privacy_experiments.py`](scripts/run_privacy_experiments.py)。
-它按“模型 × 数据集 × 防御 × seed × 目标客户端”展开训练任务；同一命令选择的
+它按“模型 × 数据集 × 防御 × seed × 目标客户端 × 联邦方法”展开训练任务；同一命令选择的
 多种攻击保留在一个任务中，共享一次训练，不会为每种攻击重复训练。
 
 先查看完整兼容矩阵，再 dry-run：
@@ -382,15 +439,56 @@ MIST、SOFT、HAMP 和 WWW 等实现。当前 CLIP 三模型正式支持 `none`�
 `www` 与 `cofedmid`；BERT Adapter/LoRA 和 GPT2 Adapter 也支持 CoFedMID。
 具体兼容性由 `configs/experiment_catalog.yaml` 维护。
 
-CLIP transformer Adapter/LoRA 另支持 FedAvg 下的实验防御 `risk_synthesis`：
-每个训练位置都使用本地几何生成的 token，风险只控制原始编码保留系数；从首轮开始替换，
-语义重试失败时保留最佳虚拟候选并记录未达标。默认仍为每类 100 张、100 轮 FedAvg。
-该全部替换版本须单独评价效果，不能继承旧部分替换方案的确认结论，也不提供 DP 保证。
-参数、暴露记录与历史兼容性见[全部替换方案](docs/risk_synthesis_all_replacement.md)。
+CLIP transformer Adapter/LoRA 的 `risk_synthesis` direct 模式支持 **FedSGD 和 FedAvg**。
+统一入口启用该防御时，默认首轮训练前聚合全部客户端的原始逐类统计，使用含自身的
+全局同类均值与完整数值秩协方差因子，生成 `(1-r) h + r mu_global_class + L epsilon`。
+通用默认每条记录生成 1 个视图，未显式设置噪声系数时幅度为 1；全部视图直接训练，
+不做候选筛选、教师语义检查、重试或原图回退。多个视图的 CE 平均后执行一次更新。
+
+默认风险按有符号 `other_loss-own_loss` 稳定升序排名，`risk_tail_fraction=1`，有参考时
+batch 中第 j 个样本的权重为 `(j-0.5)/B`；首轮无参考时风险为 0，仍生成并加噪。
+`risk_score=absolute_loss_gap` 可改为按绝对损失差排序，只改变生成风险的排序输入，
+独立 WWW 与原始有符号诊断保持原定义。
+
+不传方法时沿用模型默认 FedSGD 1000 轮、等权；`--methods fedavg` 为 100 轮、
+每轮一个完整本地 epoch、按样本数聚合。新任务默认 `statistics_retention: cleanup_on_exit`，
+成功或失败退出均清理所属的四类大统计缓存，保留配置、模型、指标、日志与逐条 CSV；
+失败清理不会获得核验通过凭据，不自动清理旧结果。方法、GPU 与清理协议分别见
+[生成方法](docs/risk_synthesis_method.md)、[FedSGD 支持](docs/risk_synthesis_fedsgd.md)、
+[统计保留策略](docs/risk_synthesis_statistics_retention.md)。
+
+类别统计没有 DP，当前 11 种攻击未评价该统计上传的泄漏；实验不提供 DP 保证。
+旧筛选模式和历史结果按原协议保留，不应用新默认值重新解释。
 
 ```bash
 python scripts/run_privacy_experiments.py --models clip_adapter --datasets cifar100 \
-  --methods fedavg --defenses risk_synthesis --attacks all
+  --defenses risk_synthesis --attacks all
+```
+
+### 当前风险分数对照
+
+`scripts/run_synthesis_risk_score_ablation.py` 默认运行 CLIP Transformer Adapter / CIFAR100 /
+FedSGD 1000 轮 / seed43 / 客户端0 / 全部11种攻击。固定10个 IID 客户端全部参与、
+batch32、学习率0.01、等权聚合、全局含自身类别中心与完整数值秩协方差、K=2、
+噪声系数0.2、风险覆盖比例1，生成 `(1-r) h + r mu_global_class + 0.2 L epsilon`。
+
+| 组 | 风险排序与分配 |
+| --- | --- |
+| `signed` | 按 `other_loss-own_loss` 稳定升序排序 |
+| `absolute` | 按 `abs(other_loss-own_loss)` 稳定升序排序 |
+| `shuffled` | 对 signed 排名权重做批内独立随机排列，保留权重集合 |
+
+三组只允许风险分数、分配模式与输出目录不同，同一原始记录的 K 个视图共享权重。
+单卡串行经唯一批量入口运行，失败停止后续组；新时间戳目录保存 `study_plan.json`。
+显式风险分数会记录 `signed_loss_gap` / `risk_ranking_score`，核验逐条排序、跨视图共享与
+打乱权重集合。命令与解释边界见[风险分数对照](docs/risk_synthesis_risk_score_ablation.md)。
+
+```bash
+# 仅检查三组配置，不启动训练、不创建结果目录
+python scripts/run_synthesis_risk_score_ablation.py --dry-run
+
+# 正式运行；单 GPU 串行，默认使用 GPU 0
+python scripts/run_synthesis_risk_score_ablation.py
 ```
 
 CoFedMID 默认**所有客户端协作防御**，开启动态类别分配、EXP3 样本回收与正则、

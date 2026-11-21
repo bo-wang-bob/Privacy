@@ -571,6 +571,7 @@ def print_plan(tasks: list[ExperimentTask], skipped: list[str]) -> None:
                   f"center_source:{synthesis.get('center_source', 'local_class')} "
                   f"mixing_mode:{synthesis.get('mixing_mode', 'risk')} "
                   f"risk_mode:{synthesis.get('mode', 'risk')} "
+                  f"risk_score:{synthesis.get('risk_score', 'signed_loss_gap')} "
                   f"risk_tail_fraction:{synthesis.get('risk_tail_fraction', 0.8)} "
                   f"views_per_record:{synthesis.get('views_per_record', 1)} "
                   f"class_rank:{synthesis.get('class_rank', 5)} "

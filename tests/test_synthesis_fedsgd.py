@@ -19,7 +19,9 @@ from test_risk_synthesis import make_model, dataset, deterministic_cpu
 
 @pytest.mark.parametrize('kind', ['clip_adapter', 'clip_lora'])
 @pytest.mark.parametrize('views', [1, 2, 3])
-def test_fedsgd_generated_gradient_original_batches_and_all_attacks(tmp_path, monkeypatch, kind, views):
+@pytest.mark.parametrize('risk_score,mode', [(None, 'risk'), ('signed_loss_gap', 'risk'),
+    ('absolute_loss_gap', 'risk'), ('signed_loss_gap', 'shuffled_risk')])
+def test_fedsgd_generated_gradient_original_batches_and_all_attacks(tmp_path, monkeypatch, kind, views, risk_score, mode):
     audit = _audit_config()
     audit.update(audit_batch_size=8, grad_sample_chunk_size=4)
     model = make_model(kind)
@@ -31,7 +33,9 @@ def test_fedsgd_generated_gradient_original_batches_and_all_attacks(tmp_path, mo
         results_dir=str(tmp_path), aggregator=build_aggregator('fedsgd', aggregation_weighting='uniform'),
         audit_config=audit, projres_config={'enabled': True, 'evaluation_interval': 1},
         defense_config={'name': 'risk_synthesis', 'synthesis': {**DEFAULTS, 'views_per_record': views,
-            'noise_scale': .5, 'mixing_mode': 'risk', 'global_distribution': 'generate',
+            'noise_scale': .2, 'mixing_mode': 'risk', 'mode': mode,
+            **({'risk_score': risk_score, 'risk_tail_fraction': 1} if risk_score is not None else {}),
+            'global_distribution': 'generate',
             'center_source': 'global_class'}}, method_config={'client_optimizer': 'sgd', 'seed': 42})
     synth = server.defense.synthesis
     generated, captures = {}, []

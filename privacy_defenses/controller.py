@@ -700,7 +700,7 @@ class DefenseController:
                 self._record_www_ranking(user, ranking, round_index, source_round,
                                          float(user.www_aggregation_weight))
                 risk, _, _ = risk_regularization_weights(
-                    ranking.scores, self.synthesis.risk_tail_fraction,
+                    self.synthesis.ranking_scores(ranking.scores), self.synthesis.risk_tail_fraction,
                     expected_batch_size=len(labels), tail_basis="actual_batch")
             with measure_stage(self, "train.synthesis_generate"):
                 views = self.synthesis.transform_views(model, user, images, labels.to(self.device),

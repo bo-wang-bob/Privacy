@@ -58,6 +58,9 @@ def synthesis_options(options):
         if (not direct or type(fraction) not in (int, float)
                 or not math.isfinite(fraction) or not 0 < fraction <= 1):
             raise ValueError("synthesis.risk_tail_fraction requires direct generation and a finite number in (0, 1].")
+    if "risk_score" in options:
+        if not direct or options["risk_score"] not in ("signed_loss_gap", "absolute_loss_gap"):
+            raise ValueError("synthesis.risk_score requires direct generation and signed_loss_gap or absolute_loss_gap.")
     if options.get("center_source") == "local_class_mean" and not direct:
         raise ValueError("synthesis.center_source=local_class_mean requires direct generation.")
     if direct and DIRECT_REMOVED_OPTIONS & set(options):
@@ -86,7 +89,7 @@ def validate_risk_synthesis(config):
     options = synthesis_options(defense.get("synthesis", {}))
     if config.get("aggregator") == "fedsgd" and options["candidate_selection"] != "direct":
         raise ValueError("FedSGD risk_synthesis requires candidate_selection=direct; historical filtered modes remain FedAvg-only.")
-    unknown = set(options) - set(LEGACY_DEFAULTS) - {"mixing_mode", "risk_tail_fraction"}
+    unknown = set(options) - set(LEGACY_DEFAULTS) - {"mixing_mode", "risk_tail_fraction", "risk_score"}
     if unknown:
         raise ValueError(f"Unknown synthesis options: {sorted(unknown)}")
     for key in ("replacement_fraction",):
@@ -337,6 +340,11 @@ class RiskSynthesis:
         self.device_geometry_cache = DeviceGeometryCache()
         self.statistics_storage = None
 
+    def ranking_scores(self, signed_loss_gaps):
+        """Transform only the current batch's ranking input; retain signed diagnostics."""
+        scores = signed_loss_gaps.detach()
+        return scores.abs() if self.options.get("risk_score", "signed_loss_gap") == "absolute_loss_gap" else scores
+
     @torch.no_grad()
     def initialize(self, users, shared_model, directory):
         if self.directory is not None:
@@ -383,6 +391,8 @@ class RiskSynthesis:
         fields = ["round", "client", "step", "sample_id", "label", "risk", "used_risk",
                   "requested", "accepted", "attempts", "reason", "nearest_distance", "source_round",
                   "norm_ratio", "teacher_margin_delta"]
+        if "risk_score" in self.options:
+            fields += ["signed_loss_gap", "risk_ranking_score"]
         if self.options["replacement_policy"] == "all":
             fields += ["quality_passed", "selected_attempt", "retained_original_fraction", "original_distance"]
         if self.options["risk_history"] != "none":
@@ -849,7 +859,9 @@ class RiskSynthesis:
                             mixing_coefficient_source={'risk':'risk', 'source':'constant_zero',
                                                        'class_center':'constant_one'}[self.options['mixing_mode']],
                             used_risk_role='class_center_mixing_coefficient',
-                            risk_ranking_policy='unchanged_when_references_available') if location_ablation else {}),
+                            risk_ranking_policy=('stable_ascending_configured_score_when_references_available'
+                                                 if 'risk_score' in self.options else
+                                                 'unchanged_when_references_available')) if location_ablation else {}),
                     geometry_source=("global_same_class" if self.options["global_distribution"] == "generate"
                                      else "local_class_only"),
                     local_statistics_geometry_source="local_class_only",
@@ -861,6 +873,12 @@ class RiskSynthesis:
                     **(dict(statistics_storage=self.statistics_storage) if self.statistics_storage else {}),
                     options=self.options, seed=self.seed,
                     risk_tail_fraction=self.risk_tail_fraction, risk_tail_basis="actual_batch",
+                    **(dict(risk_score=self.options['risk_score'],
+                            signed_loss_gap_definition='other_loss_minus_own_loss',
+                            risk_score_transform=('absolute_value' if self.options['risk_score'] == 'absolute_loss_gap'
+                                                  else 'identity'),
+                            risk_score_source='current_original_batch_previous_participation_models',
+                            risk_score_logged=True) if 'risk_score' in self.options else {}),
                     history_definition=("mean_per_round_zero_assigned_risk_frequency" if
                                         self.options["risk_history"] != "none" else None),
                     history_combination=("equal_midrank_sum_then_loss_gap_then_batch_order" if

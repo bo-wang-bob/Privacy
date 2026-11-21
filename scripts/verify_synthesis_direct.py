@@ -17,6 +17,30 @@ UNMEASURED = ('quality_passed', 'teacher_margin_delta', 'norm_ratio',
               'original_distance', 'nearest_distance')
 
 
+def verify_risk_scores(rows, options):
+    """Check score transform and stable ranks using the retained per-record gaps."""
+    available = [int(row['source_round']) >= 0 for row in rows]
+    require(all(available) or not any(available), 'Mixed risk score reference availability.')
+    if not any(available):
+        require(all(row.get('signed_loss_gap') == row.get('risk_ranking_score') == ''
+                    and float(row['risk']) == 0 for row in rows), 'Unavailable risk scores must be empty.')
+        return
+    scores = []
+    for row in rows:
+        require(row.get('signed_loss_gap') not in (None, '') and row.get('risk_ranking_score') not in (None, ''),
+                'Missing risk score evidence.')
+        gap, score = float(row['signed_loss_gap']), float(row['risk_ranking_score'])
+        expected = abs(gap) if options['risk_score'] == 'absolute_loss_gap' else gap
+        require(math.isfinite(gap) and math.isfinite(score) and score == expected, 'Invalid risk score transform.')
+        scores.append(score)
+    width = math.ceil(options.get('risk_tail_fraction', .8) * len(rows))
+    expected_risk = [0.] * len(rows)
+    for j, position in enumerate(sorted(range(len(rows)), key=scores.__getitem__)[-width:]):
+        expected_risk[position] = (j+.5)/width
+    require(all(math.isclose(float(row['risk']), risk, rel_tol=0, abs_tol=1e-7)
+                for row, risk in zip(rows, expected_risk)), 'Risk weights disagree with recorded score ranks.')
+
+
 def read_mechanism(directory, summary, *, complete):
     directory = Path(directory)
     from privacy_defenses.synthesis_cleanup import require_geometry_available
@@ -42,7 +66,9 @@ def read_mechanism(directory, summary, *, complete):
                 and summary.get('mixing_coefficient_source') == {
                     'risk':'risk', 'source':'constant_zero', 'class_center':'constant_one'}[mixing_mode]
                 and summary.get('used_risk_role') == 'class_center_mixing_coefficient'
-                and summary.get('risk_ranking_policy') == 'unchanged_when_references_available',
+                and summary.get('risk_ranking_policy') == (
+                    'stable_ascending_configured_score_when_references_available' if 'risk_score' in options
+                    else 'unchanged_when_references_available'),
                 'Invalid direct mixing metadata.')
     else:
         require('mixing_mode' not in options, 'Historical direct generation cannot declare a mixing ablation.')
@@ -67,6 +93,14 @@ def read_mechanism(directory, summary, *, complete):
             and summary['candidate_failure_policy'] == 'no_rejection_or_retry', 'Incorrect direct-generation metadata.')
     k = options['views_per_record']
     require(type(k) is int and k >= 1, 'Invalid view count.')
+    if 'risk_score' in options:
+        require(options['risk_score'] in ('signed_loss_gap', 'absolute_loss_gap')
+                and summary.get('risk_score') == options['risk_score']
+                and summary.get('signed_loss_gap_definition') == 'other_loss_minus_own_loss'
+                and summary.get('risk_score_transform') == (
+                    'absolute_value' if options['risk_score'] == 'absolute_loss_gap' else 'identity')
+                and summary.get('risk_score_source') == 'current_original_batch_previous_participation_models'
+                and summary.get('risk_score_logged') is True, 'Invalid risk score metadata.')
     if 'risk_tail_fraction' in options:
         fraction = options['risk_tail_fraction']
         require(type(fraction) in (int, float) and math.isfinite(fraction) and 0 < fraction <= 1
@@ -123,6 +157,8 @@ def read_mechanism(directory, summary, *, complete):
             rows = list(rows)
             ids = [int(r['sample_id']) for r in rows]
             require(len(set(ids)) == len(ids), 'Duplicate source within a batch.')
+            if 'risk_score' in options:
+                verify_risk_scores(rows, options)
             if 'risk_tail_fraction' in options:
                 available = [int(r['source_round']) >= 0 for r in rows]
                 require(all(available) or not any(available), 'Mixed risk reference availability within a batch.')
@@ -170,8 +206,11 @@ def read_mechanism(directory, summary, *, complete):
                             and row['quality_passed_views'] == '' and row['representative_view_index'] == '0'
                             and int(row['views_per_record']) == int(row['total_attempts']) == k,
                             'Original row must describe the first draw without semantic quality claims.')
-                    require(all(all(records[v*len(rows)+j][f] == row[f] for f in
-                            ('risk','used_risk','source_round','label')) for v in range(k)), 'Risk differs across views.')
+                    shared_fields = ('risk','used_risk','source_round','label')
+                    if 'risk_score' in options:
+                        shared_fields += ('signed_loss_gap', 'risk_ranking_score')
+                    require(all(all(records[v*len(rows)+j][f] == row[f] for f in shared_fields)
+                                for v in range(k)), 'Risk differs across views.')
                 count = dict(visits=1,requested=1,accepted=1,fallback=0)
                 totals.update(count); reasons[row['reason']] += 1
                 risk_bin = min(4,int(float(row['risk'])*5)); bins[str(risk_bin)].update(count)

@@ -1,5 +1,11 @@
 # Repository guidance
 
+## 风险分数对照（2026-10-03）
+
+- direct生成新增可选 `defense.synthesis.risk_score: signed_loss_gap | absolute_loss_gap`；缺省保留有符号 `other_loss-own_loss`。只变换生成风险的排序输入，独立WWW和原始有符号诊断不变。当前batch重新计算分数，首轮无参考风险仍为0。
+- 新入口 `scripts/run_synthesis_risk_score_ablation.py` 固定0.2噪声、全局含自身中心/完整秩协方差、K=2、全覆盖风险；默认Adapter/CIFAR100/FedSGD1000轮/seed43/客户端0/全部11攻击。signed、absolute、shuffled三组只允许risk_score/mode/输出目录不同，shuffled为有符号排名权重的批内独立排列。单卡串行经唯一批量入口执行，新目录保存study_plan；失败停止后续组并保留现有缓存清理语义。
+- 显式risk_score时CSV记录signed_loss_gap/risk_ranking_score，摘要记录分数定义；核验排序与逐条权重、跨视图共享及打乱权重集合。旧配置及结果不改写。122项CPU/协议回归和19项真实CUDA测试通过；方案及命令见 `docs/risk_synthesis_risk_score_ablation.md`。
+
 ## 失败实验的统计清理（2026-10-02）
 
 - 用户要求失败时也清除大统计缓存。新direct/catalog默认 `statistics_retention: cleanup_on_exit`；显式旧 `cleanup_on_success` 和 `keep` 保留原语义。成功仍先核验再保存精简凭据，失败/核验异常另存 `statistics_cleanup_manifest.json` 和 `statistics_cleanup.json`，标记 `cleaned_unverified`，不把实验升级为核验通过。
